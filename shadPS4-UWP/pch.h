@@ -1,6 +1,8 @@
 ﻿#pragma once
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <wrl.h>
 #include <wrl/client.h>
 #include <dxgi1_4.h>

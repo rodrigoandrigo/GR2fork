@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
+#include <boost/container/small_vector.hpp>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -18,8 +19,8 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/buffer_cache/stream_copy_lane.h"
+#include "video_core/gpu_command_sink.h"
 #include "video_core/renderdoc.h"
-#include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
 
@@ -103,7 +104,7 @@ SHAD_FORCE_INLINE static void BeginDraw(Liverpool::PacketStats& stats, GfxStateS
 // Every queued lane copy still reads guest memory that the fence tells the guest it may reuse,
 // so the lanes drain before anything guest-visible is written. Then the downloads and the sync
 // batch, so a fence sees them.
-static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
+static void FenceDrainAndDownload(VideoCore::GpuCommandSink* rasterizer) {
     VideoCore::StreamCopyLane::Instance().DrainProducer();
     if (rasterizer) {
         rasterizer->OnFence();
@@ -255,7 +256,7 @@ static_assert(RegBlocksInRange(kRtRegBlocks));
 
 } // namespace
 
-SHAD_FORCE_INLINE static void CpWriteOrCopy(Vulkan::Rasterizer* rasterizer, void* dst,
+SHAD_FORCE_INLINE static void CpWriteOrCopy(VideoCore::GpuCommandSink* rasterizer, void* dst,
                                             const void* src, u64 size) {
     // A CP write lands in guest memory at parse time. On hardware every earlier draw has read
     // its inputs by then; here those reads may still be queued on the copy lanes, and the write
@@ -299,6 +300,11 @@ Liverpool::Liverpool() {
 Liverpool::~Liverpool() {
     process_thread.request_stop();
     process_thread.join();
+}
+void Liverpool::OwnRasterizer(std::unique_ptr<VideoCore::GpuCommandSink> renderer) {
+    WaitGpuIdle();
+    owned_rasterizer = std::move(renderer);
+    rasterizer = owned_rasterizer.get();
 }
 
 void Liverpool::DrainCommands() {
@@ -652,7 +658,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             body();
         }
     };
-    Vulkan::Rasterizer::PacketRunGuard run{rasterizer};
+    VideoCore::GpuCommandSink::PacketRunGuard run{rasterizer};
 
     while (!dcb.empty()) {
         // One poll, one load: the drain re-tests the same counter, and the copy

@@ -17,9 +17,10 @@ struct ShaderParams {
     std::span<const u32, NumShaderUserData> user_data;
     std::span<const u32> code;
     u64 hash;
+    VAddr guest_base{};
 
     VAddr Base() const noexcept {
-        return reinterpret_cast<VAddr>(code.data());
+        return guest_base ? guest_base : reinterpret_cast<VAddr>(code.data());
     }
 };
 

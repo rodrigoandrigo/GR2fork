@@ -8,6 +8,8 @@
 #include "common/shared_first_mutex.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/gpu_command_sink.h"
+#include "video_core/gpu_memory_sink.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -30,11 +32,11 @@ SHAD_NO_INLINE void BindAssertFailed();
 class GraphicsPipeline;
 class Runtime;
 
-class Rasterizer {
+class Rasterizer : public VideoCore::GpuCommandSink, public VideoCore::GpuMemorySink {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
-    ~Rasterizer();
+    ~Rasterizer() override;
 
     [[nodiscard]] Scheduler& GetScheduler() noexcept {
         return scheduler;
@@ -52,12 +54,27 @@ public:
         return texture_cache;
     }
 
-    void Draw(bool is_indexed, u32 index_offset = 0);
+    void Draw(bool is_indexed, u32 index_offset = 0) override;
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
-                      VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
+                      VAddr count_address, u16 vertex_sgpr_offset,
+                      u16 instance_sgpr_offset) override;
+    void DrawIndirect(bool indexed, VAddr address, u32 offset, u32 stride, u32 count,
+                      VAddr count_address) override {
+        DrawIndirect(indexed, address, offset, stride, count, count_address, 0, 0);
+    }
+    void ProcessDownloadImages() override {
+        OnFence();
+    }
+    void CpSync() override {
+        Finish();
+        OnFence();
+    }
+    bool HostMarkersEnabled() const override {
+        return host_markers_enabled;
+    }
 
-    void DispatchDirect();
-    void DispatchIndirect(VAddr address, u32 offset, u32 size);
+    void DispatchDirect() override;
+    void DispatchIndirect(VAddr address, u32 offset, u32 size) override;
 
     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
         if (host_markers_enabled) {
@@ -69,27 +86,27 @@ public:
         }
     }
 
-    void ScopeMarkerBegin(const std::string_view& str, bool from_guest = false);
-    void ScopeMarkerEnd(bool from_guest = false);
+    void ScopeMarkerBegin(std::string_view str, bool from_guest = false) override;
+    void ScopeMarkerEnd(bool from_guest = false) override;
     void ScopedMarkerInsert(const std::string_view& str, bool from_guest = false);
-    void ScopedMarkerInsertColor(const std::string_view& str, const u32 color,
-                                 bool from_guest = false);
+    void ScopedMarkerInsertColor(std::string_view str, const u32 color,
+                                 bool from_guest = false) override;
 
-    void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
-    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
-    u32 ReadDataFromGds(u32 gsd_offset);
-    bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
-    bool TryCpWriteBacking(VAddr addr, const void* data, u64 size);
+    void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) override;
+    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) override;
+    u32 ReadDataFromGds(u32 gsd_offset) override;
+    bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false) override;
+    bool TryCpWriteBacking(VAddr addr, const void* data, u64 size) override;
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
-    void MapMemory(VAddr addr, u64 size);
-    void RegisterMemory(VAddr addr, u64 size);
-    void UnmapMemory(VAddr addr, u64 size);
+    void MapMemory(VAddr addr, u64 size) override;
+    void RegisterMemory(VAddr addr, u64 size) override;
+    void UnmapMemory(VAddr addr, u64 size) override;
 
-    u64 Flush();
-    void Finish();
-    void OnSubmit();
-    void OnFence();
+    u64 Flush() override;
+    void Finish() override;
+    void OnSubmit() override;
+    void OnFence() override;
 
     // Scopes a guest-copy hold to one packet run: the caller yields to guest
     // threads between runs and the submit loop sleeps, so the hold must not
@@ -112,10 +129,10 @@ public:
     private:
         Rasterizer* r_;
     };
-    void BeginPacketRun();
-    void EndPacketRun();
+    void BeginPacketRun() override;
+    void EndPacketRun() override;
     /// The command drain runs fault-download hops inline; none may run under the hold.
-    void DropCopyHoldForCommands();
+    void DropCopyHoldForCommands() override;
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;

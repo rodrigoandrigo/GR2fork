@@ -1,14 +1,17 @@
 param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
     [string]$SDL3Source = 'C:\Users\rodri\Dev1\Projetos\SDL3-uwp',
-    [string]$D3D12Source = 'C:\Users\rodri\Dev1\Projetos\xbox-series-d3d12-main',
+    [string]$D3D12Source = '',
     [int]$Jobs = 6,
     [string]$PythonExecutable = '',
-    [switch]$CoreOnly
+    [switch]$CoreOnly,
+    [switch]$SkipSigning,
+    [string]$CertificatePath = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $repository = Split-Path $PSScriptRoot -Parent
+if (!$D3D12Source) { $D3D12Source = Join-Path $repository 'externals\d3d12-native' }
 $buildDirectory = Join-Path $repository "Build\UWP-$Configuration"
 $runtimeDirectory = Join-Path $repository "shadPS4-UWP\Runtime\$Configuration"
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -42,6 +45,12 @@ if ($LASTEXITCODE) { throw "Core configuration failed: $LASTEXITCODE" }
 & cmake --build $buildDirectory --target shadps4 --parallel $Jobs
 if ($LASTEXITCODE) { throw "Core build failed: $LASTEXITCODE" }
 if (!$CoreOnly) {
-    & $msbuild (Join-Path $repository 'shadPS4-UWP\shadPS4-UWP.vcxproj') /m /t:Build "/p:Configuration=$Configuration" /p:Platform=x64 /p:BuildCore=false /v:minimal /nologo
+    & $msbuild (Join-Path $repository 'shadPS4-UWP\shadPS4-UWP.vcxproj') /m /t:Build "/p:Configuration=$Configuration" /p:Platform=x64 /p:BuildCore=false "/p:D3D12Source=$D3D12Source" /v:minimal /nologo
     if ($LASTEXITCODE) { throw "UWP application build failed: $LASTEXITCODE" }
+    if (!$SkipSigning) {
+        $bundle = Get-ChildItem (Join-Path $repository 'shadPS4-UWP\AppPackages') -Filter '*.msixbundle' -Recurse |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (!$bundle) { throw 'The UWP package bundle was not generated.' }
+        & (Join-Path $PSScriptRoot 'sign-uwp.ps1') -Package $bundle.FullName -CertificatePath $CertificatePath
+    }
 }

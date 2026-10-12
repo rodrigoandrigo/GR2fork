@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -104,6 +105,10 @@ public:
     Colour GetLightBarRGB();
     void PollLightColour();
     bool SetVibration(u8 smallMotor, u8 largeMotor);
+#ifdef SHADPS4_UWP
+    void UpdateNativeState(const State& state);
+    uint16_t GetNativeVibration() const;
+#endif
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
 
     float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
@@ -122,6 +127,9 @@ private:
     std::optional<Colour> override_colour{};
 
     State m_state;
+#ifdef SHADPS4_UWP
+    std::atomic<uint16_t> native_vibration{};
+#endif
 
     std::mutex m_state_mutex;
     RingBufferQueue<State> m_states_queue;

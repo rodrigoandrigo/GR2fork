@@ -1,0 +1,159 @@
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <nlohmann/json.hpp>
+#include <agile.h>
+#include "FrontendRenderer.h"
+#include "ShadPS4Host.h"
+
+struct FrontendInput {
+    std::array<bool, 256> keys{};
+    std::vector<uint32_t> characters;
+    float x{-10000};
+    float y{-10000};
+    float wheel{};
+    bool left{};
+    bool right{};
+    bool captured{};
+    bool suspended{};
+    bool active{true};
+    uint32_t width{1280};
+    uint32_t height{720};
+};
+
+struct FrontendGame {
+    std::string path;
+    std::string title;
+    std::string serial;
+    std::string version;
+};
+struct FrontendRoot {
+    Platform::Agile<Windows::Storage::StorageFolder> folder;
+    std::string token;
+    bool enabled{true};
+};
+
+class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
+public:
+    explicit ImGuiFrontend(Windows::UI::Xaml::Controls::SwapChainPanel ^ panel);
+    ~ImGuiFrontend();
+    void Start(std::wstring root);
+    void Stop();
+    void UpdateInput(const std::function<void(FrontendInput&)>& update);
+    void SetFolder(Platform::Agile<Windows::Storage::StorageFolder> folder, std::string token);
+    void SetFolders(std::vector<FrontendRoot> folders);
+    void ImportFolder(Platform::Agile<Windows::Storage::StorageFolder> folder, std::wstring target);
+    std::function<void(std::wstring)> choose_folder;
+    std::function<void(std::string, std::string, bool, std::function<void(std::string)>)> edit_text;
+    std::function<void(std::wstring)> failure;
+    std::function<void()> ready;
+
+private:
+    struct Setting {
+        std::string group;
+        std::string key;
+        std::string label;
+        nlohmann::json value;
+        nlohmann::json choices;
+        double minimum{};
+        double maximum{};
+        bool editable{true};
+        std::string profile;
+    };
+    struct Library {
+        std::vector<FrontendGame> games;
+        std::shared_ptr<const std::vector<size_t>> indices;
+        uint64_t generation{};
+        std::vector<std::pair<std::string, std::string>> profiles;
+        struct Root {
+            std::string name;
+            std::string token;
+            bool enabled;
+        };
+        std::vector<Root> roots;
+    };
+    void Run(std::wstring root);
+    void Work();
+    bool Queue(std::function<void()> job, bool thumbnail = false);
+    void Complete(std::function<void()> update);
+    void LoadSettings(std::string profile = {}, uint64_t request = 0);
+    void SaveSetting(const Setting& setting, nlohmann::json value);
+    void Scan();
+    void ChangeRoot(std::string token, bool enabled, bool remove);
+    void PersistRoots();
+    void Filter();
+    std::vector<uint8_t> ReadFile(const std::string& path, uint64_t limit);
+    ThumbnailPixels Decode(const std::string& key, const std::string& path);
+    void RequestImage(const std::string& key, const std::string& path);
+    void Draw();
+    void DrawLibrary();
+    void DrawSettings();
+    void DrawLogs();
+    void SubmitInput(const FrontendInput& input);
+    HRESULT Attach(IDXGISwapChain* chain);
+    std::shared_ptr<ShadPS4Host> core;
+    Platform::Agile<Windows::UI::Xaml::Controls::SwapChainPanel> panel;
+    Platform::Agile<Windows::UI::Core::CoreDispatcher> dispatcher;
+    std::unique_ptr<FrontendRenderer> renderer;
+    std::mutex input_mutex;
+    FrontendInput input;
+    std::mutex work_mutex;
+    std::condition_variable work_ready;
+    std::deque<std::function<void()>> commands;
+    std::function<void()> filter_job;
+    std::deque<std::function<void()>> thumbnail_jobs;
+    std::deque<std::function<void()>> completed;
+    std::deque<std::string> pending_logs;
+    std::thread worker;
+    std::atomic_bool stopping{};
+    std::atomic_bool scanning{};
+    std::atomic<uint32_t> scanned{};
+    std::atomic<uint32_t> scan_depth{2};
+    std::atomic<uint64_t> generation{};
+    uint64_t filter_generation{};
+    std::shared_ptr<const Library> library;
+    std::shared_ptr<const std::vector<size_t>> visible;
+    std::vector<Setting> settings;
+    std::unordered_set<std::string> pending_images;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> failed_images;
+    std::deque<ThumbnailPixels> decoded;
+    std::deque<std::string> logs;
+    size_t excluded{};
+    int tab{};
+    int settings_tab{};
+    size_t selection{};
+    float ui_scale{1.0f};
+    bool show_fps{};
+    std::string settings_profile;
+    std::atomic<uint64_t> settings_request{};
+    char search[256]{};
+    std::string status{"Inicializando…"};
+    std::wstring user_root;
+    std::vector<FrontendRoot> roots;
+    std::vector<std::string> root_mounts;
+    decltype(&shadps4_unmount_storage_folder) unmount{};
+    decltype(&shadps4_get_settings) get_settings{};
+    decltype(&shadps4_set_host_state) set_host_state{};
+    decltype(&shadps4_set_setting) set_setting{};
+    decltype(&shadps4_reset_settings) reset_settings{};
+    decltype(&shadps4_mount_storage_folder) mount{};
+    decltype(&shadps4_storage_enumerate) enumerate{};
+    decltype(&shadps4_storage_stat) stat{};
+    decltype(&shadps4_open_mounted_file) open{};
+    decltype(&shadps4_file_read) read{};
+    decltype(&shadps4_file_get_size) size{};
+    decltype(&shadps4_file_close) close{};
+    decltype(&shadps4_get_game_settings) get_game_settings{};
+    decltype(&shadps4_set_game_setting) set_game_setting{};
+    decltype(&shadps4_delete_game_settings) delete_game_settings{};
+};

@@ -14,7 +14,13 @@ class ShadPS4Host : public std::enable_shared_from_this<ShadPS4Host> {
 public:
     explicit ShadPS4Host(Windows::UI::Xaml::Controls::SwapChainPanel ^ panel);
     ~ShadPS4Host();
-    void Initialize(const std::wstring& user_directory, uint32_t width, uint32_t height);
+    void Initialize(const std::wstring& user_directory, uint32_t width, uint32_t height,
+                    bool frontend = false);
+    template <typename T>
+    T GetApi(const char* name) {
+        return Resolve<T>(name);
+    }
+    void SetLogConsumer(std::function<void(std::string)> consumer);
     void Run(std::wstring executable, std::function<void(std::wstring)> completed);
     void Pause(bool paused);
     void Stop();
@@ -62,4 +68,6 @@ private:
     uint32_t pending_width{};
     uint32_t pending_height{};
     std::atomic_bool presentation_failed{};
+    std::mutex log_mutex;
+    std::function<void(std::string)> log_consumer;
 };

@@ -16,9 +16,12 @@
 #include "common/path_util.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/audio/audioout_backend.h"
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "uwp/d3d12_presenter.h"
+#include "uwp/gamepad_input.h"
+#include "uwp/xaudio2_output.h"
 
 namespace {
 std::atomic<uint32_t> state{SHADPS4_UNINITIALIZED};
@@ -27,7 +30,7 @@ std::atomic_bool pause_requested{};
 std::atomic_bool guest_ready{};
 std::mutex api_mutex;
 std::string last_error;
-std::unique_ptr<Core::Uwp::D3D12Presenter> presentation;
+std::shared_ptr<Core::Uwp::D3D12Presenter> presentation;
 std::mutex presentation_mutex;
 void* panel{};
 ShadPS4ErrorCallback error_callback{};
@@ -102,6 +105,11 @@ namespace Core::Uwp {
 void ReportError(std::string message) {
     Fail(std::move(message));
 }
+void FailGuestSession(std::string message) {
+    stop_requested.store(true);
+    guest_ready.store(false);
+    Fail(std::move(message));
+}
 bool StopRequested() {
     return stop_requested.load();
 }
@@ -144,7 +152,10 @@ int32_t shadps4_shutdown() {
     }
     try {
         std::scoped_lock lock{presentation_mutex};
+        VideoCore::SetPresentationSink({});
         presentation.reset();
+        Core::Uwp::StopGamepadInput();
+        Libraries::AudioOut::ShutdownAudioOut();
         Core::Uwp::ClearStorage();
         panel = nullptr;
         Common::Log::Flush();
@@ -197,9 +208,12 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
         }
         if (config->panel) {
             panel = config->panel;
-            presentation = std::make_unique<Core::Uwp::D3D12Presenter>();
+            presentation = std::make_shared<Core::Uwp::D3D12Presenter>();
             presentation->Initialize(*config);
+            VideoCore::SetPresentationSink(presentation);
         }
+        Core::Uwp::SuspendAudio(false);
+        Core::Uwp::StartGamepadInput();
         state.store(SHADPS4_READY);
         return 0;
     } catch (const winrt::hresult_error& exception) {
@@ -208,6 +222,21 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
                     winrt::to_string(exception.message()));
     } catch (const std::exception& exception) {
         return Fail(exception.what());
+    }
+}
+
+int32_t shadps4_set_host_state(int32_t active, int32_t input_captured) {
+    if ((active != 0 && active != 1) || (input_captured != 0 && input_captured != 1) ||
+        state.load() == SHADPS4_UNINITIALIZED)
+        return Fail("Invalid host input/audio state");
+    try {
+        Core::Uwp::CaptureGamepadInput(!active || input_captured);
+        Core::Uwp::SuspendAudio(!active);
+        return 0;
+    } catch (const winrt::hresult_error& exception) {
+        return Fail("XAudio2 HRESULT " +
+                    std::to_string(static_cast<uint32_t>(exception.code().value)) + ": " +
+                    winrt::to_string(exception.message()));
     }
 }
 
@@ -226,7 +255,7 @@ int32_t shadps4_run(const wchar_t* executable) {
             return Fail("The guest executable is not accessible in AppContainer");
         }
         state.store(SHADPS4_READY);
-        return Fail("The selected D3D12 source has no integrated PS4 draw/dispatch renderer yet");
+        return Fail("The D3D12 renderer still lacks complete image/sampler bindings and advanced guest graphics state; guest boot remains disabled");
     } catch (const std::exception& exception) {
         state.store(SHADPS4_FAILED);
         return Fail(exception.what());

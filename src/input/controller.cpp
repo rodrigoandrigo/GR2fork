@@ -264,16 +264,49 @@ void GameControllers::ResetLightbarColors() {
 }
 
 bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
+#ifdef SHADPS4_UWP
+    std::lock_guard lock{m_state_mutex};
+    native_vibration.store(static_cast<uint16_t>(smallMotor) |
+                           (static_cast<uint16_t>(largeMotor) << 8));
+    return m_state.connected;
+#else
     if (m_sdl_gamepad != nullptr) {
         return SDL_RumbleGamepad(m_sdl_gamepad, (smallMotor / 255.0f) * 0xFFFF,
                                  (largeMotor / 255.0f) * 0xFFFF, -1);
     }
     return true;
+#endif
 }
+
+#ifdef SHADPS4_UWP
+void GameController::UpdateNativeState(const State& state) {
+    std::lock_guard lock{m_state_mutex};
+    auto count = m_state.connected_count;
+    const auto intercepted = OrbisPadButtonDataOffset::Intercepted;
+    if ((state.buttonsState & intercepted) != (m_state.buttonsState & intercepted))
+        m_states_queue.Clear();
+    if (state.connected && !m_state.connected) {
+        if (++count == 0)
+            count = 1;
+        m_states_queue.Clear();
+    }
+    m_state = state;
+    m_state.connected_count = count;
+    if (!state.connected) {
+        native_vibration.store(0);
+        m_states_queue.Clear();
+    }
+    m_states_queue.Push(m_state);
+}
+uint16_t GameController::GetNativeVibration() const {
+    return native_vibration.load();
+}
+#endif
 
 static bool is_first_check = true;
 
 void GameControllers::TryOpenSDLControllers() {
+#ifndef SHADPS4_UWP
     using namespace Libraries::UserService;
     int controller_count;
     SDL_JoystickID* new_joysticks = SDL_GetGamepads(&controller_count);
@@ -361,6 +394,13 @@ void GameControllers::TryOpenSDLControllers() {
         }
     }
     SDL_free(new_joysticks);
+#else
+    for (size_t slot = 0; slot < 4; ++slot) {
+        auto* user = UserManagement.GetUserByPlayerIndex(static_cast<int>(slot + 1));
+        if (user)
+            UserManagement.LoginUser(user, static_cast<int>(slot + 1));
+    }
+#endif
 }
 u8 GameControllers::GetGamepadIndexFromJoystickId(SDL_JoystickID id) {
     auto g = SDL_GetGamepadFromID(id);

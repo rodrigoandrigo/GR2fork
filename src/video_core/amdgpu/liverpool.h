@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -21,8 +22,8 @@
 #include "video_core/amdgpu/gfx_state_stamp.h"
 #include "video_core/amdgpu/regs.h"
 
-namespace Vulkan {
-class Rasterizer;
+namespace VideoCore {
+class GpuCommandSink;
 }
 
 namespace Libraries::VideoOut {
@@ -97,9 +98,10 @@ public:
         vo_port = port;
     }
 
-    void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
+    void BindRasterizer(VideoCore::GpuCommandSink* rasterizer_) {
         rasterizer = rasterizer_;
     }
+    void OwnRasterizer(std::unique_ptr<VideoCore::GpuCommandSink> renderer);
 
     /// True when a submit or a queued command is waiting for the parser. Work
     /// the GPU command thread runs while otherwise idle polls this to yield.
@@ -310,7 +312,8 @@ private:
         static std::array<u8, 48_KB> constants_heap;
     } cblock{};
 
-    Vulkan::Rasterizer* rasterizer{};
+    VideoCore::GpuCommandSink* rasterizer{};
+    std::unique_ptr<VideoCore::GpuCommandSink> owned_rasterizer;
     Libraries::VideoOut::VideoOutPort* vo_port{};
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};

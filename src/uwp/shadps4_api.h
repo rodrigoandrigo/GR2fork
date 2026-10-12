@@ -63,6 +63,7 @@ SHADPS4_API int32_t __cdecl shadps4_initialize(const ShadPS4Config* config);
 SHADPS4_API int32_t __cdecl shadps4_run(const wchar_t* executable);
 SHADPS4_API void __cdecl shadps4_request_stop(void);
 SHADPS4_API void __cdecl shadps4_set_paused(int32_t paused);
+SHADPS4_API int32_t __cdecl shadps4_set_host_state(int32_t active, int32_t input_captured);
 SHADPS4_API void __cdecl shadps4_resize(uint32_t width, uint32_t height);
 SHADPS4_API int32_t __cdecl shadps4_render_host_frame(void);
 SHADPS4_API uint32_t __cdecl shadps4_get_state(void);
@@ -93,6 +94,15 @@ SHADPS4_API int32_t __cdecl shadps4_storage_enumerate(const char* path,
 SHADPS4_API int32_t __cdecl shadps4_storage_create_directory(const char* path);
 SHADPS4_API int32_t __cdecl shadps4_storage_delete(const char* path);
 SHADPS4_API int32_t __cdecl shadps4_storage_rename(const char* from, const char* to);
+SHADPS4_API int32_t __cdecl shadps4_get_settings(char* data, uint32_t capacity, uint32_t* required);
+SHADPS4_API int32_t __cdecl shadps4_set_setting(const char* group, const char* key,
+                                                const char* value_json);
+SHADPS4_API int32_t __cdecl shadps4_reset_settings(void);
+SHADPS4_API int32_t __cdecl shadps4_get_game_settings(const char* serial, char* data,
+                                                      uint32_t capacity, uint32_t* required);
+SHADPS4_API int32_t __cdecl shadps4_set_game_setting(const char* serial, const char* group,
+                                                     const char* key, const char* value_json);
+SHADPS4_API int32_t __cdecl shadps4_delete_game_settings(const char* serial);
 
 #ifdef __cplusplus
 }

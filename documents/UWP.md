@@ -8,8 +8,8 @@ continua disponível na configuração padrão.
 
 - Visual Studio com C++ UWP, Windows SDK 10.0.26100.0 e clang-cl.
 - CMake, Ninja e Python 3.
-- SDL3 em `...\SDL3-uwp`.
-- D3D12 em `...\xbox-series-d3d12-main`.
+- SDL3 em `C:\Users\rodri\Dev1\Projetos\SDL3-uwp`.
+- D3D12 em `externals/d3d12-native`.
 
 Execute na raiz:
 
@@ -20,6 +20,12 @@ Execute na raiz:
 Use `-PythonExecutable` se Python não estiver no PATH. `-SDL3Source` e
 `-D3D12Source` substituem as pastas acima. `-CoreOnly` compila e copia a DLL,
 sem compilar o aplicativo. A solução UWP também chama esse script antes do build.
+
+O script assina o bundle com `shadPS4-UWP/shadPS4-UWP_TemporaryKey.pfx`,
+verifica a assinatura CMS e exporta o certificado público `.cer` junto ao pacote.
+`-CertificatePath` substitui o certificado; `-SkipSigning` gera somente o pacote
+sem assinatura. A assinatura exige que o Subject corresponda ao Publisher do
+manifesto. `scripts/sign-uwp.ps1 -Package <bundle>` permite assinar separadamente.
 
 SDL3 é compilado com MSVC/C++/CX; o núcleo usa clang-cl para preservar a ABI SysV
 e o assembly x64 do PS4. O modo UWP não compila o SDL de `externals/sdl3`.
@@ -36,10 +42,12 @@ O núcleo compila diretamente os componentes do projeto indicado:
 - `d3d12_resource_allocator.cpp`: recursos e orçamento.
 - `d3d12_command_encoder.cpp`: transições e comandos de transferência.
 - `d3d12_pipeline_cache.cpp`: descritores, root signatures e pipelines.
+- `d3d12_videocore_bridge.cpp`: contrato de comandos, transferências e readback.
 
-Um adaptador de apresentação cria o swapchain de composição e usa o callback
-da ABI para anexá-lo ao SwapChainPanel na thread UI. Os frames de fundo são
-gravados e submetidos na DLL usando os componentes D3D12 importados.
+O frontend ImGui cria seu swapchain de composição usando o dispositivo D3D12
+importado e anexa-o ao SwapChainPanel na thread UI. Ele inicializa a DLL sem
+painel, separando apresentação da interface e núcleo. A ABI mantém também
+o adaptador de apresentação de fundo para outros consumidores.
 Não há dependência de Dozen nem carregamento de um ICD Vulkan neste caminho.
 
 ## Limite atual
@@ -47,6 +55,10 @@ Não há dependência de Dozen nem carregamento de um ICD Vulkan neste caminho.
 **Ainda não há renderer PS4 D3D12 integrado.** O projeto D3D12 fornecido também
 declara essa pendência: seu consumidor inicial rejeita draw e dispatch guest,
 e a conversão de shaders cobre contratos restritos de validação.
+
+O estado da migração do renderer e os caminhos ainda pendentes estão em
+[D3D12-RENDERER.md](D3D12-RENDERER.md). A cópia local e o contrato PM4 comum
+não removem essas limitações.
 
 Consequentemente, inicializar dispositivo, apresentar o fundo e compilar a DLL
 não equivale a executar um jogo PS4. O aplicativo mantém o boot desabilitado;
@@ -60,15 +72,14 @@ capacidades nem simulados draws para contornar essa ausência.
 ## Armazenamento e diagnóstico
 
 Configuração, logs, saves e módulos usam LocalFolder/shadPS4. O FolderPicker
-fornece um StorageFolder à DLL para montar `/app0` em modo somente leitura.
-O host lê metadados e o início do eboot pela API, sem copiar a árvore para
-LocalCache e sem converter o grant em um caminho externo. Selecionar a pasta
-está disponível; iniciar o guest continua desabilitado.
+fornece StorageFolders à DLL para montar `/libraryN` em modo somente leitura.
+O worker lê metadados e capas pela API sem converter o grant em caminho externo.
+Selecionar pastas está disponível; iniciar o guest continua desabilitado.
 
-O host salva a seleção sob o token `shadps4-game` no FutureAccessList do
-próprio pacote e recupera o StorageFolder na próxima inicialização. Remoção
-do arquivo, revogação do acesso e falhas de restauração aparecem na UI;
-o usuário pode selecionar outra pasta.
+O host salva tokens gerados pela FutureAccessList do próprio pacote e a lista
+de pastas em LocalSettings. Na próxima inicialização recupera os StorageFolders;
+grants revogados são ignorados. O token antigo `shadps4-game` é migrado quando
+não existe uma lista. Falhas de leitura aparecem na UI; outra pasta pode ser adicionada.
 
 ## Arquivos brokered
 
@@ -139,7 +150,7 @@ Referência: [File access permissions](https://learn.microsoft.com/en-us/windows
 FutureAccessList é privado do pacote, não uma autorização compartilhada com
 outros aplicativos. Nenhuma capability broadFileSystemAccess foi adicionada.
 
-Validação local desta camada: build Release da DLL, host e MSIX; 32 exports
+Validação local desta camada: build Release da DLL, host e MSIX; 39 exports
 públicos conferidos; flag AppContainer e hash da DLL dentro do pacote conferidos.
 O probe nativo exercitou StorageFile/StorageFolder, CRUD, EOF, leitura/escrita
 em blocos acima de 1 MiB, append, truncate, handles síncronos/assíncronos,
@@ -199,3 +210,88 @@ e gameplay são verificações separadas. Não se presume resultado no Xbox a
 partir dos resultados registrados pelo outro projeto.
 
 Referência: [VirtualProtectFromApp e codeGeneration](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualprotectfromapp).
+
+
+## Frontend ImGui
+
+O ImGui 1.89.5 WIP e seu backend DX12 foram copiados, sem modificações, de
+RPCS3-UWP/Frontend/dependencies/imgui para shadPS4-UWP/third_party/imgui,
+incluindo LICENSE.txt. Essa cópia pertence somente ao host; nenhuma estrutura
+ImGui atravessa a ABI da DLL.
+
+Biblioteca, configurações globais e por jogo, importação de módulos/fontes/DLCs
+e logs ficam no frontend. A biblioteca aceita até 64 pastas brokered, com
+habilitar/remover/atualizar e tokens persistidos na FutureAccessList.
+A lista é virtualizada; busca, ordenação, leitura de PSF e decodificação WIC
+acontecem no worker MTA. A última busca substitui a busca pendente.
+
+A thread UI modifica apenas o snapshot protegido por mutex. A thread de
+renderização possui o contexto ImGui. Entrada é limpa ao perder foco, sair
+com o ponteiro ou abrir diálogo nativo. O desligamento interrompe filas,
+aguarda o worker e libera a DLL depois do renderer.
+
+O heap possui 65 descritores: um para fonte e 64 para capas. A expulsão LRU
+espera o fence do último uso antes de reutilizar um descritor. Capas têm até
+256x256 pixels; filas, logs, erros de capa e uploads são limitados. Até dois
+uploads entram na lista de comandos de cada frame, sem espera global por capa.
+
+A API de configurações usa os oito grupos reais do desktop e valida tipo,
+faixa, enumeração e política antes de salvar. O inventário completo de 167
+opções, com 46 editáveis e justificativas para 121 exclusões desta base atual,
+está em [UWP-SETTINGS.md](UWP-SETTINGS.md). Perfis por jogo respeitam os campos
+overrideable do desktop, sem alterar o singleton global.
+
+Validação local: build Release do núcleo, host e pacote; API de configurações
+com persistência, reset, perfis, isolamento e rejeição de traversal; renderer
+nativo com 400 frames/capas, cache máximo de 64, lista sintética de 100 mil
+itens e readback de GPU. Esses probes não executam o aplicativo empacotado.
+Instalação, navegação visual completa, picker/FutureAccessList no AppContainer,
+resumo da suspensão e Xbox continuam sem validação de execução.
+
+
+## XAudio2 e Windows.Gaming.Input
+
+XAudio2 é o backend de saída padrão em novas configurações UWP e aparece no
+seletor Audio/audio_backend com valor 2. Configurações existentes de SDL3 ou
+OpenAL são preservadas. Microfone continua usando o backend SDL de entrada;
+XAudio2 não é uma API de captura. O mixer Audio3d existente entrega sua saída
+à mesma camada AudioOut.
+
+As portas XAudio2 compartilham dispositivo/mastering voice numa thread MTA
+própria, que mantém COM até a destruição do dispositivo, e possuem source
+voices independentes. Não se exige COM inicializado na thread guest que abre
+a porta. A compilação usa WINAPI_FAMILY_APP e importa XAudio2_9 diretamente,
+sem o fallback de carregamento da API desktop. São aceitos S16 e float, mono/estéreo/oito canais, com
+remapeamento pelo AudioFormatInfo do núcleo e ganhos por canal mais o volume
+global. Cada porta conserva oito buffers próprios até OnBufferEnd; callbacks
+fazem apenas operações atômicas, sem logs, alocações ou espera. Uma fila cheia
+descarta o novo bloco e registra diagnóstico limitado, sem bloquear a UI.
+DestroyVoice ocorre antes de liberar os buffers. O shutdown interrompe e
+aguarda as threads AudioOut antes de destruir vozes e dispositivo.
+
+Windows.Gaming.Input alimenta tanto a navegação ImGui quanto os pads do núcleo.
+Um worker MTA mantém até quatro slots estáveis por identidade do Gamepad,
+detecta conexão/desconexão e publica cada pacote completo sob o mutex do
+GameController. Botões A/B/X/Y correspondem a Cross/Circle/Square/Triangle,
+Menu a Options e View ao clique do TouchPad. Direcional, L1/R1, L3/R3,
+sticks e gatilhos são mapeados; Y é invertido para o sistema PS4. Sticks usam
+0..255 com centro 128; gatilhos usam 0..255. Não são simulados sensores ou
+uma superfície touch ausentes no Gamepad. Os slots usam os usuários já
+configurados no desktop. Timestamps de entrada vêm do relógio monotônico da
+sessão do host, sem depender de inicialização do relógio guest.
+
+Pedidos de vibração do guest são atômicos; somente o worker WGI escreve
+Gamepad.Vibration. O motor grande usa LeftMotor e o pequeno RightMotor.
+Captura de UI/foco/suspensão limpa entrada antiga e vibração. A nova função
+aditiva shadps4_set_host_state(active, input_captured) coordena essa captura e
+StopEngine/StartEngine do XAudio2. Desconexão e encerramento também param os
+motores. O worker é aguardado antes de descarregar a DLL.
+
+Validação Release: 288 buffers silenciosos consumidos pelo XAudio2 real em
+1/2/8 canais, limite de fila, pausa/retomada, rejeição de tamanho inválido e
+destruição com buffers pendentes; ativação WGI real e mapeamento de 14 botões,
+dois gatilhos, centros/extremos/limites dos eixos. Nenhum controle físico estava
+conectado. Hotplug físico, vibração sentida, qualidade audível, execução guest,
+aplicativo instalado/AppContainer e Xbox continuam sem prova de execução.
+O bundle foi assinado com CN=rodri e verificado por SignTool, sem instalar o
+pacote nem alterar certificados confiáveis do sistema.

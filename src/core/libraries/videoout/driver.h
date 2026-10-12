@@ -6,14 +6,11 @@
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
+#include "video_core/presentation_sink.h"
 
 #include <condition_variable>
 #include <mutex>
 #include <queue>
-
-namespace Vulkan {
-struct Frame;
-}
 
 namespace Libraries::VideoOut {
 
@@ -94,7 +91,8 @@ public:
 
 private:
     struct Request {
-        Vulkan::Frame* frame;
+        VideoCore::FrameHandle frame;
+        std::shared_ptr<VideoCore::PresentationSink> sink;
         VideoOutPort* port;
         s64 flip_arg;
         s32 index;

@@ -36,4 +36,12 @@ public:
     std::unique_ptr<PortBackend> Open(PortOut& port) override;
 };
 
+#ifdef SHADPS4_UWP
+class XAudio2AudioOut final : public AudioOutBackend {
+public:
+    std::unique_ptr<PortBackend> Open(PortOut& port) override;
+};
+void ShutdownAudioOut();
+#endif
+
 } // namespace Libraries::AudioOut

@@ -216,15 +216,50 @@ s32 PS4_SYSV_ABI sceAudioOutInit() {
         return ORBIS_AUDIO_OUT_ERROR_ALREADY_INIT;
     }
 
-    if (EmulatorSettings.GetAudioBackend() == AudioBackend::OpenAL) {
+    switch (EmulatorSettings.GetAudioBackend()) {
+    case AudioBackend::OpenAL:
         audio = std::make_unique<OpenALAudioOut>();
-    } else {
+        break;
+#ifdef SHADPS4_UWP
+    case AudioBackend::XAudio2:
+        audio = std::make_unique<XAudio2AudioOut>();
+        break;
+#endif
+    default:
         audio = std::make_unique<SDLAudioOut>();
+        break;
     }
 
     LOG_INFO(Lib_AudioOut, "Audio system initialized");
     return ORBIS_OK;
 }
+
+#ifdef SHADPS4_UWP
+void ShutdownAudioOut() {
+    std::scoped_lock allocation_lock{port_allocation_mutex};
+    decltype(port_table) ports;
+    {
+        std::unique_lock lock{port_table_mutex};
+        ports.swap(port_table);
+    }
+    for (auto& port : ports) {
+        if (!port)
+            continue;
+        {
+            std::scoped_lock lock{port->mutex};
+            port->closing = true;
+            port->output_ready = false;
+        }
+        port->output_cv.notify_all();
+        port->output_thread.Stop();
+        std::free(port->output_buffer);
+        port->output_buffer = nullptr;
+        port->impl.reset();
+    }
+    audio.reset();
+    lazy_init.store(0);
+}
+#endif
 
 s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
                                  OrbisAudioOutPort port_type, s32 index, u32 length,

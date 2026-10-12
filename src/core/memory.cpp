@@ -5,6 +5,7 @@
 #include <atomic>
 #include <thread>
 
+#include <shared_mutex>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -15,7 +16,7 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
-#include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/gpu_memory_sink.h"
 
 namespace Core {
 

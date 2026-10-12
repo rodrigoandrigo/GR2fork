@@ -11,9 +11,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
-#include "video_core/renderer_vulkan/vk_presenter.h"
-
-extern std::unique_ptr<Vulkan::Presenter> presenter;
+#include "video_core/presentation_sink.h"
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
@@ -169,7 +167,7 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
         port->buffer_labels[startIndex + i] = 0;
         port->SignalVoLabel();
 
-        presenter->RegisterVideoOutSurface(group, address);
+        VideoCore::GetPresentationSink()->RegisterVideoOutSurface(group, address);
         LOG_INFO(Lib_VideoOut, "buffers[{}] = {:#x}", i + startIndex, address);
     }
 
@@ -235,10 +233,10 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
-    presenter->SetHDR(req.port->is_hdr);
+    req.sink->SetHDR(req.port->is_hdr);
 
     // Present the frame.
-    presenter->Present(req.frame);
+    req.sink->Present(req.frame);
 
     // Update flip status.
     auto* port = req.port;
@@ -278,14 +276,16 @@ void VideoOutDriver::Flip(const Request& req) {
 }
 
 void VideoOutDriver::DrawBlankFrame() {
-    const auto empty_frame = presenter->PrepareBlankFrame(true);
-    presenter->Present(empty_frame, false, false);
+    const auto sink = VideoCore::GetPresentationSink();
+    const auto empty_frame = sink->PrepareBlankFrame(true);
+    sink->Present(empty_frame, false, false);
 }
 
 void VideoOutDriver::DrawLastFrame() {
-    const auto frame = presenter->PrepareLastFrame();
+    const auto sink = VideoCore::GetPresentationSink();
+    const auto frame = sink->PrepareLastFrame();
     if (frame != nullptr) {
-        presenter->Present(frame, true);
+        sink->Present(frame, true);
     }
 }
 
@@ -316,19 +316,21 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
-    Vulkan::Frame* frame;
+    VideoCore::FrameHandle frame;
+    const auto sink = VideoCore::GetPresentationSink();
     if (index == -1) {
-        frame = presenter->PrepareBlankFrame(false);
+        frame = sink->PrepareBlankFrame(false);
     } else {
         const auto& buffer = port->buffer_slots[index];
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
-        frame = presenter->PrepareFrame(group, buffer.address_left);
+        frame = sink->PrepareFrame(group, buffer.address_left);
     }
 
     std::scoped_lock lock{mutex};
     requests.push({
         .frame = frame,
+        .sink = sink,
         .port = port,
         .flip_arg = flip_arg,
         .index = index,

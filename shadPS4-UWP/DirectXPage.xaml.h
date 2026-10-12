@@ -1,7 +1,6 @@
 #pragma once
 #include "DirectXPage.g.h"
-#include "ShadPS4Host.h"
-
+#include "ImGuiFrontend.h"
 namespace shadPS4_UWP {
 public
 ref class DirectXPage sealed {
@@ -12,16 +11,24 @@ public:
 
 private:
     void OnLoaded(Platform::Object ^ sender, Windows::UI::Xaml::RoutedEventArgs ^ args);
-    void OnRendering(Platform::Object ^ sender, Platform::Object ^ args);
-    void OnOpenGame(Platform::Object ^ sender, Windows::UI::Xaml::RoutedEventArgs ^ args);
-    void RestoreGameFolder();
-    void OnPause(Platform::Object ^ sender, Windows::UI::Xaml::RoutedEventArgs ^ args);
-    void OnStop(Platform::Object ^ sender, Windows::UI::Xaml::RoutedEventArgs ^ args);
+    void OnUnloaded(Platform::Object ^ sender, Windows::UI::Xaml::RoutedEventArgs ^ args);
+    void OnPointer(Platform::Object ^ sender,
+                   Windows::UI::Xaml::Input::PointerRoutedEventArgs ^ args);
     void OnPanelSizeChanged(Platform::Object ^ sender,
                             Windows::UI::Xaml::SizeChangedEventArgs ^ args);
-    std::shared_ptr<ShadPS4Host> core;
-    bool paused{};
-    bool initialized{};
-    bool initializing{};
+    void PickFolder(std::wstring purpose);
+    void EditText(std::string label, std::string value, bool secret,
+                  std::function<void(std::string)> completed);
+    void Capture(bool captured);
+    void OnPointerLost(Platform::Object ^ sender,
+                       Windows::UI::Xaml::Input::PointerRoutedEventArgs ^ args);
+    void OnCompositionScaleChanged(Windows::UI::Xaml::Controls::SwapChainPanel ^ sender,
+                                   Platform::Object ^ args);
+    std::shared_ptr<ImGuiFrontend> frontend;
+    Windows::UI::Core::CoreWindow ^ window;
+    Windows::Foundation::EventRegistrationToken down_token;
+    Windows::Foundation::EventRegistrationToken up_token;
+    Windows::Foundation::EventRegistrationToken character_token;
+    Windows::Foundation::EventRegistrationToken activation_token;
 };
 } // namespace shadPS4_UWP
