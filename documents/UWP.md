@@ -8,8 +8,8 @@ continua disponível na configuração padrão.
 
 - Visual Studio com C++ UWP, Windows SDK 10.0.26100.0 e clang-cl.
 - CMake, Ninja e Python 3.
-- SDL3 em `C:\Users\rodri\Dev1\Projetos\SDL3-uwp`.
-- D3D12 em `C:\Users\rodri\Dev1\Projetos\xbox-series-d3d12-main`.
+- SDL3 em `...\SDL3-uwp`.
+- D3D12 em `...\xbox-series-d3d12-main`.
 
 Execute na raiz:
 
