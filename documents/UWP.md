@@ -8,7 +8,7 @@ continua disponível na configuração padrão.
 
 - Visual Studio com C++ UWP, Windows SDK 10.0.26100.0 e clang-cl.
 - CMake, Ninja e Python 3.
-- SDL3 em `.../SDL3-uwp`.
+- SDL3 em `C:\Users\rodri\Dev1\Projetos\SDL3-uwp`.
 - D3D12 em `externals/d3d12-native`.
 
 Execute na raiz:

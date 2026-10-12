@@ -1,6 +1,7 @@
 #include "video_core/renderer_d3d12/shader_cache.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <stdexcept>
 #include <spirv_hlsl.hpp>
@@ -9,6 +10,104 @@
 
 namespace D3D12 {
 namespace {
+std::string SemanticMember(const std::string& source, std::string_view structure,
+                           std::string_view semantic) {
+    const auto begin = source.find("struct " + std::string(structure));
+    if (begin == std::string::npos)
+        throw std::runtime_error("Missing HLSL stage interface structure");
+    const auto end = source.find("};", begin);
+    const auto colon = source.find(": " + std::string(semantic), begin);
+    if (colon == std::string::npos || colon > end)
+        return {};
+    size_t last = colon;
+    while (last > begin && std::isspace(static_cast<unsigned char>(source[last - 1])))
+        --last;
+    size_t first = last;
+    while (first > begin && (std::isalnum(static_cast<unsigned char>(source[first - 1])) ||
+                             source[first - 1] == '_'))
+        --first;
+    if (first == last)
+        throw std::runtime_error("Invalid HLSL stage semantic member");
+    return source.substr(first, last - first);
+}
+void AddSemanticMember(std::string& source, std::string_view structure,
+                       std::string_view declaration) {
+    const auto begin = source.find("struct " + std::string(structure));
+    const auto end = source.find("};", begin);
+    if (begin == std::string::npos || end == std::string::npos)
+        throw std::runtime_error("Missing HLSL stage interface structure");
+    source.insert(end, std::string(declaration) + "\n");
+}
+void ApplySampleMasks(std::string& source, bool sample_shading) {
+    auto entry = source.find(" main(");
+    if (entry == std::string::npos)
+        throw std::runtime_error("Missing HLSL fragment entry point");
+    const auto close = source.find(')', entry);
+    const bool has_input = close > entry + 6;
+    const auto line = source.rfind('\n', entry);
+    const bool has_output = source
+                                .substr(line == std::string::npos ? 0 : line + 1,
+                                        entry - (line == std::string::npos ? 0 : line + 1))
+                                .find("void") == std::string::npos;
+    std::string position = "shadMsaaPosition";
+    std::string sample = "shadSampleIndex";
+    if (has_input) {
+        const auto member = SemanticMember(source, "SPIRV_Cross_Input", "SV_Position");
+        if (member.empty())
+            AddSemanticMember(source, "SPIRV_Cross_Input",
+                              "float4 shadMsaaPosition : SV_Position;");
+        else
+            position = member;
+        position = "input." + position;
+        if (sample_shading) {
+            const auto sample_member =
+                SemanticMember(source, "SPIRV_Cross_Input", "SV_SampleIndex");
+            if (sample_member.empty())
+                AddSemanticMember(source, "SPIRV_Cross_Input",
+                                  "uint shadSampleIndex : SV_SampleIndex;");
+            else
+                sample = sample_member;
+            sample = "input." + sample;
+        }
+    }
+    std::string coverage = "shadMsaaCoverage";
+    if (has_output) {
+        const auto member = SemanticMember(source, "SPIRV_Cross_Output", "SV_Coverage");
+        if (member.empty())
+            AddSemanticMember(source, "SPIRV_Cross_Output", "uint shadMsaaCoverage : SV_Coverage;");
+        else
+            coverage = member;
+        const bool exported = !member.empty();
+        coverage += exported ? " &= mask;" : " = mask;";
+    } else {
+        source += "\nstruct ShadMsaaOutput { uint shadMsaaCoverage : SV_Coverage; };\n";
+        coverage += " = mask;";
+    }
+    entry = source.find(" main(");
+    source.replace(entry + 1, 4, "shad_guest_main");
+    source += "\ncbuffer ShadMsaaState : register(b3, space0) { uint4 shadMsaaMasks; };\n";
+    if (source.find("[earlydepthstencil]") != std::string::npos)
+        source += "[earlydepthstencil]\n";
+    source += has_output ? "SPIRV_Cross_Output" : "ShadMsaaOutput";
+    if (has_input)
+        source += " main(SPIRV_Cross_Input input) {\n";
+    else
+        source += sample_shading ? " main(float4 shadMsaaPosition : SV_Position, uint "
+                                   "shadSampleIndex : SV_SampleIndex) {\n"
+                                 : " main(float4 shadMsaaPosition : SV_Position) {\n";
+    source += "uint2 pixel = uint2(" + position +
+              ".xy);\nuint mask = shadMsaaMasks[(pixel.x & 1) | ((pixel.y & 1) << 1)];\n";
+    if (sample_shading)
+        source += "mask &= (1u << " + sample + ");\n";
+    if (has_output)
+        source += "SPIRV_Cross_Output output = shad_guest_main(";
+    else
+        source += "shad_guest_main(";
+    source += has_input ? "input);\n" : ");\n";
+    if (!has_output)
+        source += "ShadMsaaOutput output;\n";
+    source += "output." + coverage + "\nreturn output;\n}\n";
+}
 const wchar_t* Target(Shader::SwStage stage) {
     switch (stage) {
     case Shader::SwStage::Vertex:
@@ -68,7 +167,8 @@ void ShaderCache::Initialize(ID3D12Device* device) {
     profile.needs_buffer_offsets = true;
 }
 CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
-                                    Shader::Backend::Bindings bindings, bool flip_y) {
+                                    Shader::Backend::Bindings bindings, bool flip_y,
+                                    bool sample_mask, bool sample_shading) {
     if (params.code.empty() || params.code.size() > 1024 * 1024 ||
         runtime.props.num_user_data > Shader::NUM_USER_DATA_REGS ||
         (runtime.sw_stage == Shader::SwStage::Fragment && runtime.hw.fs.num_inputs > 32))
@@ -84,12 +184,14 @@ CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::Runtime
         throw std::runtime_error("D3D12 shader stages exceed push buffer offset capacity");
     const auto words =
         Shader::Backend::SPIRV::EmitSPIRV(profile, result.runtime, program, result.end_bindings);
-    result.binary = CompileSpirv(words, runtime.sw_stage, flip_y);
+    result.binary = CompileSpirv(words, runtime.sw_stage, flip_y, sample_mask, sample_shading);
     result.info.RefreshFlatBuf();
     return result;
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u32> words,
-                                                              Shader::SwStage stage, bool flip_y) {
+                                                              Shader::SwStage stage, bool flip_y,
+                                                              bool sample_mask,
+                                                              bool sample_shading) {
     if (words.size() < 5 || words.size() > 4 * 1024 * 1024 || words[0] != spv::MagicNumber)
         throw std::runtime_error("Invalid guest SPIR-V module");
     for (size_t offset = 5; offset < words.size();) {
@@ -102,7 +204,8 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u3
             throw std::runtime_error("D3D12 graphics wave64 lowering is not implemented");
         offset += length;
     }
-    std::vector<u32> key{static_cast<u32>(stage), static_cast<u32>(flip_y)};
+    std::vector<u32> key{static_cast<u32>(stage), static_cast<u32>(flip_y),
+                         static_cast<u32>(sample_mask), static_cast<u32>(sample_shading)};
     key.insert(key.end(), words.begin(), words.end());
     if (const auto found = cache.find(key); found != cache.end())
         return found->second;
@@ -177,6 +280,11 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u3
     cross.set_hlsl_aux_buffer_binding(spirv_cross::HLSL_AUX_BINDING_BASE_VERTEX_INSTANCE, 1, 0);
     cross.set_hlsl_options(options);
     result->hlsl = cross.compile();
+    if (sample_mask || sample_shading) {
+        if (stage != Shader::SwStage::Fragment)
+            throw std::runtime_error("Sample masks require a fragment shader");
+        ApplySampleMasks(result->hlsl, sample_shading);
+    }
     if (stage == Shader::SwStage::Compute) {
         const auto entry = result->hlsl.find("[numthreads(");
         if (entry == std::string::npos)

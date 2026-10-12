@@ -34,12 +34,18 @@ public:
         D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut{D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED};
         s32 base_vertex{};
         bool flip_y{};
+        bool sample_shading{};
+        u32 samples{1};
+        std::array<u32, 4> sample_masks{UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX};
+        std::vector<D3D12_SAMPLE_POSITION> sample_positions;
     };
     void Initialize(ResourceCache::Read read, ResourceCache::Write write,
                     ResourceCache::Resolve resolve = {});
     void Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                   std::array<u32, 3> groups, VAddr border_colors = 0);
     void Draw(const DrawRequest& request);
+    void Resolve(const VideoCore::ImageInfo& source, const VideoCore::ImageInfo& destination,
+                 u32 source_layer = 0, u32 destination_layer = 0, u32 layers = 0);
     u64 Flush();
     ResourceCache& Resources() {
         return resources;

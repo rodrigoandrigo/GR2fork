@@ -106,6 +106,7 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     bindings.Upload(commands.Get(), push, planes, border_colors, read, gds, shared_memory);
     std::array<u32, 20> constants{};
     commands->SetComputeRootSignature(root.Get());
+    commands->SetPipelineState(pipeline.Get());
     static_assert(sizeof(push) <= sizeof(constants));
     std::memcpy(constants.data(), &push, sizeof(push));
     commands->SetComputeRoot32BitConstants(0, constants.size(), constants.data(), 0);
@@ -118,6 +119,29 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     device.Wait(device.Submit(commands.Get()));
     resources.CommitDownloads();
     bindings.CommitGds(gds);
+    images.CommitDownloads();
+    recording.completed = true;
+}
+void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
+                             const VideoCore::ImageInfo& destination, u32 source_layer,
+                             u32 destination_layer, u32 layers) {
+    std::scoped_lock lock{mutex};
+    if (failed)
+        throw std::runtime_error(
+            "D3D12 command runtime requires recreation after recording failure");
+    images.BeginBatch();
+    auto& input = images.GetImage(source, ConvertFormat(source.pixel_format),
+                                  D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, source_layer, layers);
+    auto& output =
+        images.GetImage(destination, ConvertFormat(destination.pixel_format),
+                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, destination_layer, layers);
+    winrt::check_hresult(allocator->Reset());
+    winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
+    RecordingGuard recording{failed};
+    images.Resolve(input, output, commands.Get());
+    images.PrepareDownloads(commands.Get());
+    winrt::check_hresult(commands->Close());
+    device.Wait(device.Submit(commands.Get()));
     images.CommitDownloads();
     recording.completed = true;
 }

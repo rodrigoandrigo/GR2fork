@@ -299,13 +299,14 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
             const auto type = sharp.GetViewType(resource.is_array);
             const bool array = type == AmdGpu::ImageType::Color1DArray ||
                                type == AmdGpu::ImageType::Color2DArray ||
+                               type == AmdGpu::ImageType::Color2DMsaaArray ||
                                type == AmdGpu::ImageType::Cube;
             const bool volume = type == AmdGpu::ImageType::Color3D;
-            const bool one_dimensional =
-                type == AmdGpu::ImageType::Color1D || type == AmdGpu::ImageType::Color1DArray;
-            if (sharp.NumSamples() != 1 || type == AmdGpu::ImageType::Color2DMsaa ||
-                type == AmdGpu::ImageType::Color2DMsaaArray)
-                throw std::runtime_error("D3D12 shader MSAA image binding is not implemented");
+            const bool multisampled = type == AmdGpu::ImageType::Color2DMsaa ||
+                                      type == AmdGpu::ImageType::Color2DMsaaArray;
+            if (multisampled && (writable || sharp.NumSamples() == 1))
+                throw std::runtime_error(
+                    "D3D12 multisample images require read-only views and at least two samples");
             DXGI_FORMAT format = ConvertFormat(VideoCore::ImageInfo{sharp, resource}.pixel_format);
             if (resource.is_depth)
                 format = sharp.GetDataFmt() == AmdGpu::DataFormat::Format16 ? DXGI_FORMAT_R16_UNORM
@@ -360,19 +361,11 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
             if (writable) {
                 D3D12_UNORDERED_ACCESS_VIEW_DESC descriptor{};
                 descriptor.Format = format;
-                descriptor.ViewDimension = volume ? D3D12_UAV_DIMENSION_TEXTURE3D
-                                           : one_dimensional
-                                               ? (array ? D3D12_UAV_DIMENSION_TEXTURE1DARRAY
-                                                        : D3D12_UAV_DIMENSION_TEXTURE1D)
+                descriptor.ViewDimension = volume  ? D3D12_UAV_DIMENSION_TEXTURE3D
                                            : array ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY
                                                    : D3D12_UAV_DIMENSION_TEXTURE2D;
                 if (volume)
                     descriptor.Texture3D = {mip, 0, std::max(1u, u32(sharp.depth + 1) >> mip)};
-                else if (one_dimensional && array)
-                    descriptor.Texture1DArray = {mip, sharp.base_array,
-                                                 sharp.NumViewLayers(resource.is_array)};
-                else if (one_dimensional)
-                    descriptor.Texture1D = {mip};
                 else if (array)
                     descriptor.Texture2DArray = {mip, sharp.base_array,
                                                  sharp.NumViewLayers(resource.is_array), 0};
@@ -384,25 +377,23 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
             } else {
                 D3D12_SHADER_RESOURCE_VIEW_DESC descriptor{};
                 descriptor.Format = format;
-                descriptor.ViewDimension = volume ? D3D12_SRV_DIMENSION_TEXTURE3D
-                                           : one_dimensional
-                                               ? (array ? D3D12_SRV_DIMENSION_TEXTURE1DARRAY
-                                                        : D3D12_SRV_DIMENSION_TEXTURE1D)
-                                           : array ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY
-                                                   : D3D12_SRV_DIMENSION_TEXTURE2D;
+                descriptor.ViewDimension = multisampled
+                                               ? (array ? D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY
+                                                        : D3D12_SRV_DIMENSION_TEXTURE2DMS)
+                                           : volume ? D3D12_SRV_DIMENSION_TEXTURE3D
+                                           : array  ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY
+                                                    : D3D12_SRV_DIMENSION_TEXTURE2D;
                 const auto mapping = sharp.DstSelect();
                 descriptor.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
                     Component(mapping.r), Component(mapping.g), Component(mapping.b),
                     Component(mapping.a));
-                if (volume)
+                if (multisampled && array)
+                    descriptor.Texture2DMSArray = {sharp.base_array,
+                                                   sharp.NumViewLayers(resource.is_array)};
+                else if (multisampled)
+                    descriptor.Texture2DMS.UnusedField_NothingToDefine = 0;
+                else if (volume)
                     descriptor.Texture3D = {mip, sharp.NumViewLevels(resource.is_array),
-                                            float(sharp.min_lod) / 256};
-                else if (one_dimensional && array)
-                    descriptor.Texture1DArray = {
-                        mip, sharp.NumViewLevels(resource.is_array), sharp.base_array,
-                        sharp.NumViewLayers(resource.is_array), float(sharp.min_lod) / 256};
-                else if (one_dimensional)
-                    descriptor.Texture1D = {mip, sharp.NumViewLevels(resource.is_array),
                                             float(sharp.min_lod) / 256};
                 else if (array)
                     descriptor.Texture2DArray = {mip,

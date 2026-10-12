@@ -226,6 +226,13 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     const auto& regs = liverpool.regs;
     if (regs.num_interp > 32)
         throw std::runtime_error("Guest fragment interpolation count exceeds register bounds");
+    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
+        const VideoCore::ImageInfo source{regs.color_buffers[0], liverpool.last_cb_extent[0]};
+        const VideoCore::ImageInfo destination{regs.color_buffers[1], liverpool.last_cb_extent[1]};
+        runtime.Resolve(source, destination, regs.color_buffers[0].BaseSlice(),
+                        regs.color_buffers[1].BaseSlice());
+        return;
+    }
     if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry)) ||
         regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Local)) ||
         regs.depth_control.stencil_enable || regs.depth_control.depth_bounds_enable ||
@@ -234,14 +241,50 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal &&
          regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) ||
         regs.color_control.rop3 != AmdGpu::ColorControl::LogicOp::Copy ||
-        regs.aa_config.NumSamples() != 1 || regs.vs_output_control.vs_out_misc_enable ||
-        regs.vs_output_control.clip_distance_enable || regs.vs_output_control.cull_distance_enable)
+        regs.vs_output_control.vs_out_misc_enable || regs.vs_output_control.clip_distance_enable ||
+        regs.vs_output_control.cull_distance_enable)
         throw std::runtime_error("D3D12 advanced guest graphics state is not implemented");
     auto vs = ReadProgram(memory, regs.vs_program);
     Program ps{};
     if (regs.ps_program.Address<VAddr>())
         ps = ReadProgram(memory, regs.ps_program);
     CommandRuntime::DrawRequest draw{vs.Params(), ps.Params()};
+    draw.samples = regs.aa_config.NumSamples();
+    if (draw.samples > 16)
+        throw std::runtime_error("Guest raster sample count exceeds D3D12 limits");
+    if (draw.samples > 1) {
+        const auto& values = regs.reg_array;
+        const u32 iterations = 1u << ((values[0xa201] >> 4) & 7);
+        if (iterations != 1 && iterations != draw.samples)
+            throw std::runtime_error(
+                "Partial guest sample shading requires additional D3D12 lowering");
+        draw.sample_shading = iterations > 1;
+        if ((values[0xa2dc] & 1) && !regs.depth_shader_control.alpha_to_mask_disable)
+            throw std::runtime_error("Guest alpha-to-mask requires additional D3D12 lowering");
+        draw.sample_masks = {values[0xa30e] & 0xffff, values[0xa30e] >> 16, values[0xa30f] & 0xffff,
+                             values[0xa30f] >> 16};
+        draw.sample_positions.resize(draw.samples * 4);
+        for (u32 pixel = 0; pixel < 4; ++pixel)
+            for (u32 sample = 0; sample < draw.samples; ++sample) {
+                const u32 packed = values[0xa2fe + pixel * 4 + sample / 4] >> ((sample % 4) * 8);
+                const auto coordinate = [](u32 value) {
+                    return static_cast<INT8>(s32(value & 15) - (value & 8 ? 16 : 0));
+                };
+                draw.sample_positions[pixel * draw.samples + sample] = {coordinate(packed),
+                                                                        coordinate(packed >> 4)};
+            }
+        bool same = true;
+        for (u32 pixel = 1; pixel < 4; ++pixel)
+            for (u32 sample = 0; sample < draw.samples; ++sample) {
+                const auto a = draw.sample_positions[sample];
+                const auto b = draw.sample_positions[pixel * draw.samples + sample];
+                same &= a.X == b.X && a.Y == b.Y;
+            }
+        if (same)
+            draw.sample_positions.resize(draw.samples);
+        if (!regs.mode_control.msaa_enable)
+            draw.sample_positions.assign(draw.samples, D3D12_SAMPLE_POSITION{0, 0});
+    }
     draw.vertex_runtime.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
     draw.fragment_runtime.Initialize(Shader::HwStage::Fragment, Shader::SwStage::Fragment);
     CommonInfo(draw.vertex_runtime, regs.vs_program);
@@ -262,8 +305,15 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     draw.fragment_runtime.hw.fs.num_inputs = regs.num_interp;
     draw.fragment_runtime.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
     draw.fragment_runtime.hw.fs.depth_before_shader = regs.depth_shader_control.depth_before_shader;
+    draw.fragment_runtime.hw.fs.num_samples =
+        regs.ps_input_addr.sample_coverage_ena && regs.ps_input_ena.sample_coverage_ena
+            ? draw.samples
+            : 1;
     draw.fragment_runtime.hw.fs.z_export_format = regs.z_export_format;
-    draw.fragment_runtime.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable;
+    draw.fragment_runtime.hw.fs.mrtz_mask =
+        regs.depth_shader_control.z_export_enable |
+        (regs.depth_shader_control.mask_export_enable << 2) |
+        (regs.depth_shader_control.coverage_to_mask_enable << 3);
     for (u32 i = 0; i < regs.num_interp; ++i)
         draw.fragment_runtime.hw.fs.inputs[i] = {
             u16(regs.ps_inputs[i].input_offset), u16(regs.ps_inputs[i].use_default),

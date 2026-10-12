@@ -1,5 +1,7 @@
 #include "video_core/renderer_d3d12/command_runtime.h"
 
+#include <bit>
+
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -99,7 +101,8 @@ void CommandRuntime::Draw(const DrawRequest& request) {
             "D3D12 command runtime requires recreation after recording failure");
     if (!request.count || !request.instances)
         return;
-    if (request.colors.size() > 8 || request.depth.StencilEnable ||
+    if (!std::has_single_bit(request.samples) || request.samples > 16 ||
+        request.colors.size() > 8 || request.depth.StencilEnable ||
         (request.depth.DepthEnable && !request.depth_image) ||
         request.vertex_runtime.sw_stage != Shader::SwStage::Vertex ||
         request.fragment_runtime.sw_stage != Shader::SwStage::Fragment)
@@ -108,8 +111,9 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     std::optional<CompiledShader> fragment;
     std::vector<CompiledShader*> stages{&vertex};
     if (!request.fragment.code.empty()) {
-        fragment.emplace(
-            shaders.Compile(request.fragment, request.fragment_runtime, vertex.end_bindings));
+        fragment.emplace(shaders.Compile(request.fragment, request.fragment_runtime,
+                                         vertex.end_bindings, false, request.samples > 1,
+                                         request.sample_shading));
         stages.push_back(&*fragment);
     } else if (!request.colors.empty())
         throw std::runtime_error("D3D12 color rendering requires a fragment shader");
@@ -119,12 +123,17 @@ void CommandRuntime::Draw(const DrawRequest& request) {
 
     std::vector<ImageCache::Image*> colors;
     for (const auto& info : request.colors) {
+        if (info.num_samples != request.samples)
+            throw std::runtime_error(
+                "Guest raster and color sample counts require unsupported EQAA");
         bindings.ValidateTargetRange(info.guest_address, info.guest_size);
         colors.push_back(&images.GetImage(info, ConvertFormat(info.pixel_format),
                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
     }
     ImageCache::Image* depth{};
     if (request.depth_image) {
+        if (request.depth_image->num_samples != request.samples)
+            throw std::runtime_error("Guest raster and depth sample counts do not match");
         bindings.ValidateTargetRange(request.depth_image->guest_address,
                                      request.depth_image->guest_size);
         if (request.depth_read_address)
@@ -209,6 +218,12 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants = {0, 0, 20};
     parameters[1].Constants = {1, 0, 4};
+    if (request.samples > 1) {
+        D3D12_ROOT_PARAMETER masks{};
+        masks.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        masks.Constants = {3, 0, 4};
+        parameters.push_back(masks);
+    }
     const auto add_table = [&](const auto& ranges) {
         const u32 slot = parameters.size();
         if (!ranges.empty()) {
@@ -232,18 +247,21 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     desc.VS = {vertex.binary->dxil.data(), vertex.binary->dxil.size()};
     if (fragment)
         desc.PS = {fragment->binary->dxil.data(), fragment->binary->dxil.size()};
+    else if (request.samples > 1)
+        desc.PS = {images.MaskShader().data(), images.MaskShader().size()};
     desc.BlendState = request.blend;
     desc.RasterizerState = request.rasterizer;
     desc.DepthStencilState = request.depth;
     desc.SampleMask = UINT_MAX;
-    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Count = request.samples;
+    desc.RasterizerState.MultisampleEnable = request.samples > 1;
     desc.InputLayout = {elements.data(), static_cast<UINT>(elements.size())};
     desc.PrimitiveTopologyType = request.topology_type;
     desc.IBStripCutValue = request.strip_cut;
     desc.NumRenderTargets = colors.size();
     for (u32 i = 0; i < colors.size(); ++i)
-        desc.RTVFormats[i] = colors[i]->native->GetDesc().Format;
-    desc.DSVFormat = depth ? depth->native->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+        desc.RTVFormats[i] = ConvertFormat(colors[i]->info.pixel_format);
+    desc.DSVFormat = depth ? ConvertFormat(depth->info.pixel_format) : DXGI_FORMAT_UNKNOWN;
     auto& cached =
         GetPipeline(PipelineKey(desc, blob.Get()), blob.Get(), [&](auto* root, auto** state) {
             desc.pRootSignature = root;
@@ -262,23 +280,45 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     RecordingGuard recording{failed};
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> color_views{};
     for (u32 i = 0; i < colors.size(); ++i) {
+        colors[i]->sample_positions = request.sample_positions;
         images.Upload(*colors[i], commands.Get());
         images.Barrier(*colors[i], commands.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
         colors[i]->written = true;
         color_views[i] = rtv.Cpu(i);
-        device.Device()->CreateRenderTargetView(colors[i]->native.Get(), nullptr, color_views[i]);
+        D3D12_RENDER_TARGET_VIEW_DESC view{};
+        view.Format = desc.RTVFormats[i];
+        if (request.samples > 1) {
+            view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+            view.Texture2DMSArray = {0, colors[i]->native_layers};
+        } else {
+            view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray = {0, 0, colors[i]->native_layers, 0};
+        }
+        device.Device()->CreateRenderTargetView(colors[i]->Native(), &view, color_views[i]);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE depth_view{};
     if (depth) {
+        depth->sample_positions = request.sample_positions;
         images.Upload(*depth, commands.Get(), request.depth_read_address);
         images.Barrier(*depth, commands.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
         depth->written = request.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
         depth_view = dsv.Cpu(0);
-        device.Device()->CreateDepthStencilView(depth->native.Get(), nullptr, depth_view);
+        D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+        view.Format = desc.DSVFormat;
+        if (request.samples > 1) {
+            view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+            view.Texture2DMSArray = {0, depth->native_layers};
+        } else {
+            view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray = {0, 0, depth->native_layers};
+        }
+        device.Device()->CreateDepthStencilView(depth->Native(), &view, depth_view);
     }
     Shader::PushData push = request.push;
     bindings.Upload(commands.Get(), push, request.clip_planes, request.border_colors, read, gds);
     commands->SetGraphicsRootSignature(root.Get());
+    commands->SetPipelineState(pipeline.Get());
+    SetSamplePositions(commands.Get(), request.samples, request.sample_positions);
     std::array<u32, 20> constants{};
     std::memcpy(constants.data(), &push, sizeof(push));
     commands->SetGraphicsRoot32BitConstants(0, constants.size(), constants.data(), 0);
@@ -286,6 +326,9 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         static_cast<u32>(request.index_address ? request.base_vertex : request.first_vertex),
         request.first_instance, 0, 0};
     commands->SetGraphicsRoot32BitConstants(1, base.size(), base.data(), 0);
+    if (request.samples > 1)
+        commands->SetGraphicsRoot32BitConstants(2, request.sample_masks.size(),
+                                                request.sample_masks.data(), 0);
     bindings.Bind(commands.Get(), true, resource_slot, sampler_slot);
     commands->IASetPrimitiveTopology(request.topology);
     commands->IASetVertexBuffers(0, vertices.size(), vertices.data());

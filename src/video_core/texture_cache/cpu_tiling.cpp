@@ -396,16 +396,16 @@ void Convert(std::span<const u8> source, std::span<u8> destination, const ImageI
             throw std::runtime_error("Invalid guest image tiling dimensions");
         for (u32 texel = 0; texel < layout.size / block; ++texel) {
             const u32 x = texel % pitch, y = (texel / pitch) % height,
-                      slice = texel / (pitch * height);
+                      plane = texel / (pitch * height), sample = plane % info.num_samples,
+                      slice = plane / info.num_samples;
             const bool macro =
                 AmdGpu::IsMacroTiled(info.array_mode) && !(info.micro_tiled_mips & (1u << mip));
             const u64 tiled =
-                layout.offset +
-                (macro
-                     ? address.ComputeSurfaceAddrFromCoordMacroTiled(x, y, slice, pitch, height, 0)
-                     : address.ComputeSurfaceAddrFromCoordMicroTiled(
-                           x, y, slice, pitch, height, std::min(address.MICRO_TILE_THICKNESS, 4u),
-                           0));
+                layout.offset + (macro ? address.ComputeSurfaceAddrFromCoordMacroTiled(
+                                             x, y, slice, pitch, height, sample)
+                                       : address.ComputeSurfaceAddrFromCoordMicroTiled(
+                                             x, y, slice, pitch, height,
+                                             std::min(address.MICRO_TILE_THICKNESS, 4u), sample));
             const u64 from = encode ? linear : tiled, to = encode ? tiled : linear;
             if (from + block > source.size() || to + block > destination.size())
                 throw std::runtime_error("Guest tiled image exceeds backing range");
@@ -417,9 +417,10 @@ void Convert(std::span<const u8> source, std::span<u8> destination, const ImageI
 } // namespace
 void ConvertTiling(std::span<const u8> source, std::span<u8> destination, const ImageInfo& info,
                    bool encode) {
-    if (info.num_samples != 1 || info.resources.levels > MAX_MIPS ||
-        info.guest_size > source.size() || info.guest_size > destination.size())
-        throw std::runtime_error("Unsupported guest image tiling range or multisampling");
+    if (!std::has_single_bit(info.num_samples) || info.num_samples > 16 ||
+        info.resources.levels > MAX_MIPS || info.guest_size > source.size() ||
+        info.guest_size > destination.size())
+        throw std::runtime_error("Unsupported guest image tiling range or sample count");
     if (!info.props.is_tiled) {
         std::memcpy(destination.data(), source.data(), info.guest_size);
         return;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include "video_core/renderer_d3d12/msaa_transfer.h"
 #include "video_core/renderer_d3d12/resource_cache.h"
 #include "video_core/texture_cache/image_info.h"
 
@@ -12,6 +13,8 @@ public:
         D3D12Resource upload, readback;
         Microsoft::WRL::ComPtr<ID3D12Resource> native;
         u64 allocation_bytes{};
+        std::unique_ptr<MsaaTransfer::Resources> msaa;
+        std::vector<D3D12_SAMPLE_POSITION> sample_positions;
         ID3D12Resource* Native() const {
             return native.Get();
         }
@@ -35,11 +38,16 @@ public:
     void Barrier(Image& image, ID3D12GraphicsCommandList* commands, D3D12_RESOURCE_STATES state);
     void PrepareDownloads(ID3D12GraphicsCommandList* commands);
     void CommitDownloads();
+    void Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands);
+    const std::vector<u8>& MaskShader() const {
+        return transfers.MaskShader();
+    }
 
 private:
     void CopyRows(Image& image, void* data, bool upload);
     D3D12DeviceContext* device{};
     D3D12ResourceAllocator allocator;
+    MsaaTransfer transfers;
     ResourceCache::Read read;
     ResourceCache::Write write;
     std::function<ResourceCache::Identity(VAddr, u64)> canonicalize;

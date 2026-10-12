@@ -9,7 +9,7 @@ Existe um renderer guest experimental ligado ao Liverpool. O renderer completo d
 | Comandos | GpuCommandSink, rasterizador D3D12 próprio e registradores Liverpool; draws diretos, indexed/instanced, expansão CPU de draws indiretos e dispatch direto/indireto |
 | Shaders | Recompiler GCN existente → SPIR-V → SPIRV-Cross HLSL → DXC DXIL; VS/PS/CS, reflexão de recursos, base vertex/instance, compute wave64 e constantes de número de workgroups |
 | Buffers | Recursos raw/typed via IR, agrupamento de views sobrepostas, identidade física para aliases contíguos, snapshots CPU, upload/download e writeback nas views guest originais; flat buffer, clip planes, GDS e spill LDS |
-| Imagens | Texturas 1D/2D/3D, mips e layers, views de layer único/arrays, formatos comuns e BC, samplers, CPU tiling/detiling, MRT e profundidade simples; read address e write address de depth separados |
+| Imagens | Texturas 1D (lowering 2D), 2D/3D, mips e layers, views de layer único/arrays, formatos comuns e BC, samplers, CPU tiling/detiling, MRT, profundidade e MSAA sem compressão; read address e write address de depth separados |
 | Pipelines | Root signatures por reflexão; cache limitado com chave dos shaders, bindings, input layout e estados usados; rasterização, blend, máscaras, topologias básicas, viewport e scissor |
 | Coerência | Upload antes do comando, download após conclusão da fence e antes do retorno; lease de memória guest protege map/unmap; aliases incompatíveis dentro do mesmo comando são rejeitados |
 | VideoOut | Contrato de apresentação compartilhado com adaptador Vulkan desktop; frame D3D12 com snapshot imutável, detiling/swizzle/gamma SDR, blank/last frame, eventos existentes e swapchain do painel de jogo UWP |
@@ -53,10 +53,16 @@ Release da DLL/host e geração/assinatura do pacote foram executados. O pacote 
 
 Há uma fonte de homebrew OpenOrbis em `documents/hardware/d3d12-guest/main.cpp`, com instruções no README ao lado. Ela ainda não foi compilada nem executada em PS4 por ausência do SDK local. Não há resultados de hardware que validem mudanças de emulação.
 
+## MSAA
+
+MSAA de cor/depth, máscaras, posições, leitura GCN e resolve estão implementados.
+Os 32 diagnósticos (15 anteriores e 17 MSAA) passaram com zero erros de validação D3D12.
+Detalhes, limites e homebrew em [MSAA-D3D12.md](MSAA-D3D12.md).
+
 ## Trabalho pendente para jogos
 
 - Geometry/tessellation, wave64 em graphics e primitivas que exigem emulação.
-- MSAA/resolve, stencil, depth bounds, HTILE/CMASK/FMASK e caminhos de compressão/fast clear.
+- EQAA, alpha-to-mask, shading parcial, stencil, depth bounds, HTILE/CMASK/FMASK e caminhos de compressão/fast clear.
 - Views simultâneas de imagem/buffer, feedback SRV/UAV, aliases de layouts incompatíveis, backing físico segmentado e dirty tracking completo.
 - Cobertura completa de formatos, estados de rasterização e operações IR.
 - HDR e apresentação float; validação visual do VideoOut em AppContainer.
@@ -64,6 +70,7 @@ Há uma fonte de homebrew OpenOrbis em `documents/hardware/d3d12-guest/main.cpp`
 - Comparações OpenOrbis/PS4 para tiling, shaders, offsets de todos os buffers, memória compartilhada, draws e fences; depois gameplay no PC e Xbox.
 
 Estados ainda não suportados geram erro explícito da sessão. Compilar e executar estes casos básicos não encerra o pedido de renderer completo.
+
 
 
 

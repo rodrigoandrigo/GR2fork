@@ -1,6 +1,7 @@
 #include "video_core/renderer_d3d12/image_cache.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <stdexcept>
 #include <winrt/base.h>
@@ -146,6 +147,7 @@ void ImageCache::Initialize(D3D12DeviceContext& context, ResourceCache::Read rea
     write = std::move(writer);
     canonicalize = std::move(resolver);
     allocator.Initialize(context.Device(), 256ULL * 1024 * 1024);
+    transfers.Initialize(context.Device());
 }
 void ImageCache::BeginBatch() {
     device->WaitForGpu();
@@ -159,8 +161,9 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         info.size.height > 16384 || !info.size.depth || info.size.depth > 2048 ||
         (!info.props.is_volume && info.size.depth != 1) || !info.resources.levels ||
         info.resources.levels > 16 || !info.resources.layers || info.resources.layers > 2048 ||
-        info.num_samples != 1 || info.meta_info.cmask_addr || info.meta_info.fmask_addr ||
-        info.meta_info.htile_addr || info.stencil_addr || info.alt_tile)
+        !std::has_single_bit(info.num_samples) || info.num_samples > 16 ||
+        info.meta_info.cmask_addr || info.meta_info.fmask_addr || info.meta_info.htile_addr ||
+        info.stencil_addr || info.alt_tile)
         throw std::runtime_error(
             "D3D12 guest image requires unsupported metadata, samples or layout");
     if (base_layer >= info.resources.layers)
@@ -171,6 +174,24 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         throw std::runtime_error("Guest image layer count exceeds allocation");
     if (info.props.is_volume && (base_layer || layer_count != 1 || info.resources.layers != 1))
         throw std::runtime_error("Invalid D3D12 volume image layer selection");
+    const bool multisampled = info.num_samples > 1;
+    const DXGI_FORMAT view_format = ConvertFormat(info.pixel_format);
+    MsaaFormat msaa_format{};
+    if (multisampled) {
+        if (info.resources.levels != 1 || info.props.is_volume || info.size.height == 0 ||
+            (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+            layer_count * info.num_samples > 2048)
+            throw std::runtime_error("Invalid D3D12 multisample image dimensions or UAV usage");
+        msaa_format = GetMsaaFormat(view_format, info.props.is_depth);
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{view_format, info.num_samples};
+        winrt::check_hresult(device->Device()->CheckFeatureSupport(
+            D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality, sizeof(quality)));
+        if (!quality.NumQualityLevels)
+            throw std::runtime_error("Guest sample count is unsupported for this D3D12 format");
+        flags |= info.props.is_depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                                     : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        format = msaa_format.resource;
+    }
     const auto identity = canonicalize ? canonicalize(info.guest_address, info.guest_size)
                                        : ResourceCache::Identity{info.guest_address, false};
     std::vector<u64> key{identity.address,      info.guest_size,  info.size.width,
@@ -179,6 +200,7 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
                          u64(info.tile_mode),   info.bank_swizzle};
     key.insert(key.end(), {base_layer, layer_count});
     key.insert(key.end(), {info.size.depth, u64(info.type), info.props.is_volume});
+    key.insert(key.end(), {info.num_samples, u64(view_format)});
     key.push_back(identity.physical);
     for (u32 mip = 0; mip < info.resources.levels; ++mip) {
         const auto& layout = info.mips_layout[mip];
@@ -196,30 +218,41 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     if (one_dimensional && info.size.height != 1)
         throw std::runtime_error("Invalid D3D12 1D image height");
     desc.Dimension = info.props.is_volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                     : one_dimensional    ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
                                           : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = info.size.width;
     desc.Height = info.size.height;
     desc.DepthOrArraySize = info.props.is_volume ? info.size.depth : layer_count;
     desc.MipLevels = info.resources.levels;
     desc.Format = format;
-    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Count = info.num_samples;
     desc.Flags = flags;
     auto result = std::make_unique<Image>();
     result->info = info;
     result->base_layer = base_layer;
     result->native_layers = layer_count;
-    const UINT count = info.resources.levels * layer_count;
+    D3D12_RESOURCE_DESC staging = desc;
+    if (multisampled) {
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+            throw std::runtime_error("D3D12 multisampling requires a 2D image");
+        staging.SampleDesc.Count = 1;
+        staging.DepthOrArraySize = layer_count * info.num_samples;
+        staging.Format = msaa_format.transfer;
+        staging.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        result->msaa = std::make_unique<MsaaTransfer::Resources>();
+    }
+    const UINT count = info.resources.levels * layer_count * info.num_samples;
     result->footprints.resize(count);
     result->rows.resize(count);
     result->row_bytes.resize(count);
     u64 bytes;
-    device->Device()->GetCopyableFootprints(&desc, 0, count, 0, result->footprints.data(),
+    device->Device()->GetCopyableFootprints(&staging, 0, count, 0, result->footprints.data(),
                                             result->rows.data(), result->row_bytes.data(), &bytes);
     const u64 allocation = device->Device()->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
-    if (allocation == UINT64_MAX || bytes > 256ULL * 1024 * 1024)
+    const u64 extra =
+        multisampled ? device->Device()->GetResourceAllocationInfo(0, 1, &staging).SizeInBytes : 0;
+    if (allocation == UINT64_MAX || extra == UINT64_MAX || bytes > 256ULL * 1024 * 1024)
         throw std::runtime_error("Unsupported D3D12 image allocation or footprint");
-    const u64 required = allocation + ((bytes + 65535) & ~u64{65535}) * 2;
+    const u64 required = allocation + extra + ((bytes + 65535) & ~u64{65535}) * 2;
     while (images.size() >= 64 ||
            required >
                allocator.Stats().budget_bytes - allocator.Stats().live_bytes - native_bytes ||
@@ -237,10 +270,28 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     }
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = view_format;
+    clear.DepthStencil.Depth = 1.f;
     winrt::check_hresult(device->Device()->CreateCommittedResource(
-        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-        IID_PPV_ARGS(&result->native)));
-    result->allocation_bytes = allocation;
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+        multisampled && info.props.is_depth ? &clear : nullptr, IID_PPV_ARGS(&result->native)));
+    result->allocation_bytes = allocation + extra;
+    if (multisampled) {
+        winrt::check_hresult(device->Device()->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &staging, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(&result->msaa->planes)));
+        auto& resources = *result->msaa;
+        resources.descriptors.Initialize(device->Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                         2, true);
+        resources.targets.Initialize(device->Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, count,
+                                     false);
+        resources.depth_targets.Initialize(device->Device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                                           layer_count, false);
+        static_cast<void>(resources.descriptors.Allocate(2));
+        static_cast<void>(resources.targets.Allocate(count));
+        static_cast<void>(resources.depth_targets.Allocate(layer_count));
+    }
     winrt::check_hresult(allocator.CreateBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD,
                                                 D3D12_RESOURCE_STATE_GENERIC_READ, result->upload));
     winrt::check_hresult(allocator.CreateBuffer(bytes, D3D12_HEAP_TYPE_READBACK,
@@ -255,6 +306,8 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
 }
 void ImageCache::Barrier(Image& image, ID3D12GraphicsCommandList* commands,
                          D3D12_RESOURCE_STATES state) {
+    if (image.msaa && image.info.props.is_depth)
+        SetSamplePositions(commands, image.info.num_samples, image.sample_positions);
     if (image.state == state) {
         if (state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
             D3D12_RESOURCE_BARRIER barrier{};
@@ -280,16 +333,18 @@ void ImageCache::CopyRows(Image& image, void* data, bool upload) {
             (image.info.num_bits / 8);
         const u64 height =
             image.info.props.is_block ? std::max<u32>((layout.height + 3) / 4, 1) : layout.height;
-        for (u32 layer = 0; layer < image.native_layers; ++layer) {
+        for (u32 layer = 0; layer < image.native_layers * image.info.num_samples; ++layer) {
             const u32 subresource = mip + layer * image.info.resources.levels;
             const auto& footprint = image.footprints[subresource];
             if (image.row_bytes[subresource] > pitch || image.rows[subresource] > height)
                 throw std::runtime_error("D3D12 footprint exceeds guest mip layout");
             for (u32 slice = 0; slice < footprint.Footprint.Depth; ++slice) {
                 for (u32 row = 0; row < image.rows[subresource]; ++row) {
-                    const u64 guest_offset = mip_offset +
-                                             (image.base_layer + layer + slice) * pitch * height +
-                                             row * pitch;
+                    const u64 guest_offset =
+                        mip_offset +
+                        (image.base_layer * image.info.num_samples + layer + slice) * pitch *
+                            height +
+                        row * pitch;
                     if (guest_offset + image.row_bytes[subresource] > image.linear.size())
                         throw std::runtime_error("D3D12 image row exceeds guest backing");
                     auto* guest = image.linear.data() + guest_offset;
@@ -307,7 +362,7 @@ void ImageCache::CopyRows(Image& image, void* data, bool upload) {
 void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr read_address) {
     std::vector<u8> guest(image.info.guest_size);
     read(read_address ? read_address : image.info.guest_address, guest);
-    if (guest == image.guest)
+    if (guest == image.guest && !image.msaa)
         return;
     image.guest = std::move(guest);
     image.linear.resize(image.guest.size());
@@ -317,25 +372,44 @@ void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr
     winrt::check_hresult(image.upload->Map(0, &empty, &mapped));
     CopyRows(image, mapped, true);
     image.upload->Unmap(0, nullptr);
-    Barrier(image, commands, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (image.msaa)
+        MsaaTransfer::Barrier(*image.msaa, commands, D3D12_RESOURCE_STATE_COPY_DEST);
+    else
+        Barrier(image, commands, D3D12_RESOURCE_STATE_COPY_DEST);
     for (u32 subresource = 0; subresource < image.footprints.size(); ++subresource) {
         D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
         source.pResource = image.upload.Get();
         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint = image.footprints[subresource];
-        destination.pResource = image.Native();
+        destination.pResource = image.msaa ? image.msaa->planes.Get() : image.Native();
         destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         destination.SubresourceIndex = subresource;
         commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
+    if (image.msaa) {
+        SetSamplePositions(commands, image.info.num_samples, image.sample_positions);
+        Barrier(image, commands,
+                image.info.props.is_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE
+                                          : D3D12_RESOURCE_STATE_RENDER_TARGET);
+        transfers.Record(commands, image.Native(), *image.msaa,
+                         ConvertFormat(image.info.pixel_format), image.info.props.is_depth, true);
     }
 }
 void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
     for (auto& [key, image] : images) {
         if (image->written) {
-            Barrier(*image, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (image->msaa) {
+                Barrier(*image, commands, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                SetSamplePositions(commands, 1, {});
+                transfers.Record(commands, image->Native(), *image->msaa,
+                                 ConvertFormat(image->info.pixel_format),
+                                 image->info.props.is_depth, false);
+                MsaaTransfer::Barrier(*image->msaa, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            } else
+                Barrier(*image, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
             for (u32 subresource = 0; subresource < image->footprints.size(); ++subresource) {
                 D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
-                source.pResource = image->Native();
+                source.pResource = image->msaa ? image->msaa->planes.Get() : image->Native();
                 source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 source.SubresourceIndex = subresource;
                 destination.pResource = image->readback.Get();
@@ -345,7 +419,30 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
             }
         }
         Barrier(*image, commands, D3D12_RESOURCE_STATE_COMMON);
+        if (image->msaa)
+            MsaaTransfer::Barrier(*image->msaa, commands, D3D12_RESOURCE_STATE_COMMON);
     }
+}
+void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands) {
+    if (!source.msaa || destination.msaa || source.info.props.is_depth ||
+        destination.info.props.is_depth || source.info.size.width != destination.info.size.width ||
+        source.info.size.height != destination.info.size.height ||
+        source.native_layers != destination.native_layers ||
+        source.info.pixel_format != destination.info.pixel_format)
+        throw std::runtime_error("Invalid D3D12 color resolve source or destination");
+    const DXGI_FORMAT format = ConvertFormat(source.info.pixel_format);
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+    winrt::check_hresult(device->Device()->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                                               &support, sizeof(support)));
+    if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE))
+        throw std::runtime_error("D3D12 format does not support multisample color resolve");
+    Upload(source, commands);
+    Upload(destination, commands);
+    Barrier(source, commands, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    Barrier(destination, commands, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    for (u32 layer = 0; layer < source.native_layers; ++layer)
+        commands->ResolveSubresource(destination.Native(), layer, source.Native(), layer, format);
+    destination.written = true;
 }
 void ImageCache::CommitDownloads() {
     for (auto& [key, image] : images) {
