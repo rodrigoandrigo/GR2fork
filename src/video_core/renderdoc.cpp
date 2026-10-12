@@ -31,7 +31,9 @@ static std::atomic<u32> screenshot_with_overlays_count{0};
 RENDERDOC_API_1_6_0* rdoc_api{};
 
 void LoadRenderDoc() {
-#ifdef WIN32
+#ifdef SHADPS4_UWP
+    return;
+#elif defined(WIN32)
 
     // Check if we are running by RDoc GUI
     HMODULE mod = GetModuleHandleA("renderdoc.dll");

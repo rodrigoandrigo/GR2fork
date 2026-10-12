@@ -8,6 +8,7 @@
 #include <vector>
 
 namespace Common::FS {
+void InitializeUserPaths(const std::filesystem::path& root);
 
 enum class PathType {
     UserDir,          // Where shadPS4 stores its data.

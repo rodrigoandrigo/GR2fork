@@ -36,6 +36,32 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 
 namespace Common::Log {
 
+static std::mutex callback_mutex;
+static Callback log_callback{};
+static void* log_context{};
+
+void SetCallback(Callback callback, void* context) {
+    std::scoped_lock lock{callback_mutex};
+    log_callback = callback;
+    log_context = context;
+}
+
+static void EmitCallback(Level level, const char* message) {
+    Callback callback;
+    void* context;
+    {
+        std::scoped_lock lock{callback_mutex};
+        callback = log_callback;
+        context = log_context;
+    }
+    if (callback) {
+        try {
+            callback(context, static_cast<uint32_t>(level), message);
+        } catch (...) {
+        }
+    }
+}
+
 static std::shared_ptr<spdlog_stdout> g_console_sink;
 static std::shared_ptr<LogFileSink> g_shad_file_sink;
 static std::array<std::unique_ptr<spdlog::logger>, NUM_LOG_CLASSES> ALL_LOGGERS{};
@@ -65,10 +91,12 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
     fmt::memory_buffer msg;
     fmt::vformat_to(fmt::appender(msg), format, args);
     const std::string_view fn = std::string_view(func) == "operator()" ? "lambda" : func;
-    logger->log(ToSpdlog(level), "[{}] <{}> ({}) {}:{} {}: {}", NameOf(log_class),
-                NameOf(ToSpdlog(level)), Common::GetCurrentThreadName(),
-                spdlog::source_loc::basename(file), line, fn,
-                std::string_view(msg.data(), msg.size()));
+    const auto message =
+        fmt::format("[{}] <{}> ({}) {}:{} {}: {}", NameOf(log_class), NameOf(ToSpdlog(level)),
+                    Common::GetCurrentThreadName(), spdlog::source_loc::basename(file), line, fn,
+                    std::string_view(msg.data(), msg.size()));
+    logger->log(ToSpdlog(level), "{}", message);
+    EmitCallback(level, message.c_str());
 }
 
 template <typename T>
@@ -108,28 +136,38 @@ static auto UpdateColorLevels(T sink) {
 }
 
 void Setup(std::string_view shadps4_filename) {
+#ifndef SHADPS4_UWP
     static std::once_flag already_registered;
 
     std::call_once(already_registered, []() {
         std::atexit(Shutdown);
         std::at_quick_exit(Flush);
     });
+#endif
 
     for (u32 i = 0; i < ALL_LOGGERS.size(); ++i) {
         const auto log_class = static_cast<Class>(i);
         auto& logger = ALL_LOGGERS[i];
         logger = std::make_unique<spdlog::logger>(std::string(NameOf(log_class)));
         logger->set_level(spdlog::level::trace);
+#ifdef SHADPS4_UWP
+        logger->set_error_handler(
+            [](const std::string& message) { EmitCallback(Level::Error, message.c_str()); });
+#endif
     }
 
     // Setup console
 
 #ifdef _WIN32
+#ifdef SHADPS4_UWP
+    g_console_sink = std::make_shared<spdlog::sinks::msvc_sink_mt>();
+#else
     if (EmulatorSettings.GetLogType() == "wincolor") {
         g_console_sink = std::make_shared<spdlog::sinks::wincolor_stdout_sink_mt>();
     } else {
         g_console_sink = std::make_shared<spdlog::sinks::msvc_sink_mt>();
     }
+#endif
 
 #else
     g_console_sink = UpdateColorLevels(std::make_shared<spdlog_stdout>(spdlog::color_mode::always));
@@ -180,8 +218,14 @@ void Flush() {
 void UpdateSinks() {
     std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
 
-    std::initializer_list<spdlog::sink_ptr> async_sink{std::make_shared<spdlog::sinks::async_sink>(
-        spdlog::sinks::async_sink::config{.sinks = sinks})};
+    spdlog::sinks::async_sink::config async_config{.sinks = sinks};
+#ifdef SHADPS4_UWP
+    async_config.custom_err_handler = [](const std::string& message) {
+        EmitCallback(Level::Error, message.c_str());
+    };
+#endif
+    std::initializer_list<spdlog::sink_ptr> async_sink{
+        std::make_shared<spdlog::sinks::async_sink>(std::move(async_config))};
 
     std::initializer_list<spdlog::sink_ptr> dup_filter{
         std::make_shared<spdlog::sinks::dup_filter_sink_mt>(

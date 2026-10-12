@@ -15,9 +15,13 @@
 #endif
 
 void assert_fail_impl() {
+#ifdef SHADPS4_UWP
+    throw std::runtime_error("Embedded core assertion failed");
+#else
     Core::Signals::Instance()->RemoveHandlers();
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     Crash();
+#endif
 }
 
 [[noreturn]] void unreachable_impl() {

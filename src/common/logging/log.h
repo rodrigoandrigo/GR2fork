@@ -26,6 +26,8 @@ void Setup(std::string_view shadps4_filename);
 void Switch(std::string_view game_filename, bool append_log);
 void Shutdown();
 void Flush();
+using Callback = void (*)(void* context, uint32_t level, const char* message);
+void SetCallback(Callback callback, void* context);
 void Terminate();
 void UpdateSinks();
 void UpdateLogLevels(std::string_view log_filter);

@@ -270,9 +270,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
 
+#ifndef SHADPS4_UWP
     static vk::detail::DynamicLoader dl;
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+#endif
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion

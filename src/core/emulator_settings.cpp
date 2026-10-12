@@ -492,7 +492,11 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                             SDL_ShowSimpleMessageBox(0, "Config Migration",
                                                      "Error transferring settings, exiting.",
                                                      nullptr);
+#ifdef SHADPS4_UWP
+                            return false;
+#else
                             std::quick_exit(1);
+#endif
                         }
                     }
                 }

@@ -1,0 +1,13 @@
+<Page x:Class="shadPS4_UWP.DirectXPage" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Background="Black" Loaded="OnLoaded">
+  <Grid>
+    <SwapChainPanel x:Name="swapChainPanel" SizeChanged="OnPanelSizeChanged" />
+    <StackPanel VerticalAlignment="Top" Background="#CC101010" Padding="12">
+      <StackPanel Orientation="Horizontal" Spacing="12">
+        <Button x:Name="openButton" Content="Selecionar pasta do jogo" Click="OnOpenGame" IsEnabled="False" />
+        <Button x:Name="pauseButton" Content="Pausar" Click="OnPause" IsEnabled="False" />
+        <Button x:Name="stopButton" Content="Parar" Click="OnStop" IsEnabled="False" />
+      </StackPanel>
+      <TextBlock x:Name="statusText" Text="Inicializando shadPS4…" Foreground="White" TextWrapping="Wrap" Margin="0,8,0,0" />
+    </StackPanel>
+  </Grid>
+</Page>

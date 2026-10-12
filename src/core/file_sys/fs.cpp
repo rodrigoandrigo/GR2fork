@@ -160,6 +160,15 @@ void MntPoints::Mount(const std::filesystem::path& host_folder, const std::strin
     LOG_INFO(Kernel_Fs, "Mounted '{}' -> '{}'", guest_folder_sanitized, host_folder.string());
 }
 
+void MntPoints::MountBackend(std::shared_ptr<IBackend> backend, const std::string& guest_folder) {
+    std::scoped_lock lock{m_mutex};
+    const auto mount = RemoveTrailingSlashes(guest_folder);
+    std::erase_if(m_mnt_pairs, [&](const MntPair& pair) { return pair.mount == mount; });
+    const bool read_only = backend->IsReadOnly();
+    m_mnt_pairs.emplace_back(std::filesystem::path{}, mount, read_only,
+                             std::vector<std::shared_ptr<IBackend>>{std::move(backend)});
+}
+
 void MntPoints::Unmount(const std::string& guest_folder) {
     std::scoped_lock lock{m_mutex};
     const auto guest_folder_sanitized = RemoveTrailingSlashes(guest_folder);
@@ -219,6 +228,9 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
 
     if (is_read_only) {
         *is_read_only = mount->read_only;
+    }
+    if (mount->host_path.empty()) {
+        return {};
     }
 
     const bool host_backed =

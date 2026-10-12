@@ -120,7 +120,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height);
-    SDL_SetNumberProperty(props, "flags", SDL_WINDOW_VULKAN);
+#ifndef SHADPS4_UWP
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
+#endif
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     // Creating the window directly in fullscreen avoids a visible windowed -> fullscreen
     // transition on startup. SDL sizes the window to the display and keeps the requested
@@ -158,7 +160,15 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
 
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 
-#if defined(SDL_PLATFORM_WIN32)
+#if defined(SHADPS4_UWP)
+    window_info.type = WindowSystemType::Windows;
+    window_info.render_surface = SDL_GetPointerProperty(
+        SDL_GetWindowProperties(window), "SDL.window.winrt.swapchain_background_panel", nullptr);
+    if (!window_info.render_surface) {
+        window_info.render_surface = SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                                                            "SDL.window.winrt.window", nullptr);
+    }
+#elif defined(SDL_PLATFORM_WIN32)
     window_info.type = WindowSystemType::Windows;
     window_info.render_surface = SDL_GetPointerProperty(SDL_GetWindowProperties(window),
                                                         SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);

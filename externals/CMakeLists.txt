@@ -80,7 +80,11 @@ if (NOT TARGET SDL3::SDL3)
     set(SDL_TEST_LIBRARY OFF)
     set(SDL_PIPEWIRE OFF)
     set(SDL_AVX512F OFF)
-    add_subdirectory(sdl3)
+    if(SHADPS4_SDL3_SOURCE_DIR)
+        add_subdirectory("${SHADPS4_SDL3_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/sdl3-external")
+    else()
+        add_subdirectory(sdl3)
+    endif()
 endif()
 
 # vulkan-headers
@@ -247,7 +251,9 @@ endif()
 
 # hwinfo
 set(HWINFO_STATIC ON)
+if(NOT SHADPS4_UWP)
 add_subdirectory(hwinfo)
+endif()
 
 if (APPLE OR ${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
     # date
@@ -317,6 +323,17 @@ set(ALSOFT_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ALSOFT_TESTS OFF CACHE BOOL "" FORCE)
 set(ALSOFT_INSTALL OFF CACHE BOOL "" FORCE)
 set(ALSOFT_CONFIG OFF CACHE BOOL "" FORCE)
+if(SHADPS4_UWP)
+    set(ALSOFT_UWP TRUE)
+    find_path(SHADPS4_CPPWINRT_INCLUDE_DIR winrt/base.h
+        HINTS "$ENV{WindowsSdkDir}/Include/$ENV{WindowsSDKVersion}/cppwinrt")
+    if(NOT SHADPS4_CPPWINRT_INCLUDE_DIR)
+        message(FATAL_ERROR "The Windows SDK C++/WinRT headers are required for UWP audio")
+    endif()
+    add_library(Microsoft::CppWinRT INTERFACE IMPORTED)
+    set_target_properties(Microsoft::CppWinRT PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${SHADPS4_CPPWINRT_INCLUDE_DIR}")
+endif()
 
 # Backends (platform-specific)
 if (WIN32)
@@ -337,6 +354,10 @@ set(ALSOFT_BACKEND_NULL ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(openal-soft EXCLUDE_FROM_ALL)
+if(SHADPS4_UWP)
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/openal-soft/alc/backends/wasapi.cpp"
+        DIRECTORY openal-soft PROPERTIES COMPILE_DEFINITIONS "WINAPI_FAMILY=WINAPI_FAMILY_APP")
+endif()
 endif()
 
 # LibreSSL

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fstream>
+#include <stdexcept>
 #include <unordered_map>
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -19,7 +20,9 @@
 #ifdef _WIN32
 // This is the maximum number of UTF-16 code units permissible in Windows file paths
 #define MAX_PATH 260
+#ifndef SHADPS4_UWP
 #include <Shlobj.h>
+#endif
 #include <windows.h>
 #else
 // This is the maximum number of UTF-8 code units permissible in all other OSes' file paths
@@ -85,33 +88,38 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 }
 #endif
 
-static auto UserPaths = [] {
+static auto CreateUserPaths(std::filesystem::path user_dir = {}) {
     // Try the portable user directory first.
-    auto user_dir = std::filesystem::current_path() / PORTABLE_DIR;
-    if (!std::filesystem::exists(user_dir)) {
-        // If it doesn't exist, use the standard path for the platform instead.
-        // NOTE: On Windows we currently just create the portable directory instead.
+    if (user_dir.empty()) {
+#ifdef SHADPS4_UWP
+        throw std::runtime_error("The UWP host must initialize the user directory");
+#else
+        user_dir = std::filesystem::current_path() / PORTABLE_DIR;
+        if (!std::filesystem::exists(user_dir)) {
+            // If it doesn't exist, use the standard path for the platform instead.
+            // NOTE: On Windows we currently just create the portable directory instead.
 #ifdef __APPLE__
-        user_dir =
-            std::filesystem::path(getenv("HOME")) / "Library" / "Application Support" / "shadPS4";
+            user_dir = std::filesystem::path(getenv("HOME")) / "Library" / "Application Support" /
+                       "shadPS4";
 #elif defined(__linux__)
-        const char* xdg_data_home = getenv("XDG_DATA_HOME");
-        if (xdg_data_home != nullptr && strlen(xdg_data_home) > 0) {
-            user_dir = std::filesystem::path(xdg_data_home) / "shadPS4";
-        } else {
-            user_dir = std::filesystem::path(getenv("HOME")) / ".local" / "share" / "shadPS4";
-        }
+            const char* xdg_data_home = getenv("XDG_DATA_HOME");
+            if (xdg_data_home != nullptr && strlen(xdg_data_home) > 0) {
+                user_dir = std::filesystem::path(xdg_data_home) / "shadPS4";
+            } else {
+                user_dir = std::filesystem::path(getenv("HOME")) / ".local" / "share" / "shadPS4";
+            }
 #elif _WIN32
-        TCHAR appdata[MAX_PATH] = {0};
-        SHGetFolderPath(NULL, CSIDL_APPDATA, NULL, 0, appdata);
-        user_dir = std::filesystem::path(appdata) / "shadPS4";
+            TCHAR appdata[MAX_PATH] = {0};
+            SHGetFolderPath(NULL, CSIDL_APPDATA, NULL, 0, appdata);
+            user_dir = std::filesystem::path(appdata) / "shadPS4";
+#endif
+        }
 #endif
     }
-
     std::unordered_map<PathType, fs::path> paths;
 
     const auto create_path = [&](PathType shad_path, const fs::path& new_path) {
-        std::filesystem::create_directory(new_path);
+        std::filesystem::create_directories(new_path);
         paths.insert_or_assign(shad_path, new_path);
     };
 
@@ -152,7 +160,17 @@ static auto UserPaths = [] {
     }
 
     return paths;
-}();
+}
+
+#ifdef SHADPS4_UWP
+static std::unordered_map<PathType, fs::path> UserPaths;
+#else
+static auto UserPaths = CreateUserPaths();
+#endif
+
+void InitializeUserPaths(const fs::path& root) {
+    UserPaths = CreateUserPaths(root);
+}
 
 bool ValidatePath(const fs::path& path) {
     if (path.empty()) {

@@ -349,7 +349,9 @@ void SignalDispatch::RemoveHandlers() {
 #if defined(_WIN32)
     if (!(RemoveVectoredExceptionHandler(handle))) {
         LOG_CRITICAL(Core, "Failed to remove exception handler.");
+#ifndef SHADPS4_UWP
         std::quick_exit(1);
+#endif
     }
 #else
     struct sigaction action{};

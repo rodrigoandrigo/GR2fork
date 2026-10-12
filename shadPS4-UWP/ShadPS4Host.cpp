@@ -1,0 +1,265 @@
+#include "pch.h"
+
+#include "ShadPS4Host.h"
+
+#include <thread>
+#include <array>
+#include <vector>
+#include <roapi.h>
+#include <windows.ui.xaml.media.dxinterop.h>
+
+using namespace Microsoft::WRL;
+using namespace Windows::UI::Core;
+
+ShadPS4Host::ShadPS4Host(Windows::UI::Xaml::Controls::SwapChainPanel ^ target) : panel{target} {}
+
+ShadPS4Host::~ShadPS4Host() {
+    Stop();
+    {
+        std::lock_guard<std::mutex> lock{work_mutex};
+        closing = true;
+    }
+    work_ready.notify_one();
+    if (presentation_thread.joinable()) {
+        presentation_thread.join();
+    }
+    if (shutdown) {
+        shutdown();
+    }
+    if (set_log_callback) {
+        set_log_callback(nullptr, nullptr);
+    }
+    if (set_error_callback) {
+        set_error_callback(nullptr, nullptr);
+    }
+    if (module) {
+        FreeLibrary(module);
+    }
+}
+
+void ShadPS4Host::Log(void*, uint32_t, const char* message) {
+    OutputDebugStringA(message);
+    OutputDebugStringA("\n");
+}
+
+void ShadPS4Host::ReportError(void*, const char* message) {
+    OutputDebugStringA(message);
+    OutputDebugStringA("\n");
+}
+
+void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width, uint32_t height) {
+    module = LoadPackagedLibrary(L"shadPS4.dll", 0);
+    if (!module) {
+        throw ref new Platform::FailureException(ref new Platform::String(
+            (L"Could not load shadPS4.dll: " + std::to_wstring(GetLastError())).c_str()));
+    }
+    const auto version = Resolve<decltype(&shadps4_get_api_version)>("shadps4_get_api_version");
+    if (version() != 1) {
+        throw ref new Platform::FailureException(L"Unsupported shadPS4 DLL interface.");
+    }
+    initialize = Resolve<decltype(initialize)>("shadps4_initialize");
+    run = Resolve<decltype(run)>("shadps4_run");
+    stop = Resolve<decltype(stop)>("shadps4_request_stop");
+    pause = Resolve<decltype(pause)>("shadps4_set_paused");
+    resize = Resolve<decltype(resize)>("shadps4_resize");
+    render = Resolve<decltype(render)>("shadps4_render_host_frame");
+    error = Resolve<decltype(error)>("shadps4_get_error");
+    shutdown = Resolve<decltype(shutdown)>("shadps4_shutdown");
+    set_log_callback = Resolve<decltype(set_log_callback)>("shadps4_set_log_callback");
+    set_error_callback = Resolve<decltype(set_error_callback)>("shadps4_set_error_callback");
+    mount_folder = Resolve<decltype(mount_folder)>("shadps4_mount_storage_folder");
+    open_file = Resolve<decltype(open_file)>("shadps4_open_mounted_file");
+    file_size = Resolve<decltype(file_size)>("shadps4_file_get_size");
+    read_file = Resolve<decltype(read_file)>("shadps4_file_read");
+    close_file = Resolve<decltype(close_file)>("shadps4_file_close");
+    set_log_callback(Log, nullptr);
+    set_error_callback(ReportError, nullptr);
+    ShadPS4Config config{};
+    config.size = sizeof(config);
+    config.version = 1;
+    config.user_directory = user_directory.c_str();
+    config.panel = reinterpret_cast<IInspectable*>(panel.Get());
+    config.width = width;
+    config.height = height;
+    config.attach_swapchain = AttachSwapChain;
+    config.attach_context = this;
+    if (initialize(&config)) {
+        throw ref new Platform::FailureException(ref new Platform::String(Error().c_str()));
+    }
+    presentation_thread = std::thread([this] { PresentationLoop(); });
+}
+
+void ShadPS4Host::PresentationLoop() {
+    const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED);
+    for (;;) {
+        std::unique_lock<std::mutex> lock{work_mutex};
+        work_ready.wait(lock, [this] { return closing || frame_pending || pending_width; });
+        if (closing) {
+            break;
+        }
+        const auto width = pending_width;
+        const auto height = pending_height;
+        const bool frame = frame_pending;
+        pending_width = 0;
+        frame_pending = false;
+        lock.unlock();
+        if (width) {
+            resize(width, height);
+        }
+        if (frame && render() != 0) {
+            presentation_failed.store(true);
+            break;
+        }
+    }
+    if (SUCCEEDED(initialized)) {
+        RoUninitialize();
+    }
+}
+
+std::wstring ShadPS4Host::Error() const {
+    if (!error) {
+        return L"The embedded core is unavailable.";
+    }
+    std::vector<char> text(error(nullptr, 0));
+    error(text.data(), static_cast<uint32_t>(text.size()));
+    const int length = MultiByteToWideChar(CP_UTF8, 0, text.data(), -1, nullptr, 0);
+    std::vector<wchar_t> wide(length);
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), -1, wide.data(), length);
+    return wide.data();
+}
+
+std::wstring ShadPS4Host::MountFolder(Platform::Agile<Windows::Storage::StorageFolder> folder) {
+    struct Apartment {
+        HRESULT result{RoInitialize(RO_INIT_MULTITHREADED)};
+        ~Apartment() {
+            if (SUCCEEDED(result)) {
+                RoUninitialize();
+            }
+        }
+    } apartment;
+    if (FAILED(apartment.result)) {
+        throw ref new Platform::FailureException(L"Brokered storage requires an MTA worker.");
+    }
+    if (mount_folder("/app0", reinterpret_cast<IInspectable*>(folder.Get()), 1)) {
+        throw ref new Platform::FailureException(ref new Platform::String(Error().c_str()));
+    }
+    uint64_t token{};
+    if (open_file("/app0/eboot.bin", SHADPS4_FILE_READ, &token)) {
+        throw ref new Platform::FailureException(ref new Platform::String(Error().c_str()));
+    }
+    uint64_t length{};
+    std::array<uint8_t, 16> header{};
+    uint64_t transferred{};
+    const auto result =
+        file_size(token, &length) || read_file(token, header.data(), header.size(), &transferred);
+    const auto message = result ? Error() : std::wstring{};
+    close_file(token);
+    if (result) {
+        throw ref new Platform::FailureException(ref new Platform::String(message.c_str()));
+    }
+    return L"Pasta vinculada por acesso brokered. eboot.bin: " + std::to_wstring(length) +
+           L" bytes. A execução de jogos ainda não está disponível.";
+}
+
+void ShadPS4Host::Run(std::wstring executable, std::function<void(std::wstring)> completed) {
+    const auto self = shared_from_this();
+    std::thread([self, executable, completed] {
+        const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED);
+        const auto result = self->run(executable.c_str());
+        const auto message = result ? self->Error()
+                                    : L"Session stopped. Restart the application "
+                                      L"to launch another title.";
+        completed(message);
+        if (SUCCEEDED(initialized)) {
+            RoUninitialize();
+        }
+    }).detach();
+}
+
+void ShadPS4Host::Pause(bool paused) {
+    if (pause) {
+        pause(paused);
+    }
+}
+
+void ShadPS4Host::Stop() {
+    if (stop) {
+        stop();
+    }
+}
+
+void ShadPS4Host::Resize(uint32_t width, uint32_t height) {
+    if (width && height) {
+        std::lock_guard<std::mutex> lock{work_mutex};
+        pending_width = width;
+        pending_height = height;
+    }
+    work_ready.notify_one();
+}
+
+bool ShadPS4Host::Render() {
+    if (presentation_failed.load()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock{work_mutex};
+        frame_pending = true;
+    }
+    work_ready.notify_one();
+    return true;
+}
+
+long ShadPS4Host::AttachSwapChain(void* context, void* swapchain) {
+    auto* self = static_cast<ShadPS4Host*>(context);
+    struct Attachment {
+        HANDLE event =
+            CreateEventExW(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS);
+        HRESULT result{E_FAIL};
+        ComPtr<IDXGISwapChain> chain;
+        ~Attachment() {
+            if (event) {
+                CloseHandle(event);
+            }
+        }
+    };
+    const auto attachment = std::make_shared<Attachment>();
+    if (!attachment->event) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    attachment->chain = static_cast<IDXGISwapChain*>(swapchain);
+    auto target = self->panel;
+    const auto attach = [target, attachment] {
+        ComPtr<ISwapChainPanelNative> native;
+        attachment->result =
+            reinterpret_cast<IInspectable*>(target.Get())->QueryInterface(IID_PPV_ARGS(&native));
+        if (SUCCEEDED(attachment->result)) {
+            attachment->result = native->SetSwapChain(attachment->chain.Get());
+        }
+        if (SUCCEEDED(attachment->result)) {
+            const auto sdl = LoadPackagedLibrary(L"SDL3.dll", 0);
+            if (!sdl) {
+                attachment->result = HRESULT_FROM_WIN32(GetLastError());
+            } else {
+                using AttachPanel = bool(__cdecl*)(void*);
+                const auto attach_panel =
+                    reinterpret_cast<AttachPanel>(GetProcAddress(sdl, "SDL_WinRTAttachXAMLPanel"));
+                attachment->result = !attach_panel ? HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND)
+                                     : attach_panel(reinterpret_cast<IInspectable*>(target.Get()))
+                                         ? S_OK
+                                         : E_FAIL;
+                FreeLibrary(sdl);
+            }
+        }
+        SetEvent(attachment->event);
+    };
+    if (target->Dispatcher->HasThreadAccess) {
+        attach();
+    } else {
+        target->Dispatcher->RunAsync(CoreDispatcherPriority::Normal,
+                                     ref new DispatchedHandler(attach));
+        if (WaitForSingleObjectEx(attachment->event, 10000, FALSE) != WAIT_OBJECT_0) {
+            return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        }
+    }
+    return attachment->result;
+}

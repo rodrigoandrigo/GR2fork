@@ -665,7 +665,7 @@ unsigned ExcludeReservedCoresFromAllOtherThreads() {
                  reserved, host_cpus, narrowed, already_narrow);
     }
     return narrowed;
-#elif defined(_WIN32)
+#elif defined(_WIN32) && !defined(SHADPS4_UWP)
     // Threads created after the snapshot are caught by the periodic walk.
     const DWORD self_pid = GetCurrentProcessId();
     const DWORD self_tid = GetCurrentThreadId();
@@ -741,7 +741,7 @@ void StartPeriodicAffinityRewalk() {
 }
 
 void RestrictProcessToOneThreadPerCore() {
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(SHADPS4_UWP)
     const auto cores = EnumeratePhysicalCores(0);
     u64 mask = 0;
     u64 all = 0;

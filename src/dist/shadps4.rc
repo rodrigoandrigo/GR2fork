@@ -31,7 +31,11 @@ BEGIN
             VALUE "FileVersion", xstr(EMULATOR_VERSION_MAJOR) "." xstr(EMULATOR_VERSION_MINOR) "." xstr(EMULATOR_VERSION_PATCH) ".0\0"
             VALUE "InternalName", "shadPS4\0"
             VALUE "LegalCopyright", "Copyright 2025 shadPS4 Team\0"
+#ifdef SHADPS4_UWP
+            VALUE "OriginalFilename", "shadPS4.dll\0"
+#else
             VALUE "OriginalFilename", "shadPS4.exe\0"
+#endif
             VALUE "ProductName", "shadPS4\0"
             VALUE "ProductVersion", xstr(EMULATOR_VERSION_MAJOR) "." xstr(EMULATOR_VERSION_MINOR) "." xstr(EMULATOR_VERSION_PATCH) ".0\0"
         END

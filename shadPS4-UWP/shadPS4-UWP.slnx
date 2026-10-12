@@ -1,0 +1,10 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="shadPS4-UWP.vcxproj" Id="0702eed0-8a40-4b51-8945-83269817e5dc">
+    <Deploy />
+  </Project>
+</Solution>

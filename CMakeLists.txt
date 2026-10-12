@@ -40,6 +40,27 @@ option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
+option(SHADPS4_UWP "Build the embedded UWP core" OFF)
+set(SHADPS4_SDL3_SOURCE_DIR "" CACHE PATH "External SDL3 source tree")
+set(SHADPS4_SDL3_LIBRARY "" CACHE FILEPATH "SDL3 UWP import library")
+set(SHADPS4_SDL3_RUNTIME "" CACHE FILEPATH "SDL3 UWP runtime")
+set(SHADPS4_D3D12_SOURCE_DIR "C:/Users/rodri/Dev1/Projetos/xbox-series-d3d12-main" CACHE PATH "Native Xbox D3D12 source tree")
+set(SHADPS4_UWP_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/shadPS4-UWP/Runtime/${CMAKE_BUILD_TYPE}" CACHE PATH "UWP runtime destination")
+if(SHADPS4_UWP)
+    if(NOT WIN32 OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR "The UWP core requires Windows x64 and clang-cl")
+    endif()
+    set(ENABLE_DISCORD_RPC OFF CACHE BOOL "" FORCE)
+    set(ENABLE_UPDATER OFF CACHE BOOL "" FORCE)
+    if(NOT SHADPS4_SDL3_SOURCE_DIR OR NOT EXISTS "${SHADPS4_SDL3_LIBRARY}" OR NOT EXISTS "${SHADPS4_SDL3_RUNTIME}")
+        message(FATAL_ERROR "Build SDL3-uwp with MSVC first and provide its source, import library and runtime")
+    endif()
+    add_library(SDL3::SDL3 SHARED IMPORTED GLOBAL)
+    set_target_properties(SDL3::SDL3 PROPERTIES
+        IMPORTED_IMPLIB "${SHADPS4_SDL3_LIBRARY}"
+        IMPORTED_LOCATION "${SHADPS4_SDL3_RUNTIME}"
+        INTERFACE_INCLUDE_DIRECTORIES "${SHADPS4_SDL3_SOURCE_DIR}/include")
+endif()
 
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
@@ -1353,7 +1374,31 @@ endif()
 
 if(NOT ENABLE_TESTS)
 
-add_executable(shadps4
+if(SHADPS4_UWP)
+    add_library(shadps4 SHARED src/uwp/shadps4_api.cpp src/uwp/shadps4_api.h)
+    set(SHADPS4_D3D12_PLATFORM "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp")
+    foreach(component IN ITEMS device_context resource_allocator command_encoder pipeline_cache)
+        if(NOT EXISTS "${SHADPS4_D3D12_PLATFORM}/d3d12_${component}.cpp")
+            message(FATAL_ERROR "Missing native D3D12 source: ${SHADPS4_D3D12_PLATFORM}/d3d12_${component}.cpp")
+        endif()
+        target_sources(shadps4 PRIVATE "${SHADPS4_D3D12_PLATFORM}/d3d12_${component}.cpp")
+    endforeach()
+    target_sources(shadps4 PRIVATE src/uwp/d3d12_presenter.cpp src/uwp/d3d12_presenter.h)
+    target_sources(shadps4 PRIVATE src/uwp/brokered_fs.cpp src/uwp/brokered_fs.h src/uwp/brokered_api.cpp)
+    target_include_directories(shadps4 PRIVATE "${SHADPS4_D3D12_PLATFORM}" "${SHADPS4_CPPWINRT_INCLUDE_DIR}")
+    target_compile_definitions(shadps4 PRIVATE SHADPS4_UWP SHADPS4_API_EXPORTS SDL_BUILDING_WINRT=1)
+    set_target_properties(shadps4 PROPERTIES OUTPUT_NAME shadPS4 WINDOWS_EXPORT_ALL_SYMBOLS OFF)
+    target_link_options(shadps4 PRIVATE /APPCONTAINER /DYNAMICBASE)
+    target_link_libraries(shadps4 PRIVATE windowsapp runtimeobject d3d12 dxgi)
+    set(SHADPS4_UWP_CRT_DIR "$ENV{VCToolsInstallDir}/lib/x64/store")
+    if(NOT EXISTS "${SHADPS4_UWP_CRT_DIR}/msvcrt.lib")
+        message(FATAL_ERROR "Initialize the Visual Studio x64 build environment with UWP CRT libraries")
+    endif()
+    target_link_directories(shadps4 BEFORE PRIVATE "${SHADPS4_UWP_CRT_DIR}")
+else()
+    add_executable(shadps4 src/main.cpp)
+endif()
+target_sources(shadps4 PRIVATE
     ${AUDIO_CORE}
     ${IMGUI}
     ${INPUT}
@@ -1363,7 +1408,6 @@ add_executable(shadps4
     ${VIDEO_CORE}
     ${EMULATOR}
     ${SHADNET}
-    src/main.cpp
     src/emulator.cpp
     src/emulator.h
     src/sdl_window.h
@@ -1375,7 +1419,10 @@ create_target_directory_groups(shadps4)
 target_link_libraries(shadps4 PRIVATE spdlog::spdlog)
 target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis SDL3::SDL3 pugixml::pugixml)
-target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
+target_link_libraries(shadps4 PRIVATE stb::headers nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
+if(NOT SHADPS4_UWP)
+    target_link_libraries(shadps4 PRIVATE lfreist-hwinfo::hwinfo)
+endif()
 target_link_libraries(shadps4 PRIVATE Freetype::Freetype)
 target_link_libraries(shadps4 PRIVATE libprotobuf)
 target_link_libraries(shadps4 PRIVATE ZArchive::zarchive)
@@ -1443,7 +1490,10 @@ elseif (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
 endif()
 
 if (WIN32)
-    target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid)
+    target_link_libraries(shadps4 PRIVATE mincore wepoll)
+    if(NOT SHADPS4_UWP)
+        target_link_libraries(shadps4 PRIVATE wbemuuid)
+    endif()
 
     if (MSVC)
         # MSVC likes putting opinions on what people can use, disable:
@@ -1465,9 +1515,9 @@ if (WIN32)
     endif()
 
     # Disable ASLR so we can reserve the user area
-    if (MSVC)
+    if (MSVC AND NOT SHADPS4_UWP)
         target_link_options(shadps4 PRIVATE /DYNAMICBASE:NO)
-    else()
+    elseif(NOT MSVC)
         target_link_options(shadps4 PRIVATE -Wl,--disable-dynamicbase)
     endif()
 
@@ -1528,6 +1578,15 @@ cmrc_add_resource_library(embedded-resources
         src/resources/amd_rcp_index_table.bin.zstd
         src/resources/amd_rsqrt_index_table.bin.zstd)
 target_link_libraries(shadps4 PRIVATE res::embedded)
+if(SHADPS4_UWP)
+    add_custom_command(TARGET shadps4 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADPS4_UWP_OUTPUT_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:shadps4>" "${SHADPS4_UWP_OUTPUT_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_LINKER_FILE:shadps4>" "${SHADPS4_UWP_OUTPUT_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_SDL3_RUNTIME}" "${SHADPS4_UWP_OUTPUT_DIR}/SDL3.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/src/uwp/shadps4_api.h" "${SHADPS4_UWP_OUTPUT_DIR}"
+        VERBATIM)
+endif()
 
 # ImGui resources
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/imgui/renderer)

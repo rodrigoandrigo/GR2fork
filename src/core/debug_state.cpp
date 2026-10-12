@@ -28,8 +28,23 @@ static ThreadID ThisThreadID() {
 #endif
 }
 
+#ifdef SHADPS4_UWP
+static std::mutex guest_handles_mutex;
+static std::unordered_map<ThreadID, HANDLE> guest_handles;
+
+static HANDLE GuestHandle(ThreadID id) {
+    std::scoped_lock lock{guest_handles_mutex};
+    const auto found = guest_handles.find(id);
+    return found == guest_handles.end() ? nullptr : found->second;
+}
+#endif
+
 static void PauseThread(ThreadID id) {
-#ifdef _WIN32
+#ifdef SHADPS4_UWP
+    if (const auto handle = GuestHandle(id)) {
+        SuspendThread(handle);
+    }
+#elif defined(_WIN32)
     auto handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE, id);
     SuspendThread(handle);
     CloseHandle(handle);
@@ -39,7 +54,11 @@ static void PauseThread(ThreadID id) {
 }
 
 static void ResumeThread(ThreadID id) {
-#ifdef _WIN32
+#ifdef SHADPS4_UWP
+    if (const auto handle = GuestHandle(id)) {
+        ::ResumeThread(handle);
+    }
+#elif defined(_WIN32)
     auto handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE, id);
     ResumeThread(handle);
     CloseHandle(handle);
@@ -51,12 +70,34 @@ static void ResumeThread(ThreadID id) {
 void DebugStateImpl::AddCurrentThreadToGuestList() {
     std::lock_guard lock{guest_threads_mutex};
     const ThreadID id = ThisThreadID();
+#ifdef SHADPS4_UWP
+    HANDLE handle{};
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+                         THREAD_SUSPEND_RESUME, FALSE, 0)) {
+        LOG_ERROR(Core, "Failed to retain a guest thread handle: {}", GetLastError());
+        return;
+    }
+    {
+        std::scoped_lock handle_lock{guest_handles_mutex};
+        guest_handles.emplace(id, handle);
+    }
+#endif
     guest_threads.push_back(id);
 }
 
 void DebugStateImpl::RemoveCurrentThreadFromGuestList() {
     std::lock_guard lock{guest_threads_mutex};
     const ThreadID id = ThisThreadID();
+#ifdef SHADPS4_UWP
+    {
+        std::scoped_lock handle_lock{guest_handles_mutex};
+        const auto found = guest_handles.find(id);
+        if (found != guest_handles.end()) {
+            CloseHandle(found->second);
+            guest_handles.erase(found);
+        }
+    }
+#endif
     std::erase_if(guest_threads, [&](const ThreadID& v) { return v == id; });
 }
 

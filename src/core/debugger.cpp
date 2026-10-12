@@ -1,6 +1,7 @@
 //  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging/log.h"
 #include "debugger.h"
 
 #include <iostream>
@@ -62,7 +63,7 @@ void Core::Debugger::WaitForDebuggerAttach() {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         if (--count <= 0) {
             count = 10;
-            std::cerr << "Waiting for debugger to attach..." << std::endl;
+            LOG_INFO(Core, "Waiting for debugger to attach...");
         }
     }
 }
@@ -77,7 +78,9 @@ int Core::Debugger::GetCurrentPid() {
 }
 
 void Core::Debugger::WaitForPid(int pid) {
-#if defined(_WIN32)
+#if defined(SHADPS4_UWP)
+    return;
+#elif defined(_WIN32)
     HANDLE process_handle = OpenProcess(SYNCHRONIZE, FALSE, pid);
     if (process_handle != nullptr) {
         std::cerr << "Waiting for process " << pid << " to exit..." << std::endl;

@@ -1,0 +1,3 @@
+<Application x:Class="shadPS4_UWP.App" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="using:shadPS4_UWP">
+
+</Application>

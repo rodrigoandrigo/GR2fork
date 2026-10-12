@@ -66,6 +66,10 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
  **/
 
 void IPC::Init() {
+#ifdef SHADPS4_UWP
+    enabled = false;
+    return;
+#else
     const char* enabledEnv = std::getenv("SHADPS4_ENABLE_IPC");
     enabled = enabledEnv && strcmp(enabledEnv, "true") == 0;
     if (!enabled) {
@@ -90,15 +94,20 @@ void IPC::Init() {
         std::cerr << "IPC: Failed to acquire run semaphore, closing process.\n";
         exit(1);
     }
+#endif
 }
 
 void IPC::SendRestart(const std::vector<std::string>& args) {
+#ifdef SHADPS4_UWP
+    LOG_ERROR(Core, "Process restart is unavailable in the embedded core");
+#else
     std::cerr << ";RESTART\n";
     std::cerr << ";" << args.size() << "\n";
     for (const auto& arg : args) {
         std::cerr << ";" << arg << "\n";
     }
     std::cerr.flush();
+#endif
 }
 
 void IPC::InputLoop() {

@@ -10,7 +10,9 @@
 #include <sstream>
 #include <fmt/core.h>
 #include <fmt/xchar.h>
+#ifndef SHADPS4_UWP
 #include <hwinfo/hwinfo.h>
+#endif
 
 #include "common/debug.h"
 #include "common/logging/log.h"
@@ -45,6 +47,11 @@
 #include "core/memory.h"
 #include "core/user_settings.h"
 #include "emulator.h"
+#ifdef SHADPS4_UWP
+#include "core/debug_state.h"
+#include "uwp/session.h"
+#include "uwp/shadps4_api.h"
+#endif
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
 
@@ -72,14 +79,18 @@ Emulator::Emulator() {
     // Initialize NT API functions, set high priority and disable WER
 #ifdef _WIN32
     Common::NtApi::Initialize();
+#ifndef SHADPS4_UWP
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
     SetErrorMode(SetErrorMode(0) | SEM_NOGPFAULTERRORBOX);
+#endif
     // need to init this in order for winsock2 to work
     WORD versionWanted = MAKEWORD(2, 2);
     WSADATA wsaData;
     WSAStartup(versionWanted, &wsaData);
 #endif
+#ifndef SHADPS4_UWP
     std::at_quick_exit([]() { Common::Singleton<Core::Emulator>::Instance()->Shutdown(); });
+#endif
 }
 
 Emulator::~Emulator() {}
@@ -582,6 +593,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "Vulkan PipelineCacheArchived: {}",
              EmulatorSettings.IsPipelineCacheArchived());
 
+#ifndef SHADPS4_UWP
     hwinfo::Memory ram;
     hwinfo::OS os;
     const auto cpus = hwinfo::getAllCPUs();
@@ -592,6 +604,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     LOG_INFO(Config, "Total RAM: {} GB", std::round(ram.total_Bytes() / pow(1024, 3)));
     LOG_INFO(Config, "Operating System: {}", os.name());
+#endif
 
     if (param_sfo_exists) {
         LOG_INFO(Loader, "Game id: {} Title: {}", id, title);
@@ -751,7 +764,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // Load the module with the linker.
     if (linker->LoadModule(guest_eboot_path) == -1) {
         LOG_CRITICAL(Loader, "Failed to load game's eboot.bin: {}", guest_eboot_path);
+#ifdef SHADPS4_UWP
+        throw std::runtime_error("Failed to load the guest executable");
+#else
         std::quick_exit(0);
+#endif
     }
 
 #ifdef ENABLE_DISCORD_RPC
@@ -778,11 +795,28 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     linker->Execute(args);
 
     window->InitTimers();
+#ifdef SHADPS4_UWP
+    Uwp::SetGuestReady(true);
+    if (Uwp::PauseRequested()) {
+        DebugState.PauseGuestThreads();
+    }
+#endif
     while (window->IsOpen()) {
+#ifdef SHADPS4_UWP
+        if (Uwp::StopRequested()) {
+            break;
+        }
+#endif
         window->WaitEvent();
     }
 
+#ifdef SHADPS4_UWP
+    Uwp::SetGuestReady(false);
+    DebugState.PauseGuestThreads();
+    Shutdown();
+#else
     std::quick_exit(0);
+#endif
 }
 
 void Emulator::Restart(std::filesystem::path eboot_path,
@@ -847,7 +881,11 @@ void Emulator::Restart(std::filesystem::path eboot_path,
     Relaunch(std::move(args));
 }
 
-[[noreturn]] void Emulator::Relaunch(std::vector<std::string> args) {
+void Emulator::Relaunch(std::vector<std::string> args) {
+#ifdef SHADPS4_UWP
+    LOG_ERROR(Common, "A new guest process requires restarting the UWP application");
+    shadps4_request_stop();
+#else
     const auto guest_args = std::find(args.begin(), args.end(), "--");
     args.insert(guest_args, {"--wait-for-pid", std::to_string(Debugger::GetCurrentPid())});
 
@@ -914,6 +952,7 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 #endif
 
     std::quick_exit(0);
+#endif
 }
 
 void Emulator::UpdatePlayTime(const std::string_view serial) {

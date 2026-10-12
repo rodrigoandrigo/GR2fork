@@ -18,6 +18,9 @@
 #include "common/path_util.h"
 #include "core/libraries/gr2_online/online_host.h"
 #include "core/libraries/gr2_online/online_session.h"
+#ifdef SHADPS4_UWP
+#include "uwp/shadps4_api.h"
+#endif
 
 namespace Libraries::Gr2Online::Session {
 
@@ -134,7 +137,12 @@ void Show(const Gate& gate, bool at_boot) {
     switch (gate.verdict) {
     case Verdict::Outdated:
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, BoxTitle, text.c_str(), nullptr);
+#ifdef SHADPS4_UWP
+        shadps4_request_stop();
+        break;
+#else
         std::quick_exit(0);
+#endif
     case Verdict::Banned:
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, BoxTitle, text.c_str(), nullptr);
         break;

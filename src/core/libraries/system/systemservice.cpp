@@ -1879,7 +1879,11 @@ int PS4_SYSV_ABI sceSystemServiceLoadExec(const char* path, const char* argv[]) 
     // Validate through the mount stack so archive-backed targets resolve.
     if (!mnt->Exists(std::string_view(path))) {
         LOG_INFO(Lib_SystemService, "Restart called with invalid file '{}', exiting.", path);
+#ifdef SHADPS4_UWP
+        return ORBIS_SYSTEM_SERVICE_ERROR_PARAMETER;
+#else
         std::quick_exit(0);
+#endif
     }
     std::filesystem::path exec_path;
     if (auto handle = mnt->Open(std::string_view(path), /*writable=*/false)) {
