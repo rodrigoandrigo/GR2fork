@@ -3,7 +3,9 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <tuple>
 #include <vector>
 #include "d3d12_device_context.h"
 #include "d3d12_resource_allocator.h"
@@ -14,6 +16,11 @@ class ResourceCache final : public VideoCore::GpuMemorySink {
 public:
     using Read = std::function<void(VAddr, std::span<u8>)>;
     using Write = std::function<void(VAddr, std::span<const u8>)>;
+    using Resolve = std::function<std::optional<VAddr>(VAddr, u64)>;
+    struct Identity {
+        VAddr address;
+        bool physical;
+    };
     struct Buffer {
         VAddr address;
         u64 size;
@@ -28,6 +35,12 @@ public:
         u64 batch{};
         bool written{};
         bool host{};
+        bool physical{};
+        struct WriteTarget {
+            VAddr address;
+            u64 offset, size;
+        };
+        std::vector<WriteTarget> targets;
         std::vector<u8> host_data;
     };
     struct Range {
@@ -38,10 +51,13 @@ public:
         Buffer* buffer;
         u64 offset;
         u64 size;
+        VAddr guest_address{};
     };
-    void Initialize(D3D12DeviceContext& device, Read read, Write write);
+    void Initialize(D3D12DeviceContext& device, Read read, Write write, Resolve resolve = {});
+    Identity Canonicalize(VAddr address, u64 size) const;
+    void MarkWritten(const View& view);
     void BeginBatch();
-    Buffer& GetBuffer(VAddr address, u64 size);
+    Buffer& GetBuffer(VAddr address, u64 size, bool physical = false);
     Buffer& GetHostBuffer(VAddr identity, std::span<const u8> data);
     std::vector<View> GetViews(std::span<const Range> ranges);
     void Upload(Buffer& buffer, ID3D12GraphicsCommandList* commands);
@@ -64,7 +80,8 @@ private:
     D3D12ResourceAllocator allocator;
     Read read;
     Write write;
-    std::map<std::pair<VAddr, u64>, std::unique_ptr<Buffer>> buffers;
+    Resolve resolve;
+    std::map<std::tuple<bool, VAddr, u64>, std::unique_ptr<Buffer>> buffers;
     std::mutex invalidation_mutex;
     std::vector<Invalidation> invalidations;
     u64 epoch{};

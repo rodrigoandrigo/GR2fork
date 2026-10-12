@@ -1,8 +1,9 @@
 #pragma once
 
+#include <winrt/base.h>
+#include "uwp/session.h"
 #include "video_core/gpu_command_sink.h"
 #include "video_core/renderer_d3d12/command_runtime.h"
-#include "uwp/session.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -26,11 +27,9 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 size, bool dst_gds, bool src_gds) override;
     u32 ReadDataFromGds(u32 offset) override;
     void ProcessDownloadImages() override {}
-    void CpSync() override {}
-    u64 Flush() override {
-        return ++submission;
-    }
-    void Finish() override {}
+    void CpSync() override;
+    u64 Flush() override;
+    void Finish() override;
     void OnSubmit() override {}
     void ScopeMarkerBegin(std::string_view, bool = false) override {}
     void ScopeMarkerEnd(bool = false) override {}
@@ -41,11 +40,17 @@ public:
     bool InvalidateMemory(VAddr address, u64 size, bool assume_locks = false) override;
 
 private:
-    template <typename Function> void Execute(Function&& function) {
+    template <typename Function>
+    void Execute(Function&& function) {
         if (failed)
             return;
         try {
             function();
+        } catch (const winrt::hresult_error& error) {
+            failed = true;
+            Core::Uwp::FailGuestSession(fmt::format("D3D12 HRESULT {:08x}: {}",
+                                                    u32(error.code().value),
+                                                    winrt::to_string(error.message())));
         } catch (const std::exception& error) {
             failed = true;
             Core::Uwp::FailGuestSession(error.what());
@@ -72,7 +77,5 @@ private:
     AmdGpu::Liverpool& liverpool;
     Core::MemoryManager& memory;
     CommandRuntime runtime;
-    std::array<u8, 65536> gds{};
-    u64 submission{};
 };
 } // namespace D3D12

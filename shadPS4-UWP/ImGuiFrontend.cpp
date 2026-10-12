@@ -106,8 +106,10 @@ void CopyFolder(StorageFolder ^ source, StorageFolder ^ target, const std::atomi
 }
 } // namespace
 
-ImGuiFrontend::ImGuiFrontend(Windows::UI::Xaml::Controls::SwapChainPanel ^ target)
-    : panel{target}, dispatcher{target->Dispatcher}, core{std::make_shared<ShadPS4Host>(target)} {}
+ImGuiFrontend::ImGuiFrontend(Windows::UI::Xaml::Controls::SwapChainPanel ^ target,
+                             Windows::UI::Xaml::Controls::SwapChainPanel ^ game_panel)
+    : core{std::make_shared<ShadPS4Host>(game_panel ? game_panel : target)},
+      game_surface{game_panel != nullptr}, panel{target}, dispatcher{target->Dispatcher} {}
 ImGuiFrontend::~ImGuiFrontend() {
     Stop();
 }
@@ -227,7 +229,7 @@ void ImGuiFrontend::Run(std::wstring root) {
                 pending_logs.pop_front();
             pending_logs.push_back(message.substr(0, 4096));
         });
-        core->Initialize(root, initial.width, initial.height, true);
+        core->Initialize(root, initial.width, initial.height, true, game_surface);
 #define RESOLVE(member, name) member = core->GetApi<decltype(member)>(name)
         RESOLVE(get_settings, "shadps4_get_settings");
         RESOLVE(set_host_state, "shadps4_set_host_state");
@@ -281,14 +283,28 @@ void ImGuiFrontend::Run(std::wstring root) {
             work_ready.notify_all();
             for (auto& update : updates)
                 update();
-            if (set_host_state(!snapshot.suspended && snapshot.active,
-                               snapshot.captured || io.NavActive || io.WantCaptureKeyboard))
+            const bool running = core->State() == SHADPS4_RUNNING;
+            if (running != game_running) {
+                game_running = running;
+                menu_open = !running;
+            }
+            const bool pressed = snapshot.keys[27];
+            if (game_running && pressed && !menu_pressed)
+                menu_open = !menu_open;
+            menu_pressed = pressed;
+            if (set_host_state(
+                    !snapshot.suspended && snapshot.active,
+                    snapshot.captured ||
+                        (game_running ? menu_open : io.NavActive || io.WantCaptureKeyboard)))
                 throw std::runtime_error(Utf8(core->Error()));
             if (snapshot.suspended || !snapshot.active) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
             renderer->Resize(snapshot.width, snapshot.height);
+            if (game_surface)
+                core->Resize(snapshot.width, snapshot.height);
+            renderer->SetTransparent(game_running);
             const auto now = std::chrono::steady_clock::now();
             const auto delta = std::chrono::duration<float>(now - last).count();
             last = now;
@@ -765,6 +781,8 @@ void ImGuiFrontend::SubmitInput(const FrontendInput& snapshot) {
 }
 
 void ImGuiFrontend::Draw() {
+    if (game_running && !menu_open)
+        return;
     const auto display = ImGui::GetIO().DisplaySize;
     ImGui::SetNextWindowPos({0, 0});
     ImGui::SetNextWindowSize(display);
@@ -870,7 +888,7 @@ void ImGuiFrontend::DrawLibrary() {
     ImGui::Button("Iniciar jogo");
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("O renderer de comandos PS4 D3D12 ainda não está implementado.");
+        ImGui::SetTooltip("A execução de jogos ainda não está disponível nesta versão.");
 }
 
 void ImGuiFrontend::DrawSettings() {

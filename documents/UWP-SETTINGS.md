@@ -4,7 +4,7 @@ Inventário extraído pela API da DLL a partir dos oito grupos reais de Emulator
 
 Os perfis por jogo usam os mesmos campos overrideable e arquivos do desktop. Campos globais permanecem somente leitura ao selecionar um jogo; excluir o perfil restaura a herança global. Aplicações inválidas retornam erro e não alteram o valor salvo.
 
-Pastas de biblioteca são selecionadas pelo broker, com grants na FutureAccessList. Importações para módulos, fontes e DLCs usam o armazenamento privado. Renderização PS4 D3D12, sensores, integração Discord e adaptadores desktop ausentes ainda exigem implementação.
+Pastas de biblioteca são selecionadas pelo broker, com grants na FutureAccessList. Importações para módulos, fontes e DLCs usam o armazenamento privado. O renderer D3D12 é experimental e o boot permanece desabilitado; sensores, integração Discord e adaptadores desktop ausentes ainda exigem implementação.
 
 | Grupo | Chave desktop | Estado no UWP | Motivo |
 | --- | --- | --- | --- |

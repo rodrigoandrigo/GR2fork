@@ -35,9 +35,9 @@ class ShaderCache {
 public:
     void Initialize(ID3D12Device* device);
     CompiledShader Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
-                           Shader::Backend::Bindings bindings = {});
+                           Shader::Backend::Bindings bindings = {}, bool flip_y = false);
     std::shared_ptr<const ShaderBinary> CompileSpirv(std::span<const u32> words,
-                                                     Shader::SwStage stage);
+                                                     Shader::SwStage stage, bool flip_y = false);
     const Shader::Profile& Profile() const {
         return profile;
     }

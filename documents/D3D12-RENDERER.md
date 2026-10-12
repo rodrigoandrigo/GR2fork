@@ -1,46 +1,69 @@
 # Renderer D3D12: estado de implementação
 
-O renderer completo de jogos PS4 **não está implementado**. O boot continua
-desabilitado. Não se presume suporte a jogos por compilar a DLL, apresentar
-ImGui, copiar buffers ou executar shaders autorais do projeto de origem.
+Existe um renderer guest experimental ligado ao Liverpool. O renderer completo de jogos PS4 ainda não está concluído, e o boot de jogos permanece desabilitado. Nenhum resultado abaixo comprova execução de jogos, AppContainer ou Xbox.
 
-## Integração feita
+## Caminhos implementados
 
-- Snapshot local em `externals/d3d12-native`, com licença e SHA256SUMS.
-- Device context, allocator, encoder, pipeline cache e VideoCore bridge
-  compilados diretamente dessa cópia. O frontend usa o mesmo snapshot local.
-- Liverpool recebe `VideoCore::GpuCommandSink`, sem incluir o rasterizador
-  Vulkan. O Vulkan implementa o contrato e conserva os hooks de packet run,
-  fences, markers e offsets SGPR dos draws indiretos deste fork.
-- A validação de ambiente da DLL exercita fill e download/readback D3D12
-  pela mesma interface de comandos.
+| Caminho | Implementação atual |
+| --- | --- |
+| Comandos | GpuCommandSink, rasterizador D3D12 próprio e registradores Liverpool; draws diretos, indexed/instanced, expansão CPU de draws indiretos e dispatch direto/indireto |
+| Shaders | Recompiler GCN existente → SPIR-V → SPIRV-Cross HLSL → DXC DXIL; VS/PS/CS, reflexão de recursos, base vertex/instance, compute wave64 e constantes de número de workgroups |
+| Buffers | Recursos raw/typed via IR, agrupamento de views sobrepostas, identidade física para aliases contíguos, snapshots CPU, upload/download e writeback nas views guest originais; flat buffer, clip planes, GDS e spill LDS |
+| Imagens | Texturas 1D/2D/3D, mips e layers, views de layer único/arrays, formatos comuns e BC, samplers, CPU tiling/detiling, MRT e profundidade simples; read address e write address de depth separados |
+| Pipelines | Root signatures por reflexão; cache limitado com chave dos shaders, bindings, input layout e estados usados; rasterização, blend, máscaras, topologias básicas, viewport e scissor |
+| Coerência | Upload antes do comando, download após conclusão da fence e antes do retorno; lease de memória guest protege map/unmap; aliases incompatíveis dentro do mesmo comando são rejeitados |
+| VideoOut | Contrato de apresentação compartilhado com adaptador Vulkan desktop; frame D3D12 com snapshot imutável, detiling/swizzle/gamma SDR, blank/last frame, eventos existentes e swapchain do painel de jogo UWP |
+| Embedding | Exceções de GPU/VideoOut tornam-se erro da sessão; thread de apresentação MTA; UWP não cria janela SDL nem executa seu loop de eventos desktop |
+| Frontend | Painéis separados de jogo e ImGui, composição com alpha premultiplicado e overlay controlado pela thread de renderização |
 
-## Caminhos de jogos ainda necessários
+As cópias locais ficam em `externals/d3d12-native` e `externals/spirv-cross`. O SDL3 continua vindo da pasta UWP indicada pelo usuário. A bridge restrita copiada do projeto de origem não traduz shaders guest: o caminho de jogos usa `src/video_core/renderer_d3d12`, o recompiler existente e o SPIRV-Cross completo. Não há Dozen ou tradução Vulkan→D3D12 neste caminho de renderização.
 
-| Caminho | Situação atual | Trabalho necessário |
-| --- | --- | --- |
-| PM4/Liverpool | Contrato de comandos independente do Vulkan | Criar e ligar o rasterizador D3D12 com registradores graphics/compute e reportar erros de submissão |
-| Memória guest | MemoryManager ainda aponta para Vulkan::Rasterizer | Adaptar map/unmap/register/invalidate, dirty tracking, aliases e download antes de sinalizar fences |
-| Buffers | Bridge nativa faz transferências de buffers registrados | Cache ligado à MMU, GDS, buffers raw/typed, uploads/downloads e retirement por fence |
-| Imagens | TextureCache e detiling ainda ligados ao Vulkan | Formatos PS4, mips/layers, render targets, depth/stencil, views, samplers, MSAA/resolve e coerência com buffers |
-| Shaders GCN | Recompiler atual emite SPIR-V para Vulkan | Perfil D3D12, conversão completa para HLSL/DXIL, reflexão e bindings coerentes com os recursos guest |
-| Tradutor copiado | VS/PS/compute restritos, sem recursos gerais de jogos | Suportar recursos, builtins, estágios e operações reais; validar divergências entre SPIR-V e DXIL |
-| Pipelines | PSO nativo inicial cobre triângulo e um color target | Blend, múltiplos targets, depth/stencil, rasterização, topologia, input layout, MSAA e chave completa do cache |
-| Draw/dispatch | Bridge copiada retorna E_NOTIMPL | Direct/indirect draws e dispatches, indexed/instanced e parâmetros SGPR |
-| VideoOut | Driver usa Vulkan::Presenter e Vulkan::Frame | Apresentação D3D12 de superfícies guest, flip labels/events, blank/last frame e suspensão |
-| Validação | Build e diagnóstico nativo da fundação | Homebrew OpenOrbis em PS4, comparação de resultados, guest real e execução no AppContainer/Xbox |
+## Limites de recursos e sincronização
 
-O limite é explícito no código de origem: `D3D12VideoCoreBridge::Draw`,
-`DrawIndirect`, `DispatchDirect`, `DispatchIndirect`, `ReadDataFromGds` e
-`ProcessDownloadImages` rejeitam operações ainda não implementadas.
-`spirv_hlsl_bridge.cpp` rejeita texturas/buffers e recursos fora do seu contrato
-restrito. Essas rejeições não foram substituídas por no-ops ou draws fictícios.
+- Buffers: 128 entradas e orçamento GPU de 256 MiB; view de até 16 MiB.
+- Imagens: 64 entradas, orçamento GPU de 256 MiB e snapshots CPU de 256 MiB; superfície guest de até 64 MiB.
+- Shaders: 512 entradas e 64 MiB; pipelines: 128 entradas e 32 MiB.
+- Bindings por comando: 512 descritores de recursos e 128 samplers.
+- VideoOut: frames e uploads limitados por orçamento de 256 MiB.
+- Spill LDS: até 16 MiB por dispatch, separado por workgroup.
 
-## Compilação
+O caminho atual espera a GPU e faz readback a cada draw/dispatch. Isso favorece coerência e diagnóstico, mas não é uma implementação de desempenho aceitável para jogos. Falta substituir essa serialização por tracking de páginas e submissões assíncronas, preservando fences, aliases e writes CPU concorrentes. Não é permitido reutilizar o runtime após falha de gravação de comandos.
 
-`scripts/build-uwp.ps1` usa a cópia local por padrão, preservando o SDL3 externo
-selecionado pelo usuário. `-D3D12Source` é um override explícito compartilhado
-pelo núcleo e pelo host. O pacote segue assinado pelo certificado UWP fornecido.
+## Validação executada no PC
 
-O progresso descrito aqui é preparação da integração. Não fecha o pedido de
-renderer completo nem demonstra execução gráfica de jogos.
+O diagnóstico nativo temporário em `Build/` liga os objetos reais de produção e executa GCN traduzido em GPU D3D12, com readback. Os quinze casos passaram:
+
+1. `BUFFER_STORE_DWORD`: writeback `11223344`.
+2. VS/PS guest e draw de triângulo: 256 pixels vermelhos.
+3. CS guest `IMAGE_STORE`: 256 pixels vermelhos em imagem com pitch.
+4. PS guest `IMAGE_SAMPLE_L`: 256 pixels vermelhos amostrados.
+5. GDS: writeback `89abcdef`.
+6. LDS de 64 KiB com spill para storage: writeback `76543210`.
+7. Aliases físicos: views compartilham recurso e readback `13579bdf`.
+8. Draw somente de profundidade: 256 valores escritos e input separado preservado.
+9. Variante VS com inversão de Y: 256 pixels amostrados.
+10. IMAGE_STORE 3D: 1.024 voxels com gradiente entre quatro fatias.
+11. IMAGE_SAMPLE_L 3D: 256 pixels da fatia selecionada.
+12. IMAGE_STORE 1D: 16 texels com gradiente.
+13. IMAGE_SAMPLE_L 1D: 256 pixels do texel selecionado.
+14. View de layer único em imagem array: 256 pixels da segunda camada.
+15. View com base mip 1: 256 pixels do mip selecionado.
+
+Release da DLL/host e geração/assinatura do pacote foram executados. O pacote inclui `dxcompiler.dll` e `dxil.dll`; a auditoria estática dessas duas DLLs contra a lista local de APIs UWP não encontrou imports proibidos. Isso não é prova de carregamento ou compilação DXIL dentro de AppContainer.
+
+Há uma fonte de homebrew OpenOrbis em `documents/hardware/d3d12-guest/main.cpp`, com instruções no README ao lado. Ela ainda não foi compilada nem executada em PS4 por ausência do SDK local. Não há resultados de hardware que validem mudanças de emulação.
+
+## Trabalho pendente para jogos
+
+- Geometry/tessellation, wave64 em graphics e primitivas que exigem emulação.
+- MSAA/resolve, stencil, depth bounds, HTILE/CMASK/FMASK e caminhos de compressão/fast clear.
+- Views simultâneas de imagem/buffer, feedback SRV/UAV, aliases de layouts incompatíveis, backing físico segmentado e dirty tracking completo.
+- Cobertura completa de formatos, estados de rasterização e operações IR.
+- HDR e apresentação float; validação visual do VideoOut em AppContainer.
+- Boot brokered completo, teardown dos threads guest e ciclo de execução de jogos embutidos.
+- Comparações OpenOrbis/PS4 para tiling, shaders, offsets de todos os buffers, memória compartilhada, draws e fences; depois gameplay no PC e Xbox.
+
+Estados ainda não suportados geram erro explícito da sessão. Compilar e executar estes casos básicos não encerra o pedido de renderer completo.
+
+
+

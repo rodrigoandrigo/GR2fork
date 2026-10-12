@@ -45,7 +45,8 @@ struct FrontendRoot {
 
 class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
 public:
-    explicit ImGuiFrontend(Windows::UI::Xaml::Controls::SwapChainPanel ^ panel);
+    explicit ImGuiFrontend(Windows::UI::Xaml::Controls::SwapChainPanel ^ panel,
+                           Windows::UI::Xaml::Controls::SwapChainPanel ^ game_panel = nullptr);
     ~ImGuiFrontend();
     void Start(std::wstring root);
     void Stop();
@@ -102,6 +103,7 @@ private:
     void SubmitInput(const FrontendInput& input);
     HRESULT Attach(IDXGISwapChain* chain);
     std::shared_ptr<ShadPS4Host> core;
+    bool game_surface{}, game_running{}, menu_open{true}, menu_pressed{};
     Platform::Agile<Windows::UI::Xaml::Controls::SwapChainPanel> panel;
     Platform::Agile<Windows::UI::Core::CoreDispatcher> dispatcher;
     std::unique_ptr<FrontendRenderer> renderer;

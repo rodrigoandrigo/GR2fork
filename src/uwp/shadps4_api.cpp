@@ -255,7 +255,8 @@ int32_t shadps4_run(const wchar_t* executable) {
             return Fail("The guest executable is not accessible in AppContainer");
         }
         state.store(SHADPS4_READY);
-        return Fail("The D3D12 renderer still lacks complete image/sampler bindings and advanced guest graphics state; guest boot remains disabled");
+        return Fail("The D3D12 renderer still lacks advanced guest graphics and complete brokered "
+                    "boot support; guest boot remains disabled");
     } catch (const std::exception& exception) {
         state.store(SHADPS4_FAILED);
         return Fail(exception.what());

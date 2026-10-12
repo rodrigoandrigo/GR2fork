@@ -40,8 +40,7 @@ static vk::Format ConvertPixelFormat(const VideoOutFormat format) {
     return {};
 }
 
-ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
-                     VAddr cpu_address) noexcept {
+ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group, VAddr cpu_address) {
     const auto& attrib = group.attrib;
     props = ImageProperties{
         .is_tiled = attrib.tiling_mode == TilingMode::Tile,
@@ -63,7 +62,7 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
     UpdateSize();
 }
 
-ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint) noexcept {
+ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint) {
     props = ImageProperties{
         .is_tiled = buffer.IsTiled(),
     };
@@ -95,7 +94,7 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
 }
 
 ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
-                     AmdGpu::CbDbExtent hint, bool write_buffer) noexcept {
+                     AmdGpu::CbDbExtent hint, bool write_buffer) {
     tile_mode = buffer.GetTileMode();
     array_mode = AmdGpu::GetArrayMode(tile_mode);
     pixel_format = LiverpoolToVK::DepthFormat(buffer.z_info.format, buffer.stencil_info.format);
@@ -166,13 +165,13 @@ ImageInfoMemo& GetImageInfoMemo() {
 
 } // Anonymous namespace
 
-ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept
+ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc)
     : ImageInfo{sharp, desc.is_depth} {}
 
 // The shader-resource ctor consumes only is_depth from the resource; this
 // form is what ImageDesc's deferred build uses, since the resource itself is
 // out of scope by the time a staged binding first needs the info.
-ImageInfo::ImageInfo(const AmdGpu::Image& sharp, bool is_depth) noexcept {
+ImageInfo::ImageInfo(const AmdGpu::Image& sharp, bool is_depth) {
     const auto raw = std::bit_cast<std::array<u64, 4>>(sharp);
     auto& entry = GetImageInfoMemo().entries[ImageInfoMemo::Index(raw)];
     if (entry.valid && entry.tsharp == raw && entry.is_depth == is_depth) {
@@ -224,7 +223,7 @@ bool ImageInfo::IsCompatible(const ImageInfo& info) const {
            num_samples == info.num_samples && num_bits == info.num_bits;
 }
 
-void ImageInfo::UpdateSize() noexcept {
+void ImageInfo::UpdateSize() {
     ASSERT_MSG(array_mode != AmdGpu::ArrayMode::ArrayLinearGeneral,
                "Unhandled array mode: ArrayLinearGeneral");
     if (std::has_single_bit(pitch) && std::bit_width(pitch) <= MAX_DIM_LOG2 &&

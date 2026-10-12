@@ -1,21 +1,50 @@
 #include "video_core/renderer_d3d12/resource_cache.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <winrt/base.h>
 
 namespace D3D12 {
-void ResourceCache::Initialize(D3D12DeviceContext& device, Read reader, Write writer) {
+void ResourceCache::Initialize(D3D12DeviceContext& device, Read reader, Write writer,
+                               Resolve resolver) {
     context = &device;
     read = std::move(reader);
     write = std::move(writer);
+    resolve = std::move(resolver);
     allocator.Initialize(device.Device(), 256ULL * 1024 * 1024);
 }
 void ResourceCache::BeginBatch() {
     context->WaitForGpu();
     ++batch;
+    for (auto& [key, buffer] : buffers)
+        buffer->targets.clear();
+}
+ResourceCache::Identity ResourceCache::Canonicalize(VAddr address, u64 size) const {
+    if (address > UINT64_MAX - size)
+        throw std::runtime_error("Guest resource range overflow");
+    if (resolve && address && size)
+        if (const auto physical = resolve(address, size))
+            return {*physical, true};
+    return {address, false};
+}
+void ResourceCache::MarkWritten(const View& view) {
+    if (!view.buffer)
+        return;
+    view.buffer->written = true;
+    if (!view.buffer->host) {
+        if (!view.guest_address || view.offset > view.buffer->size ||
+            view.size > view.buffer->size - view.offset)
+            throw std::runtime_error("Invalid guest writeback view");
+        const auto found = std::ranges::find_if(view.buffer->targets, [&](const auto& target) {
+            return target.address == view.guest_address && target.offset == view.offset &&
+                   target.size == view.size;
+        });
+        if (found == view.buffer->targets.end())
+            view.buffer->targets.push_back({view.guest_address, view.offset, view.size});
+    }
 }
 ResourceCache::Buffer& ResourceCache::GetHostBuffer(VAddr identity, std::span<const u8> data) {
     auto& buffer = GetBuffer(identity, data.size());
@@ -24,54 +53,65 @@ ResourceCache::Buffer& ResourceCache::GetHostBuffer(VAddr identity, std::span<co
     return buffer;
 }
 std::vector<ResourceCache::View> ResourceCache::GetViews(std::span<const Range> ranges) {
-    std::vector<Range> groups;
+    std::vector<Identity> identities;
+    std::array<std::vector<Range>, 2> groups;
     for (const auto& range : ranges) {
-        if (!range.address || !range.size)
-            continue;
         if (range.size > 16ULL * 1024 * 1024 || range.address > UINT64_MAX - range.size - 3)
             throw std::runtime_error("Invalid D3D12 guest buffer view");
-        const VAddr start = range.address & ~u64{3};
-        groups.push_back({start, ((range.address + range.size + 3) & ~u64{3}) - start});
-    }
-    std::ranges::sort(groups, {}, &Range::address);
-    std::vector<Range> merged;
-    for (const auto& range : groups) {
-        if (merged.empty() || range.address >= merged.back().address + merged.back().size)
-            merged.push_back(range);
-        else
-            merged.back().size =
-                std::max(merged.back().address + merged.back().size, range.address + range.size) -
-                merged.back().address;
+        const auto identity = Canonicalize(range.address, range.size);
+        identities.push_back(identity);
+        if (!range.address || !range.size)
+            continue;
+        if (identity.address > UINT64_MAX - range.size - 3)
+            throw std::runtime_error("Invalid physical D3D12 buffer view");
+        const VAddr start = identity.address & ~u64{3};
+        groups[identity.physical].push_back(
+            {start, ((identity.address + range.size + 3) & ~u64{3}) - start});
     }
     std::vector<Buffer*> allocations;
-    for (const auto& group : merged)
-        allocations.push_back(&GetBuffer(group.address, group.size));
+    for (u32 physical = 0; physical < 2; ++physical) {
+        std::ranges::sort(groups[physical], {}, &Range::address);
+        std::vector<Range> merged;
+        for (const auto& range : groups[physical]) {
+            if (merged.empty() || range.address >= merged.back().address + merged.back().size)
+                merged.push_back(range);
+            else
+                merged.back().size = std::max(merged.back().address + merged.back().size,
+                                              range.address + range.size) -
+                                     merged.back().address;
+        }
+        for (const auto& group : merged)
+            allocations.push_back(&GetBuffer(group.address, group.size, physical != 0));
+    }
     std::vector<View> result;
-    for (const auto& range : ranges) {
+    for (u32 i = 0; i < ranges.size(); ++i) {
+        const auto& range = ranges[i];
+        const auto& identity = identities[i];
         View view{};
         for (auto* buffer : allocations)
-            if (range.address && range.size && range.address >= buffer->address &&
-                range.address + range.size <= buffer->address + buffer->size) {
-                view = {buffer, range.address - buffer->address, range.size};
+            if (range.address && range.size && identity.physical == buffer->physical &&
+                identity.address >= buffer->address &&
+                identity.address + range.size <= buffer->address + buffer->size) {
+                view = {buffer, identity.address - buffer->address, range.size, range.address};
                 break;
             }
         result.push_back(view);
     }
     return result;
 }
-ResourceCache::Buffer& ResourceCache::GetBuffer(VAddr address, u64 size) {
+ResourceCache::Buffer& ResourceCache::GetBuffer(VAddr address, u64 size, bool physical) {
     if (!address || !size || size > 16ULL * 1024 * 1024 ||
         size > std::numeric_limits<VAddr>::max() - address)
         throw std::runtime_error("Invalid D3D12 guest buffer range");
-    const auto key = std::pair{address, size};
+    const auto key = std::tuple{physical, address, size};
     if (const auto found = buffers.find(key); found != buffers.end()) {
         found->second->used = ++age;
         found->second->batch = batch;
         return *found->second;
     }
     for (const auto& [existing, buffer] : buffers)
-        if (buffer->batch == batch && address < buffer->address + buffer->size &&
-            buffer->address < address + size)
+        if (buffer->physical == physical && buffer->batch == batch &&
+            address < buffer->address + buffer->size && buffer->address < address + size)
             throw std::runtime_error("Overlapping D3D12 buffer views require a shared allocation");
     while (buffers.size() >= 128 ||
            allocator.Stats().live_bytes + native_bytes + size * 3 + 3 * 65536 >
@@ -88,6 +128,7 @@ ResourceCache::Buffer& ResourceCache::GetBuffer(VAddr address, u64 size) {
     }
     auto result = std::make_unique<Buffer>();
     result->address = address;
+    result->physical = physical;
     result->size = size;
     result->used = ++age;
     result->batch = batch;
@@ -143,6 +184,8 @@ void ResourceCache::Upload(Buffer& buffer, ID3D12GraphicsCommandList* commands) 
     std::vector<u8> data(buffer.size);
     if (buffer.host)
         data = buffer.host_data;
+    else if (buffer.physical)
+        std::memcpy(data.data(), reinterpret_cast<const void*>(buffer.address), data.size());
     else
         read(buffer.address, data);
     if (data != buffer.snapshot || Changed(buffer)) {
@@ -188,12 +231,14 @@ void ResourceCache::CommitDownloads() {
         if (buffer->host)
             buffer->host_data = buffer->snapshot;
         else
-            write(buffer->address, buffer->snapshot);
+            for (const auto& target : buffer->targets)
+                write(target.address,
+                      {buffer->snapshot.data() + target.offset, static_cast<size_t>(target.size)});
         buffer->written = false;
     }
 }
 bool ResourceCache::Changed(const Buffer& buffer) {
-    if (buffer.host)
+    if (buffer.host || buffer.physical)
         return false;
     std::scoped_lock lock{invalidation_mutex};
     if (buffer.epoch < invalidation_floor)

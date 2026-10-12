@@ -4,6 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <winrt/base.h>
+#include "video_core/amdgpu/resource.h"
 #include "video_core/texture_cache/cpu_tiling.h"
 
 namespace D3D12 {
@@ -19,6 +20,8 @@ DXGI_FORMAT ConvertFormat(vk::Format format) {
         return DXGI_FORMAT_R8_SINT;
     case vk::Format::eR8G8Unorm:
         return DXGI_FORMAT_R8G8_UNORM;
+    case vk::Format::eR8G8Snorm:
+        return DXGI_FORMAT_R8G8_SNORM;
     case vk::Format::eR8G8Uint:
         return DXGI_FORMAT_R8G8_UINT;
     case vk::Format::eR8G8Sint:
@@ -45,14 +48,32 @@ DXGI_FORMAT ConvertFormat(vk::Format format) {
         return DXGI_FORMAT_R16_FLOAT;
     case vk::Format::eR16Unorm:
         return DXGI_FORMAT_R16_UNORM;
+    case vk::Format::eR16Snorm:
+        return DXGI_FORMAT_R16_SNORM;
     case vk::Format::eR16Uint:
         return DXGI_FORMAT_R16_UINT;
     case vk::Format::eR16Sint:
         return DXGI_FORMAT_R16_SINT;
     case vk::Format::eR16G16Sfloat:
         return DXGI_FORMAT_R16G16_FLOAT;
+    case vk::Format::eR16G16Unorm:
+        return DXGI_FORMAT_R16G16_UNORM;
+    case vk::Format::eR16G16Snorm:
+        return DXGI_FORMAT_R16G16_SNORM;
+    case vk::Format::eR16G16Uint:
+        return DXGI_FORMAT_R16G16_UINT;
+    case vk::Format::eR16G16Sint:
+        return DXGI_FORMAT_R16G16_SINT;
     case vk::Format::eR16G16B16A16Sfloat:
         return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case vk::Format::eR16G16B16A16Unorm:
+        return DXGI_FORMAT_R16G16B16A16_UNORM;
+    case vk::Format::eR16G16B16A16Snorm:
+        return DXGI_FORMAT_R16G16B16A16_SNORM;
+    case vk::Format::eR16G16B16A16Uint:
+        return DXGI_FORMAT_R16G16B16A16_UINT;
+    case vk::Format::eR16G16B16A16Sint:
+        return DXGI_FORMAT_R16G16B16A16_SINT;
     case vk::Format::eR32Sfloat:
         return DXGI_FORMAT_R32_FLOAT;
     case vk::Format::eR32Uint:
@@ -61,10 +82,26 @@ DXGI_FORMAT ConvertFormat(vk::Format format) {
         return DXGI_FORMAT_R32_SINT;
     case vk::Format::eR32G32Sfloat:
         return DXGI_FORMAT_R32G32_FLOAT;
+    case vk::Format::eR32G32Uint:
+        return DXGI_FORMAT_R32G32_UINT;
+    case vk::Format::eR32G32Sint:
+        return DXGI_FORMAT_R32G32_SINT;
     case vk::Format::eR32G32B32Sfloat:
         return DXGI_FORMAT_R32G32B32_FLOAT;
+    case vk::Format::eR32G32B32Uint:
+        return DXGI_FORMAT_R32G32B32_UINT;
+    case vk::Format::eR32G32B32Sint:
+        return DXGI_FORMAT_R32G32B32_SINT;
     case vk::Format::eR32G32B32A32Sfloat:
         return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case vk::Format::eR32G32B32A32Uint:
+        return DXGI_FORMAT_R32G32B32A32_UINT;
+    case vk::Format::eR32G32B32A32Sint:
+        return DXGI_FORMAT_R32G32B32A32_SINT;
+    case vk::Format::eB10G11R11UfloatPack32:
+        return DXGI_FORMAT_R11G11B10_FLOAT;
+    case vk::Format::eE5B9G9R9UfloatPack32:
+        return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
     case vk::Format::eD32Sfloat:
         return DXGI_FORMAT_D32_FLOAT;
     case vk::Format::eD16Unorm:
@@ -102,10 +139,12 @@ DXGI_FORMAT ConvertFormat(vk::Format format) {
     }
 }
 void ImageCache::Initialize(D3D12DeviceContext& context, ResourceCache::Read reader,
-                            ResourceCache::Write writer) {
+                            ResourceCache::Write writer,
+                            std::function<ResourceCache::Identity(VAddr, u64)> resolver) {
     device = &context;
     read = std::move(reader);
     write = std::move(writer);
+    canonicalize = std::move(resolver);
     allocator.Initialize(context.Device(), 256ULL * 1024 * 1024);
 }
 void ImageCache::BeginBatch() {
@@ -113,19 +152,34 @@ void ImageCache::BeginBatch() {
     ++batch;
 }
 ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_FORMAT format,
-                                        D3D12_RESOURCE_FLAGS flags) {
+                                        D3D12_RESOURCE_FLAGS flags, u32 base_layer,
+                                        u32 layer_count) {
     if (!info.guest_address || !info.guest_size || info.guest_size > 64 * 1024 * 1024 ||
         !info.size.width || !info.size.height || info.size.width > 16384 ||
-        info.size.height > 16384 || info.size.depth != 1 || !info.resources.levels ||
+        info.size.height > 16384 || !info.size.depth || info.size.depth > 2048 ||
+        (!info.props.is_volume && info.size.depth != 1) || !info.resources.levels ||
         info.resources.levels > 16 || !info.resources.layers || info.resources.layers > 2048 ||
         info.num_samples != 1 || info.meta_info.cmask_addr || info.meta_info.fmask_addr ||
         info.meta_info.htile_addr || info.stencil_addr || info.alt_tile)
         throw std::runtime_error(
             "D3D12 guest image requires unsupported metadata, samples or layout");
-    std::vector<u64> key{info.guest_address,    info.guest_size,  info.size.width,
+    if (base_layer >= info.resources.layers)
+        throw std::runtime_error("Guest image base layer exceeds allocation");
+    if (!layer_count)
+        layer_count = info.resources.layers - base_layer;
+    if (layer_count > info.resources.layers - base_layer)
+        throw std::runtime_error("Guest image layer count exceeds allocation");
+    if (info.props.is_volume && (base_layer || layer_count != 1 || info.resources.layers != 1))
+        throw std::runtime_error("Invalid D3D12 volume image layer selection");
+    const auto identity = canonicalize ? canonicalize(info.guest_address, info.guest_size)
+                                       : ResourceCache::Identity{info.guest_address, false};
+    std::vector<u64> key{identity.address,      info.guest_size,  info.size.width,
                          info.size.height,      info.pitch,       info.resources.levels,
                          info.resources.layers, u64(format),      u64(flags),
                          u64(info.tile_mode),   info.bank_swizzle};
+    key.insert(key.end(), {base_layer, layer_count});
+    key.insert(key.end(), {info.size.depth, u64(info.type), info.props.is_volume});
+    key.push_back(identity.physical);
     for (u32 mip = 0; mip < info.resources.levels; ++mip) {
         const auto& layout = info.mips_layout[mip];
         key.insert(key.end(), {layout.size, layout.pitch, layout.height, layout.offset});
@@ -133,30 +187,43 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     if (auto found = images.find(key); found != images.end()) {
         found->second->batch = batch;
         found->second->age = ++age;
+        found->second->info = info;
         return *found->second;
     }
     D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    const bool one_dimensional =
+        info.type == AmdGpu::ImageType::Color1D || info.type == AmdGpu::ImageType::Color1DArray;
+    if (one_dimensional && info.size.height != 1)
+        throw std::runtime_error("Invalid D3D12 1D image height");
+    desc.Dimension = info.props.is_volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                     : one_dimensional    ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                                          : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = info.size.width;
     desc.Height = info.size.height;
-    desc.DepthOrArraySize = info.resources.layers;
+    desc.DepthOrArraySize = info.props.is_volume ? info.size.depth : layer_count;
     desc.MipLevels = info.resources.levels;
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Flags = flags;
     auto result = std::make_unique<Image>();
     result->info = info;
-    const UINT count = info.resources.levels * info.resources.layers;
+    result->base_layer = base_layer;
+    result->native_layers = layer_count;
+    const UINT count = info.resources.levels * layer_count;
     result->footprints.resize(count);
     result->rows.resize(count);
     result->row_bytes.resize(count);
     u64 bytes;
     device->Device()->GetCopyableFootprints(&desc, 0, count, 0, result->footprints.data(),
                                             result->rows.data(), result->row_bytes.data(), &bytes);
-    const u64 required = device->Device()->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes +
-                         ((bytes + 65535) & ~u64{65535}) * 2;
+    const u64 allocation = device->Device()->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    if (allocation == UINT64_MAX || bytes > 256ULL * 1024 * 1024)
+        throw std::runtime_error("Unsupported D3D12 image allocation or footprint");
+    const u64 required = allocation + ((bytes + 65535) & ~u64{65535}) * 2;
     while (images.size() >= 64 ||
-           required > allocator.Stats().budget_bytes - allocator.Stats().live_bytes) {
+           required >
+               allocator.Stats().budget_bytes - allocator.Stats().live_bytes - native_bytes ||
+           cpu_bytes + u64(info.guest_size) * 2 > 256ULL * 1024 * 1024) {
         auto oldest = images.end();
         for (auto it = images.begin(); it != images.end(); ++it)
             if (it->second->batch != batch && !it->second->written &&
@@ -164,10 +231,16 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
                 oldest = it;
         if (oldest == images.end())
             throw std::runtime_error("D3D12 image cache budget exhausted");
+        cpu_bytes -= u64(oldest->second->info.guest_size) * 2;
+        native_bytes -= oldest->second->allocation_bytes;
         images.erase(oldest);
     }
-    winrt::check_hresult(
-        allocator.CreateTexture2D(desc, D3D12_RESOURCE_STATE_COMMON, result->native));
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    winrt::check_hresult(device->Device()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&result->native)));
+    result->allocation_bytes = allocation;
     winrt::check_hresult(allocator.CreateBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD,
                                                 D3D12_RESOURCE_STATE_GENERIC_READ, result->upload));
     winrt::check_hresult(allocator.CreateBuffer(bytes, D3D12_HEAP_TYPE_READBACK,
@@ -176,6 +249,8 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     result->batch = batch;
     auto& output = *result;
     images.emplace(std::move(key), std::move(result));
+    native_bytes += output.allocation_bytes;
+    cpu_bytes += u64(info.guest_size) * 2;
     return output;
 }
 void ImageCache::Barrier(Image& image, ID3D12GraphicsCommandList* commands,
@@ -184,14 +259,14 @@ void ImageCache::Barrier(Image& image, ID3D12GraphicsCommandList* commands,
         if (state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
             D3D12_RESOURCE_BARRIER barrier{};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barrier.UAV.pResource = image.native.Get();
+            barrier.UAV.pResource = image.Native();
             commands->ResourceBarrier(1, &barrier);
         }
         return;
     }
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {image.native.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, image.state,
+    barrier.Transition = {image.Native(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, image.state,
                           state};
     commands->ResourceBarrier(1, &barrier);
     image.state = state;
@@ -205,28 +280,33 @@ void ImageCache::CopyRows(Image& image, void* data, bool upload) {
             (image.info.num_bits / 8);
         const u64 height =
             image.info.props.is_block ? std::max<u32>((layout.height + 3) / 4, 1) : layout.height;
-        for (u32 layer = 0; layer < image.info.resources.layers; ++layer) {
+        for (u32 layer = 0; layer < image.native_layers; ++layer) {
             const u32 subresource = mip + layer * image.info.resources.levels;
             const auto& footprint = image.footprints[subresource];
             if (image.row_bytes[subresource] > pitch || image.rows[subresource] > height)
                 throw std::runtime_error("D3D12 footprint exceeds guest mip layout");
-            for (u32 row = 0; row < image.rows[subresource]; ++row) {
-                const u64 guest_offset = mip_offset + layer * pitch * height + row * pitch;
-                if (guest_offset + image.row_bytes[subresource] > image.linear.size())
-                    throw std::runtime_error("D3D12 image row exceeds guest backing");
-                auto* guest = image.linear.data() + guest_offset;
-                auto* host =
-                    static_cast<u8*>(data) + footprint.Offset + row * footprint.Footprint.RowPitch;
-                std::memcpy(upload ? host : guest, upload ? guest : host,
-                            image.row_bytes[subresource]);
+            for (u32 slice = 0; slice < footprint.Footprint.Depth; ++slice) {
+                for (u32 row = 0; row < image.rows[subresource]; ++row) {
+                    const u64 guest_offset = mip_offset +
+                                             (image.base_layer + layer + slice) * pitch * height +
+                                             row * pitch;
+                    if (guest_offset + image.row_bytes[subresource] > image.linear.size())
+                        throw std::runtime_error("D3D12 image row exceeds guest backing");
+                    auto* guest = image.linear.data() + guest_offset;
+                    auto* host =
+                        static_cast<u8*>(data) + footprint.Offset +
+                        (slice * image.rows[subresource] + row) * footprint.Footprint.RowPitch;
+                    std::memcpy(upload ? host : guest, upload ? guest : host,
+                                image.row_bytes[subresource]);
+                }
             }
         }
         mip_offset += layout.size;
     }
 }
-void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands) {
+void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr read_address) {
     std::vector<u8> guest(image.info.guest_size);
-    read(image.info.guest_address, guest);
+    read(read_address ? read_address : image.info.guest_address, guest);
     if (guest == image.guest)
         return;
     image.guest = std::move(guest);
@@ -243,7 +323,7 @@ void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands) {
         source.pResource = image.upload.Get();
         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint = image.footprints[subresource];
-        destination.pResource = image.native.Get();
+        destination.pResource = image.Native();
         destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         destination.SubresourceIndex = subresource;
         commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
@@ -255,7 +335,7 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
             Barrier(*image, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
             for (u32 subresource = 0; subresource < image->footprints.size(); ++subresource) {
                 D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
-                source.pResource = image->native.Get();
+                source.pResource = image->Native();
                 source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 source.SubresourceIndex = subresource;
                 destination.pResource = image->readback.Get();

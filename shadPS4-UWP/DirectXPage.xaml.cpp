@@ -32,7 +32,7 @@ DirectXPage::DirectXPage() {
 void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
     if (frontend)
         return;
-    frontend = std::make_shared<ImGuiFrontend>(swapChainPanel);
+    frontend = std::make_shared<ImGuiFrontend>(swapChainPanel, gameSwapChainPanel);
     WeakReference weak(this);
     const auto dispatch = Dispatcher;
     frontend->choose_folder = [weak, dispatch](std::wstring purpose) {

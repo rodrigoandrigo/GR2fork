@@ -6,11 +6,97 @@
 #include <winrt/base.h>
 #include "d3d12_pipeline_cache.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
+#include "video_core/renderer_d3d12/resource_bindings.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
 namespace D3D12 {
+namespace {
+std::vector<u8> PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3DBlob* root) {
+    std::vector<u8> key{1};
+    const auto integer = [&](u64 value) {
+        for (u32 i = 0; i < 8; ++i)
+            key.push_back(static_cast<u8>(value >> (i * 8)));
+    };
+    const auto bytes = [&](const void* data, size_t size) {
+        integer(size);
+        if (!size)
+            return;
+        const auto* begin = static_cast<const u8*>(data);
+        key.insert(key.end(), begin, begin + size);
+    };
+    const auto real = [&](float value) { integer(std::bit_cast<u32>(value)); };
+    bytes(root->GetBufferPointer(), root->GetBufferSize());
+    bytes(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
+    bytes(desc.PS.pShaderBytecode, desc.PS.BytecodeLength);
+    integer(desc.BlendState.AlphaToCoverageEnable);
+    integer(desc.BlendState.IndependentBlendEnable);
+    for (const auto& blend : desc.BlendState.RenderTarget) {
+        integer(blend.BlendEnable);
+        integer(blend.LogicOpEnable);
+        integer(blend.SrcBlend);
+        integer(blend.DestBlend);
+        integer(blend.BlendOp);
+        integer(blend.SrcBlendAlpha);
+        integer(blend.DestBlendAlpha);
+        integer(blend.BlendOpAlpha);
+        integer(blend.LogicOp);
+        integer(blend.RenderTargetWriteMask);
+    }
+    const auto& raster = desc.RasterizerState;
+    integer(raster.FillMode);
+    integer(raster.CullMode);
+    integer(raster.FrontCounterClockwise);
+    integer(raster.DepthBias);
+    real(raster.DepthBiasClamp);
+    real(raster.SlopeScaledDepthBias);
+    integer(raster.DepthClipEnable);
+    integer(raster.MultisampleEnable);
+    integer(raster.AntialiasedLineEnable);
+    integer(raster.ForcedSampleCount);
+    integer(raster.ConservativeRaster);
+    const auto& depth = desc.DepthStencilState;
+    integer(depth.DepthEnable);
+    integer(depth.DepthWriteMask);
+    integer(depth.DepthFunc);
+    integer(depth.StencilEnable);
+    integer(depth.StencilReadMask);
+    integer(depth.StencilWriteMask);
+    for (const auto& face : {depth.FrontFace, depth.BackFace}) {
+        integer(face.StencilFailOp);
+        integer(face.StencilDepthFailOp);
+        integer(face.StencilPassOp);
+        integer(face.StencilFunc);
+    }
+    integer(desc.InputLayout.NumElements);
+    for (u32 i = 0; i < desc.InputLayout.NumElements; ++i) {
+        const auto& element = desc.InputLayout.pInputElementDescs[i];
+        bytes(element.SemanticName, std::strlen(element.SemanticName));
+        integer(element.SemanticIndex);
+        integer(element.Format);
+        integer(element.InputSlot);
+        integer(element.AlignedByteOffset);
+        integer(element.InputSlotClass);
+        integer(element.InstanceDataStepRate);
+    }
+    integer(desc.SampleMask);
+    integer(desc.IBStripCutValue);
+    integer(desc.PrimitiveTopologyType);
+    integer(desc.NumRenderTargets);
+    for (const auto format : desc.RTVFormats)
+        integer(format);
+    integer(desc.DSVFormat);
+    integer(desc.SampleDesc.Count);
+    integer(desc.SampleDesc.Quality);
+    integer(desc.NodeMask);
+    integer(desc.Flags);
+    return key;
+}
+} // namespace
 void CommandRuntime::Draw(const DrawRequest& request) {
     std::scoped_lock lock{mutex};
+    if (failed)
+        throw std::runtime_error(
+            "D3D12 command runtime requires recreation after recording failure");
     if (!request.count || !request.instances)
         return;
     if (request.colors.size() > 8 || request.depth.StencilEnable ||
@@ -18,62 +104,43 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         request.vertex_runtime.sw_stage != Shader::SwStage::Vertex ||
         request.fragment_runtime.sw_stage != Shader::SwStage::Fragment)
         throw std::runtime_error("Invalid or unsupported D3D12 guest graphics state");
-    auto vertex = shaders.Compile(request.vertex, request.vertex_runtime);
-    auto fragment =
-        shaders.Compile(request.fragment, request.fragment_runtime, vertex.end_bindings);
-    struct Binding {
-        CompiledShader* shader;
-        ShaderBinding descriptor;
-        u32 index;
-    };
-    std::vector<Binding> bindings;
-    std::vector<D3D12_DESCRIPTOR_RANGE> ranges;
-    std::vector<ResourceCache::Range> guest_ranges;
-    for (auto* shader : {&vertex, &fragment})
-        for (const auto& binding : shader->binary->bindings) {
-            const u32 index = binding.binding - shader->start_bindings.unified;
-            if (binding.kind != ResourceKind::Buffer || binding.count != 1 ||
-                index >= shader->info.buffers.size())
-                throw std::runtime_error("D3D12 draw image/sampler binding is not implemented");
-            bindings.push_back({shader, binding, index});
-            ranges.push_back({binding.type, 1, binding.binding, binding.space,
-                              static_cast<UINT>(ranges.size())});
-            ResourceCache::Range range{};
-            const auto& resource = shader->info.buffers[index];
-            if (resource.buffer_type == Shader::BufferType::Guest) {
-                const auto sharp = resource.GetSharp(shader->info);
-                range = {sharp.base_address,
-                         u64(sharp.num_records) * std::max<u32>(1, sharp.stride)};
-            } else if (resource.buffer_type != Shader::BufferType::Flatbuf &&
-                       resource.buffer_type != Shader::BufferType::ClipPlanes)
-                throw std::runtime_error(fmt::format("D3D12 draw special buffer {} is not implemented",
-                                                     u32(resource.buffer_type)));
-            guest_ranges.push_back(range);
-        }
+    auto vertex = shaders.Compile(request.vertex, request.vertex_runtime, {}, request.flip_y);
+    std::optional<CompiledShader> fragment;
+    std::vector<CompiledShader*> stages{&vertex};
+    if (!request.fragment.code.empty()) {
+        fragment.emplace(
+            shaders.Compile(request.fragment, request.fragment_runtime, vertex.end_bindings));
+        stages.push_back(&*fragment);
+    } else if (!request.colors.empty())
+        throw std::runtime_error("D3D12 color rendering requires a fragment shader");
+    ResourceBindings bindings{device, resources, images, stages};
     resources.BeginBatch();
     images.BeginBatch();
-    const auto views = resources.GetViews(guest_ranges);
+
     std::vector<ImageCache::Image*> colors;
-    for (const auto& info : request.colors)
+    for (const auto& info : request.colors) {
+        bindings.ValidateTargetRange(info.guest_address, info.guest_size);
         colors.push_back(&images.GetImage(info, ConvertFormat(info.pixel_format),
                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
+    }
     ImageCache::Image* depth{};
-    if (request.depth_image)
+    if (request.depth_image) {
+        bindings.ValidateTargetRange(request.depth_image->guest_address,
+                                     request.depth_image->guest_size);
+        if (request.depth_read_address)
+            bindings.ValidateTargetRange(request.depth_read_address,
+                                         request.depth_image->guest_size);
         depth =
             &images.GetImage(*request.depth_image, ConvertFormat(request.depth_image->pixel_format),
-                             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+                             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, request.depth_base_layer);
+    }
     D3D12ResourceAllocator transient;
     transient.Initialize(device.Device(), 64ULL * 1024 * 1024);
     std::vector<D3D12Resource> input_resources;
     const auto upload_input = [&](VAddr address, u64 size) -> ID3D12Resource* {
         if (!size || size > 16ULL * 1024 * 1024 || address > UINT64_MAX - size)
             throw std::runtime_error("Invalid D3D12 guest input buffer");
-        for (u32 i = 0; i < bindings.size(); ++i)
-            if (bindings[i].shader->info.buffers[bindings[i].index].is_written &&
-                guest_ranges[i].address && guest_ranges[i].address < address + size &&
-                address < guest_ranges[i].address + guest_ranges[i].size)
-                throw std::runtime_error(
-                    "D3D12 writable shader/input buffer alias requires coherent fetching");
+        bindings.ValidateInputRange(address, size);
         std::vector<u8> contents(size);
         read(address, contents);
         D3D12Resource resource;
@@ -137,27 +204,34 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(size),
                       request.index_format};
     }
-    std::array<D3D12_ROOT_PARAMETER, 3> parameters{};
+    std::vector<D3D12_ROOT_PARAMETER> parameters(2);
     parameters[0].ParameterType = parameters[1].ParameterType =
         D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants = {0, 0, 20};
     parameters[1].Constants = {1, 0, 4};
-    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[2].DescriptorTable = {static_cast<UINT>(ranges.size()), ranges.data()};
+    const auto add_table = [&](const auto& ranges) {
+        const u32 slot = parameters.size();
+        if (!ranges.empty()) {
+            D3D12_ROOT_PARAMETER parameter{};
+            parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            parameter.DescriptorTable = {static_cast<UINT>(ranges.size()), ranges.data()};
+            parameters.push_back(parameter);
+        }
+        return slot;
+    };
+    const u32 resource_slot = add_table(bindings.ResourceRanges());
+    const u32 sampler_slot = add_table(bindings.SamplerRanges());
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
-    root_desc.NumParameters = ranges.empty() ? 2 : 3;
+    root_desc.NumParameters = parameters.size();
     root_desc.pParameters = parameters.data();
     root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     Microsoft::WRL::ComPtr<ID3DBlob> blob, errors;
     winrt::check_hresult(
         D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors));
-    Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
-    winrt::check_hresult(device.Device()->CreateRootSignature(
-        0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)));
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-    desc.pRootSignature = root.Get();
     desc.VS = {vertex.binary->dxil.data(), vertex.binary->dxil.size()};
-    desc.PS = {fragment.binary->dxil.data(), fragment.binary->dxil.size()};
+    if (fragment)
+        desc.PS = {fragment->binary->dxil.data(), fragment->binary->dxil.size()};
     desc.BlendState = request.blend;
     desc.RasterizerState = request.rasterizer;
     desc.DepthStencilState = request.depth;
@@ -170,19 +244,22 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     for (u32 i = 0; i < colors.size(); ++i)
         desc.RTVFormats[i] = colors[i]->native->GetDesc().Format;
     desc.DSVFormat = depth ? depth->native->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
-    winrt::check_hresult(
-        device.Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)));
-    D3D12DescriptorArena rtv, dsv, descriptors;
+    auto& cached =
+        GetPipeline(PipelineKey(desc, blob.Get()), blob.Get(), [&](auto* root, auto** state) {
+            desc.pRootSignature = root;
+            return device.Device()->CreateGraphicsPipelineState(
+                &desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(state));
+        });
+    auto& pipeline = cached.state;
+    auto& root = cached.root;
+    D3D12DescriptorArena rtv, dsv;
     rtv.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, false);
     dsv.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
-    descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                           std::max<u32>(1, bindings.size()), true);
     static_cast<void>(rtv.Allocate(8));
     static_cast<void>(dsv.Allocate(1));
-    static_cast<void>(descriptors.Allocate(std::max<u32>(1, bindings.size())));
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), pipeline.Get()));
+    RecordingGuard recording{failed};
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> color_views{};
     for (u32 i = 0; i < colors.size(); ++i) {
         images.Upload(*colors[i], commands.Get());
@@ -193,49 +270,14 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     }
     D3D12_CPU_DESCRIPTOR_HANDLE depth_view{};
     if (depth) {
-        images.Upload(*depth, commands.Get());
+        images.Upload(*depth, commands.Get(), request.depth_read_address);
         images.Barrier(*depth, commands.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
         depth->written = request.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
         depth_view = dsv.Cpu(0);
         device.Device()->CreateDepthStencilView(depth->native.Get(), nullptr, depth_view);
     }
     Shader::PushData push = request.push;
-    std::vector<ResourceCache::Buffer*> uploaded;
-    for (u32 i = 0; i < bindings.size(); ++i) {
-        const auto& binding = bindings[i];
-        const auto& resource = binding.shader->info.buffers[binding.index];
-        auto view = views[i];
-        if (resource.buffer_type == Shader::BufferType::Flatbuf) {
-            const auto& info = binding.shader->info;
-            const u64 bytes = (info.flattened_ud_buf.empty() ? Shader::NUM_USER_DATA_REGS
-                                                             : info.flattened_ud_buf.size()) *
-                              sizeof(u32);
-            view = {&resources.GetHostBuffer(
-                        0xffff000000000000ULL + (u64(info.sw_stage) << 32),
-                        {reinterpret_cast<const u8*>(info.flat_ud), static_cast<size_t>(bytes)}),
-                    0, bytes};
-        } else if (resource.buffer_type == Shader::BufferType::ClipPlanes) {
-            view = {&resources.GetHostBuffer(0xfffd000000000000ULL,
-                {reinterpret_cast<const u8*>(request.clip_planes.data()), sizeof(request.clip_planes)}),
-                0, sizeof(request.clip_planes)};
-        } else
-            push.AddOffset(binding.shader->start_bindings.buffer + binding.index, view.offset & 3);
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-        uav.Format = DXGI_FORMAT_R32_TYPELESS;
-        uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-        uav.Buffer.FirstElement = view.offset / 4;
-        uav.Buffer.NumElements = view.buffer ? (view.size + (view.offset & 3) + 3) / 4 : 1;
-        uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-        device.Device()->CreateUnorderedAccessView(
-            view.buffer ? view.buffer->native.Get() : nullptr, nullptr, &uav, descriptors.Cpu(i));
-        if (view.buffer) {
-            if (std::ranges::find(uploaded, view.buffer) == uploaded.end()) {
-                resources.Upload(*view.buffer, commands.Get());
-                uploaded.push_back(view.buffer);
-            }
-            view.buffer->written |= resource.is_written;
-        }
-    }
+    bindings.Upload(commands.Get(), push, request.clip_planes, request.border_colors, read, gds);
     commands->SetGraphicsRootSignature(root.Get());
     std::array<u32, 20> constants{};
     std::memcpy(constants.data(), &push, sizeof(push));
@@ -244,10 +286,7 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         static_cast<u32>(request.index_address ? request.base_vertex : request.first_vertex),
         request.first_instance, 0, 0};
     commands->SetGraphicsRoot32BitConstants(1, base.size(), base.data(), 0);
-    ID3D12DescriptorHeap* heaps[]{descriptors.Heap()};
-    commands->SetDescriptorHeaps(1, heaps);
-    if (!bindings.empty())
-        commands->SetGraphicsRootDescriptorTable(2, descriptors.Gpu(0));
+    bindings.Bind(commands.Get(), true, resource_slot, sampler_slot);
     commands->IASetPrimitiveTopology(request.topology);
     commands->IASetVertexBuffers(0, vertices.size(), vertices.data());
     commands->RSSetViewports(1, &request.viewport);
@@ -267,6 +306,8 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     winrt::check_hresult(commands->Close());
     device.Wait(device.Submit(commands.Get()));
     resources.CommitDownloads();
+    bindings.CommitGds(gds);
     images.CommitDownloads();
+    recording.completed = true;
 }
 } // namespace D3D12

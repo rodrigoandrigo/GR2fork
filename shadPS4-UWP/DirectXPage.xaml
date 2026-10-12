@@ -1,5 +1,6 @@
 <Page x:Class="shadPS4_UWP.DirectXPage" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Background="Black" Loaded="OnLoaded" Unloaded="OnUnloaded">
   <Grid>
+    <SwapChainPanel x:Name="gameSwapChainPanel" IsHitTestVisible="False" />
     <SwapChainPanel x:Name="swapChainPanel" SizeChanged="OnPanelSizeChanged" PointerMoved="OnPointer" PointerPressed="OnPointer" PointerReleased="OnPointer" PointerWheelChanged="OnPointer" PointerExited="OnPointerLost" PointerCaptureLost="OnPointerLost" CompositionScaleChanged="OnCompositionScaleChanged" />
     <TextBlock x:Name="statusText" Text="Inicializando shadPS4…" Foreground="White" TextWrapping="Wrap" VerticalAlignment="Top" Padding="16" />
   </Grid>

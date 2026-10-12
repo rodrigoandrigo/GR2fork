@@ -119,11 +119,53 @@ D3D12_BLEND_OP BlendOperation(AmdGpu::BlendControl::BlendFunc function) {
         throw std::runtime_error("Invalid guest blend operation");
     }
 }
+D3D12_BLEND AlphaBlendFactor(AmdGpu::BlendControl::BlendFactor factor) {
+    switch (BlendFactor(factor)) {
+    case D3D12_BLEND_SRC_COLOR:
+        return D3D12_BLEND_SRC_ALPHA;
+    case D3D12_BLEND_INV_SRC_COLOR:
+        return D3D12_BLEND_INV_SRC_ALPHA;
+    case D3D12_BLEND_DEST_COLOR:
+        return D3D12_BLEND_DEST_ALPHA;
+    case D3D12_BLEND_INV_DEST_COLOR:
+        return D3D12_BLEND_INV_DEST_ALPHA;
+    case D3D12_BLEND_SRC_ALPHA_SAT:
+        return D3D12_BLEND_ONE;
+    case D3D12_BLEND_SRC1_COLOR:
+        return D3D12_BLEND_SRC1_ALPHA;
+    case D3D12_BLEND_INV_SRC1_COLOR:
+        return D3D12_BLEND_INV_SRC1_ALPHA;
+    default:
+        return BlendFactor(factor);
+    }
+}
 } // namespace
 Rasterizer::Rasterizer(AmdGpu::Liverpool& gpu, Core::MemoryManager& manager)
     : liverpool{gpu}, memory{manager} {
-    runtime.Initialize([this](VAddr address, std::span<u8> data) { Read(address, data); },
-                       [this](VAddr address, std::span<const u8> data) { Write(address, data); });
+    runtime.Initialize(
+        [this](VAddr address, std::span<u8> data) { Read(address, data); },
+        [this](VAddr address, std::span<const u8> data) { Write(address, data); },
+        [this](VAddr address, u64 size) -> std::optional<VAddr> {
+            if (!Core::MemoryManager::tls_in_guest_copy_scope)
+                throw std::runtime_error("D3D12 backing resolution requires a guest memory lease");
+            std::array<Core::MemoryManager::BackingSpan, 64> spans;
+            const u32 count =
+                memory.ResolveBackingSpans(address, size, spans.data(), spans.size(), false);
+            if (!count)
+                throw std::runtime_error(
+                    "Guest GPU range lacks contiguous mapped physical backing");
+            const auto base = reinterpret_cast<VAddr>(spans[0].ptr);
+            u64 offset{};
+            for (u32 i = 0; i < count; ++i) {
+                if (reinterpret_cast<VAddr>(spans[i].ptr) != base + offset)
+                    throw std::runtime_error(
+                        "D3D12 noncontiguous physical buffers require segmented views");
+                offset += spans[i].size;
+            }
+            if (offset != size)
+                throw std::runtime_error("D3D12 physical backing resolution is incomplete");
+            return base;
+        });
     memory.SetRasterizer(this);
 }
 Rasterizer::~Rasterizer() {
@@ -148,7 +190,7 @@ void Rasterizer::Dispatch(std::array<u32, 3> groups) {
     Shader::RuntimeInfo info{};
     info.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
     info.props.num_user_data = cs.settings.num_user_regs;
-    info.props.num_allocated_vgprs = cs.settings.num_vgprs * 4;
+    info.props.num_allocated_vgprs = (cs.settings.num_vgprs + 1) * 4;
     info.props.fp_denorm_mode32 = cs.settings.fp_denorm_mode32;
     info.props.fp_denorm_mode16_64 = cs.settings.fp_denorm_mode64;
     info.props.fp_round_mode32 = cs.settings.fp_round_mode32;
@@ -157,7 +199,7 @@ void Rasterizer::Dispatch(std::array<u32, 3> groups) {
     info.hw.cs.workgroup_size = {cs.num_thread_x.full, cs.num_thread_y.full, cs.num_thread_z.full};
     info.hw.cs.tgid_enable = {cs.IsTgidEnabled(0), cs.IsTgidEnabled(1), cs.IsTgidEnabled(2)};
     info.hw.cs.shared_memory_size = cs.SharedMemSize();
-    runtime.Dispatch(program.Params(), info, groups);
+    runtime.Dispatch(program.Params(), info, groups, liverpool.regs.ta_bc_base.Address());
 }
 void Rasterizer::DispatchDirect() {
     Execute([&] {
@@ -182,18 +224,23 @@ void Rasterizer::Draw(bool indexed, u32 index_offset) {
 void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<IndirectDraw> indirect) {
     Core::MemoryManager::GuestCopyScope scope{&memory};
     const auto& regs = liverpool.regs;
+    if (regs.num_interp > 32)
+        throw std::runtime_error("Guest fragment interpolation count exceeds register bounds");
     if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry)) ||
         regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Local)) ||
         regs.depth_control.stencil_enable || regs.depth_control.depth_bounds_enable ||
         regs.depth_control.enable_color_writes_on_depth_fail ||
         regs.depth_control.disable_color_writes_on_depth_pass ||
-        regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal ||
+        (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal &&
+         regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) ||
         regs.color_control.rop3 != AmdGpu::ColorControl::LogicOp::Copy ||
         regs.aa_config.NumSamples() != 1 || regs.vs_output_control.vs_out_misc_enable ||
         regs.vs_output_control.clip_distance_enable || regs.vs_output_control.cull_distance_enable)
         throw std::runtime_error("D3D12 advanced guest graphics state is not implemented");
     auto vs = ReadProgram(memory, regs.vs_program);
-    auto ps = ReadProgram(memory, regs.ps_program);
+    Program ps{};
+    if (regs.ps_program.Address<VAddr>())
+        ps = ReadProgram(memory, regs.ps_program);
     CommandRuntime::DrawRequest draw{vs.Params(), ps.Params()};
     draw.vertex_runtime.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
     draw.fragment_runtime.Initialize(Shader::HwStage::Fragment, Shader::SwStage::Fragment);
@@ -223,6 +270,8 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             u16(regs.ps_inputs[i].flat_shade), u16(regs.ps_inputs[i].default_value)};
     draw.blend.IndependentBlendEnable = TRUE;
     for (u32 i = 0; i < 8; ++i) {
+        if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable)
+            break;
         const auto& color = regs.color_buffers[i];
         if (!color) {
             if (regs.color_target_mask.GetMask(i))
@@ -244,16 +293,17 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         target.SrcBlend = BlendFactor(blend.color_src_factor);
         target.DestBlend = BlendFactor(blend.color_dst_factor);
         target.BlendOp = BlendOperation(blend.color_func);
-        target.SrcBlendAlpha = BlendFactor(blend.separate_alpha_blend ? blend.alpha_src_factor
-                                                                      : blend.color_src_factor);
-        target.DestBlendAlpha = BlendFactor(blend.separate_alpha_blend ? blend.alpha_dst_factor
-                                                                       : blend.color_dst_factor);
+        target.SrcBlendAlpha = AlphaBlendFactor(
+            blend.separate_alpha_blend ? blend.alpha_src_factor : blend.color_src_factor);
+        target.DestBlendAlpha = AlphaBlendFactor(
+            blend.separate_alpha_blend ? blend.alpha_dst_factor : blend.color_dst_factor);
         target.BlendOpAlpha =
             BlendOperation(blend.separate_alpha_blend ? blend.alpha_func : blend.color_func);
         target.RenderTargetWriteMask = regs.color_target_mask.GetMask(i);
         target.LogicOp = D3D12_LOGIC_OP_NOOP;
     }
     draw.blend_factor = regs.blend_constants;
+    draw.border_colors = regs.ta_bc_base.Address();
     const auto& polygon = regs.polygon_control;
     if (polygon.cull_front && polygon.cull_back)
         return;
@@ -276,27 +326,63 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     draw.depth.DepthWriteMask = regs.depth_control.depth_write_enable ? D3D12_DEPTH_WRITE_MASK_ALL
                                                                       : D3D12_DEPTH_WRITE_MASK_ZERO;
     draw.depth.DepthFunc = D3D12_COMPARISON_FUNC(u32(regs.depth_control.depth_func) + 1);
+    draw.depth.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                            D3D12_COMPARISON_FUNC_ALWAYS};
+    draw.depth.BackFace = draw.depth.FrontFace;
     if (draw.depth.DepthEnable)
         draw.depth_image.emplace(regs.depth_buffer, regs.depth_view.NumSlices(),
                                  VAddr(regs.depth_htile_data_base.address) << 8,
                                  liverpool.last_db_extent, true);
+    draw.depth_read_address = regs.depth_buffer.DepthAddress();
+    draw.depth_base_layer = regs.depth_view.slice_start;
     const auto& vp = regs.viewports[0];
     const float xscale = regs.viewport_control.xscale_enable ? vp.xscale : 1;
     const float yscale = regs.viewport_control.yscale_enable ? vp.yscale : 1;
     const float xoffset = regs.viewport_control.xoffset_enable ? vp.xoffset : 0;
     const float yoffset = regs.viewport_control.yoffset_enable ? vp.yoffset : 0;
-    if (xscale <= 0 || yscale >= 0 || !std::isfinite(xscale) || !std::isfinite(yscale))
+    const float zscale = regs.viewport_control.zscale_enable ? vp.zscale : 1;
+    const float zoffset = regs.viewport_control.zoffset_enable ? vp.zoffset : 0;
+    const float min_depth = regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW
+                                ? zoffset - zscale
+                                : zoffset;
+    const float max_depth = zoffset + zscale;
+    if (!std::isfinite(min_depth) || !std::isfinite(max_depth) || min_depth > max_depth)
+        throw std::runtime_error("Invalid D3D12 guest viewport depth range");
+    if (xscale <= 0 || yscale == 0 || !std::isfinite(xscale) || !std::isfinite(yscale) ||
+        !std::isfinite(xoffset) || !std::isfinite(yoffset))
         throw std::runtime_error("D3D12 guest viewport orientation is not implemented");
-    draw.viewport = {xoffset - xscale,
-                     yoffset + yscale,
-                     xscale * 2,
-                     -yscale * 2,
-                     regs.viewport_depths[0].zmin,
-                     regs.viewport_depths[0].zmax};
+    draw.flip_y = yscale > 0;
+    draw.viewport = {
+        xoffset - xscale,     yoffset - std::abs(yscale),      xscale * 2,
+        std::abs(yscale) * 2, std::clamp(min_depth, 0.f, 1.f), std::clamp(max_depth, 0.f, 1.f)};
+    if (regs.IsClipDisabled()) {
+        draw.flip_y = true;
+        draw.viewport.TopLeftX = draw.viewport.TopLeftY = 0;
+        draw.viewport.Width = draw.viewport.Height = 16384;
+    }
+    if (polygon.enable_window_offset) {
+        draw.viewport.TopLeftX += regs.window_offset.window_x_offset;
+        draw.viewport.TopLeftY += regs.window_offset.window_y_offset;
+    }
     const auto& scissor = regs.screen_scissor;
-    draw.scissor = {std::max<s32>(0, scissor.top_left_x), std::max<s32>(0, scissor.top_left_y),
-                    std::max<s32>(0, scissor.bottom_right_x),
-                    std::max<s32>(0, scissor.bottom_right_y)};
+    const s16 wx =
+        regs.window_scissor.window_offset_disable ? 0 : regs.window_offset.window_x_offset;
+    const s16 wy =
+        regs.window_scissor.window_offset_disable ? 0 : regs.window_offset.window_y_offset;
+    const auto top_left = [](s16 screen, s16 window, s16 generic, s16 offset) {
+        return std::max<s32>({0, screen, s16(window + offset), s16(generic + offset)});
+    };
+    const auto bottom_right = [](s16 screen, s16 window, s16 generic, s16 offset) {
+        return std::max<s32>(0, std::min({screen, s16(window + offset), s16(generic + offset)}));
+    };
+    draw.scissor = {top_left(scissor.top_left_x, regs.window_scissor.top_left_x,
+                             regs.generic_scissor.top_left_x, wx),
+                    top_left(scissor.top_left_y, regs.window_scissor.top_left_y,
+                             regs.generic_scissor.top_left_y, wy),
+                    bottom_right(scissor.bottom_right_x, regs.window_scissor.bottom_right_x,
+                                 regs.generic_scissor.bottom_right_x, wx),
+                    bottom_right(scissor.bottom_right_y, regs.window_scissor.bottom_right_y,
+                                 regs.generic_scissor.bottom_right_y, wy)};
     if (regs.mode_control.vport_scissor_enable) {
         const auto& vp_scissor = regs.viewport_scissors[0];
         draw.scissor.left = std::max<LONG>(draw.scissor.left, vp_scissor.top_left_x);
@@ -352,27 +438,32 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         if (regs.enable_primitive_restart) {
             const u32 cut = size == 2 ? 0xffff : UINT32_MAX;
             if (regs.primitive_restart_index != cut)
-                throw std::runtime_error("D3D12 custom guest restart index requires primitive conversion");
+                throw std::runtime_error(
+                    "D3D12 custom guest restart index requires primitive conversion");
             draw.strip_cut = size == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF
-                                      : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+                                       : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
         }
     } else
         draw.first_vertex = indirect ? indirect->first : regs.index_offset;
     runtime.Draw(draw);
 }
-void Rasterizer::DrawIndirect(bool indexed, VAddr address, u32 offset, u32 stride, u32 count, VAddr count_address) {
+void Rasterizer::DrawIndirect(bool indexed, VAddr address, u32 offset, u32 stride, u32 count,
+                              VAddr count_address) {
     DrawIndirect(indexed, address, offset, stride, count, count_address, 0, 0);
 }
 void Rasterizer::DrawIndirect(bool indexed, VAddr address, u32 offset, u32 stride, u32 count,
-                             VAddr count_address, u16 vertex_sgpr, u16 instance_sgpr) {
-    Execute([&] { DrawIndirectImpl(indexed, address, offset, stride, count, count_address,
-                                   vertex_sgpr, instance_sgpr); });
+                              VAddr count_address, u16 vertex_sgpr, u16 instance_sgpr) {
+    Execute([&] {
+        DrawIndirectImpl(indexed, address, offset, stride, count, count_address, vertex_sgpr,
+                         instance_sgpr);
+    });
 }
 void Rasterizer::DrawIndirectImpl(bool indexed, VAddr address, u32 offset, u32 stride, u32 count,
-                                 VAddr count_address, u16 vertex_sgpr, u16 instance_sgpr) {
+                                  VAddr count_address, u16 vertex_sgpr, u16 instance_sgpr) {
     Core::MemoryManager::GuestCopyScope scope{&memory};
     const u32 bytes = indexed ? 20 : 16;
-    if (count > 4096 || (count > 1 && (stride < bytes || stride % 4)) || address > UINT64_MAX - offset)
+    if (count > 4096 || (count > 1 && (stride < bytes || stride % 4)) ||
+        address > UINT64_MAX - offset)
         throw std::runtime_error("Invalid guest indirect draw range");
     if (count_address) {
         u32 actual;
@@ -386,14 +477,17 @@ void Rasterizer::DrawIndirectImpl(bool indexed, VAddr address, u32 offset, u32 s
             throw std::runtime_error("Guest indirect draw address overflow");
         std::array<u32, 5> args{};
         Read(first + delta, {reinterpret_cast<u8*>(args.data()), bytes});
-        DrawImpl(indexed, 0, IndirectDraw{args[0], args[1], args[2], indexed ? args[4] : args[3],
-            indexed ? std::bit_cast<s32>(args[3]) : 0, vertex_sgpr, instance_sgpr});
+        DrawImpl(indexed, 0,
+                 IndirectDraw{args[0], args[1], args[2], indexed ? args[4] : args[3],
+                              indexed ? std::bit_cast<s32>(args[3]) : 0, vertex_sgpr,
+                              instance_sgpr});
     }
 }
 void Rasterizer::FillBuffer(VAddr address, u32 size, u32 value, bool use_gds) {
     Execute([&] { FillBufferImpl(address, size, value, use_gds); });
 }
 void Rasterizer::FillBufferImpl(VAddr address, u32 size, u32 value, bool use_gds) {
+    const auto gds = runtime.Gds();
     Core::MemoryManager::GuestCopyScope scope{&memory};
     if (!size)
         return;
@@ -411,6 +505,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 size, bool dst_gds, bool s
     Execute([&] { CopyBufferImpl(dst, src, size, dst_gds, src_gds); });
 }
 void Rasterizer::CopyBufferImpl(VAddr dst, VAddr src, u32 size, bool dst_gds, bool src_gds) {
+    const auto gds = runtime.Gds();
     Core::MemoryManager::GuestCopyScope scope{&memory};
     if (size > 16 * 1024 * 1024 || (src_gds && (src > gds.size() || size > gds.size() - src)) ||
         (dst_gds && (dst > gds.size() || size > gds.size() - dst)))
@@ -426,6 +521,7 @@ void Rasterizer::CopyBufferImpl(VAddr dst, VAddr src, u32 size, bool dst_gds, bo
         Write(dst, data);
 }
 u32 Rasterizer::ReadDataFromGds(u32 offset) {
+    const auto gds = runtime.Gds();
     u32 value{};
     Execute([&] {
         if (offset > gds.size() - 4)
@@ -436,6 +532,17 @@ u32 Rasterizer::ReadDataFromGds(u32 offset) {
 }
 void Rasterizer::MapMemory(VAddr address, u64 size) {
     runtime.Resources().MapMemory(address, size);
+}
+u64 Rasterizer::Flush() {
+    u64 ticket{};
+    Execute([&] { ticket = runtime.Flush(); });
+    return ticket;
+}
+void Rasterizer::Finish() {
+    static_cast<void>(Flush());
+}
+void Rasterizer::CpSync() {
+    Finish();
 }
 void Rasterizer::RegisterMemory(VAddr address, u64 size) {
     runtime.Resources().RegisterMemory(address, size);

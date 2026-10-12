@@ -680,6 +680,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
+#ifndef SHADPS4_UWP
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,
                                                    window_title);
@@ -691,6 +692,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     } else {
         window->SetIcon({});
     }
+#endif
 
     const auto& mount_data_dir = Common::FS::GetUserPath(Common::FS::PathType::GameDataDir);
     mnt->Mount(mount_data_dir, "/data");
@@ -794,27 +796,20 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     linker->Execute(args);
 
-    window->InitTimers();
 #ifdef SHADPS4_UWP
     Uwp::SetGuestReady(true);
     if (Uwp::PauseRequested()) {
         DebugState.PauseGuestThreads();
     }
-#endif
-    while (window->IsOpen()) {
-#ifdef SHADPS4_UWP
-        if (Uwp::StopRequested()) {
-            break;
-        }
-#endif
-        window->WaitEvent();
-    }
-
-#ifdef SHADPS4_UWP
+    while (!Uwp::StopRequested())
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     Uwp::SetGuestReady(false);
     DebugState.PauseGuestThreads();
     Shutdown();
 #else
+    window->InitTimers();
+    while (window->IsOpen())
+        window->WaitEvent();
     std::quick_exit(0);
 #endif
 }

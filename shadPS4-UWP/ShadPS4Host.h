@@ -15,7 +15,8 @@ public:
     explicit ShadPS4Host(Windows::UI::Xaml::Controls::SwapChainPanel ^ panel);
     ~ShadPS4Host();
     void Initialize(const std::wstring& user_directory, uint32_t width, uint32_t height,
-                    bool frontend = false);
+                    bool frontend = false, bool game_surface = false);
+    uint32_t State() const { return state ? state() : SHADPS4_UNINITIALIZED; }
     template <typename T>
     T GetApi(const char* name) {
         return Resolve<T>(name);
@@ -46,6 +47,7 @@ private:
     HMODULE module{};
     Platform::Agile<Windows::UI::Xaml::Controls::SwapChainPanel> panel;
     decltype(&shadps4_initialize) initialize{};
+    decltype(&shadps4_get_state) state{};
     decltype(&shadps4_run) run{};
     decltype(&shadps4_request_stop) stop{};
     decltype(&shadps4_set_paused) pause{};

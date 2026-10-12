@@ -94,7 +94,7 @@ void FrontendRenderer::Initialize(uint32_t new_width, uint32_t new_height,
         description.BufferCount = frames.size();
         description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         description.Scaling = DXGI_SCALING_STRETCH;
-        description.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
         Microsoft::WRL::ComPtr<IDXGISwapChain1> chain;
         Check(factory->CreateSwapChainForComposition(context.DirectQueue(), &description, nullptr,
                                                      &chain));
@@ -261,7 +261,9 @@ void FrontendRenderer::EndFrame() {
                D3D12_RESOURCE_STATE_RENDER_TARGET);
     auto target = rtv->GetCPUDescriptorHandleForHeapStart();
     target.ptr += frame_index * rtv_stride;
-    const float color[]{0.025f, 0.035f, 0.055f, 1.0f};
+    const float opaque[]{0.025f, 0.035f, 0.055f, 1.0f};
+    const float clear[]{0, 0, 0, 0};
+    const float* color = transparent ? clear : opaque;
     commands->ClearRenderTargetView(target, color, 0, nullptr);
     commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
     auto* heaps = srv.Get();

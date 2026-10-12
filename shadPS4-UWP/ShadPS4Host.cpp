@@ -59,7 +59,7 @@ void ShadPS4Host::ReportError(void*, const char* message) {
 }
 
 void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width, uint32_t height,
-                             bool frontend) {
+                             bool frontend, bool game_surface) {
     module = LoadPackagedLibrary(L"shadPS4.dll", 0);
     if (!module) {
         throw ref new Platform::FailureException(ref new Platform::String(
@@ -70,6 +70,7 @@ void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width,
         throw ref new Platform::FailureException(L"Unsupported shadPS4 DLL interface.");
     }
     initialize = Resolve<decltype(initialize)>("shadps4_initialize");
+    state = Resolve<decltype(state)>("shadps4_get_state");
     run = Resolve<decltype(run)>("shadps4_run");
     stop = Resolve<decltype(stop)>("shadps4_request_stop");
     pause = Resolve<decltype(pause)>("shadps4_set_paused");
@@ -90,10 +91,11 @@ void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width,
     config.size = sizeof(config);
     config.version = 1;
     config.user_directory = user_directory.c_str();
-    config.panel = frontend ? nullptr : reinterpret_cast<IInspectable*>(panel.Get());
+    config.panel =
+        !frontend || game_surface ? reinterpret_cast<IInspectable*>(panel.Get()) : nullptr;
     config.width = width;
     config.height = height;
-    config.attach_swapchain = frontend ? nullptr : AttachSwapChain;
+    config.attach_swapchain = !frontend || game_surface ? AttachSwapChain : nullptr;
     config.attach_context = this;
     if (initialize(&config)) {
         throw ref new Platform::FailureException(ref new Platform::String(Error().c_str()));
@@ -202,6 +204,11 @@ void ShadPS4Host::Stop() {
 }
 
 void ShadPS4Host::Resize(uint32_t width, uint32_t height) {
+    if (!presentation_thread.joinable()) {
+        if (resize && width && height)
+            resize(width, height);
+        return;
+    }
     if (width && height) {
         std::lock_guard<std::mutex> lock{work_mutex};
         pending_width = width;

@@ -50,7 +50,9 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
     auto frame = std::make_shared<Frame>();
     const u64 charge = u64(group.attrib.width) * group.attrib.height * 8;
     constexpr u64 limit = 256ULL * 1024 * 1024;
-    if (charge > limit || frame_bytes->fetch_add(charge) > limit - charge) {
+    if (charge > limit)
+        throw std::runtime_error("D3D12 VideoOut frame exceeds budget");
+    if (frame_bytes->fetch_add(charge) > limit - charge) {
         frame_bytes->fetch_sub(charge);
         throw std::runtime_error("D3D12 VideoOut frame budget exhausted");
     }
@@ -272,6 +274,8 @@ void D3D12Presenter::RenderFrame() {
 
 void D3D12Presenter::Resize(uint32_t new_width, uint32_t new_height) {
     std::scoped_lock lock{mutex};
+    if (last_frame && last_frame->width && last_frame->height)
+        return;
     ResizeBuffers(new_width, new_height);
 }
 void D3D12Presenter::ResizeBuffers(uint32_t new_width, uint32_t new_height) {

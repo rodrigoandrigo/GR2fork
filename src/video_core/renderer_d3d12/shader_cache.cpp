@@ -64,11 +64,15 @@ void ShaderCache::Initialize(ID3D12Device* device) {
     profile.max_viewport_width = D3D12_VIEWPORT_BOUNDS_MAX;
     profile.max_viewport_height = D3D12_VIEWPORT_BOUNDS_MAX;
     profile.max_shared_memory_size = D3D12_CS_TGSM_REGISTER_COUNT * sizeof(u32);
-    profile.support_int64 = true;
+    profile.support_int64 = options.Int64ShaderOps;
     profile.needs_buffer_offsets = true;
 }
 CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
-                                    Shader::Backend::Bindings bindings) {
+                                    Shader::Backend::Bindings bindings, bool flip_y) {
+    if (params.code.empty() || params.code.size() > 1024 * 1024 ||
+        runtime.props.num_user_data > Shader::NUM_USER_DATA_REGS ||
+        (runtime.sw_stage == Shader::SwStage::Fragment && runtime.hw.fs.num_inputs > 32))
+        throw std::runtime_error("Invalid guest shader code or register bounds");
     CompiledShader result{
         Shader::Info{runtime.hw_stage, runtime.sw_stage, params}, runtime, bindings, bindings, {}};
     pools.ReleaseContents();
@@ -80,12 +84,12 @@ CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::Runtime
         throw std::runtime_error("D3D12 shader stages exceed push buffer offset capacity");
     const auto words =
         Shader::Backend::SPIRV::EmitSPIRV(profile, result.runtime, program, result.end_bindings);
-    result.binary = CompileSpirv(words, runtime.sw_stage);
+    result.binary = CompileSpirv(words, runtime.sw_stage, flip_y);
     result.info.RefreshFlatBuf();
     return result;
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u32> words,
-                                                              Shader::SwStage stage) {
+                                                              Shader::SwStage stage, bool flip_y) {
     if (words.size() < 5 || words.size() > 4 * 1024 * 1024 || words[0] != spv::MagicNumber)
         throw std::runtime_error("Invalid guest SPIR-V module");
     for (size_t offset = 5; offset < words.size();) {
@@ -98,7 +102,7 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u3
             throw std::runtime_error("D3D12 graphics wave64 lowering is not implemented");
         offset += length;
     }
-    std::vector<u32> key{static_cast<u32>(stage)};
+    std::vector<u32> key{static_cast<u32>(stage), static_cast<u32>(flip_y)};
     key.insert(key.end(), words.begin(), words.end());
     if (const auto found = cache.find(key); found != cache.end())
         return found->second;
@@ -107,6 +111,9 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u3
     if (entries.size() != 1 || entries.front().execution_model != Model(stage))
         throw std::runtime_error("Guest shader entry point mismatch");
     cross.set_entry_point(entries.front().name, Model(stage));
+    auto common_options = cross.get_common_options();
+    common_options.vertex.flip_vert_y = flip_y;
+    cross.set_common_options(common_options);
     auto result = std::make_shared<ShaderBinary>();
     const auto resources = cross.get_shader_resources();
     const u32 space = static_cast<u32>(stage) + 1;
@@ -150,6 +157,19 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u3
     push.binding = spirv_cross::ResourceBindingPushConstantBinding;
     push.cbv = {0, 0};
     cross.add_hlsl_resource_binding(push);
+    if (stage == Shader::SwStage::Compute) {
+        if (const auto workgroups = cross.remap_num_workgroups_builtin()) {
+            constexpr u32 auxiliary_set = UINT32_MAX - 1;
+            cross.set_decoration(workgroups, spv::DecorationDescriptorSet, auxiliary_set);
+            cross.set_decoration(workgroups, spv::DecorationBinding, 0);
+            spirv_cross::HLSLResourceBinding remap{};
+            remap.stage = Model(stage);
+            remap.desc_set = auxiliary_set;
+            remap.binding = 0;
+            remap.cbv = {0, 2};
+            cross.add_hlsl_resource_binding(remap);
+        }
+    }
     auto options = cross.get_hlsl_options();
     options.shader_model = 66;
     options.force_storage_buffer_as_uav = true;

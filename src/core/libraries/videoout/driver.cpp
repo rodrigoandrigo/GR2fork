@@ -12,6 +12,10 @@
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/presentation_sink.h"
+#ifdef SHADPS4_UWP
+#include <winrt/base.h>
+#include "uwp/session.h"
+#endif
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
@@ -43,10 +47,32 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
     main_port.resolution.pane_height = height;
-    present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
+    present_thread = std::jthread([&](std::stop_token token) {
+#ifdef SHADPS4_UWP
+        try {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            struct ApartmentLifetime {
+                ~ApartmentLifetime() {
+                    winrt::uninit_apartment();
+                }
+            } apartment;
+            PresentThread(token);
+        } catch (const winrt::hresult_error& error) {
+            Core::Uwp::FailGuestSession("D3D12 VideoOut: " + winrt::to_string(error.message()));
+        } catch (const std::exception& error) {
+            Core::Uwp::FailGuestSession("D3D12 VideoOut: " + std::string(error.what()));
+        }
+#else
+        PresentThread(token);
+#endif
+    });
 }
 
-VideoOutDriver::~VideoOutDriver() = default;
+VideoOutDriver::~VideoOutDriver() {
+    present_thread.request_stop();
+    if (present_thread.joinable())
+        present_thread.join();
+}
 
 int VideoOutDriver::Open(const ServiceThreadParams* params) {
     if (main_port.is_open) {
@@ -316,26 +342,36 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
-    VideoCore::FrameHandle frame;
-    const auto sink = VideoCore::GetPresentationSink();
-    if (index == -1) {
-        frame = sink->PrepareBlankFrame(false);
-    } else {
-        const auto& buffer = port->buffer_slots[index];
-        ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
-        const auto& group = port->groups[buffer.group_index];
-        frame = sink->PrepareFrame(group, buffer.address_left);
-    }
+#ifdef SHADPS4_UWP
+    try {
+#endif
+        VideoCore::FrameHandle frame;
+        const auto sink = VideoCore::GetPresentationSink();
+        if (index == -1) {
+            frame = sink->PrepareBlankFrame(false);
+        } else {
+            const auto& buffer = port->buffer_slots[index];
+            ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
+            const auto& group = port->groups[buffer.group_index];
+            frame = sink->PrepareFrame(group, buffer.address_left);
+        }
 
-    std::scoped_lock lock{mutex};
-    requests.push({
-        .frame = frame,
-        .sink = sink,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-    });
+        std::scoped_lock lock{mutex};
+        requests.push({
+            .frame = frame,
+            .sink = sink,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+        });
+#ifdef SHADPS4_UWP
+    } catch (const winrt::hresult_error& error) {
+        Core::Uwp::FailGuestSession("D3D12 flip: " + winrt::to_string(error.message()));
+    } catch (const std::exception& error) {
+        Core::Uwp::FailGuestSession("D3D12 flip: " + std::string(error.what()));
+    }
+#endif
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {

@@ -25,12 +25,14 @@ public:
     void Resize(uint32_t width, uint32_t height);
     void BeginFrame(float delta);
     void EndFrame();
+    void SetTransparent(bool value) { transparent = value; }
     bool Upload(const ThumbnailPixels& pixels);
     uintptr_t Image(const std::string& key);
     size_t ImageCount() const;
     std::vector<uint8_t> Readback();
 
 private:
+    bool transparent{};
     struct Frame {
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
         Microsoft::WRL::ComPtr<ID3D12Resource> target;

@@ -15,6 +15,8 @@ public:
         Shader::RuntimeInfo vertex_runtime, fragment_runtime;
         std::vector<VideoCore::ImageInfo> colors;
         std::optional<VideoCore::ImageInfo> depth_image;
+        VAddr depth_read_address{};
+        u32 depth_base_layer{};
         Shader::PushData push{};
         std::array<float, 24> clip_planes{};
         D3D12_BLEND_DESC blend{};
@@ -27,23 +29,41 @@ public:
         std::array<float, 4> blend_factor{};
         u32 count{}, instances{1}, first_vertex{}, first_instance{};
         VAddr index_address{};
+        VAddr border_colors{};
         DXGI_FORMAT index_format{DXGI_FORMAT_R16_UINT};
         D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut{D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED};
         s32 base_vertex{};
+        bool flip_y{};
     };
-    void Initialize(ResourceCache::Read read, ResourceCache::Write write);
+    void Initialize(ResourceCache::Read read, ResourceCache::Write write,
+                    ResourceCache::Resolve resolve = {});
     void Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
-                  std::array<u32, 3> groups);
+                  std::array<u32, 3> groups, VAddr border_colors = 0);
     void Draw(const DrawRequest& request);
+    u64 Flush();
     ResourceCache& Resources() {
         return resources;
     }
+    std::span<u8, 65536> Gds() {
+        return gds;
+    }
 
 private:
+    struct RecordingGuard {
+        bool& failed;
+        bool completed{};
+        ~RecordingGuard() {
+            failed |= !completed;
+        }
+    };
+    bool failed{};
     struct Pipeline {
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
         Microsoft::WRL::ComPtr<ID3D12PipelineState> state;
     };
+    Pipeline& GetPipeline(
+        std::vector<u8> key, ID3DBlob* root,
+        const std::function<HRESULT(ID3D12RootSignature*, ID3D12PipelineState**)>& create);
     std::map<std::vector<u8>, Pipeline> pipelines;
     size_t pipeline_bytes{};
     D3D12DeviceContext device;
@@ -51,6 +71,7 @@ private:
     ResourceCache resources;
     ImageCache images;
     ResourceCache::Read read;
+    std::array<u8, 65536> gds{};
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commands;
     std::mutex mutex;

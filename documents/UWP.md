@@ -45,29 +45,28 @@ O núcleo compila diretamente os componentes do projeto indicado:
 - `d3d12_videocore_bridge.cpp`: contrato de comandos, transferências e readback.
 
 O frontend ImGui cria seu swapchain de composição usando o dispositivo D3D12
-importado e anexa-o ao SwapChainPanel na thread UI. Ele inicializa a DLL sem
-painel, separando apresentação da interface e núcleo. A ABI mantém também
-o adaptador de apresentação de fundo para outros consumidores.
+importado e anexa-o ao SwapChainPanel na thread UI. A DLL recebe um segundo
+painel, usado pelo VideoOut guest; o ImGui pode compor um overlay transparente.
+A ABI mantém também o adaptador de apresentação para outros consumidores.
 Não há dependência de Dozen nem carregamento de um ICD Vulkan neste caminho.
 
 ## Limite atual
 
-**Ainda não há renderer PS4 D3D12 integrado.** O projeto D3D12 fornecido também
-declara essa pendência: seu consumidor inicial rejeita draw e dispatch guest,
-e a conversão de shaders cobre contratos restritos de validação.
+**Há um renderer guest D3D12 experimental, ainda incompleto para jogos.**
+Liverpool usa um rasterizador próprio com draw/dispatch, recursos guest e
+GCN→SPIR-V→HLSL→DXIL. A bridge restrita do snapshot não executa esse caminho.
 
 O estado da migração do renderer e os caminhos ainda pendentes estão em
-[D3D12-RENDERER.md](D3D12-RENDERER.md). A cópia local e o contrato PM4 comum
-não removem essas limitações.
+[D3D12-RENDERER.md](D3D12-RENDERER.md), incluindo os resultados de execução
+GCN em GPU D3D12 e as limitações ainda presentes.
 
 Consequentemente, inicializar dispositivo, apresentar o fundo e compilar a DLL
 não equivale a executar um jogo PS4. O aplicativo mantém o boot desabilitado;
 a ABI rejeita pedidos de boot antes de executar o guest. O núcleo Vulkan fica
 compilado como parte da base desktop, mas não é usado pela apresentação UWP.
 
-O restante exige ligar Liverpool/PM4, recursos guest, caches, shaders,
-pipelines e apresentação de videoout ao renderer nativo. Não são anunciadas
-capacidades nem simulados draws para contornar essa ausência.
+Ainda faltam estágios e estados gráficos avançados, coerência completa,
+boot brokered e teardown guest. Operações não suportadas geram erro da sessão.
 
 ## Armazenamento e diagnóstico
 
@@ -192,7 +191,7 @@ Inicialização roda em tarefa de background no host; apresentação e resize us
 uma thread de trabalho, que agrupa pedidos de frame/resize. A thread UI apenas
 solicita trabalho e anexa o swapchain quando o callback é despachado para ela.
 `shadps4_run` pertence à thread de sessão, já separada da UI, e continua
-rejeitando boot enquanto falta o renderer guest.
+rejeitando boot enquanto faltam caminhos gráficos avançados e boot brokered completo.
 
 O encerramento segue: solicitar stop, aguardar a sessão e a apresentação,
 chamar shutdown, remover callbacks e liberar a DLL. Shutdown libera a

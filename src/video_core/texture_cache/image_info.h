@@ -38,12 +38,12 @@ struct ImageProperties {
 
 struct ImageInfo {
     ImageInfo() = default;
-    ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group, VAddr cpu_address) noexcept;
-    ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint) noexcept;
+    ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group, VAddr cpu_address);
+    ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint);
     ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
-              AmdGpu::CbDbExtent hint, bool write_buffer = false) noexcept;
-    ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept;
-    ImageInfo(const AmdGpu::Image& sharp, bool is_depth) noexcept;
+              AmdGpu::CbDbExtent hint, bool write_buffer = false);
+    ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc);
+    ImageInfo(const AmdGpu::Image& sharp, bool is_depth);
 
     bool IsTiled() const {
         return tile_mode != AmdGpu::TileMode::DisplayLinearAligned;
@@ -60,7 +60,7 @@ struct ImageInfo {
     bool IsCompatible(const ImageInfo& info) const;
     // Writes guest_size; runs only from the constructors, since the texture
     // cache mirrors the field into a per-image record while it is registered.
-    void UpdateSize() noexcept;
+    void UpdateSize();
 
     struct {
         VAddr cmask_addr;
