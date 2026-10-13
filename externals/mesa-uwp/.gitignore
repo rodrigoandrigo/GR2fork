@@ -8,3 +8,12 @@
 .venv/
 *.mda.tar
 /install*
+
+# Source directories hidden by the parent repository's build-output rules.
+!/bin/
+!/bin/**
+!/build-support/
+!/build-support/**
+!/src/freedreno/tests/reference/*.log
+!/src/gallium/drivers/radeonsi/ci/build/
+!/src/gallium/drivers/radeonsi/ci/build/**
