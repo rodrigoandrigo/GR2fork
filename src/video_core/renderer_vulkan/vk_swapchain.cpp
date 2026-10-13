@@ -24,7 +24,9 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
     FindPresentMode();
 
     Create(window.GetWidth(), window.GetHeight());
+#ifndef SHADPS4_UWP
     ImGui::Core::Initialize(instance, window, image_count, surface_format.format);
+#endif
 }
 
 Swapchain::~Swapchain() {
@@ -98,8 +100,10 @@ void Swapchain::SetHDR(bool hdr) {
 
     needs_hdr = hdr;
     Recreate(width, height);
+#ifndef SHADPS4_UWP
     ImGui::Core::OnSurfaceFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
                                                  : surface_format.format);
+#endif
 }
 
 bool Swapchain::AcquireNextImage() {
@@ -146,7 +150,11 @@ bool Swapchain::Present() {
 
     frame_index = (frame_index + 1) % image_count;
 
+#ifdef SHADPS4_UWP
+    return result == vk::Result::eSuccess || result == vk::Result::eSuboptimalKHR;
+#else
     return !needs_recreation;
+#endif
 }
 
 void Swapchain::FindPresentFormat() {
@@ -198,6 +206,10 @@ void Swapchain::FindPresentMode() {
         return;
     }
 
+#ifdef SHADPS4_UWP
+    present_mode = vk::PresentModeKHR::eFifo;
+    return;
+#endif
     const auto requested_mode = EmulatorSettings.GetPresentMode();
     if (requested_mode == "Mailbox") {
         present_mode = vk::PresentModeKHR::eMailbox;

@@ -1,5 +1,7 @@
 # MSAA no renderer D3D12
 
+O backend nativo descrito abaixo foi preservado como trabalho experimental. O caminho padrão UWP passou a Vulkan/Dozen; veja [DOZEN-UWP.md](DOZEN-UWP.md).
+
 O caminho guest implementa MSAA de cor e profundidade sem compressão. O draw
 usa a contagem dos registradores Liverpool, PSO e attachments compatíveis,
 máscaras dos quatro pixels do padrão 2×2 e posições programáveis. A frequência

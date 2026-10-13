@@ -38,6 +38,11 @@
 #include <common/singleton.h>
 #include <core/linker.h>
 #include "aio.h"
+#ifdef SHADPS4_UWP
+#include <winrt/base.h>
+#include "common/scope_exit.h"
+#include "uwp/session.h"
+#endif
 
 namespace Libraries::Kernel {
 
@@ -58,6 +63,16 @@ void KernelSignalRequest() {
     ++asio_requests;
     cv_asio_req.notify_one();
 }
+
+#ifdef SHADPS4_UWP
+void ShutdownKernel() {
+    service_thread.request_stop();
+    io_context.stop();
+    cv_asio_req.notify_all();
+    if (service_thread.joinable())
+        service_thread.join();
+}
+#endif
 
 static void KernelServiceThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:KernelServiceThread");
@@ -463,7 +478,23 @@ u64 PS4_SYSV_ABI posix_sysconf(s32 name) {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+#ifdef SHADPS4_UWP
+    service_thread = std::jthread{[](std::stop_token stop) {
+        try {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            SCOPE_EXIT {
+                winrt::uninit_apartment();
+            };
+            KernelServiceThread(stop);
+        } catch (const std::exception& error) {
+            Core::Uwp::FailGuestSession(error.what());
+        } catch (const winrt::hresult_error& error) {
+            Core::Uwp::FailGuestSession(winrt::to_string(error.message()));
+        }
+    }};
+#else
     service_thread = std::jthread{KernelServiceThread};
+#endif
 
     static char const** kernel_environ = g_environment;
 

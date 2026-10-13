@@ -243,8 +243,9 @@ public:
     }
 
     /// Returns true if the subgroup size can be set to match guest subgroup size
-    bool IsSubgroupSize64Supported() const {
-        return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
+    bool IsSubgroupSize64Supported(vk::ShaderStageFlagBits stage = vk::ShaderStageFlagBits::eCompute) const {
+        return vk13_features.subgroupSizeControl && vk13_props.minSubgroupSize <= 64 &&
+               vk13_props.maxSubgroupSize >= 64 && bool(vk13_props.requiredSubgroupSizeStages & stage);
     }
 
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.

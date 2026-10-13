@@ -15,6 +15,7 @@ ShadPS4Host::ShadPS4Host(Windows::UI::Xaml::Controls::SwapChainPanel ^ target) :
 
 ShadPS4Host::~ShadPS4Host() {
     Stop();
+    Wait();
     {
         std::lock_guard<std::mutex> lock{work_mutex};
         closing = true;
@@ -23,16 +24,14 @@ ShadPS4Host::~ShadPS4Host() {
     if (presentation_thread.joinable()) {
         presentation_thread.join();
     }
-    if (shutdown) {
-        shutdown();
-    }
+    const bool released = !shutdown || shutdown() == 0;
     if (set_log_callback) {
         set_log_callback(nullptr, nullptr);
     }
     if (set_error_callback) {
         set_error_callback(nullptr, nullptr);
     }
-    if (module) {
+    if (module && released) {
         FreeLibrary(module);
     }
 }
@@ -131,16 +130,55 @@ void ShadPS4Host::PresentationLoop() {
     }
 }
 
+void ShadPS4Host::Reload(const std::wstring &user_directory, uint32_t width,
+                         uint32_t height, bool frontend, bool game_surface) {
+  std::scoped_lock lock{module_mutex};
+  stop_pending.store(false);
+  Wait();
+  if (shutdown && shutdown())
+    throw ref new Platform::FailureException(
+        ref new Platform::String(Error().c_str()));
+  if (set_log_callback)
+    set_log_callback(nullptr, nullptr);
+  if (set_error_callback)
+    set_error_callback(nullptr, nullptr);
+  if (module) {
+    if (!FreeLibrary(module))
+      throw ref new Platform::FailureException(
+          L"Não foi possível descarregar o núcleo.");
+    module = nullptr;
+    if (GetModuleHandleExW(0, L"shadPS4.dll", &module))
+      throw ref new Platform::FailureException(
+          L"O núcleo ainda possui tarefas ativas; não é seguro iniciar outra "
+          L"sessão.");
+  }
+  initialize = nullptr;
+  state = nullptr;
+  run = nullptr;
+  stop = nullptr;
+  pause = nullptr;
+  resize = nullptr;
+  render = nullptr;
+  error = nullptr;
+  shutdown = nullptr;
+  set_log_callback = nullptr;
+  set_error_callback = nullptr;
+  Initialize(user_directory, width, height, frontend, game_surface);
+  if (stop_pending.load())
+    stop();
+}
+
 std::wstring ShadPS4Host::Error() const {
-    if (!error) {
-        return L"The embedded core is unavailable.";
-    }
-    std::vector<char> text(error(nullptr, 0));
-    error(text.data(), static_cast<uint32_t>(text.size()));
-    const int length = MultiByteToWideChar(CP_UTF8, 0, text.data(), -1, nullptr, 0);
-    std::vector<wchar_t> wide(length);
-    MultiByteToWideChar(CP_UTF8, 0, text.data(), -1, wide.data(), length);
-    return wide.data();
+  if (!error) {
+    return L"The embedded core is unavailable.";
+  }
+  std::vector<char> text(error(nullptr, 0));
+  error(text.data(), static_cast<uint32_t>(text.size()));
+  const int length =
+      MultiByteToWideChar(CP_UTF8, 0, text.data(), -1, nullptr, 0);
+  std::vector<wchar_t> wide(length);
+  MultiByteToWideChar(CP_UTF8, 0, text.data(), -1, wide.data(), length);
+  return wide.data();
 }
 
 std::wstring ShadPS4Host::MountFolder(Platform::Agile<Windows::Storage::StorageFolder> folder) {
@@ -176,19 +214,27 @@ std::wstring ShadPS4Host::MountFolder(Platform::Agile<Windows::Storage::StorageF
            L" bytes. A execução de jogos ainda não está disponível.";
 }
 
-void ShadPS4Host::Run(std::wstring executable, std::function<void(std::wstring)> completed) {
-    const auto self = shared_from_this();
-    std::thread([self, executable, completed] {
-        const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED);
-        const auto result = self->run(executable.c_str());
-        const auto message = result ? self->Error()
-                                    : L"Session stopped. Restart the application "
-                                      L"to launch another title.";
-        completed(message);
-        if (SUCCEEDED(initialized)) {
-            RoUninitialize();
-        }
-    }).detach();
+void ShadPS4Host::Run(std::wstring executable,
+                      std::function<void(std::wstring)> completed) {
+  if (session_thread.joinable())
+    session_thread.join();
+  session_thread = std::thread([this, executable, completed] {
+    const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED);
+    const auto result = SUCCEEDED(initialized) ? run(executable.c_str()) : -1;
+    const auto message = FAILED(initialized)
+                             ? L"Não foi possível iniciar o worker MTA."
+                         : result ? Error()
+                                  : L"Sessão encerrada.";
+    if (SUCCEEDED(initialized)) {
+      RoUninitialize();
+    }
+    completed(message);
+  });
+}
+
+void ShadPS4Host::Wait() {
+  if (session_thread.joinable())
+    session_thread.join();
 }
 
 void ShadPS4Host::Pause(bool paused) {
@@ -198,23 +244,25 @@ void ShadPS4Host::Pause(bool paused) {
 }
 
 void ShadPS4Host::Stop() {
-    if (stop) {
-        stop();
-    }
+  stop_pending.store(true);
+  std::unique_lock lock{module_mutex, std::try_to_lock};
+  if (lock.owns_lock() && stop) {
+    stop();
+  }
 }
 
 void ShadPS4Host::Resize(uint32_t width, uint32_t height) {
-    if (!presentation_thread.joinable()) {
-        if (resize && width && height)
-            resize(width, height);
-        return;
-    }
-    if (width && height) {
-        std::lock_guard<std::mutex> lock{work_mutex};
-        pending_width = width;
-        pending_height = height;
-    }
-    work_ready.notify_one();
+  if (!presentation_thread.joinable()) {
+    if (resize && width && height)
+      resize(width, height);
+    return;
+  }
+  if (width && height) {
+    std::lock_guard<std::mutex> lock{work_mutex};
+    pending_width = width;
+    pending_height = height;
+  }
+  work_ready.notify_one();
 }
 
 bool ShadPS4Host::Render() {

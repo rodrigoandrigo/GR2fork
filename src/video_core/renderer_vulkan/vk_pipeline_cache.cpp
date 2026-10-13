@@ -952,8 +952,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
         .max_shared_memory_size = instance.MaxComputeSharedMemorySize(),
+#ifdef SHADPS4_UWP
+        .supported_spirv = 0x00010500U,
+#else
         .supported_spirv = SpirvVersion1_6,
-        .subgroup_size = instance.SubgroupSize(),
+#endif
+        .subgroup_size = instance.IsSubgroupSize64Supported() ? 64 : instance.SubgroupSize(),
         .sparse_page_shift = sparse_page_shift,
         .support_int8 = instance.IsShaderInt8Supported(),
         .support_int16 = instance.IsShaderInt16Supported(),

@@ -5,6 +5,14 @@
 
 #include <cstring>
 #include "common/types.h"
+#ifdef SHADPS4_UWP
+#include <exception>
+#include "uwp/session.h"
+namespace Libraries::Kernel {
+bool IsGuestThread();
+[[noreturn]] void ExitGuestThread();
+}
+#endif
 #ifdef _WIN32
 #include <malloc.h>
 #endif
@@ -53,7 +61,20 @@ struct HostCallWrapperImpl;
 template <class ReturnType, class... Args, PS4_SYSV_ABI ReturnType (*func)(Args...)>
 struct HostCallWrapperImpl<func> {
     static ReturnType PS4_SYSV_ABI wrap(Args... args) {
+#ifdef SHADPS4_UWP
+        if (Core::Uwp::StopRequested() && Libraries::Kernel::IsGuestThread())
+            Libraries::Kernel::ExitGuestThread();
+        try {
+            return func(args...);
+        } catch (const std::exception& error) {
+            Core::Uwp::FailGuestSession(error.what());
+        } catch (...) {
+            Core::Uwp::FailGuestSession("Unhandled host exception in a guest HLE call");
+        }
+        Libraries::Kernel::ExitGuestThread();
+#else
         return func(args...);
+#endif
     }
 };
 

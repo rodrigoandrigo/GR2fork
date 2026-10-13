@@ -24,7 +24,12 @@ static constexpr u32 ORBIS_FPUCW = 0x037f;
 
 NativeThread::NativeThread() : native_handle{0} {}
 
-NativeThread::~NativeThread() {}
+NativeThread::~NativeThread() {
+#ifdef SHADPS4_UWP
+    if (native_handle)
+        CloseHandle(native_handle);
+#endif
+}
 
 int NativeThread::Create(ThreadFunc func, void* arg) {
 #ifndef _WIN64
@@ -40,14 +45,18 @@ int NativeThread::Create(ThreadFunc func, void* arg) {
 }
 
 void NativeThread::Exit() {
+#ifndef SHADPS4_UWP
     if (!native_handle) {
         return;
     }
+#endif
 
     tid = 0;
 
 #ifdef _WIN64
+#ifndef SHADPS4_UWP
     native_handle = nullptr;
+#endif
     ExitThread(0);
 #else
     // Disable and free the signal stack.

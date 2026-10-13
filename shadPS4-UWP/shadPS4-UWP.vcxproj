@@ -127,6 +127,12 @@
       <DeploymentContent>true</DeploymentContent>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="$(CoreRuntimeDir)\vulkan_dzn.dll">
+      <Link>vulkan_dzn.dll</Link>
+      <TargetPath>vulkan_dzn.dll</TargetPath>
+      <DeploymentContent>true</DeploymentContent>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="$(CoreRuntimeDir)\dxcompiler.dll">
       <Link>dxcompiler.dll</Link>
       <TargetPath>dxcompiler.dll</TargetPath>

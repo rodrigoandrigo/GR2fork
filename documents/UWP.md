@@ -7,9 +7,9 @@ continua disponível na configuração padrão.
 ## Dependências e compilação
 
 - Visual Studio com C++ UWP, Windows SDK 10.0.26100.0 e clang-cl.
-- CMake, Ninja e Python 3.
+- CMake, Ninja, Python 3 com Meson, bison e flex.
 - SDL3 em `C:\Users\rodri\Dev1\Projetos\SDL3-uwp`.
-- D3D12 em `externals/d3d12-native`.
+- Mesa/Dozen em `externals/mesa-uwp`; D3D12 do frontend em `externals/d3d12-native`.
 
 Execute na raiz:
 
@@ -32,48 +32,32 @@ e o assembly x64 do PS4. O modo UWP não compila o SDL de `externals/sdl3`.
 
 O post-build copia a DLL, a import library, SDL3.dll e o header da ABI para
 `shadPS4-UWP/Runtime/<Configuration>`. O aplicativo inclui shadPS4.dll e
-SDL3.dll na raiz do pacote. Apenas x64 é suportado.
+SDL3.dll, vulkan_dzn.dll, dxcompiler.dll e dxil.dll na raiz do pacote. Apenas x64 é suportado.
 
-## D3D12 usado pelo host
+## Vulkan/Dozen usado pelo núcleo
 
-O núcleo compila diretamente os componentes do projeto indicado:
+O caminho padrão UWP agora é shadPS4 Vulkan → Dozen → D3D12 → SwapChainPanel.
+O driver de `externals/mesa-uwp` é compilado pelo script com Meson e carregado
+como DLL do pacote, sem depender de um loader Vulkan externo. O frontend ImGui
+mantém seu dispositivo D3D12 e painel separado.
 
-- `d3d12_device_context.cpp`: dispositivo, fila DIRECT, fences e espera.
-- `d3d12_resource_allocator.cpp`: recursos e orçamento.
-- `d3d12_command_encoder.cpp`: transições e comandos de transferência.
-- `d3d12_pipeline_cache.cpp`: descritores, root signatures e pipelines.
-- `d3d12_videocore_bridge.cpp`: contrato de comandos, transferências e readback.
+A apresentação usa FIFO, sem descartar frames nem acrescentar um limite de FPS.
+A cadência solicitada pelo guest e o refresh físico continuam sendo respeitados.
 
-O frontend ImGui cria seu swapchain de composição usando o dispositivo D3D12
-importado e anexa-o ao SwapChainPanel na thread UI. A DLL recebe um segundo
-painel, usado pelo VideoOut guest; o ImGui pode compor um overlay transparente.
-A ABI mantém também o adaptador de apresentação para outros consumidores.
-Não há dependência de Dozen nem carregamento de um ICD Vulkan neste caminho.
-
-## Limite atual
-
-**Há um renderer guest D3D12 experimental, ainda incompleto para jogos.**
-Liverpool usa um rasterizador próprio com draw/dispatch, recursos guest e
-GCN→SPIR-V→HLSL→DXIL. A bridge restrita do snapshot não executa esse caminho.
-
-O estado da migração do renderer e os caminhos ainda pendentes estão em
-[D3D12-RENDERER.md](D3D12-RENDERER.md), incluindo os resultados de execução
-GCN em GPU D3D12 e as limitações ainda presentes.
-
-Consequentemente, inicializar dispositivo, apresentar o fundo e compilar a DLL
-não equivale a executar um jogo PS4. O aplicativo mantém o boot desabilitado;
-a ABI rejeita pedidos de boot antes de executar o guest. O núcleo Vulkan fica
-compilado como parte da base desktop, mas não é usado pela apresentação UWP.
-
-Ainda faltam estágios e estados gráficos avançados, coerência completa,
-boot brokered e teardown guest. Operações não suportadas geram erro da sessão.
+[DOZEN-UWP.md](DOZEN-UWP.md) descreve a integração, os diagnósticos GPU e as
+limitações. O boot brokered está conectado à sessão da DLL e ao frontend.
+[BOOT-UWP.md](BOOT-UWP.md) descreve o ciclo e sua validação. Build, execução
+de um ELF mínimo e apresentação do fundo não comprovam gameplay, AppContainer
+ou Xbox.
 
 ## Armazenamento e diagnóstico
 
 Configuração, logs, saves e módulos usam LocalFolder/shadPS4. O FolderPicker
 fornece StorageFolders à DLL para montar `/libraryN` em modo somente leitura.
 O worker lê metadados e capas pela API sem converter o grant em caminho externo.
-Selecionar pastas está disponível; iniciar o guest continua desabilitado.
+O frontend inicia o executável selecionado por seu caminho virtual. A DLL
+deriva `/app0` e `/hostapp` do StorageFolder autorizado, preservando o acesso
+brokered inclusive quando o título está em uma subpasta.
 
 O host salva tokens gerados pela FutureAccessList do próprio pacote e a lista
 de pastas em LocalSettings. Na próxima inicialização recupera os StorageFolders;
@@ -177,7 +161,7 @@ falhas do próprio logger são encaminhadas ao callback. O host atual encaminha
 os callbacks ao debugger; outro consumidor pode encaminhá-los à sua UI.
 
 Configuração com `panel` e `attach_swapchain` nulos inicializa o núcleo sem
-apresentação, para consumidores sem XAML. Nesse modo a validação CPU/D3D12,
+apresentação, para consumidores sem XAML. Nesse modo a validação CPU/Dozen,
 armazenamento, callbacks e logs permanecem ativos; render_host_frame retorna erro.
 
 Callbacks são síncronos na thread emissora e podem ocorrer em threads diferentes.
@@ -190,15 +174,21 @@ que usam a DLL.
 Inicialização roda em tarefa de background no host; apresentação e resize usam
 uma thread de trabalho, que agrupa pedidos de frame/resize. A thread UI apenas
 solicita trabalho e anexa o swapchain quando o callback é despachado para ela.
-`shadps4_run` pertence à thread de sessão, já separada da UI, e continua
-rejeitando boot enquanto faltam caminhos gráficos avançados e boot brokered completo.
+`shadps4_run` pertence à thread de sessão MTA, separada da UI. Recebe um caminho
+virtual absoluto de um mount brokered, como `/library0/titulo/eboot.bin`.
+Cada carregamento da DLL aceita uma sessão. O frontend recarrega a DLL após
+encerrá-la, restaura os grants e atualiza os ponteiros da API antes da próxima
+sessão; singletons e caches guest não são reutilizados entre títulos.
 
 O encerramento segue: solicitar stop, aguardar a sessão e a apresentação,
 chamar shutdown, remover callbacks e liberar a DLL. Shutdown libera a
 apresentação e drena/fecha os logs; chamadas com sessão ainda ativa retornam
 erro. Assertions do núcleo UWP lançam erro para a fronteira de embedding em
-vez de executar breakpoint/encerrar o processo. A recuperação de faults em
-threads guest ainda depende da implementação futura de execução guest.
+vez de executar breakpoint/encerrar o processo. A fronteira HLE captura erros
+do host e sinaliza a falha da sessão. A parada retoma threads pausadas, solicita
+cancelamento e espera seus handles reais; se exceder o prazo, retorna erro e
+preserva o núcleo carregado. O shutdown encerra também os serviços do kernel,
+VideoOut, áudio e os contextos AJM/Vdecsw registrados.
 
 A interface valida tamanho/versão da configuração e verifica execução e
 modificação de código x64 antes de inicializar o host. Erros D3D12 preservam

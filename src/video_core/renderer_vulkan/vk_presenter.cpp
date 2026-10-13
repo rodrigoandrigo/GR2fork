@@ -45,6 +45,9 @@
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#ifdef SHADPS4_UWP
+#include "uwp/session.h"
+#endif
 
 namespace Vulkan {
 
@@ -492,24 +495,37 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
+#ifndef SHADPS4_UWP
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
     ImGui::Friends::Register();
     ImGui::ShadNetNotify::Register();
     ImGui::InvitationPrompt::Register();
+#endif
 }
 
 Presenter::~Presenter() {
+#ifndef SHADPS4_UWP
     ImGui::InvitationPrompt::Unregister();
     ImGui::ShadNetNotify::Unregister();
     ImGui::Friends::Unregister();
     ImGui::Layer::RemoveLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
+#endif
 
+#ifdef SHADPS4_UWP
+    try {
+#endif
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
+
+#ifdef SHADPS4_UWP
+    } catch (const std::exception& error) {
+        LOG_ERROR(Render_Vulkan, "Guest renderer shutdown: {}", error.what());
+    }
+#endif
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -526,7 +542,9 @@ bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const
 void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     const vk::Device device = instance.GetDevice();
     if (frame->imgui_texture) {
+#ifndef SHADPS4_UWP
         ImGui::Vulkan::RemoveTexture(frame->imgui_texture);
+#endif
     }
     if (frame->image_view) {
         device.destroyImageView(frame->image_view);
@@ -587,7 +605,9 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->width = width;
     frame->height = height;
 
+#ifndef SHADPS4_UWP
     frame->imgui_texture = ImGui::Vulkan::AddTexture(view, vk::ImageLayout::eShaderReadOnlyOptimal);
+#endif
     frame->is_hdr = swapchain.GetHDR();
 }
 
@@ -841,6 +861,9 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+#ifdef SHADPS4_UWP
+    PresentEmbedded(frame, is_reusing_frame, is_game_frame);
+#else
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1085,6 +1108,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
     }
+#endif
 }
 
 Frame* Presenter::GetRenderFrame() {
@@ -1092,7 +1116,15 @@ Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
+#ifdef SHADPS4_UWP
+        while (free_queue.empty()) {
+            if (Core::Uwp::StopRequested())
+                throw std::runtime_error("Frame preparation cancelled during shutdown");
+            free_cv.wait_for(lock, std::chrono::milliseconds(10));
+        }
+#else
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
+#endif
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -1104,7 +1136,13 @@ Frame* Presenter::GetRenderFrame() {
     vk::Result result{};
 
     const auto wait = [&]() {
+#ifdef SHADPS4_UWP
+        if (Core::Uwp::StopRequested())
+            throw std::runtime_error("Frame preparation cancelled during shutdown");
+        result = device.waitForFences(frame->present_done, false, 10000000);
+#else
         result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
+#endif
         return result;
     };
 
@@ -1137,5 +1175,86 @@ void Presenter::SetExpectedGameSize(s32 width, s32 height) {
         expected_frame_height = static_cast<s32>(width / expected_ratio);
     }
 }
+
+#ifdef SHADPS4_UWP
+void Presenter::PresentEmbedded(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    std::scoped_lock lock{embedded_present_mutex};
+    bool sampled = is_reusing_frame;
+    for (;;) {
+        if (Core::Uwp::StopRequested())
+            throw std::runtime_error("Presentation cancelled during session shutdown");
+        if (!window.GetWidth() || !window.GetHeight()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight())
+            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        if (!swapchain.AcquireNextImage()) {
+            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        Check(instance.GetDevice().resetFences(frame->present_done));
+        auto cmdbuf = present_scheduler.CommandBuffer();
+        const vk::ImageSubresourceRange range{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                              .levelCount = 1, .layerCount = 1};
+        const std::array barriers{
+            vk::ImageMemoryBarrier{.dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                                   .oldLayout = vk::ImageLayout::eUndefined,
+                                   .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .image = swapchain.Image(), .subresourceRange = range},
+            vk::ImageMemoryBarrier{.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                                   .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+                                   .oldLayout = sampled ? vk::ImageLayout::eShaderReadOnlyOptimal
+                                                        : vk::ImageLayout::eGeneral,
+                                   .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .image = frame->image, .subresourceRange = range}};
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                               vk::PipelineStageFlagBits::eAllGraphics, {}, {}, {}, barriers);
+        Frame output{};
+        output.image = swapchain.Image();
+        output.image_view = swapchain.ImageView();
+        output.width = swapchain.GetExtent().width;
+        output.height = swapchain.GetExtent().height;
+        pp_pass.Render(cmdbuf, frame->image_view, {frame->width, frame->height}, output, {});
+        const vk::ImageMemoryBarrier to_present{
+            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::ePresentSrcKHR,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = output.image, .subresourceRange = range};
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics,
+                               vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, {}, to_present);
+        SubmitInfo info{};
+        info.AddWait(swapchain.GetImageAcquiredSemaphore());
+        info.AddWait(frame->ready_semaphore, frame->ready_tick);
+        info.AddSignal(swapchain.GetPresentReadySemaphore());
+        info.AddSignal(frame->present_done);
+        present_scheduler.Flush(info);
+        bool presented;
+        {
+            std::scoped_lock submit_lock{Scheduler::submit_mutex};
+            presented = swapchain.Present();
+        }
+        if (presented)
+            break;
+        present_scheduler.Finish();
+        sampled = true;
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+    if (!is_reusing_frame) {
+        last_submit_frame = frame;
+        std::scoped_lock free_lock{free_mutex};
+        free_queue.push(frame);
+        free_cv.notify_one();
+        if (is_game_frame)
+            DebugState.IncFlipFrameNum();
+    }
+}
+#endif
 
 } // namespace Vulkan

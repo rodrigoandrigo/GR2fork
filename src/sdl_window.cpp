@@ -41,6 +41,19 @@ CMRC_DECLARE(res);
 
 namespace Frontend {
 
+#ifdef SHADPS4_UWP
+WindowSDL::WindowSDL(s32 width_, s32 height_, void* panel) : width{width_}, height{height_} {
+    ResizeEmbedded(width_, height_);
+    window_info.type = WindowSystemType::Windows;
+    window_info.render_surface = panel;
+}
+
+void WindowSDL::ResizeEmbedded(s32 width_, s32 height_) {
+    embedded_extent.store(u64{static_cast<u32>(width_)} |
+                          (u64{static_cast<u32>(height_)} << 32));
+}
+#endif
+
 using namespace Libraries::Pad;
 
 static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {

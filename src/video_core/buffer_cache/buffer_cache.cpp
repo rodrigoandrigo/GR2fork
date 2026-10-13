@@ -88,11 +88,16 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         .usage = ARENA_USAGE,
         .sharingMode = vk::SharingMode::eExclusive,
     };
-    const vk::DeviceBufferMemoryRequirements req_info = {
-        .pCreateInfo = &probe_ci,
-    };
     const auto device = instance.GetDevice();
+#ifdef SHADPS4_UWP
+    auto probe_info = probe_ci;
+    probe_info.usage &= ~vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    const auto probe = Vulkan::Check(device.createBufferUnique(probe_info));
+    const auto reqs = device.getBufferMemoryRequirements(*probe);
+#else
+    const vk::DeviceBufferMemoryRequirements req_info = {.pCreateInfo = &probe_ci};
     const auto reqs = device.getBufferMemoryRequirements(req_info).memoryRequirements;
+#endif
     block_size = Common::AlignUp(std::max<u64>(reqs.alignment, MIN_BLOCK_SIZE), reqs.alignment);
     ASSERT_MSG(std::popcount(block_size) == 1, "Sparse block size {} is not a power of 2",
                block_size);
@@ -527,7 +532,11 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     }
 
     const vk::MemoryAllocateFlagsInfo alloc_flags = {
+#ifdef SHADPS4_UWP
+        .flags = {},
+#else
         .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+#endif
     };
     const vk::MemoryAllocateInfo alloc_info = {
         .pNext = &alloc_flags,

@@ -221,6 +221,7 @@ struct dxil_spirv_runtime_conf {
 
    // Reserve generic IO locations when stages are compiled independently.
    uint32_t preserve_generic_io_location_count;
+   bool split_viewport_sizes;
 };
 
 struct dxil_spirv_debug_options {

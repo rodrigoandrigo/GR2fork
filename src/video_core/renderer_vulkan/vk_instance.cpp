@@ -172,14 +172,16 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
-    CreateDevice();
+    ASSERT_MSG(CreateDevice(), "Failed to initialize the Vulkan device");
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
 }
 
 Instance::~Instance() {
+#ifndef SHADPS4_UWP
     ImGui::Core::Shutdown(GetDevice());
+#endif
     vmaDestroyAllocator(allocator);
 }
 
@@ -229,7 +231,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -245,6 +247,17 @@ bool Instance::CreateDevice() {
         return false;
     };
 
+#ifdef SHADPS4_UWP
+    for (const char* extension : {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+                                 VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+                                 VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
+                                 VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME,
+                                 VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME,
+                                 VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
+                                 VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME}) {
+        ASSERT_MSG(add_extension(extension), "Required Dozen extension unavailable: {}", extension);
+    }
+#endif
     // Required
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
@@ -424,6 +437,9 @@ bool Instance::CreateDevice() {
                 .shaderInt16 = features.shaderInt16,
                 .sparseBinding = features.sparseBinding,
                 .sparseResidencyBuffer = features.sparseResidencyBuffer,
+#ifdef SHADPS4_UWP
+                .sparseResidencyAliased = features.sparseResidencyAliased,
+#endif
             },
         },
         vk::PhysicalDeviceVulkan11Features{
@@ -443,7 +459,11 @@ bool Instance::CreateDevice() {
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
             .hostQueryReset = vk12_features.hostQueryReset,
             .timelineSemaphore = vk12_features.timelineSemaphore,
+#ifdef SHADPS4_UWP
+            .bufferDeviceAddress = false,
+#else
             .bufferDeviceAddress = vk12_features.bufferDeviceAddress,
+#endif
             .shaderOutputLayer = vk12_features.shaderOutputLayer,
         },
         vk::PhysicalDeviceVulkan13Features{
@@ -454,6 +474,16 @@ bool Instance::CreateDevice() {
             .dynamicRendering = vk13_features.dynamicRendering,
             .maintenance4 = vk13_features.maintenance4,
         },
+#ifdef SHADPS4_UWP
+        vk::PhysicalDeviceDynamicRenderingFeaturesKHR{.dynamicRendering = vk13_features.dynamicRendering},
+        vk::PhysicalDeviceSynchronization2FeaturesKHR{.synchronization2 = vk13_features.synchronization2},
+        vk::PhysicalDeviceMaintenance4FeaturesKHR{.maintenance4 = vk13_features.maintenance4},
+        vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT{.subgroupSizeControl = vk13_features.subgroupSizeControl},
+        vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT{.shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation},
+        vk::PhysicalDeviceImageRobustnessFeaturesEXT{.robustImageAccess = vk13_features.robustImageAccess},
+        vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT{.extendedDynamicState = true},
+        vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT{.extendedDynamicState2 = true},
+#endif
         // Extensions
         vk::PhysicalDeviceCustomBorderColorFeaturesEXT{
             .customBorderColors = true,
@@ -471,7 +501,7 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceRobustness2FeaturesEXT{
             .robustBufferAccess2 = true,
-            .robustImageAccess2 = true,
+            .robustImageAccess2 = robustness2_features.robustImageAccess2,
             .nullDescriptor = true,
         },
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
@@ -533,6 +563,10 @@ bool Instance::CreateDevice() {
         },
     };
 
+#ifdef SHADPS4_UWP
+    device_chain.unlink<vk::PhysicalDeviceVulkan13Features>();
+    device_chain.unlink<vk::PhysicalDeviceMaintenance4FeaturesKHR>();
+#endif
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();
     }
@@ -644,7 +678,11 @@ void Instance::CreateAllocator() {
     };
 
     const VmaAllocatorCreateInfo allocator_info = {
+#ifdef SHADPS4_UWP
+        .flags = 0,
+#else
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+#endif
         .physicalDevice = physical_device,
         .device = *device,
         .pVulkanFunctions = &functions,
@@ -765,6 +803,8 @@ void Instance::CollectImageFormatInfo() {
 }
 
 void Instance::CollectToolingInfo() const {
+    if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceToolProperties)
+        return;
     if (driver_id == vk::DriverId::eAmdProprietary ||
         driver_id == vk::DriverId::eIntelProprietaryWindows) {
         // AMD: Causes issues with Reshade.

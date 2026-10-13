@@ -213,7 +213,7 @@ temp_var_info(const struct glsl_type* type, unsigned* size, unsigned* align)
 }
 
 static nir_variable *
-add_runtime_data_var(nir_shader *nir, unsigned desc_set, unsigned binding)
+add_runtime_data_var(nir_shader *nir, unsigned desc_set, unsigned binding, bool split_viewports)
 {
    /* Generated Dozen point-fill GS can already declare the same runtime CBV. */
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo) {
@@ -223,7 +223,8 @@ add_runtime_data_var(nir_shader *nir, unsigned desc_set, unsigned binding)
    unsigned runtime_data_size =
       nir->info.stage == MESA_SHADER_COMPUTE
          ? sizeof(struct dxil_spirv_compute_runtime_data)
-         : sizeof(struct dxil_spirv_vertex_runtime_data);
+         : split_viewports ? offsetof(struct dxil_spirv_vertex_runtime_data, viewport_sizes)
+                           : sizeof(struct dxil_spirv_vertex_runtime_data);
 
    const struct glsl_type *array_type =
       glsl_array_type(glsl_uint_type(), runtime_data_size / sizeof(unsigned),
@@ -614,13 +615,13 @@ load_viewport_size(nir_builder *b, const struct dxil_spirv_runtime_conf *conf,
                    nir_def *viewport_index)
 {
    const unsigned offset =
-      offsetof(struct dxil_spirv_vertex_runtime_data, viewport_sizes);
+      conf->split_viewport_sizes ? 0 : offsetof(struct dxil_spirv_vertex_runtime_data, viewport_sizes);
    nir_address_format format = nir_address_format_32bit_index_offset;
    nir_def *index = nir_vulkan_resource_index(
       b, nir_address_format_num_components(format),
       nir_address_format_bit_size(format), nir_imm_int(b, 0),
       .desc_set = conf->runtime_data_cbv.register_space,
-      .binding = conf->runtime_data_cbv.base_shader_register,
+      .binding = conf->runtime_data_cbv.base_shader_register + (conf->split_viewport_sizes ? 1 : 0),
       .desc_type = nir_descriptor_type_uniform_buffer);
    nir_def *descriptor = nir_load_vulkan_descriptor(
       b, nir_address_format_num_components(format),
@@ -866,7 +867,7 @@ dxil_spirv_write_pntc(nir_shader *nir, const struct dxil_spirv_runtime_conf *con
    };
    nir_variable *ubo_var = nir_get_binding_variable(nir, binding);
    if (!ubo_var)
-      add_runtime_data_var(nir, conf->runtime_data_cbv.register_space, conf->runtime_data_cbv.base_shader_register);
+      add_runtime_data_var(nir, conf->runtime_data_cbv.register_space, conf->runtime_data_cbv.base_shader_register, conf->split_viewport_sizes);
    return true;
 }
 
@@ -1278,7 +1279,10 @@ dxil_spirv_nir_passes(nir_shader *nir,
 
    if (metadata->requires_runtime_data) {
       add_runtime_data_var(nir, conf->runtime_data_cbv.register_space,
-                           conf->runtime_data_cbv.base_shader_register);
+                           conf->runtime_data_cbv.base_shader_register, conf->split_viewport_sizes);
+      if (conf->split_viewport_sizes && nir->info.stage != MESA_SHADER_COMPUTE)
+         add_push_constant_var(nir, sizeof(((struct dxil_spirv_vertex_runtime_data *)0)->viewport_sizes),
+                               conf->runtime_data_cbv.register_space, conf->runtime_data_cbv.base_shader_register + 1);
    }
 
    if (push_constant_size > 0) {

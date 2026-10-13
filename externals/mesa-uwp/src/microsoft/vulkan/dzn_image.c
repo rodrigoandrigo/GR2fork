@@ -1630,6 +1630,7 @@ dzn_buffer_view_create(struct dzn_device *device,
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vk_object_base_init(&device->vk, &bview->base, VK_OBJECT_TYPE_BUFFER_VIEW);
+   bview->format = pCreateInfo->format;
 
    enum pipe_format pfmt = vk_format_to_pipe_format(pCreateInfo->format);
    unsigned blksz = util_format_get_blocksize(pfmt);

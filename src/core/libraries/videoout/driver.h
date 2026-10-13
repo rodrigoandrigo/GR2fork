@@ -9,6 +9,7 @@
 #include "video_core/presentation_sink.h"
 
 #include <condition_variable>
+#include <atomic>
 #include <mutex>
 #include <queue>
 
@@ -28,7 +29,7 @@ struct VideoOutPort {
     std::mutex port_mutex;
     std::condition_variable vo_cv;
     std::condition_variable vblank_cv;
-    int flip_rate = 0;
+    std::atomic<int> flip_rate{0};
     int prev_index = -1;
     bool is_open = false;
     bool is_hdr = false;
@@ -112,6 +113,11 @@ private:
     std::mutex mutex;
     VideoOutPort main_port{};
     std::jthread present_thread;
+#ifdef SHADPS4_UWP
+    std::jthread flip_thread;
+    std::condition_variable_any flip_ready;
+    void OrderedPresentThread(std::stop_token token);
+#endif
     std::queue<Request> requests;
 };
 

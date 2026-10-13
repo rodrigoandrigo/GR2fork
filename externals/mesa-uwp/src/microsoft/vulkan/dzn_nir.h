@@ -177,4 +177,8 @@ bool dzn_nir_lower_last_provoking_vertex(nir_shader *nir);
 nir_shader *
 dzn_nir_polygon_point_mode_gs(const nir_shader *vs, struct dzn_nir_point_gs_info *info);
 
+struct dzn_pipeline_layout;
+bool dzn_nir_lower_robust_images(nir_shader *nir, const struct dzn_pipeline_layout *layout,
+                                 bool images, bool buffers);
+
 #endif

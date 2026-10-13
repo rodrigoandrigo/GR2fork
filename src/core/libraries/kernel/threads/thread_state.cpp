@@ -37,7 +37,13 @@ void ThreadState::Collect(Pthread* curthread) {
         std::scoped_lock lk{thread_list_lock};
         for (auto it = gc_list.begin(); it != gc_list.end();) {
             Pthread* td = *it;
-            if (td->tid != TidTerminated) {
+            if (td->tid != TidTerminated
+#ifdef SHADPS4_UWP
+                || (td->native_thr &&
+                    WaitForSingleObjectEx(reinterpret_cast<HANDLE>(td->native_thr->GetHandle()), 0,
+                                          FALSE) != WAIT_OBJECT_0)
+#endif
+            ) {
                 ++it;
                 continue;
             }
@@ -50,6 +56,32 @@ void ThreadState::Collect(Pthread* curthread) {
         Free(curthread, td);
     }
 }
+
+#ifdef SHADPS4_UWP
+ThreadState::~ThreadState() {
+    ReleaseResources();
+}
+
+void ThreadState::ReleaseResources() {
+    const auto release = [](Pthread* thread) {
+        delete[] thread->specific;
+        for (auto* cleanup : thread->cleanup)
+            if (cleanup->onheap)
+                delete cleanup;
+        delete thread->sleepqueue;
+        std::destroy_at(thread);
+    };
+    for (auto* thread : threads)
+        release(thread);
+    for (auto* thread : gc_list)
+        release(thread);
+    for (auto* thread : free_threads)
+        release(thread);
+    threads.clear();
+    gc_list.clear();
+    free_threads.clear();
+}
+#endif
 
 void ThreadState::TryCollect(Pthread* thread) {
     SCOPE_EXIT {
@@ -103,6 +135,9 @@ Pthread* ThreadState::Alloc(Pthread* curthread) {
         tcb = TcbCtor(thread, 1 /* initial tls */);
     }
     if (tcb != nullptr) {
+#ifdef SHADPS4_UWP
+        std::destroy_at(thread);
+#endif
         // Initialize thread struct memory to 0. This is safe since it will be constructed
         // immediately after.
         std::memset(static_cast<void*>(thread), 0, sizeof(Pthread));

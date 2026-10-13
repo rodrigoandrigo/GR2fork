@@ -83,6 +83,9 @@ void UniqueBuffer::Destroy() {
 
 void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                           VmaAllocationInfo* out_alloc_info) {
+#ifdef SHADPS4_UWP
+    buffer_ci.usage &= ~vk::BufferUsageFlagBits::eShaderDeviceAddress;
+#endif
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
     if (mem_type != MemoryType::Sparse) {
         const VmaAllocationCreateFlags bda_flag =
@@ -107,6 +110,9 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
     } else {
         buffer_ci.flags |=
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+#ifdef SHADPS4_UWP
+        buffer_ci.flags |= vk::BufferCreateFlagBits::eSparseAliased;
+#endif
         buffer = Vulkan::Check(device.createBuffer(buffer_ci));
     }
 

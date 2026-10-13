@@ -12,6 +12,9 @@ class SymbolsResolver;
 }
 
 namespace Libraries::Ajm {
+#ifdef SHADPS4_UWP
+void ShutdownAjm();
+#endif
 
 constexpr u32 ORBIS_AT9_CONFIG_DATA_SIZE = 4;
 constexpr u32 AJM_INSTANCE_STATISTICS = 0x80000;

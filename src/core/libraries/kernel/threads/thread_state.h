@@ -29,6 +29,10 @@ struct ThreadState {
     static constexpr size_t MaxCachedThreads = 100;
 
     explicit ThreadState();
+#ifdef SHADPS4_UWP
+    ~ThreadState();
+    void ReleaseResources();
+#endif
 
     bool GcNeeded() const noexcept {
         return gc_list.size() >= GcThreshold;

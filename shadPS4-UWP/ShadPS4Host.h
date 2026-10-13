@@ -16,6 +16,8 @@ public:
     ~ShadPS4Host();
     void Initialize(const std::wstring& user_directory, uint32_t width, uint32_t height,
                     bool frontend = false, bool game_surface = false);
+    void Reload(const std::wstring& user_directory, uint32_t width, uint32_t height,
+                bool frontend, bool game_surface);
     uint32_t State() const { return state ? state() : SHADPS4_UNINITIALIZED; }
     template <typename T>
     T GetApi(const char* name) {
@@ -25,6 +27,7 @@ public:
     void Run(std::wstring executable, std::function<void(std::wstring)> completed);
     void Pause(bool paused);
     void Stop();
+    void Wait();
     void Resize(uint32_t width, uint32_t height);
     bool Render();
     std::wstring Error() const;
@@ -63,6 +66,9 @@ private:
     decltype(&shadps4_file_read) read_file{};
     decltype(&shadps4_file_close) close_file{};
     std::thread presentation_thread;
+    std::thread session_thread;
+    std::mutex module_mutex;
+    std::atomic_bool stop_pending{};
     std::mutex work_mutex;
     std::condition_variable work_ready;
     bool closing{};

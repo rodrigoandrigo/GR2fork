@@ -4,6 +4,7 @@
 #pragma once
 
 #include <span>
+#include <atomic>
 #include <string>
 
 #include "common/types.h"
@@ -48,15 +49,25 @@ class WindowSDL {
     int keyboard_grab = 0;
 
 public:
+#ifdef SHADPS4_UWP
+    explicit WindowSDL(s32 width, s32 height, void* panel);
+    void ResizeEmbedded(s32 width, s32 height);
+#endif
     explicit WindowSDL(s32 width, s32 height, Input::GameControllers* controllers,
                        std::string_view window_title);
     ~WindowSDL();
 
     s32 GetWidth() const {
+#ifdef SHADPS4_UWP
+        return static_cast<s32>(embedded_extent.load());
+#endif
         return width;
     }
 
     s32 GetHeight() const {
+#ifdef SHADPS4_UWP
+        return static_cast<s32>(embedded_extent.load() >> 32);
+#endif
         return height;
     }
 
@@ -91,6 +102,9 @@ private:
     Input::GameControllers controllers{};
     WindowSystemInfo window_info{};
     SDL_Window* window{};
+#ifdef SHADPS4_UWP
+    std::atomic<u64> embedded_extent{};
+#endif
     bool is_shown{};
     bool is_open{true};
 };

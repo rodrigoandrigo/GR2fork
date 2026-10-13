@@ -3695,8 +3695,6 @@ dzn_cmd_buffer_update_heaps(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint)
                uint32_t dynamic_buffer_count = pipeline->sets[s].dynamic_buffer_count;
                for (uint32_t o = 0; o < dynamic_buffer_count; o++) {
                   struct dzn_buffer_desc bdesc = set->dynamic_buffers[o];
-                  if (!bdesc.buffer)
-                     continue;
                   bdesc.offset += desc_state->sets[s].dynamic_offsets[o];
 
                   bool primary_is_writable = bdesc.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
@@ -3714,6 +3712,43 @@ dzn_cmd_buffer_update_heaps(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint)
                   }
                }
             }
+         }
+
+         if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+             pipeline->image_metadata_offset != ~0u) {
+            uint32_t elements = MAX2(pipeline->image_metadata_offset, 1);
+            uint32_t bytes = elements * sizeof(uint32_t);
+            ID3D12Resource *upload;
+            uint64_t offset;
+            VkResult result = dzn_cmd_buffer_alloc_internal_buf(
+                cmdbuf, bytes, DZN_INTERNAL_BUF_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 256,
+                &upload, &offset);
+            if (result != VK_SUCCESS)
+               return;
+            void *mapped;
+            D3D12_RANGE read_range = {0, 0};
+            if (FAILED(ID3D12Resource_Map(upload, 0, &read_range, &mapped))) {
+               vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_MEMORY_MAP_FAILED);
+               return;
+            }
+            if (pipeline->image_metadata_offset)
+               memcpy((char *)mapped + offset, dst_heap->format_defaults + dst_heap_offset, bytes);
+            else
+               memset((char *)mapped + offset, 0, bytes);
+            D3D12_RANGE written = {offset, offset + bytes};
+            ID3D12Resource_Unmap(upload, 0, &written);
+            D3D12_SHADER_RESOURCE_VIEW_DESC desc = {
+                .Format = DXGI_FORMAT_R32_TYPELESS,
+                .ViewDimension = D3D12_SRV_DIMENSION_BUFFER,
+                .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .Buffer = {.FirstElement = offset / 4,
+                           .NumElements = elements,
+                           .Flags = D3D12_BUFFER_SRV_FLAG_RAW},
+            };
+            ID3D12Device1_CreateShaderResourceView(
+                device->dev, upload, &desc,
+                dzn_descriptor_heap_get_cpu_handle(dst_heap, dst_heap_offset +
+                                                                 pipeline->image_metadata_offset));
          }
 
          new_heaps[type] = dst_heap;
@@ -3825,8 +3860,27 @@ dzn_cmd_buffer_update_sysvals(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint)
    uint32_t sysval_cbv_param_idx = pipeline->root.sysval_cbv_param_idx;
 
    if (bindpoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+      ID3D12Resource *upload;
+      uint64_t offset;
+      VkResult result = dzn_cmd_buffer_alloc_internal_buf(cmdbuf, 256, DZN_INTERNAL_BUF_UPLOAD,
+         D3D12_RESOURCE_STATE_GENERIC_READ, 256, &upload, &offset);
+      if (result != VK_SUCCESS)
+         return;
+      void *mapped;
+      D3D12_RANGE empty = {0, 0};
+      if (FAILED(ID3D12Resource_Map(upload, 0, &empty, &mapped))) {
+         vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_MEMORY_MAP_FAILED);
+         return;
+      }
+      memset((uint8_t *)mapped + offset, 0, 256);
+      memcpy((uint8_t *)mapped + offset, cmdbuf->state.sysvals.gfx.viewport_sizes,
+             sizeof(cmdbuf->state.sysvals.gfx.viewport_sizes));
+      D3D12_RANGE written = {offset, offset + 256};
+      ID3D12Resource_Unmap(upload, 0, &written);
+      ID3D12GraphicsCommandList1_SetGraphicsRootConstantBufferView(cmdbuf->cmdlist,
+         pipeline->root.viewport_cbv_param_idx, ID3D12Resource_GetGPUVirtualAddress(upload) + offset);
       ID3D12GraphicsCommandList1_SetGraphicsRoot32BitConstants(cmdbuf->cmdlist, sysval_cbv_param_idx,
-                                                     sizeof(cmdbuf->state.sysvals.gfx) / 4,
+                                                     offsetof(struct dxil_spirv_vertex_runtime_data, viewport_sizes) / 4,
                                                      &cmdbuf->state.sysvals.gfx, 0);
    } else {
       ID3D12GraphicsCommandList1_SetComputeRoot32BitConstants(cmdbuf->cmdlist, sysval_cbv_param_idx,

@@ -22,6 +22,9 @@ namespace Libraries::Ajm {
 class AjmContext {
 public:
     AjmContext();
+#ifdef SHADPS4_UWP
+    ~AjmContext();
+#endif
 
     s32 InstanceCreate(AjmCodecType codec_type, AjmInstanceFlags flags, u32* out_instance_id);
     s32 InstanceDestroy(u32 instance_id);

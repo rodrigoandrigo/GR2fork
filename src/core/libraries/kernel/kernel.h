@@ -12,6 +12,9 @@ class SymbolsResolver;
 }
 
 namespace Libraries::Kernel {
+#ifdef SHADPS4_UWP
+void ShutdownKernel();
+#endif
 
 void ErrSceToPosix(s32 result);
 s32 ErrnoToSceKernelError(s32 e);

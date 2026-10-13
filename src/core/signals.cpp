@@ -12,6 +12,9 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/signals.h"
 #include "emulator.h"
+#ifdef SHADPS4_UWP
+#include "uwp/session.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -31,6 +34,11 @@ namespace Core {
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
     const auto* signals = Signals::Instance();
+#ifdef SHADPS4_UWP
+    if (pExp && pExp->ExceptionRecord &&
+        pExp->ExceptionRecord->ExceptionCode == 0xe06d7363)
+        return EXCEPTION_CONTINUE_SEARCH;
+#endif
 
     const bool use_static_windows_guest_red_zone_protection =
         WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
@@ -143,7 +151,14 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+#ifdef SHADPS4_UWP
+        if (g_curthread && guest_info._si_signo != 0) {
+            Uwp::FailGuestSession(fmt::format("Unhandled guest exception {:#x} at {}", code, address));
+            posix_pthread_exit(nullptr);
+        }
+#else
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+#endif
     }
 
     return EXCEPTION_CONTINUE_SEARCH;

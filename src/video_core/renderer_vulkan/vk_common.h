@@ -3,6 +3,10 @@
 
 #pragma once
 
+#if defined(SHADPS4_UWP) && !defined(VK_USE_PLATFORM_WIN32_KHR)
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
+
 // Include vulkan-hpp header
 #define VK_ENABLE_BETA_EXTENSIONS
 #define VK_NO_PROTOTYPES

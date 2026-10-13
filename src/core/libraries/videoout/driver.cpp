@@ -58,17 +58,39 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
             } apartment;
             PresentThread(token);
         } catch (const winrt::hresult_error& error) {
-            Core::Uwp::FailGuestSession("D3D12 VideoOut: " + winrt::to_string(error.message()));
+            if (!Core::Uwp::StopRequested())
+                Core::Uwp::FailGuestSession("D3D12 VideoOut: " + winrt::to_string(error.message()));
         } catch (const std::exception& error) {
-            Core::Uwp::FailGuestSession("D3D12 VideoOut: " + std::string(error.what()));
+            if (!Core::Uwp::StopRequested())
+                Core::Uwp::FailGuestSession("D3D12 VideoOut: " + std::string(error.what()));
         }
 #else
         PresentThread(token);
 #endif
     });
+#ifdef SHADPS4_UWP
+    flip_thread = std::jthread([this](std::stop_token token) {
+        try {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            struct ApartmentLifetime {
+                ~ApartmentLifetime() { winrt::uninit_apartment(); }
+            } apartment;
+            OrderedPresentThread(token);
+        } catch (const std::exception& error) {
+            if (!Core::Uwp::StopRequested())
+                Core::Uwp::FailGuestSession("Dozen presentation: " + std::string(error.what()));
+        }
+    });
+#endif
 }
 
 VideoOutDriver::~VideoOutDriver() {
+#ifdef SHADPS4_UWP
+    flip_thread.request_stop();
+    flip_ready.notify_all();
+    if (flip_thread.joinable())
+        flip_thread.join();
+#endif
     present_thread.request_stop();
     if (present_thread.joinable())
         present_thread.join();
@@ -366,6 +388,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .eop = is_eop,
         });
 #ifdef SHADPS4_UWP
+        flip_ready.notify_one();
     } catch (const winrt::hresult_error& error) {
         Core::Uwp::FailGuestSession("D3D12 flip: " + winrt::to_string(error.message()));
     } catch (const std::exception& error) {
@@ -395,7 +418,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     while (!token.stop_requested()) {
         timer.Start();
+        auto& vblank_status = main_port.vblank_status;
 
+#ifndef SHADPS4_UWP
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
             timer.End();
@@ -403,7 +428,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         // Check if it's time to take a request.
-        auto& vblank_status = main_port.vblank_status;
         if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (!request) {
@@ -419,6 +443,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 FRAME_END;
             }
         }
+#endif
 
         {
             // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
@@ -447,5 +472,38 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         timer.End();
     }
 }
+
+#ifdef SHADPS4_UWP
+void VideoOutDriver::OrderedPresentThread(std::stop_token token) {
+    Common::SetCurrentThreadName("shadPS4:OrderedPresent");
+    u64 last_vblank = 0;
+    while (!token.stop_requested()) {
+        Request request;
+        {
+            std::unique_lock lock{mutex};
+            if (!flip_ready.wait(lock, token, [this] { return !requests.empty(); }))
+                return;
+            request = requests.front();
+            requests.pop();
+        }
+        const auto rate = request.port->flip_rate.load();
+        if (rate > 0) {
+            std::unique_lock lock{request.port->vo_mutex};
+            const auto target = last_vblank + static_cast<u64>(rate) + 1;
+            while (request.port->vblank_status.count < target) {
+                if (token.stop_requested() || Core::Uwp::StopRequested())
+                    return;
+                request.port->vblank_cv.wait_for(lock, std::chrono::milliseconds(10));
+            }
+        }
+        Flip(request);
+        {
+            std::scoped_lock lock{request.port->vo_mutex};
+            last_vblank = request.port->vblank_status.count;
+        }
+        FRAME_END;
+    }
+}
+#endif
 
 } // namespace Libraries::VideoOut

@@ -1,5 +1,7 @@
 # Renderer D3D12: estado de implementação
 
+O backend nativo descrito abaixo foi preservado como trabalho experimental. O caminho padrão UWP passou a Vulkan/Dozen; veja [DOZEN-UWP.md](DOZEN-UWP.md).
+
 Existe um renderer guest experimental ligado ao Liverpool. O renderer completo de jogos PS4 ainda não está concluído, e o boot de jogos permanece desabilitado. Nenhum resultado abaixo comprova execução de jogos, AppContainer ou Xbox.
 
 ## Caminhos implementados

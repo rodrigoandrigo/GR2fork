@@ -51,6 +51,11 @@
 #include "core/debug_state.h"
 #include "uwp/session.h"
 #include "uwp/shadps4_api.h"
+#include "core/libraries/audio/audioout_backend.h"
+#include "core/libraries/videoout/video_out.h"
+#include "core/libraries/kernel/threads/thread_state.h"
+#include "core/libraries/ajm/ajm.h"
+#include "core/libraries/videodec/vdecsw.h"
 #endif
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
@@ -93,10 +98,13 @@ Emulator::Emulator() {
 #endif
 }
 
-Emulator::~Emulator() {}
+Emulator::~Emulator() {
+#ifdef SHADPS4_UWP
+    WSACleanup();
+#endif
+}
 
 void Emulator::Shutdown() {
-    static bool exit_done = false;
     std::scoped_lock l{exit_mutex};
     if (exit_done) {
         return;
@@ -122,6 +130,10 @@ s32 ReadCompiledSdkVersion(const std::string& guest_or_host_path) {
     std::unique_ptr<Core::FileSys::IFile> handle;
     if (!guest_or_host_path.empty() && guest_or_host_path.front() == '/') {
         handle = mnt->Open(guest_or_host_path, /*writable=*/false);
+#ifdef SHADPS4_UWP
+        if (!handle)
+            throw std::runtime_error("The brokered executable could not be opened");
+#endif
     }
 
     Core::Loader::Elf elf;
@@ -141,7 +153,8 @@ s32 ReadCompiledSdkVersion(const std::string& guest_or_host_path) {
 
     if (i_procparam != elf_pheader.end()) {
         Core::OrbisProcParam param{};
-        elf.LoadSegment(u64(&param), i_procparam->p_offset, i_procparam->p_filesz);
+        elf.LoadSegment(u64(&param), i_procparam->p_offset,
+                        std::min<u64>(i_procparam->p_filesz, sizeof(param)));
         return param.sdk_version;
     }
     return 0;
@@ -297,6 +310,14 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         Debugger::WaitForDebuggerAttach();
     }
 
+#ifdef SHADPS4_UWP
+    const auto guest_file = file.generic_string();
+    if (!guest_file.starts_with("/app0/"))
+        throw std::runtime_error("Embedded boot requires a brokered /app0 executable");
+    std::filesystem::path game_folder{"/app0"};
+    const auto eboot_name = file.lexically_relative(game_folder);
+    auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
+#else
     if (std::filesystem::is_directory(file)) {
         file /= "eboot.bin";
     }
@@ -391,13 +412,14 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     mnt->Mount(game_folder, "/app0", true);
     // Certain games may use /hostapp as well such as CUSA001100
     mnt->Mount(game_folder, "/hostapp", true);
+#endif
 
     // Load param.sfo details if it exists
     std::string id;
     std::string title;
     std::string app_version;
-    u32 sdk_version;
-    u32 fw_version;
+    u32 sdk_version{};
+    u32 fw_version{0x4700000};
     bool param_sfo_exists = false;
     Common::PSFAttributes psf_attributes{};
 
@@ -626,11 +648,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         args.insert(args.begin(), guest_eboot_path);
     }
 
+#ifndef SHADPS4_UWP
     const auto mods_folder = FileSys::OverlayPath(game_folder, "-mods");
 
     if (std::filesystem::exists(mods_folder) && !std::filesystem::is_empty(mods_folder)) {
         LOG_INFO(Loader, "Files found in game mods folder");
     }
+#endif
 
 #ifdef _WIN32
     // Enable red-zone patching if the setting is enabled
@@ -798,14 +822,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
 #ifdef SHADPS4_UWP
     Uwp::SetGuestReady(true);
-    if (Uwp::PauseRequested()) {
+    if (Uwp::PauseRequested() && !Uwp::StopRequested()) {
         DebugState.PauseGuestThreads();
     }
     while (!Uwp::StopRequested())
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     Uwp::SetGuestReady(false);
-    DebugState.PauseGuestThreads();
-    Shutdown();
+    StopGuest();
 #else
     window->InitTimers();
     while (window->IsOpen())
@@ -813,6 +836,26 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::quick_exit(0);
 #endif
 }
+
+#ifdef SHADPS4_UWP
+void Emulator::StopGuest() {
+    Uwp::SetGuestReady(false);
+    DebugState.ResumeGuestThreads();
+    if (linker) {
+        Libraries::Kernel::StopGuestThreads();
+        linker->Stop();
+    }
+    Libraries::VideoOut::ShutdownVideoOut();
+    Libraries::AudioOut::ShutdownAudioOut();
+    Libraries::Ajm::ShutdownAjm();
+    Libraries::Vdecsw::ShutdownVdecsw();
+    Libraries::Np::NpHandler::GetInstance().Shutdown();
+    Libraries::Kernel::ShutdownKernel();
+    if (linker)
+        Libraries::Kernel::ThrState::Instance()->ReleaseResources();
+    Shutdown();
+}
+#endif
 
 void Emulator::Restart(std::filesystem::path eboot_path,
                        const std::vector<std::string>& guest_args) {

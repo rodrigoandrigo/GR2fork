@@ -8,8 +8,23 @@
 #include "core/libraries/videodec/vdecsw.h"
 #include "core/libraries/videodec/vdecsw_impl.h"
 #include "core/libraries/videodec/videodec_error.h"
+#ifdef SHADPS4_UWP
+#include <mutex>
+#include <unordered_set>
+#endif
 
 namespace Libraries::Vdecsw {
+#ifdef SHADPS4_UWP
+static std::mutex decoders_mutex;
+static std::unordered_set<VdecDecoder*> decoders;
+
+void ShutdownVdecsw() {
+    std::scoped_lock lock{decoders_mutex};
+    for (auto* decoder : decoders)
+        delete decoder;
+    decoders.clear();
+}
+#endif
 
 static constexpr u64 kMinimumMemorySize = 16_MB; ///> Fake minimum memory size for querying
 
@@ -158,7 +173,14 @@ s32 PS4_SYSV_ABI sceVdecswCreateDecoder(const OrbisVdecswDecoderConfigInfo* deco
         return ORBIS_VDECSW_ERROR_STRUCT_SIZE;
     }
 
+#ifdef SHADPS4_UWP
+    auto decoder = std::make_unique<VdecDecoder>(*decoder_config_info_in, *decoder_memory_info_in);
+    std::scoped_lock lock{decoders_mutex};
+    decoders.insert(decoder.get());
+    *decoder_instance_out = decoder.release();
+#else
     *decoder_instance_out = new VdecDecoder(*decoder_config_info_in, *decoder_memory_info_in);
+#endif
     return ORBIS_OK;
 }
 
@@ -170,6 +192,11 @@ s32 PS4_SYSV_ABI sceVdecswDeleteDecoder(OrbisVdecswDecoder decoder_instance_in) 
         return ORBIS_VDECSW_ERROR_DECODER_INSTANCE;
     }
 
+#ifdef SHADPS4_UWP
+    std::scoped_lock lock{decoders_mutex};
+    if (!decoders.erase(decoder_instance_in))
+        return ORBIS_VDECSW_ERROR_DECODER_INSTANCE;
+#endif
     delete decoder_instance_in;
     return ORBIS_OK;
 }

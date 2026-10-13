@@ -30,6 +30,8 @@
 #include "dxil_spirv_nir.h"
 
 #include "util/mesa-blake3.h"
+#include "util/format/u_format.h"
+#include "vk_format.h"
 
 static uint32_t
 translate_desc_stages(VkShaderStageFlags in)
@@ -643,8 +645,7 @@ dzn_pipeline_layout_destroy(struct vk_device *vk_device,
    vk_pipeline_layout_destroy(vk_device, &layout->vk);
 }
 
-// Reserve two root parameters for the push constants and sysvals CBVs.
-#define MAX_INTERNAL_ROOT_PARAMS 2
+#define MAX_INTERNAL_ROOT_PARAMS 3
 
 // One root parameter for samplers and the other one for views, multiplied by
 // the number of visibility combinations, plus the internal root parameters.
@@ -683,6 +684,9 @@ dzn_pipeline_layout_hash_stages(struct dzn_pipeline_layout *layout,
                continue;
 
             _mesa_blake3_update(&ctx, &b, sizeof(b));
+            _mesa_blake3_update(&ctx, &set, sizeof(set));
+            _mesa_blake3_update(&ctx, &layout->binding_translation[set].image_offsets[b],
+                                sizeof(uint32_t));
             _mesa_blake3_update(&ctx, &set_layout->bindings[b].base_shader_register,
                               sizeof(set_layout->bindings[b].base_shader_register));
          }
@@ -712,6 +716,7 @@ dzn_pipeline_layout_create(struct dzn_device *device,
    VK_MULTIALLOC(ma);
    VK_MULTIALLOC_DECL(&ma, struct dzn_pipeline_layout, layout, 1);
    VK_MULTIALLOC_DECL(&ma, uint32_t, binding_translation, binding_count);
+   VK_MULTIALLOC_DECL(&ma, uint32_t, image_offsets, binding_count);
    VK_MULTIALLOC_DECL(&ma, uint8_t, binding_class, binding_count);
 
    if (!vk_pipeline_layout_multizalloc(&device->vk, &ma, pCreateInfo))
@@ -726,6 +731,8 @@ dzn_pipeline_layout_create(struct dzn_device *device,
          continue;
 
       layout->binding_translation[s].base_reg = binding_translation;
+      layout->binding_translation[s].image_offsets = image_offsets;
+      image_offsets += set_layout->binding_count;
       layout->binding_translation[s].binding_class = binding_class;
       binding_translation += set_layout->binding_count;
       binding_class += set_layout->binding_count;
@@ -769,6 +776,17 @@ dzn_pipeline_layout_create(struct dzn_device *device,
             range_count += set_layout->range_count[i][type];
       }
 
+      for (uint32_t b = 0; b < set_layout->binding_count; b++) {
+         uint32_t image_offset = ~0u;
+         if (!device->bindless && set_layout->bindings[b].descriptor_count) {
+            image_offset = dzn_descriptor_set_layout_get_heap_offset(
+                set_layout, b, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, false, false);
+            if (image_offset != ~0u)
+               image_offset += layout->sets[j].heap_offsets[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV];
+         }
+         layout->binding_translation[j].image_offsets[b] = image_offset;
+      }
+
       if (!device->bindless)
          layout->desc_count[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV] += set_layout->dynamic_buffers.desc_count;
 
@@ -794,6 +812,12 @@ dzn_pipeline_layout_create(struct dzn_device *device,
             layout->sets[j].dynamic_buffer_heap_offsets[o].alt = alt_heap_offset != ~0 ? alt_heap_offset + elem : ~0;
          }
       }
+   }
+
+   layout->image_metadata_offset = ~0u;
+   if (!device->bindless) {
+      layout->image_metadata_offset = layout->desc_count[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV]++;
+      range_count++;
    }
 
    D3D12_DESCRIPTOR_RANGE1 *ranges =
@@ -856,6 +880,19 @@ dzn_pipeline_layout_create(struct dzn_device *device,
                range_ptr += range_count;
             }
 
+            if (i == D3D12_SHADER_VISIBILITY_ALL &&
+                type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+               *range_ptr++ = (D3D12_DESCRIPTOR_RANGE1){
+                   .RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                   .NumDescriptors = 1,
+                   .BaseShaderRegister = DZN_IMAGE_METADATA_BINDING,
+                   .RegisterSpace = DZN_REGISTER_SPACE_SYSVALS,
+                   .Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+                   .OffsetInDescriptorsFromTableStart = layout->image_metadata_offset,
+               };
+               root_param->DescriptorTable.NumDescriptorRanges++;
+            }
+
             if (root_param->DescriptorTable.NumDescriptorRanges) {
                layout->root.type[layout->root.param_count++] = (D3D12_DESCRIPTOR_HEAP_TYPE)type;
                root_dwords++;
@@ -885,11 +922,20 @@ dzn_pipeline_layout_create(struct dzn_device *device,
    root_param->Descriptor.RegisterSpace = DZN_REGISTER_SPACE_SYSVALS;
    root_param->Constants.ShaderRegister = 0;
    root_param->Constants.Num32BitValues =
-       DIV_ROUND_UP(MAX2(sizeof(struct dxil_spirv_vertex_runtime_data),
+       DIV_ROUND_UP(MAX2(offsetof(struct dxil_spirv_vertex_runtime_data, viewport_sizes),
                          sizeof(struct dxil_spirv_compute_runtime_data)),
                     4);
    root_param->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
    root_dwords += root_param->Constants.Num32BitValues;
+   layout->root.viewport_cbv_param_idx = layout->root.param_count;
+   root_param = &root_params[layout->root.param_count++];
+   root_param->ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+   root_param->Descriptor.RegisterSpace = DZN_REGISTER_SPACE_SYSVALS;
+   root_param->Descriptor.ShaderRegister = 1;
+   root_param->Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
+   root_param->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+   root_dwords += 2;
+
 
    if (pdev->root_sig_version >= D3D_ROOT_SIGNATURE_VERSION_1_2) {
       D3D12_STATIC_SAMPLER_DESC1 *static_sampler_ptr = static_sampler_descs;
@@ -996,6 +1042,8 @@ dzn_CreatePipelineLayout(VkDevice device,
 void
 dzn_descriptor_heap_finish(struct dzn_descriptor_heap *heap)
 {
+   free(heap->format_defaults);
+   heap->format_defaults = NULL;
    if (heap->heap)
       ID3D12DescriptorHeap_Release(heap->heap);
 }
@@ -1024,6 +1072,15 @@ dzn_descriptor_heap_init(struct dzn_descriptor_heap *heap,
       return vk_error(device,
                       shader_visible ?
                       VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+      heap->format_defaults = calloc(desc_count, sizeof(uint32_t));
+      if (!heap->format_defaults) {
+         ID3D12DescriptorHeap_Release(heap->heap);
+         heap->heap = NULL;
+         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
    }
 
    D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = dzn_ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap->heap);
@@ -1067,6 +1124,55 @@ dzn_descriptor_heap_write_sampler_desc(struct dzn_device *device,
                                   dzn_descriptor_heap_get_cpu_handle(heap, desc_offset));
 }
 
+static void
+dzn_descriptor_heap_write_null_desc(struct dzn_device *device,
+                                    struct dzn_descriptor_heap *heap,
+                                    uint32_t offset, bool writable,
+                                    bool buffer)
+{
+   D3D12_CPU_DESCRIPTOR_HANDLE handle = dzn_descriptor_heap_get_cpu_handle(heap, offset);
+   if (writable) {
+      D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {
+         .Format = buffer ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_R32G32B32A32_FLOAT,
+         .ViewDimension = buffer ? D3D12_UAV_DIMENSION_BUFFER : D3D12_UAV_DIMENSION_TEXTURE2D,
+      };
+      if (buffer) {
+         desc.Buffer.NumElements = 1;
+         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+      }
+      ID3D12Device1_CreateUnorderedAccessView(device->dev, NULL, NULL, &desc, handle);
+   } else {
+      D3D12_SHADER_RESOURCE_VIEW_DESC desc = {
+         .Format = buffer ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_R32G32B32A32_FLOAT,
+         .ViewDimension = buffer ? D3D12_SRV_DIMENSION_BUFFER : D3D12_SRV_DIMENSION_TEXTURE2D,
+         .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+      };
+      if (buffer) {
+         desc.Buffer.NumElements = 1;
+         desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+      } else {
+         desc.Texture2D.MipLevels = 1;
+      }
+      ID3D12Device1_CreateShaderResourceView(device->dev, NULL, &desc, handle);
+   }
+}
+
+static uint32_t dzn_format_defaults(VkFormat format, uint32_t mapping)
+{
+   const struct util_format_description *desc =
+       util_format_description(vk_format_to_pipe_format(format));
+   uint32_t ones = 0, mapped = 0;
+   for (unsigned c = 0; c < 4; c++)
+      ones |= (desc->swizzle[c] == PIPE_SWIZZLE_1) << c;
+   for (unsigned c = 0; c < 4; c++) {
+      unsigned source = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(c, mapping);
+      if (source == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1 ||
+          (source < 4 && (ones & BITFIELD_BIT(source))))
+         mapped |= BITFIELD_BIT(c);
+   }
+   return mapped;
+}
+
 void
 dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
                                           struct dzn_descriptor_heap *heap,
@@ -1074,6 +1180,16 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
                                           bool writeable, bool cube_as_2darray,
                                           const struct dzn_image_view *iview)
 {
+   heap->format_defaults[desc_offset] =
+       iview ? dzn_format_defaults(iview->vk.format, writeable
+                                                         ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+                                                         : iview->srv_desc.Shader4ComponentMapping)
+             : 0;
+   if (!iview) {
+      dzn_descriptor_heap_write_null_desc(device, heap, desc_offset, writeable, false);
+      return;
+   }
+
    D3D12_CPU_DESCRIPTOR_HANDLE view_handle =
       dzn_descriptor_heap_get_cpu_handle(heap, desc_offset);
    struct dzn_image *image = container_of(iview->vk.image, struct dzn_image, vk);
@@ -1118,6 +1234,13 @@ dzn_descriptor_heap_write_buffer_view_desc(struct dzn_device *device,
                                            bool writeable,
                                            const struct dzn_buffer_view *bview)
 {
+   heap->format_defaults[desc_offset] =
+       bview ? dzn_format_defaults(bview->format, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING) : 0;
+   if (!bview) {
+      dzn_descriptor_heap_write_null_desc(device, heap, desc_offset, writeable, true);
+      return;
+   }
+
    D3D12_CPU_DESCRIPTOR_HANDLE view_handle =
       dzn_descriptor_heap_get_cpu_handle(heap, desc_offset);
 
@@ -1134,6 +1257,16 @@ dzn_descriptor_heap_write_buffer_desc(struct dzn_device *device,
                                       bool writeable,
                                       const struct dzn_buffer_desc *info)
 {
+   if (!info->buffer) {
+      if (info->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+          info->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+         ID3D12Device1_CreateConstantBufferView(device->dev, NULL,
+            dzn_descriptor_heap_get_cpu_handle(heap, desc_offset));
+      else
+         dzn_descriptor_heap_write_null_desc(device, heap, desc_offset, writeable, true);
+      return;
+   }
+
    D3D12_CPU_DESCRIPTOR_HANDLE view_handle =
       dzn_descriptor_heap_get_cpu_handle(heap, desc_offset);
 
@@ -1388,6 +1521,10 @@ dzn_descriptor_heap_copy(struct dzn_device *device,
                          uint32_t desc_count,
                          D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
+   if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+      memmove(dst_heap->format_defaults + dst_offset, src_heap->format_defaults + src_offset,
+              desc_count * sizeof(uint32_t));
+
    D3D12_CPU_DESCRIPTOR_HANDLE dst_handle =
       dzn_descriptor_heap_get_cpu_handle(dst_heap, dst_offset);
    D3D12_CPU_DESCRIPTOR_HANDLE src_handle =
@@ -2235,8 +2372,7 @@ dzn_descriptor_set_write(struct dzn_device *device,
              set->layout->bindings[ptr.binding].immutable_sampler_idx == ~0)
             dzn_descriptor_set_ptr_write_sampler_desc(device, set, &ptr, sampler);
 
-         if (iview)
-            dzn_descriptor_set_ptr_write_image_view_desc(device, pDescriptorWrite->descriptorType,
+         dzn_descriptor_set_ptr_write_image_view_desc(device, pDescriptorWrite->descriptorType,
                                                          set, &ptr, cube_as_2darray, iview);
 
          d++;
@@ -2252,8 +2388,7 @@ dzn_descriptor_set_write(struct dzn_device *device,
          const VkDescriptorImageInfo *pImageInfo = pDescriptorWrite->pImageInfo + d;
          VK_FROM_HANDLE(dzn_image_view, iview, pImageInfo->imageView);
 
-         if (iview)
-            dzn_descriptor_set_ptr_write_image_view_desc(device, pDescriptorWrite->descriptorType,
+         dzn_descriptor_set_ptr_write_image_view_desc(device, pDescriptorWrite->descriptorType,
                                                          set, &ptr, cube_as_2darray, iview);
 
          d++;
@@ -2271,8 +2406,7 @@ dzn_descriptor_set_write(struct dzn_device *device,
             binfo->range, binfo->offset
          };
 
-         if (desc.buffer)
-            dzn_descriptor_set_ptr_write_buffer_desc(device, pDescriptorWrite->descriptorType, set, &ptr, &desc);
+         dzn_descriptor_set_ptr_write_buffer_desc(device, pDescriptorWrite->descriptorType, set, &ptr, &desc);
 
          d++;
       }
@@ -2290,8 +2424,7 @@ dzn_descriptor_set_write(struct dzn_device *device,
             binfo->range, binfo->offset
          };
 
-         if (desc.buffer)
-            dzn_descriptor_set_ptr_write_dynamic_buffer_desc(device, set, &ptr, &desc);
+         dzn_descriptor_set_ptr_write_dynamic_buffer_desc(device, set, &ptr, &desc);
 
          d++;
       }
@@ -2304,8 +2437,7 @@ dzn_descriptor_set_write(struct dzn_device *device,
          assert(dzn_descriptor_set_ptr_get_vk_type(set->layout, &ptr) == pDescriptorWrite->descriptorType);
          VK_FROM_HANDLE(dzn_buffer_view, bview, pDescriptorWrite->pTexelBufferView[d]);
 
-         if (bview)
-            dzn_descriptor_set_ptr_write_buffer_view_desc(device, pDescriptorWrite->descriptorType,
+         dzn_descriptor_set_ptr_write_buffer_view_desc(device, pDescriptorWrite->descriptorType,
                                                           set, &ptr, bview);
 
          d++;
@@ -2753,8 +2885,7 @@ dzn_UpdateDescriptorSetWithTemplate(VkDevice _device,
             if (sampler && !entry->immutable_sampler)
                dzn_descriptor_set_write_sampler_desc(device, set, entry->heap_offsets.sampler + d, sampler);
 
-            if (iview)
-               dzn_descriptor_set_write_image_view_desc(device, entry->type, set,
+            dzn_descriptor_set_write_image_view_desc(device, entry->type, set,
                                                         entry->heap_offsets.cbv_srv_uav + d, ~0,
                                                         cube_as_2darray, iview);
          }
@@ -2772,8 +2903,7 @@ dzn_UpdateDescriptorSetWithTemplate(VkDevice _device,
                entry->heap_offsets.extra_srv + d : ~0;
             VK_FROM_HANDLE(dzn_image_view, iview, info->imageView);
 
-            if (iview)
-               dzn_descriptor_set_write_image_view_desc(device, entry->type, set,
+            dzn_descriptor_set_write_image_view_desc(device, entry->type, set,
                                                         heap_offset, alt_heap_offset,
                                                         cube_as_2darray, iview);
          }
@@ -2794,8 +2924,7 @@ dzn_UpdateDescriptorSetWithTemplate(VkDevice _device,
                info->range, info->offset
             };
 
-            if (desc.buffer)
-               dzn_descriptor_set_write_buffer_desc(device, entry->type, set, heap_offset,
+            dzn_descriptor_set_write_buffer_desc(device, entry->type, set, heap_offset,
                                                     alt_heap_offset, &desc);
          }
          break;
@@ -2813,8 +2942,7 @@ dzn_UpdateDescriptorSetWithTemplate(VkDevice _device,
                info->range, info->offset
             };
 
-            if (desc.buffer)
-               dzn_descriptor_set_write_dynamic_buffer_desc(device, set, dyn_buf_idx, &desc);
+            dzn_descriptor_set_write_dynamic_buffer_desc(device, set, dyn_buf_idx, &desc);
          }
          break;
 
@@ -2829,8 +2957,7 @@ dzn_UpdateDescriptorSetWithTemplate(VkDevice _device,
                dzn_descriptor_type_depends_on_shader_usage(entry->type, device->bindless) ?
                entry->heap_offsets.extra_srv + d : ~0;
 
-            if (bview)
-               dzn_descriptor_set_write_buffer_view_desc(device, entry->type, set, heap_offset, alt_heap_offset, bview);
+            dzn_descriptor_set_write_buffer_view_desc(device, entry->type, set, heap_offset, alt_heap_offset, bview);
          }
          break;
 

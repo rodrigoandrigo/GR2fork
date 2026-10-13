@@ -21,6 +21,9 @@
 #include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/gpu_command_sink.h"
 #include "video_core/renderdoc.h"
+#ifdef SHADPS4_UWP
+#include "uwp/session.h"
+#endif
 
 namespace AmdGpu {
 
@@ -294,7 +297,22 @@ Liverpool::Liverpool() {
     occlude_all_ = EmulatorSettings.IsOccludeAll();
     reg_run_ = EmulatorSettings.IsParserRegRun();
     Common::SetCoreReservationEnabled(EmulatorSettings.IsGpuThreadCoreReserve());
+#ifdef SHADPS4_UWP
+    process_thread = std::jthread{[this](std::stop_token stop) {
+        try {
+            Process(stop);
+        } catch (const std::exception& error) {
+            Core::Uwp::FailGuestSession(error.what());
+            {
+                std::scoped_lock lock{submit_mutex};
+                num_submits.store(0);
+            }
+            submit_cv.notify_all();
+        }
+    }};
+#else
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
+#endif
 }
 
 Liverpool::~Liverpool() {

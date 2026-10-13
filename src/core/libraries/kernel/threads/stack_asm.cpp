@@ -24,11 +24,21 @@ asm(R"(
   movq %gs:0x08, %r14 # teb->stack_bottom
   movq %gs:0x10, %r15 # teb->stack_top
 
+)");
+
+#ifdef SHADPS4_UWP
+asm(R"(
+  movq %rdx, %gs:0x08
+  movq %rcx, %gs:0x10
+)");
+#else
+asm(R"(
   # disable stack checks
   xorq %rcx, %rcx
   movq %rcx, %gs:0x08 # teb->stack_bottom = 0
   movq %rcx, %gs:0x10 # teb->stack_top = 0
 )");
+#endif
 
 #endif
 

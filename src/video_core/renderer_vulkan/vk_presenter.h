@@ -102,6 +102,10 @@ public:
     Frame* PrepareLastFrame();
 
 private:
+#ifdef SHADPS4_UWP
+    void PresentEmbedded(Frame* frame, bool is_reusing_frame, bool is_game_frame);
+    std::mutex embedded_present_mutex;
+#endif
     Frame* GetRenderFrame();
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
@@ -130,7 +134,7 @@ private:
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
     std::queue<Frame*> free_queue;
-    Frame* last_submit_frame;
+    Frame* last_submit_frame{};
     std::mutex free_mutex;
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;

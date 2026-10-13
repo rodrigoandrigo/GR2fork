@@ -1263,7 +1263,14 @@ public:
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesAsync, readback_linear_images_async)
+#ifdef SHADPS4_UWP
+    bool IsDirectMemoryAccessEnabled() const { return false; }
+    void SetDirectMemoryAccessEnabled(bool value, bool specific = false) {
+        m_gpu.direct_memory_access_enabled.set(value, specific);
+    }
+#else
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
+#endif
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)

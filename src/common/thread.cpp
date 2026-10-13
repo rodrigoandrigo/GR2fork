@@ -724,6 +724,7 @@ unsigned ExcludeReservedCoresFromAllOtherThreads() {
 }
 
 void StartPeriodicAffinityRewalk() {
+#ifndef SHADPS4_UWP
     static std::once_flag started;
     std::call_once(started, [] {
         std::thread([] {
@@ -738,6 +739,7 @@ void StartPeriodicAffinityRewalk() {
             }
         }).detach();
     });
+#endif
 }
 
 void RestrictProcessToOneThreadPerCore() {

@@ -85,6 +85,7 @@ private:
     };
     void Run(std::wstring root);
     void Work();
+    void ResolveApi();
     bool Queue(std::function<void()> job, bool thumbnail = false);
     void Complete(std::function<void()> update);
     void LoadSettings(std::string profile = {}, uint64_t request = 0);
@@ -104,6 +105,7 @@ private:
     HRESULT Attach(IDXGISwapChain* chain);
     std::shared_ptr<ShadPS4Host> core;
     bool game_surface{}, game_running{}, menu_open{true}, menu_pressed{};
+    bool session_pending{}, session_paused{};
     Platform::Agile<Windows::UI::Xaml::Controls::SwapChainPanel> panel;
     Platform::Agile<Windows::UI::Core::CoreDispatcher> dispatcher;
     std::unique_ptr<FrontendRenderer> renderer;
@@ -118,6 +120,8 @@ private:
     std::deque<std::string> pending_logs;
     std::thread worker;
     std::atomic_bool stopping{};
+    std::atomic_bool worker_stopping{};
+    bool reload_core{};
     std::atomic_bool scanning{};
     std::atomic<uint32_t> scanned{};
     std::atomic<uint32_t> scan_depth{2};

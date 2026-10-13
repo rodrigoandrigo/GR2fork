@@ -119,6 +119,7 @@ void ImGuiFrontend::Start(std::wstring root) {
 }
 void ImGuiFrontend::Stop() {
     stopping.store(true);
+    core->Stop();
     work_ready.notify_all();
 }
 void ImGuiFrontend::UpdateInput(const std::function<void(FrontendInput&)>& update) {
@@ -136,8 +137,10 @@ bool ImGuiFrontend::Queue(std::function<void()> job, bool thumbnail) {
 }
 void ImGuiFrontend::Complete(std::function<void()> update) {
     std::unique_lock<std::mutex> lock{work_mutex};
-    work_ready.wait(lock, [this] { return stopping.load() || completed.size() < 32; });
-    if (!stopping.load())
+    work_ready.wait(lock, [this] {
+        return stopping.load() || worker_stopping.load() || completed.size() < 32;
+    });
+    if (!stopping.load() && !worker_stopping.load())
         completed.push_back(std::move(update));
 }
 void ImGuiFrontend::Work() {
@@ -151,10 +154,10 @@ void ImGuiFrontend::Work() {
         {
             std::unique_lock<std::mutex> lock{work_mutex};
             work_ready.wait(lock, [this] {
-                return stopping.load() || !commands.empty() || filter_job ||
+                return stopping.load() || worker_stopping.load() || !commands.empty() || filter_job ||
                        !thumbnail_jobs.empty();
             });
-            if (stopping.load())
+            if (stopping.load() || worker_stopping.load())
                 break;
             if (commands.empty() && filter_job) {
                 job = std::move(filter_job);
@@ -213,164 +216,203 @@ HRESULT ImGuiFrontend::Attach(IDXGISwapChain* chain) {
     return binding->result;
 }
 
-void ImGuiFrontend::Run(std::wstring root) {
-    const auto apartment = RoInitialize(RO_INIT_MULTITHREADED);
-    try {
-        Check(apartment);
-        user_root = root;
-        FrontendInput initial;
-        {
-            std::lock_guard<std::mutex> lock{input_mutex};
-            initial = input;
-        }
-        core->SetLogConsumer([this](std::string message) {
-            std::lock_guard<std::mutex> lock{work_mutex};
-            if (pending_logs.size() == 256)
-                pending_logs.pop_front();
-            pending_logs.push_back(message.substr(0, 4096));
-        });
-        core->Initialize(root, initial.width, initial.height, true, game_surface);
+void ImGuiFrontend::ResolveApi() {
 #define RESOLVE(member, name) member = core->GetApi<decltype(member)>(name)
-        RESOLVE(get_settings, "shadps4_get_settings");
-        RESOLVE(set_host_state, "shadps4_set_host_state");
-        RESOLVE(set_setting, "shadps4_set_setting");
-        RESOLVE(reset_settings, "shadps4_reset_settings");
-        RESOLVE(mount, "shadps4_mount_storage_folder");
-        RESOLVE(unmount, "shadps4_unmount_storage_folder");
-        RESOLVE(enumerate, "shadps4_storage_enumerate");
-        RESOLVE(stat, "shadps4_storage_stat");
-        RESOLVE(open, "shadps4_open_mounted_file");
-        RESOLVE(read, "shadps4_file_read");
-        RESOLVE(size, "shadps4_file_get_size");
-        RESOLVE(close, "shadps4_file_close");
-        RESOLVE(get_game_settings, "shadps4_get_game_settings");
-        RESOLVE(set_game_setting, "shadps4_set_game_setting");
-        RESOLVE(delete_game_settings, "shadps4_delete_game_settings");
+  RESOLVE(get_settings, "shadps4_get_settings");
+  RESOLVE(set_host_state, "shadps4_set_host_state");
+  RESOLVE(set_setting, "shadps4_set_setting");
+  RESOLVE(reset_settings, "shadps4_reset_settings");
+  RESOLVE(mount, "shadps4_mount_storage_folder");
+  RESOLVE(unmount, "shadps4_unmount_storage_folder");
+  RESOLVE(enumerate, "shadps4_storage_enumerate");
+  RESOLVE(stat, "shadps4_storage_stat");
+  RESOLVE(open, "shadps4_open_mounted_file");
+  RESOLVE(read, "shadps4_file_read");
+  RESOLVE(size, "shadps4_file_get_size");
+  RESOLVE(close, "shadps4_file_close");
+  RESOLVE(get_game_settings, "shadps4_get_game_settings");
+  RESOLVE(set_game_setting, "shadps4_set_game_setting");
+  RESOLVE(delete_game_settings, "shadps4_delete_game_settings");
 #undef RESOLVE
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        auto& io = ImGui::GetIO();
-        io.IniFilename = nullptr;
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
-        ImGui::StyleColorsDark();
-        renderer = std::make_unique<FrontendRenderer>();
-        renderer->Initialize(initial.width, initial.height,
-                             [this](IDXGISwapChain* chain) { return Attach(chain); });
-        worker = std::thread([this] { Work(); });
-        Queue([this] { LoadSettings(); });
-        if (ready)
-            ready();
-        auto last = std::chrono::steady_clock::now();
-        while (!stopping.load()) {
-            FrontendInput snapshot;
-            {
-                std::lock_guard<std::mutex> lock{input_mutex};
-                snapshot = input;
-                input.wheel = 0;
-                input.characters.clear();
-            }
-            std::deque<std::function<void()>> updates;
-            {
-                std::lock_guard<std::mutex> lock{work_mutex};
-                updates.swap(completed);
-                while (!pending_logs.empty()) {
-                    logs.push_back(std::move(pending_logs.front()));
-                    pending_logs.pop_front();
-                    if (logs.size() > 512)
-                        logs.pop_front();
-                }
-            }
-            work_ready.notify_all();
-            for (auto& update : updates)
-                update();
-            const bool running = core->State() == SHADPS4_RUNNING;
-            if (running != game_running) {
-                game_running = running;
-                menu_open = !running;
-            }
-            const bool pressed = snapshot.keys[27];
-            if (game_running && pressed && !menu_pressed)
-                menu_open = !menu_open;
-            menu_pressed = pressed;
-            if (set_host_state(
-                    !snapshot.suspended && snapshot.active,
-                    snapshot.captured ||
-                        (game_running ? menu_open : io.NavActive || io.WantCaptureKeyboard)))
-                throw std::runtime_error(Utf8(core->Error()));
-            if (snapshot.suspended || !snapshot.active) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                continue;
-            }
-            renderer->Resize(snapshot.width, snapshot.height);
-            if (game_surface)
-                core->Resize(snapshot.width, snapshot.height);
-            renderer->SetTransparent(game_running);
-            const auto now = std::chrono::steady_clock::now();
-            const auto delta = std::chrono::duration<float>(now - last).count();
-            last = now;
-            SubmitInput(snapshot);
-            io.FontGlobalScale =
-                std::clamp(std::min(snapshot.width / 1280.0f, snapshot.height / 720.0f) * ui_scale,
-                           0.75f, 3.0f);
-            renderer->BeginFrame(delta);
-            unsigned uploads{};
-            while (!decoded.empty() && uploads < 2) {
-                if (!renderer->Upload(decoded.front()))
-                    break;
-                pending_images.erase(decoded.front().key);
-                decoded.pop_front();
-                ++uploads;
-            }
-            Draw();
-            renderer->EndFrame();
-        }
-    } catch (const winrt::hresult_error& error) {
-        try {
-            if (failure)
-                failure(L"D3D12 HRESULT " +
-                        std::to_wstring(static_cast<uint32_t>(error.code().value)) + L": " +
-                        std::wstring(error.message()));
-        } catch (...) {
-        }
-    } catch (Platform::Exception ^ error) {
-        try {
-            if (failure)
-                failure(error->Message->Data());
-        } catch (...) {
-        }
-    } catch (const std::exception& error) {
-        try {
-            if (failure)
-                failure(Wide(error.what()));
-        } catch (...) {
-        }
-    } catch (...) {
-        try {
-            if (failure)
-                failure(L"Falha inesperada no frontend.");
-        } catch (...) {
-        }
-    }
-    stopping.store(true);
-    work_ready.notify_all();
-    if (worker.joinable())
-        worker.join();
+}
+
+void ImGuiFrontend::Run(std::wstring root) {
+  const auto apartment = RoInitialize(RO_INIT_MULTITHREADED);
+  try {
+    Check(apartment);
+    user_root = root;
+    FrontendInput initial;
     {
-        std::lock_guard<std::mutex> lock{work_mutex};
-        commands.clear();
-        thumbnail_jobs.clear();
-        completed.clear();
+      std::lock_guard<std::mutex> lock{input_mutex};
+      initial = input;
     }
-    renderer.reset();
-    if (ImGui::GetCurrentContext())
-        ImGui::DestroyContext();
+    core->SetLogConsumer([this](std::string message) {
+      std::lock_guard<std::mutex> lock{work_mutex};
+      if (pending_logs.size() == 256)
+        pending_logs.pop_front();
+      pending_logs.push_back(message.substr(0, 4096));
+    });
+    core->Initialize(root, initial.width, initial.height, true, game_surface);
+    ResolveApi();
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    auto &io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.ConfigFlags |=
+        ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    ImGui::StyleColorsDark();
+    renderer = std::make_unique<FrontendRenderer>();
+    renderer->Initialize(
+        initial.width, initial.height,
+        [this](IDXGISwapChain *chain) { return Attach(chain); });
+    worker = std::thread([this] { Work(); });
+    Queue([this] { LoadSettings(); });
+    if (ready)
+      ready();
+    auto last = std::chrono::steady_clock::now();
+    while (!stopping.load()) {
+      FrontendInput snapshot;
+      {
+        std::lock_guard<std::mutex> lock{input_mutex};
+        snapshot = input;
+        input.wheel = 0;
+        input.characters.clear();
+      }
+      std::deque<std::function<void()>> updates;
+      {
+        std::lock_guard<std::mutex> lock{work_mutex};
+        updates.swap(completed);
+        while (!pending_logs.empty()) {
+          logs.push_back(std::move(pending_logs.front()));
+          pending_logs.pop_front();
+          if (logs.size() > 512)
+            logs.pop_front();
+        }
+      }
+      work_ready.notify_all();
+      for (auto &update : updates)
+        update();
+      if (reload_core) {
+        worker_stopping.store(true);
+        work_ready.notify_all();
+        if (worker.joinable())
+          worker.join();
+        {
+          std::lock_guard<std::mutex> lock{work_mutex};
+          commands.clear();
+          thumbnail_jobs.clear();
+          filter_job = {};
+          completed.clear();
+        }
+        pending_images.clear();
+        decoded.clear();
+        core->Reload(user_root, snapshot.width, snapshot.height, true,
+                     game_surface);
+        ResolveApi();
+        root_mounts.clear();
+        reload_core = false;
+        session_pending = false;
+        session_paused = false;
+        worker_stopping.store(false);
+        worker = std::thread([this] { Work(); });
+        scanning.store(true);
+        Queue([this] {
+          Scan();
+          LoadSettings();
+        });
+      }
+      const bool running = core->State() == SHADPS4_RUNNING;
+      if (running != game_running) {
+        game_running = running;
+        menu_open = !running;
+      }
+      const bool pressed = snapshot.keys[27];
+      if (game_running && pressed && !menu_pressed)
+        menu_open = !menu_open;
+      menu_pressed = pressed;
+      if (set_host_state(!snapshot.suspended && snapshot.active,
+                         snapshot.captured ||
+                             (game_running
+                                  ? menu_open
+                                  : io.NavActive || io.WantCaptureKeyboard)))
+        throw std::runtime_error(Utf8(core->Error()));
+      if (snapshot.suspended || !snapshot.active) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;
+      }
+      renderer->Resize(snapshot.width, snapshot.height);
+      if (game_surface)
+        core->Resize(snapshot.width, snapshot.height);
+      renderer->SetTransparent(game_running);
+      const auto now = std::chrono::steady_clock::now();
+      const auto delta = std::chrono::duration<float>(now - last).count();
+      last = now;
+      SubmitInput(snapshot);
+      io.FontGlobalScale = std::clamp(
+          std::min(snapshot.width / 1280.0f, snapshot.height / 720.0f) *
+              ui_scale,
+          0.75f, 3.0f);
+      renderer->BeginFrame(delta);
+      unsigned uploads{};
+      while (!decoded.empty() && uploads < 2) {
+        if (!renderer->Upload(decoded.front()))
+          break;
+        pending_images.erase(decoded.front().key);
+        decoded.pop_front();
+        ++uploads;
+      }
+      Draw();
+      renderer->EndFrame();
+    }
+  } catch (const winrt::hresult_error &error) {
     try {
-        Attach(nullptr);
+      if (failure)
+        failure(L"D3D12 HRESULT " +
+                std::to_wstring(static_cast<uint32_t>(error.code().value)) +
+                L": " + std::wstring(error.message()));
     } catch (...) {
     }
-    core.reset();
-    if (SUCCEEDED(apartment))
-        RoUninitialize();
+  } catch (Platform::Exception ^ error) {
+    try {
+      if (failure)
+        failure(error->Message->Data());
+    } catch (...) {
+    }
+  } catch (const std::exception &error) {
+    try {
+      if (failure)
+        failure(Wide(error.what()));
+    } catch (...) {
+    }
+  } catch (...) {
+    try {
+      if (failure)
+        failure(L"Falha inesperada no frontend.");
+    } catch (...) {
+    }
+  }
+  stopping.store(true);
+  work_ready.notify_all();
+  if (worker.joinable())
+    worker.join();
+  core->Stop();
+  core->Wait();
+  {
+    std::lock_guard<std::mutex> lock{work_mutex};
+    commands.clear();
+    thumbnail_jobs.clear();
+    completed.clear();
+  }
+  renderer.reset();
+  if (ImGui::GetCurrentContext())
+    ImGui::DestroyContext();
+  try {
+    Attach(nullptr);
+  } catch (...) {
+  }
+  core->SetLogConsumer({});
+  if (SUCCEEDED(apartment))
+    RoUninitialize();
 }
 
 void ImGuiFrontend::SetFolder(Platform::Agile<StorageFolder> source, std::string token) {
@@ -550,7 +592,7 @@ void ImGuiFrontend::Scan() {
         failed_images.clear();
         decoded.clear();
         status = std::to_string(result->games.size()) +
-                 " jogos encontrados. Execução guest D3D12 ainda indisponível.";
+                 " jogos encontrados. Boot guest Vulkan/Dozen ainda indisponível.";
         scanning.store(false);
         Filter();
     });
@@ -802,14 +844,14 @@ void ImGuiFrontend::Draw() {
             tab = index;
     }
     ImGui::SameLine();
-    ImGui::BeginDisabled(scanning.load());
+    ImGui::BeginDisabled(scanning.load() || session_pending || game_running);
     if (ImGui::Button("Adicionar pasta") && choose_folder)
         choose_folder(L"library");
     ImGui::SameLine();
     if (ImGui::Button("Atualizar biblioteca"))
         Queue([this] { Scan(); });
     ImGui::EndDisabled();
-    if (ImGui::BeginMenu("Importar")) {
+    if (ImGui::BeginMenu("Importar", !session_pending && !game_running)) {
         if (ImGui::MenuItem("Módulos de sistema") && choose_folder)
             choose_folder(L"sys_modules");
         if (ImGui::MenuItem("Fontes") && choose_folder)
@@ -824,8 +866,11 @@ void ImGuiFrontend::Draw() {
     ImGui::Separator();
     if (tab == 0)
         DrawLibrary();
-    else if (tab == 1)
+    else if (tab == 1) {
+        ImGui::BeginDisabled(session_pending || game_running);
         DrawSettings();
+        ImGui::EndDisabled();
+    }
     else
         DrawLogs();
     ImGui::End();
@@ -833,7 +878,7 @@ void ImGuiFrontend::Draw() {
 
 void ImGuiFrontend::DrawLibrary() {
     if (library && ImGui::TreeNode("Pastas da biblioteca")) {
-        ImGui::BeginDisabled(scanning.load());
+        ImGui::BeginDisabled(scanning.load() || session_pending || game_running);
         for (const auto& root : library->roots) {
             ImGui::PushID(root.token.c_str());
             bool enabled = root.enabled;
@@ -884,122 +929,165 @@ void ImGuiFrontend::DrawLibrary() {
             ImGui::PopID();
         }
     ImGui::EndChild();
-    ImGui::BeginDisabled();
-    ImGui::Button("Iniciar jogo");
+    ImGui::BeginDisabled(!game_surface || scanning.load() || session_pending ||
+                         core->State() != SHADPS4_READY || !library ||
+                         selection >= library->games.size());
+    if (ImGui::Button("Iniciar jogo")) {
+      const auto executable = library->games[selection].path + "/eboot.bin";
+      session_pending = true;
+      status = "Iniciando jogo…";
+      const auto weak = weak_from_this();
+      if (!Queue([this, executable, weak] {
+            core->Run(Wide(executable), [weak](std::wstring message) {
+              if (const auto self = weak.lock())
+                self->Complete([self, message] {
+                  self->reload_core = self->core->State() != SHADPS4_READY;
+                  self->session_pending = self->reload_core;
+                  self->session_paused = false;
+                  self->status = Utf8(message);
+                });
+            });
+          })) {
+        session_pending = false;
+        status = "O worker está ocupado.";
+      }
+    }
     ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("A execução de jogos ainda não está disponível nesta versão.");
+    if (game_running) {
+      ImGui::SameLine();
+      if (ImGui::Button(session_paused ? "Continuar" : "Pausar")) {
+        session_paused = !session_paused;
+        core->Pause(session_paused);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Parar")) {
+        status = "Encerrando sessão…";
+        core->Stop();
+      }
+    }
 }
 
 void ImGuiFrontend::DrawSettings() {
-    if (ImGui::BeginCombo("Perfil",
-                          settings_profile.empty() ? "Global" : settings_profile.c_str())) {
-        ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(library ? library->profiles.size() + 1 : 1));
-        while (clipper.Step())
-            for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
-                const auto serial = index ? library->profiles[index - 1].second : std::string{};
-                const auto label = index ? library->profiles[index - 1].first + " (" + serial + ")"
-                                         : std::string{"Global"};
-                if (ImGui::Selectable(label.c_str(), settings_profile == serial)) {
-                    const auto request = ++settings_request;
-                    if (Queue([this, serial, request] { LoadSettings(serial, request); })) {
-                        settings_profile = serial;
-                        settings.clear();
-                    }
-                }
+  if (ImGui::BeginCombo("Perfil", settings_profile.empty()
+                                      ? "Global"
+                                      : settings_profile.c_str())) {
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(library ? library->profiles.size() + 1 : 1));
+    while (clipper.Step())
+      for (int index = clipper.DisplayStart; index < clipper.DisplayEnd;
+           ++index) {
+        const auto serial =
+            index ? library->profiles[index - 1].second : std::string{};
+        const auto label =
+            index ? library->profiles[index - 1].first + " (" + serial + ")"
+                  : std::string{"Global"};
+        if (ImGui::Selectable(label.c_str(), settings_profile == serial)) {
+          const auto request = ++settings_request;
+          if (Queue(
+                  [this, serial, request] { LoadSettings(serial, request); })) {
+            settings_profile = serial;
+            settings.clear();
+          }
+        }
+      }
+    ImGui::EndCombo();
+  }
+  ImGui::Text(
+      "%zu opções compatíveis; %zu opções incompatíveis preservadas e ocultas.",
+      settings.size(), excluded);
+  if (ImGui::Button(settings_profile.empty() ? "Restaurar padrões"
+                                             : "Excluir perfil do jogo")) {
+    const auto profile = settings_profile;
+    const auto request = settings_request.load();
+    Queue([this, profile, request] {
+      if (profile.empty() ? reset_settings()
+                          : delete_game_settings(profile.c_str()))
+        throw std::runtime_error(Utf8(core->Error()));
+      LoadSettings(profile, request);
+    });
+  }
+  std::vector<std::string> groups;
+  for (const auto &setting : settings)
+    if (std::find(groups.begin(), groups.end(), setting.group) == groups.end())
+      groups.push_back(setting.group);
+  if (ImGui::BeginTabBar("settings-pages")) {
+    for (const auto &group : groups)
+      if (ImGui::BeginTabItem(group.c_str())) {
+        ImGui::BeginChild(group.c_str(), {0, 0}, false);
+        for (const auto &setting : settings) {
+          if (setting.group != group)
+            continue;
+          ImGui::PushID(setting.key.c_str());
+          ImGui::BeginDisabled(!setting.editable);
+          if (!setting.choices.empty()) {
+            std::string label = setting.value.dump();
+            for (const auto &choice : setting.choices)
+              if (choice.at("value") == setting.value)
+                label = choice.at("label");
+            if (ImGui::BeginCombo(setting.label.c_str(), label.c_str())) {
+              for (const auto &choice : setting.choices)
+                if (ImGui::Selectable(choice.at("label")
+                                          .get_ref<const std::string &>()
+                                          .c_str(),
+                                      choice.at("value") == setting.value))
+                  SaveSetting(setting, choice.at("value"));
+              ImGui::EndCombo();
             }
-        ImGui::EndCombo();
-    }
-    ImGui::Text("%zu opções compatíveis; %zu opções incompatíveis preservadas e ocultas.",
-                settings.size(), excluded);
-    if (ImGui::Button(settings_profile.empty() ? "Restaurar padrões" : "Excluir perfil do jogo")) {
-        const auto profile = settings_profile;
-        const auto request = settings_request.load();
-        Queue([this, profile, request] {
-            if (profile.empty() ? reset_settings() : delete_game_settings(profile.c_str()))
-                throw std::runtime_error(Utf8(core->Error()));
-            LoadSettings(profile, request);
-        });
-    }
-    std::vector<std::string> groups;
-    for (const auto& setting : settings)
-        if (std::find(groups.begin(), groups.end(), setting.group) == groups.end())
-            groups.push_back(setting.group);
-    if (ImGui::BeginTabBar("settings-pages")) {
-        for (const auto& group : groups)
-            if (ImGui::BeginTabItem(group.c_str())) {
-                ImGui::BeginChild(group.c_str(), {0, 0}, false);
-                for (const auto& setting : settings) {
-                    if (setting.group != group)
-                        continue;
-                    ImGui::PushID(setting.key.c_str());
-                    ImGui::BeginDisabled(!setting.editable);
-                    if (!setting.choices.empty()) {
-                        std::string label = setting.value.dump();
-                        for (const auto& choice : setting.choices)
-                            if (choice.at("value") == setting.value)
-                                label = choice.at("label");
-                        if (ImGui::BeginCombo(setting.label.c_str(), label.c_str())) {
-                            for (const auto& choice : setting.choices)
-                                if (ImGui::Selectable(
-                                        choice.at("label").get_ref<const std::string&>().c_str(),
-                                        choice.at("value") == setting.value))
-                                    SaveSetting(setting, choice.at("value"));
-                            ImGui::EndCombo();
-                        }
-                    } else if (setting.value.is_boolean()) {
-                        bool value = setting.value;
-                        if (ImGui::Checkbox(setting.label.c_str(), &value))
-                            SaveSetting(setting, value);
-                    } else if (setting.value.is_number_integer()) {
-                        int64_t value = setting.value,
-                                minimum = static_cast<int64_t>(setting.minimum),
-                                maximum = static_cast<int64_t>(setting.maximum);
-                        if (ImGui::InputScalar(setting.label.c_str(), ImGuiDataType_S64, &value,
-                                               nullptr, nullptr, "%lld",
-                                               ImGuiInputTextFlags_EnterReturnsTrue))
-                            SaveSetting(setting, std::clamp(value, minimum, maximum));
-                    } else if (setting.value.is_number()) {
-                        double value = setting.value;
-                        if (ImGui::InputDouble(setting.label.c_str(), &value, 0, 0, "%.3f",
-                                               ImGuiInputTextFlags_EnterReturnsTrue))
-                            SaveSetting(setting,
-                                        std::clamp(value, setting.minimum, setting.maximum));
-                    } else {
-                        ImGui::TextWrapped("%s: %s", setting.label.c_str(),
-                                           setting.value.get_ref<const std::string&>().c_str());
-                        if (ImGui::Button("Editar") && edit_text) {
-                            const auto copy = setting;
-                            const auto request = settings_request.load();
-                            edit_text(
-                                setting.label, setting.value, false,
-                                [self = shared_from_this(), copy, request](std::string value) {
-                                    self->Queue([self, copy, value, request] {
-                                        const auto json = nlohmann::json(value).dump();
-                                        if (copy.profile.empty()
-                                                ? self->set_setting(copy.group.c_str(),
-                                                                    copy.key.c_str(), json.c_str())
-                                                : self->set_game_setting(
-                                                      copy.profile.c_str(), copy.group.c_str(),
-                                                      copy.key.c_str(), json.c_str()))
-                                            throw std::runtime_error(Utf8(self->core->Error()));
-                                        self->LoadSettings(copy.profile, request);
-                                    });
-                                });
-                        }
-                    }
-                    ImGui::EndDisabled();
-                    if (!setting.editable &&
-                        ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("Esta opção é global e é herdada pelo perfil.");
-                    ImGui::PopID();
-                }
-                ImGui::EndChild();
-                ImGui::EndTabItem();
+          } else if (setting.value.is_boolean()) {
+            bool value = setting.value;
+            if (ImGui::Checkbox(setting.label.c_str(), &value))
+              SaveSetting(setting, value);
+          } else if (setting.value.is_number_integer()) {
+            int64_t value = setting.value,
+                    minimum = static_cast<int64_t>(setting.minimum),
+                    maximum = static_cast<int64_t>(setting.maximum);
+            if (ImGui::InputScalar(setting.label.c_str(), ImGuiDataType_S64,
+                                   &value, nullptr, nullptr, "%lld",
+                                   ImGuiInputTextFlags_EnterReturnsTrue))
+              SaveSetting(setting, std::clamp(value, minimum, maximum));
+          } else if (setting.value.is_number()) {
+            double value = setting.value;
+            if (ImGui::InputDouble(setting.label.c_str(), &value, 0, 0, "%.3f",
+                                   ImGuiInputTextFlags_EnterReturnsTrue))
+              SaveSetting(setting,
+                          std::clamp(value, setting.minimum, setting.maximum));
+          } else {
+            ImGui::TextWrapped(
+                "%s: %s", setting.label.c_str(),
+                setting.value.get_ref<const std::string &>().c_str());
+            if (ImGui::Button("Editar") && edit_text) {
+              const auto copy = setting;
+              const auto request = settings_request.load();
+              edit_text(
+                  setting.label, setting.value, false,
+                  [self = shared_from_this(), copy,
+                   request](std::string value) {
+                    self->Queue([self, copy, value, request] {
+                      const auto json = nlohmann::json(value).dump();
+                      if (copy.profile.empty()
+                              ? self->set_setting(copy.group.c_str(),
+                                                  copy.key.c_str(),
+                                                  json.c_str())
+                              : self->set_game_setting(
+                                    copy.profile.c_str(), copy.group.c_str(),
+                                    copy.key.c_str(), json.c_str()))
+                        throw std::runtime_error(Utf8(self->core->Error()));
+                      self->LoadSettings(copy.profile, request);
+                    });
+                  });
             }
-        ImGui::EndTabBar();
-    }
+          }
+          ImGui::EndDisabled();
+          if (!setting.editable &&
+              ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Esta opção é global e é herdada pelo perfil.");
+          ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+      }
+    ImGui::EndTabBar();
+  }
 }
 void ImGuiFrontend::DrawLogs() {
     if (ImGui::Button("Limpar visualização"))

@@ -27,6 +27,9 @@
 #include "core/memory.h"
 #include "core/tls.h"
 #include "ipc/ipc.h"
+#ifdef SHADPS4_UWP
+#include "uwp/shadps4_api.h"
+#endif
 
 #ifndef _WIN32
 #include <signal.h>
@@ -35,7 +38,12 @@
 namespace Core {
 
 static PS4_SYSV_ABI void ProgramExitFunc() {
+#ifdef SHADPS4_UWP
+    shadps4_request_stop();
+    Libraries::Kernel::posix_pthread_exit(nullptr);
+#else
     LOG_ERROR(Core_Linker, "Exit function called");
+#endif
 }
 
 static PS4_SYSV_ABI void* RunMainEntry [[noreturn]] (EntryParams* params) {
@@ -224,6 +232,12 @@ s32 Linker::LoadModule(const std::filesystem::path& elf_name, bool is_dynamic) {
     std::unique_ptr<Core::FileSys::IFile> handle;
     if (!as_guest.empty() && as_guest.front() == '/') {
         handle = mnt->Open(as_guest, /*writable=*/false);
+#ifdef SHADPS4_UWP
+        if (!handle) {
+            LOG_ERROR(Core_Linker, "Guest module {} could not be opened", as_guest);
+            return -1;
+        }
+#endif
     }
     if (!handle) {
         if (!std::filesystem::exists(elf_name)) {

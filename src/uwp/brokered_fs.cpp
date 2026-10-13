@@ -374,6 +374,12 @@ StorageFolder BrokeredFsBackend::Folder(std::string_view relative) const {
     }
     return folder;
 }
+
+std::shared_ptr<BrokeredFsBackend> BrokeredFsBackend::Subdirectory(
+    std::string_view relative) const {
+    const auto folder = Folder(relative);
+    return std::make_shared<BrokeredFsBackend>(winrt::get_abi(folder), read_only);
+}
 IStorageItem BrokeredFsBackend::Item(std::string_view relative) const {
     if (relative.empty()) {
         return root;

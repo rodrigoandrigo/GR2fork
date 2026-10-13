@@ -20,6 +20,11 @@ constexpr int ORBIS_AJM_CHANNELMASK_5POINT1 = 0x060F;
 constexpr int ORBIS_AJM_CHANNELMASK_7POINT1 = 0x063F;
 
 static std::unordered_map<u32, std::unique_ptr<AjmContext>> contexts{};
+#ifdef SHADPS4_UWP
+void ShutdownAjm() {
+    contexts.clear();
+}
+#endif
 
 u32 GetChannelMask(u32 num_channels) {
     switch (num_channels) {

@@ -217,6 +217,26 @@ struct AddressSpace::Impl {
     }
 
     ~Impl() {
+#ifdef SHADPS4_UWP
+        for (const auto& [address, region] : regions) {
+            if (region.is_mapped) {
+                if ((region.fd != -1 && region.prot != PAGE_READONLY) ||
+                    (region.fd == -1 && region.phys_base != PAddr(-1))) {
+                    if (!UnmapViewOfFile2(process, reinterpret_cast<void*>(address),
+                                          MEM_PRESERVE_PLACEHOLDER))
+                        LOG_ERROR(Core, "Failed to unmap guest region {:#x}: {}", address,
+                                  GetLastError());
+                } else if (!VirtualFreeEx(process, reinterpret_cast<void*>(address), region.size,
+                                          MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                    LOG_ERROR(Core, "Failed to restore guest placeholder {:#x}: {}", address,
+                              GetLastError());
+                }
+            }
+            if (!VirtualFreeEx(process, reinterpret_cast<void*>(address), 0, MEM_RELEASE))
+                LOG_ERROR(Core, "Failed to release guest region {:#x}: {}", address,
+                          GetLastError());
+        }
+#endif
         if (virtual_base) {
             if (!VirtualFree(virtual_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(Core, "Failed to free virtual memory");

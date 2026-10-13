@@ -96,9 +96,28 @@ ShadPS4FileInfo Info(const Core::FileSys::FileStat& stat) {
 } // namespace
 
 namespace Core::Uwp {
+std::string PrepareBootStorage(std::string executable) {
+    std::scoped_lock lock{storage_mutex};
+    auto [backend, relative] = Resolve(executable.c_str());
+    const auto slash = relative.find_last_of('/');
+    const auto parent = slash == std::string::npos ? std::string{} : relative.substr(0, slash);
+    const auto filename = slash == std::string::npos ? relative : relative.substr(slash + 1);
+    Require(!filename.empty());
+    const auto info = backend->Stat(relative);
+    Require(!info.is_directory, HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND));
+    auto game = backend->Subdirectory(parent);
+    Mounts()->MountBackend(game, "/app0");
+    Mounts()->MountBackend(game, "/hostapp");
+    folders.insert_or_assign("/app0", game);
+    folders.insert_or_assign("/hostapp", game);
+    return "/app0/" + filename;
+}
+
 void ClearStorage() {
     std::scoped_lock lock{storage_mutex};
     files.clear();
+    Mounts()->Unmount("/app0");
+    Mounts()->Unmount("/hostapp");
     for (const auto& [mount, backend] : folders) {
         Mounts()->Unmount(mount);
     }

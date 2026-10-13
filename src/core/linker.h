@@ -160,6 +160,9 @@ public:
     bool Resolve(const std::string& name, Loader::SymbolType type, Module* module,
                  Loader::SymbolRecord* return_info);
     void Execute(const std::vector<std::string>& args = {});
+    void Stop() {
+        main_thread.Stop();
+    }
     void DebugDump();
 
 private:

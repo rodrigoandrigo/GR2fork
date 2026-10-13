@@ -225,34 +225,6 @@ struct dzn_nir_options {
    const nir_shader_compiler_options *nir_opts;
 };
 
-static bool
-dzn_robust_image_access_intrinsic_filter(const nir_intrinsic_instr *intr,
-                                         const void *data)
-{
-   (void)data;
-   switch (intr->intrinsic) {
-   case nir_intrinsic_image_load:
-   case nir_intrinsic_bindless_image_load:
-   case nir_intrinsic_image_store:
-   case nir_intrinsic_bindless_image_store:
-   case nir_intrinsic_image_atomic:
-   case nir_intrinsic_bindless_image_atomic:
-   case nir_intrinsic_image_atomic_swap:
-   case nir_intrinsic_bindless_image_atomic_swap:
-   case nir_intrinsic_image_deref_load:
-   case nir_intrinsic_image_deref_store:
-   case nir_intrinsic_image_deref_atomic:
-   case nir_intrinsic_image_deref_atomic_swap:
-   case nir_intrinsic_image_heap_load:
-   case nir_intrinsic_image_heap_store:
-   case nir_intrinsic_image_heap_atomic:
-   case nir_intrinsic_image_heap_atomic_swap:
-      return true;
-   default:
-      return false;
-   }
-}
-
 static VkResult
 dzn_pipeline_get_nir_shader(struct dzn_device *device,
                             const struct dzn_pipeline_layout *layout,
@@ -304,17 +276,21 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
    if (options->lower_clip_halfz)
       NIR_PASS(_, *nir, nir_lower_clip_halfz);
 
-   /* D3D12 does not guarantee Vulkan's out-of-bounds storage-image behavior.
-    * Rewrite image accesses to check the descriptor view dimensions in NIR.
-    */
-   if (options->robustness.images == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT ||
-       options->robustness.images == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2_EXT)
-      NIR_PASS(_, *nir, nir_lower_robust_access,
-               dzn_robust_image_access_intrinsic_filter, NULL);
+   bool robust_images = options->robustness.images ==
+                            VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT ||
+                        options->robustness.images ==
+                            VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2_EXT;
+   bool robust_buffers = options->robustness.uniform_buffers ==
+                             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT ||
+                         options->robustness.storage_buffers ==
+                             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT;
+   if (robust_images || robust_buffers)
+      NIR_PASS(_, *nir, dzn_nir_lower_robust_images, layout, robust_images, robust_buffers);
 
    struct dxil_spirv_runtime_conf conf = {
       .fixed_point_size = !options->lower_large_points,
       .preserve_point_size = true,
+      .split_viewport_sizes = true,
       .runtime_data_cbv = {
          .register_space = DZN_REGISTER_SPACE_SYSVALS,
          .base_shader_register = 0,
@@ -1036,6 +1012,7 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
                                 sizeof(depth_clip_negative_one_to_one));
             _mesa_blake3_update(&nir_hash_ctx, &lower_view_index, sizeof(lower_view_index));
          }
+         _mesa_blake3_update(&nir_hash_ctx, layout->stages[stage].hash, BLAKE3_KEY_LEN);
          _mesa_blake3_update(&nir_hash_ctx, stages[stage].spirv_hash, sizeof(stages[stage].spirv_hash));
          _mesa_blake3_final(&nir_hash_ctx, stages[stage].nir_hash);
       }
@@ -1128,6 +1105,7 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
          struct dxil_spirv_runtime_conf point_conf = {
             .fixed_point_size = false,
             .preserve_point_size = true,
+      .split_viewport_sizes = true,
             .runtime_data_cbv = {
                .register_space = DZN_REGISTER_SPACE_SYSVALS,
                .base_shader_register = 0,
@@ -2172,11 +2150,13 @@ dzn_pipeline_init(struct dzn_pipeline *pipeline,
                   struct dzn_pipeline_layout *layout,
                   D3D12_PIPELINE_STATE_STREAM_DESC *stream_desc)
 {
+   pipeline->image_metadata_offset = layout->image_metadata_offset;
    pipeline->type = type;
    pipeline->device = device;
    pipeline->flags = flags;
    pipeline->root.sets_param_count = layout->root.sets_param_count;
    pipeline->root.sysval_cbv_param_idx = layout->root.sysval_cbv_param_idx;
+   pipeline->root.viewport_cbv_param_idx = layout->root.viewport_cbv_param_idx;
    pipeline->root.push_constant_cbv_param_idx = layout->root.push_constant_cbv_param_idx;
    pipeline->root.dynamic_buffer_bindless_param_idx = layout->root.dynamic_buffer_bindless_param_idx;
    STATIC_ASSERT(sizeof(pipeline->root.type) == sizeof(layout->root.type));
@@ -2727,15 +2707,7 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
                    "depth-format=%u)\n",
                    (unsigned)hres, pCreateInfo->stageCount, color_count,
                    (unsigned)zs_fmt);
-         /* UWP has no stderr/debug layer on retail devices. Preserve the
-          * native D3D12 failure value so an embedding host can diagnose the
-          * rejected PSO instead of seeing the misleading generic -1. This is
-          * only used on the failure path and is never exposed as success. */
-#ifdef _XBOX_UWP
-         ret = (VkResult)(int32_t)hres;
-#else
          ret = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-#endif
          goto out;
       }
 
@@ -3543,6 +3515,7 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
       _mesa_blake3_update(&nir_hash_ctx,
                           &device->vk.enabled_features.robustImageAccess2,
                           sizeof(device->vk.enabled_features.robustImageAccess2));
+      _mesa_blake3_update(&nir_hash_ctx, layout->stages[MESA_SHADER_COMPUTE].hash, BLAKE3_KEY_LEN);
       _mesa_blake3_update(&nir_hash_ctx, spirv_hash, sizeof(spirv_hash));
       _mesa_blake3_final(&nir_hash_ctx, nir_hash);
    }

@@ -32,6 +32,9 @@ public:
              std::vector<std::string> const& env_vars = {}, bool append_log = false);
     void UpdatePlayTime(const std::string_view serial);
     void Shutdown();
+#ifdef SHADPS4_UWP
+    void StopGuest();
+#endif
 
     /**
      * This will kill the current process and launch a new process with the same configuration
@@ -49,6 +52,7 @@ public:
     bool waitForDebuggerBeforeRun{false};
 
 private:
+    bool exit_done{};
     void LoadSystemModules(const std::string& game_serial);
 
     Core::MemoryManager* memory{};

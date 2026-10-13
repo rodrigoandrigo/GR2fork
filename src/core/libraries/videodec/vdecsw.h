@@ -9,6 +9,9 @@ namespace Core::Loader {
 class SymbolsResolver;
 }
 namespace Libraries::Vdecsw {
+#ifdef SHADPS4_UWP
+void ShutdownVdecsw();
+#endif
 
 class VdecDecoder;
 

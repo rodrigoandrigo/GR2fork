@@ -12,6 +12,10 @@ set(SHADER_DIR ${SHADER_INCLUDE}/video_core/host_shaders)
 set(HOST_SHADERS_INCLUDE ${SHADER_INCLUDE} PARENT_SCOPE)
 
 set(SHADER_FILES "")
+set(HOST_SHADER_VULKAN_VERSION vulkan1.3)
+if(SHADPS4_UWP)
+    set(HOST_SHADER_VULKAN_VERSION vulkan1.2)
+endif()
 
 function(add_host_shader FILENAME SHADER_NAME)
     set(SOURCE_HEADER_FILE ${SHADER_DIR}/${SHADER_NAME}.h)
@@ -22,7 +26,7 @@ function(add_host_shader FILENAME SHADER_NAME)
     add_custom_command(
         OUTPUT ${SOURCE_HEADER_FILE}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
-        COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3
+        COMMAND ${GLSLANG_COMPILER} --target-env ${HOST_SHADER_VULKAN_VERSION}
                 -o ${SOURCE_HEADER_FILE} --vn ${SYMBOL} --depfile ${DEPFILE}
                 ${SHADER_DEFINES} ${CMAKE_CURRENT_SOURCE_DIR}/${FILENAME}
         COMMAND ${CMAKE_COMMAND} "-DHEADER_FILE=${SOURCE_HEADER_FILE}"

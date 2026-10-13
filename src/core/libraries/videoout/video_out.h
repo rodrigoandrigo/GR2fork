@@ -12,6 +12,9 @@ class SymbolsResolver;
 }
 
 namespace Libraries::VideoOut {
+#ifdef SHADPS4_UWP
+void ShutdownVideoOut();
+#endif
 
 // SceVideoOutBusType
 constexpr int SCE_VIDEO_OUT_BUS_TYPE_MAIN = 0;                    // Main output

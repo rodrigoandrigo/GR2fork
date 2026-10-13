@@ -14,12 +14,13 @@
 #include "common/key_manager.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/user_settings.h"
 #include "emulator.h"
-#include "uwp/d3d12_presenter.h"
+#include "uwp/dozen_host.h"
 #include "uwp/gamepad_input.h"
 #include "uwp/xaudio2_output.h"
 
@@ -28,9 +29,14 @@ std::atomic<uint32_t> state{SHADPS4_UNINITIALIZED};
 std::atomic_bool stop_requested{};
 std::atomic_bool pause_requested{};
 std::atomic_bool guest_ready{};
+std::atomic_bool guest_started{};
+std::atomic_bool guest_threads_stopped{true};
+std::atomic_bool session_failed{};
+std::mutex session_mutex;
+std::mutex guest_control_mutex;
 std::mutex api_mutex;
 std::string last_error;
-std::shared_ptr<Core::Uwp::D3D12Presenter> presentation;
+std::shared_ptr<Core::Uwp::DozenHost> presentation;
 std::mutex presentation_mutex;
 void* panel{};
 ShadPS4ErrorCallback error_callback{};
@@ -106,6 +112,7 @@ void ReportError(std::string message) {
     Fail(std::move(message));
 }
 void FailGuestSession(std::string message) {
+    session_failed.store(true);
     stop_requested.store(true);
     guest_ready.store(false);
     Fail(std::move(message));
@@ -119,7 +126,8 @@ bool PauseRequested() {
 }
 
 void SetGuestReady(bool ready) {
-    guest_ready.store(ready);
+    std::scoped_lock lock{guest_control_mutex};
+    guest_ready.store(ready && !stop_requested.load());
 }
 } // namespace Core::Uwp
 
@@ -147,13 +155,23 @@ void shadps4_flush_logs() {
 
 int32_t shadps4_shutdown() {
     shadps4_request_stop();
-    if (state.load() == SHADPS4_RUNNING) {
+    std::unique_lock session_lock{session_mutex, std::try_to_lock};
+    if (!session_lock.owns_lock() || state.load() == SHADPS4_RUNNING) {
         return Fail("Wait for the guest session to return before shutdown");
     }
+    if (!guest_threads_stopped.load()) {
+        try {
+            Common::Singleton<Core::Emulator>::Instance()->StopGuest();
+            guest_threads_stopped.store(true);
+        } catch (const std::exception& exception) {
+            return Fail(exception.what());
+        }
+    }
     try {
+        stop_requested.store(true);
         std::scoped_lock lock{presentation_mutex};
-        VideoCore::SetPresentationSink({});
         presentation.reset();
+        Core::Uwp::ShutdownDozenDriver();
         Core::Uwp::StopGamepadInput();
         Libraries::AudioOut::ShutdownAudioOut();
         Core::Uwp::ClearStorage();
@@ -173,7 +191,7 @@ int32_t shadps4_check_environment() {
         return -1;
     }
     try {
-        Core::Uwp::D3D12Presenter::CheckEnvironment();
+        Core::Uwp::DozenHost::CheckEnvironment();
     } catch (const winrt::hresult_error& exception) {
         return Fail("D3D12 HRESULT " +
                     std::to_string(static_cast<uint32_t>(exception.code().value)) + ": " +
@@ -194,6 +212,13 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
     if (state.load() != SHADPS4_UNINITIALIZED) {
         return Fail("The core has already been initialized");
     }
+    SCOPE_EXIT {
+        if (state.load() == SHADPS4_UNINITIALIZED) {
+            stop_requested.store(true);
+            presentation.reset();
+            panel = nullptr;
+        }
+    };
     try {
         Common::FS::InitializeUserPaths(config->user_directory);
         Common::Log::Setup("shadps4.log");
@@ -208,9 +233,8 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
         }
         if (config->panel) {
             panel = config->panel;
-            presentation = std::make_shared<Core::Uwp::D3D12Presenter>();
+            presentation = std::make_shared<Core::Uwp::DozenHost>();
             presentation->Initialize(*config);
-            VideoCore::SetPresentationSink(presentation);
         }
         Core::Uwp::SuspendAudio(false);
         Core::Uwp::StartGamepadInput();
@@ -244,23 +268,61 @@ int32_t shadps4_run(const wchar_t* executable) {
     if (!executable || !*executable) {
         return Fail("No guest executable was selected");
     }
+    std::unique_lock session_lock{session_mutex, std::try_to_lock};
+    if (!session_lock.owns_lock())
+        return Fail("A guest session is already running");
+    if (guest_started.load())
+        return Fail("Reload the core DLL before starting another guest session");
     uint32_t expected = SHADPS4_READY;
     if (!state.compare_exchange_strong(expected, SHADPS4_RUNNING)) {
-        return Fail("Only one guest session is supported per application process");
+        return Fail("The core is not ready for a guest session");
     }
+    Core::Emulator* emulator{};
     try {
-        const std::filesystem::path path{executable};
-        if (!std::filesystem::is_regular_file(path)) {
-            state.store(SHADPS4_READY);
-            return Fail("The guest executable is not accessible in AppContainer");
+        APTTYPE apartment;
+        APTTYPEQUALIFIER qualifier;
+        winrt::check_hresult(CoGetApartmentType(&apartment, &qualifier));
+        if (apartment != APTTYPE_MTA && apartment != APTTYPE_NA)
+            throw std::runtime_error("Guest boot requires an MTA worker");
+        if (!presentation)
+            throw std::runtime_error("Guest boot requires a host game presentation surface");
+        const auto path =
+            Core::Uwp::PrepareBootStorage(winrt::to_string(std::wstring_view{executable}));
+        {
+            std::scoped_lock lock{api_mutex};
+            last_error.clear();
         }
-        state.store(SHADPS4_READY);
-        return Fail("The D3D12 renderer still lacks advanced guest graphics and complete brokered "
-                    "boot support; guest boot remains disabled");
+        session_failed.store(false);
+        guest_started.store(true);
+        guest_threads_stopped.store(false);
+        emulator = Common::Singleton<Core::Emulator>::Instance();
+        emulator->Run(std::filesystem::path{path});
+        guest_threads_stopped.store(true);
+        state.store(session_failed.load() ? SHADPS4_FAILED : SHADPS4_STOPPED);
+        return session_failed.load() ? -1 : 0;
     } catch (const std::exception& exception) {
-        state.store(SHADPS4_FAILED);
-        return Fail(exception.what());
+        Fail(exception.what());
+    } catch (const winrt::hresult_error& exception) {
+        Fail(winrt::to_string(exception.message()));
+    } catch (...) {
+        Fail("Unknown embedded boot error");
     }
+    stop_requested.store(true);
+    guest_ready.store(false);
+    if (emulator) {
+        try {
+            emulator->StopGuest();
+            guest_threads_stopped.store(true);
+        } catch (const std::exception& exception) {
+            Fail(exception.what());
+        }
+    } else {
+        guest_threads_stopped.store(true);
+    }
+    state.store(guest_started.load() ? SHADPS4_FAILED : SHADPS4_READY);
+    if (!guest_started.load())
+        stop_requested.store(false);
+    return -1;
 }
 
 void shadps4_request_stop() {
@@ -273,8 +335,9 @@ void shadps4_request_stop() {
 }
 
 void shadps4_set_paused(int32_t paused) {
+    std::scoped_lock lock{guest_control_mutex};
     pause_requested.store(paused != 0);
-    if (state.load() != SHADPS4_RUNNING || !guest_ready.load()) {
+    if (state.load() != SHADPS4_RUNNING || !guest_ready.load() || stop_requested.load()) {
         return;
     }
     try {

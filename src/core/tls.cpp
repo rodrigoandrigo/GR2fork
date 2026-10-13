@@ -37,6 +37,14 @@ static std::once_flag slot_alloc_flag;
 
 static void AllocTcbKey() {
     slot = TlsAlloc();
+#ifdef SHADPS4_UWP
+    struct SlotLifetime {
+        ~SlotLifetime() {
+            TlsFree(slot);
+        }
+    };
+    static SlotLifetime lifetime;
+#endif
 }
 
 u32 GetTcbKey() {

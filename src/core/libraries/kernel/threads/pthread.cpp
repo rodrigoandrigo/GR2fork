@@ -23,10 +23,15 @@
 #include "core/libraries/libs.h"
 #include "core/memory.h"
 #include "core/signals.h"
+#ifdef SHADPS4_UWP
+#include <winrt/base.h>
+#include "uwp/shadps4_api.h"
+static thread_local bool guest_apartment_initialized{};
+#endif
 
 #if defined(ARCH_X86_64) || defined(__arm64__) || defined(__aarch64__)
-extern "C" void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func,
-                                                 void* stackb) asm("_runOnAnotherStack");
+extern "C" void* PS4_SYSV_ABI _runOnAnotherStack(
+    void* arg, void* func, void* stackb, void* stack_limit = nullptr) asm("_runOnAnotherStack");
 #else
 void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func, void* stackb) {
     UNREACHABLE_MSG("_runOnAnotherStack not implemented on target architecture.");
@@ -47,17 +52,27 @@ void PS4_SYSV_ABI _sceKernelSetThreadDtors(ThreadDtor dtor) {
     ThreadDtors = dtor;
 }
 
-static void ExitThread() {
+[[noreturn]] static void ExitThread() {
     Pthread* curthread = g_curthread;
 
     /* Check if there is thread specific data: */
-    if (curthread->specific != nullptr) {
+    if (curthread->specific != nullptr
+#ifdef SHADPS4_UWP
+        && !Core::Uwp::StopRequested()
+#endif
+    ) {
         /* Run the thread-specific data destructors: */
         _thread_cleanupspecific();
     }
 
     auto* thread_state = ThrState::Instance();
+#ifdef SHADPS4_UWP
+    if (thread_state->active_threads.fetch_sub(1) == 1)
+        shadps4_request_stop();
+    DebugState.RemoveCurrentThreadFromGuestList();
+#else
     ASSERT(thread_state->active_threads.fetch_sub(1) != 1);
+#endif
 
     curthread->lock->lock();
     curthread->state = PthreadState::Dead;
@@ -81,6 +96,12 @@ static void ExitThread() {
     curthread->tid.notify_all();
     curthread->join_wait_cv.notify_all();
 
+#ifdef SHADPS4_UWP
+    if (guest_apartment_initialized) {
+        winrt::uninit_apartment();
+        guest_apartment_initialized = false;
+    }
+#endif
     curthread->native_thr->Exit();
     UNREACHABLE();
     /* Never reach! */
@@ -101,7 +122,11 @@ void PS4_SYSV_ABI posix_pthread_exit(void* status) {
 
     /* Save the return value: */
     curthread->ret = status;
-    while (!curthread->cleanup.empty()) {
+    while (!curthread->cleanup.empty()
+#ifdef SHADPS4_UWP
+           && !Core::Uwp::StopRequested()
+#endif
+    ) {
         PthreadCleanup* old = curthread->cleanup.front();
         curthread->cleanup.pop_front();
         old->routine(old->routine_arg);
@@ -109,11 +134,29 @@ void PS4_SYSV_ABI posix_pthread_exit(void* status) {
             delete old;
         }
     }
-    if (ThreadDtors) {
+    if (ThreadDtors
+#ifdef SHADPS4_UWP
+        && !Core::Uwp::StopRequested()
+#endif
+    ) {
         (ThreadDtors)();
     }
     ExitThread();
 }
+
+#ifdef SHADPS4_UWP
+bool IsGuestThread() {
+    return g_curthread != nullptr;
+}
+
+[[noreturn]] void ExitGuestThread() {
+    if (!g_curthread)
+        throw std::runtime_error("Host HLE call failed outside a guest thread");
+    g_curthread->cancelling = true;
+    g_curthread->ret = nullptr;
+    ExitThread();
+}
+#endif
 
 static int JoinThread(PthreadT pthread, void** thread_return, const OrbisKernelTimespec* abstime) {
     Pthread* curthread = g_curthread;
@@ -212,6 +255,18 @@ static int JoinThread(PthreadT pthread, void** thread_return, const OrbisKernelT
 }
 
 int PS4_SYSV_ABI posix_pthread_join(PthreadT pthread, void** thread_return) {
+#ifdef SHADPS4_UWP
+    if (!g_curthread) {
+        if (!pthread || !pthread->native_thr)
+            return POSIX_EINVAL;
+        const auto handle = reinterpret_cast<HANDLE>(pthread->native_thr->GetHandle());
+        if (WaitForSingleObjectEx(handle, INFINITE, FALSE) != WAIT_OBJECT_0)
+            return POSIX_EINVAL;
+        if (thread_return)
+            *thread_return = pthread->ret;
+        return 0;
+    }
+#endif
     return JoinThread(pthread, thread_return, nullptr);
 }
 
@@ -279,10 +334,29 @@ static void* RunThread(void* arg) {
     /* Run the current thread's start routine with argument: */
     auto* const stack =
         (void*)(((size_t)curthread->attr.stackaddr_attr + curthread->attr.stacksize_attr) & (~15));
-    void* ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack);
+    void* ret{};
+#ifdef SHADPS4_UWP
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        guest_apartment_initialized = true;
+        if (!Core::Uwp::StopRequested())
+            ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack,
+                                     curthread->attr.stackaddr_attr);
+    } catch (const std::exception& error) {
+        Core::Uwp::FailGuestSession(error.what());
+    } catch (const winrt::hresult_error& error) {
+        Core::Uwp::FailGuestSession(winrt::to_string(error.message()));
+    } catch (...) {
+        Core::Uwp::FailGuestSession("Guest thread initialization failed");
+    }
+#else
+    ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack);
+#endif
 
     /* Remove thread from tracking */
+#ifndef SHADPS4_UWP
     DebugState.RemoveCurrentThreadFromGuestList();
+#endif
     posix_pthread_exit(ret);
 #ifdef WIN32
     return 0;
@@ -655,7 +729,25 @@ enum class PthreadCancelType : u32 {
 namespace {
 
 #ifdef _WIN32
-void PthreadCancelApc(void*, void*, void*, PCONTEXT) {
+void PthreadCancelApc(void*, void*, void*, PCONTEXT context) {
+#ifdef SHADPS4_UWP
+    if (Core::Uwp::StopRequested() && g_curthread && context) {
+        auto& space = Core::Memory::Instance()->GetAddressSpace();
+        const auto address = context->Rip;
+        const bool guest =
+            (address >= space.UserVirtualBase() &&
+             address - space.UserVirtualBase() < space.UserVirtualSize()) ||
+            (address >= space.SystemManagedVirtualBase() &&
+             address - space.SystemManagedVirtualBase() < space.SystemManagedVirtualSize()) ||
+            (address >= space.SystemReservedVirtualBase() &&
+             address - space.SystemReservedVirtualBase() < space.SystemReservedVirtualSize());
+        MEMORY_BASIC_INFORMATION info{};
+        if (guest && VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) &&
+            info.Type != MEM_IMAGE)
+            PthreadTestCancel();
+        return;
+    }
+#endif
     PthreadCancelInterrupt();
 }
 #else
@@ -711,6 +803,42 @@ void InterruptPthreadForCancellation(Pthread* thread) noexcept {
 }
 
 } // namespace
+
+#ifdef SHADPS4_UWP
+void StopGuestThreads() {
+    auto* state = ThrState::Instance();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        bool running = false;
+        {
+            std::scoped_lock list_lock{state->thread_list_lock};
+            const auto visit = [&](Pthread* thread) {
+                if (!thread->native_thr)
+                    return;
+                const auto handle = reinterpret_cast<HANDLE>(thread->native_thr->GetHandle());
+                if (!handle || WaitForSingleObjectEx(handle, 0, FALSE) == WAIT_OBJECT_0)
+                    return;
+                running = true;
+                if (!thread->cancel_pending.exchange(true)) {
+                    thread->wake_sema.release();
+                    thread->signal_sema.release();
+                }
+                thread->join_wait_cv.notify_all();
+                InterruptPthreadForCancellation(thread);
+            };
+            for (auto* thread : state->threads)
+                visit(thread);
+            for (auto* thread : state->gc_list)
+                visit(thread);
+        }
+        if (!running)
+            return;
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("Guest threads did not stop; the core must remain loaded");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+#endif
 
 void PthreadTestCancel() {
     const Pthread* curthread = g_curthread;
@@ -1056,7 +1184,8 @@ bool Pthread::DispatchSignal(s32 sig, Siginfo* info, Ucontext* context) {
 
         auto* stack = reinterpret_cast<void*>(
             (reinterpret_cast<uintptr_t>(sigaltstack.ss_sp) + sigaltstack.ss_size) & (~15ull));
-        _runOnAnotherStack(&arg, reinterpret_cast<void*>(CallbackWrapper), stack);
+        _runOnAnotherStack(&arg, reinterpret_cast<void*>(CallbackWrapper), stack,
+                             sigaltstack.ss_sp);
 
         sigaltstack.ss_flags &= ~POSIX_SS_ONSTACK;
     } else {

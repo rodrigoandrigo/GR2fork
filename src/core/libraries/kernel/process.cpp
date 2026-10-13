@@ -9,6 +9,10 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
 #include "core/linker.h"
+#ifdef SHADPS4_UWP
+#include "core/libraries/kernel/threads/pthread.h"
+#include "uwp/shadps4_api.h"
+#endif
 
 namespace Libraries::Kernel {
 
@@ -309,7 +313,13 @@ u32 PS4_SYSV_ABI posix_getuid() {
 }
 
 s32 PS4_SYSV_ABI exit(s32 status) {
+#ifdef SHADPS4_UWP
+    LOG_INFO(Lib_Kernel, "Guest exited with status {}", status);
+    shadps4_request_stop();
+    posix_pthread_exit(reinterpret_cast<void*>(static_cast<intptr_t>(status)));
+#else
     UNREACHABLE_MSG("Exiting with status code {}", status);
+#endif
     return 0;
 }
 

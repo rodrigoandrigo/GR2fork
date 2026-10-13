@@ -19,6 +19,9 @@
 #include "core/libraries/kernel/time.h"
 #include "core/thread.h"
 #include "core/tls.h"
+#ifdef SHADPS4_UWP
+#include "uwp/session.h"
+#endif
 
 #define GLOBAL_PID 0xBAD1
 
@@ -382,6 +385,10 @@ struct Pthread {
     }
 
     bool ShouldCancel() const noexcept {
+#ifdef SHADPS4_UWP
+        if (Core::Uwp::StopRequested() && !cancelling)
+            return true;
+#endif
         return cancel_pending && cancel_enable && no_cancel == 0;
     }
 

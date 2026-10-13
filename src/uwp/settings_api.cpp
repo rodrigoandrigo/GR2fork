@@ -17,9 +17,15 @@ constexpr std::array groups{"General", "Network", "Log", "Debug",
                             "Input",   "Audio",   "GPU", "Vulkan"};
 
 std::string Unsupported(std::string_view group, std::string_view key, const json& value) {
-    if (group == "Vulkan" || (group == "GPU" && key != "vblank_frequency")) {
-        return "Esta opção usa o renderer Vulkan desktop, ausente no caminho D3D12 UWP.";
-    }
+    if (group == "GPU" && key == "present_mode")
+        return "O host apresenta todos os frames em FIFO, sem descarte.";
+    if (group == "Vulkan" && (key.starts_with("vkvalidation") || key.starts_with("vkcrash") ||
+                              key == "renderdoc_enabled"))
+        return "As ferramentas de validação/captura desktop não estão incluídas no pacote UWP.";
+    if (group == "GPU" && key == "userfaultfd")
+        return "userfaultfd é uma API Linux, indisponível no UWP.";
+    if (group == "GPU" && key == "direct_memory_access_enabled")
+        return "O Dozen usa descritores com limites; acesso BDA direto não está habilitado neste caminho.";
     if (group == "General") {
         if (key == "install_dirs" || key.ends_with("_dir")) {
             return "O UWP usa pastas brokered e armazenamento privado; use Biblioteca/Importar.";
@@ -37,10 +43,8 @@ std::string Unsupported(std::string_view group, std::string_view key, const json
     if (group == "Log" && key == "type") {
         return "O host usa callback e arquivo, sem console desktop.";
     }
-    if (group == "Debug" && key != "debug_dump") {
-        return key == "config_version" ? "Metadado interno, não é uma preferência."
-                                       : "A coleta de shaders usa o renderer Vulkan.";
-    }
+    if (group == "Debug" && key == "config_version")
+        return "Metadado interno, não é uma preferência.";
     if (group == "Input") {
         if (key.starts_with("gyro_") || key == "motion_controls_enabled") {
             return "O backend SDL WinRT não fornece sensores de movimento neste host.";

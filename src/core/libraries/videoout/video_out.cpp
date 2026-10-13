@@ -16,6 +16,11 @@
 namespace Libraries::VideoOut {
 
 static std::unique_ptr<VideoOutDriver> driver;
+#ifdef SHADPS4_UWP
+void ShutdownVideoOut() {
+    driver.reset();
+}
+#endif
 
 void PS4_SYSV_ABI sceVideoOutSetBufferAttribute(BufferAttribute* attribute, PixelFormat pixelFormat,
                                                 u32 tilingMode, u32 aspectRatio, u32 width,

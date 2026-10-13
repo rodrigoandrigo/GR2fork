@@ -61,6 +61,9 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
                                               const char* name);
 
 void RegisterThreads(Core::Loader::SymbolsResolver* sym);
+#ifdef SHADPS4_UWP
+void StopGuestThreads();
+#endif
 
 class Thread {
 public:
@@ -100,7 +103,17 @@ public:
 
     static void* PS4_SYSV_ABI RunWrapper(void* arg) {
         Thread* thr = (Thread*)arg;
+#ifdef SHADPS4_UWP
+        try {
+            thr->func(thr->stop.get_token());
+        } catch (const std::exception& error) {
+            Core::Uwp::FailGuestSession(error.what());
+        } catch (...) {
+            Core::Uwp::FailGuestSession("Guest main initialization failed");
+        }
+#else
         thr->func(thr->stop.get_token());
+#endif
         return nullptr;
     }
 

@@ -25,6 +25,14 @@ AjmContext::AjmContext() {
     worker_thread = std::jthread([this](std::stop_token stop) { this->WorkerThread(stop); });
 }
 
+#ifdef SHADPS4_UWP
+AjmContext::~AjmContext() {
+    worker_thread.request_stop();
+    if (worker_thread.joinable())
+        worker_thread.join();
+}
+#endif
+
 bool AjmContext::IsRegistered(AjmCodecType type) const {
     return registered_codecs[std::to_underlying(type)];
 }
