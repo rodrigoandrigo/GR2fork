@@ -39,6 +39,7 @@ namespace Common::Log {
 static std::mutex callback_mutex;
 static Callback log_callback{};
 static void* log_context{};
+static std::shared_ptr<spdlog::sinks::async_sink> async_log_sink;
 
 void SetCallback(Callback callback, void* context) {
     std::scoped_lock lock{callback_mutex};
@@ -203,9 +204,16 @@ void Shutdown() {
 
     g_shad_file_sink.reset();
     g_console_sink.reset();
+    async_log_sink.reset();
 }
 
 void Flush() {
+#ifdef SHADPS4_UWP
+    if (async_log_sink) {
+        async_log_sink->flush();
+        async_log_sink->wait_all();
+    }
+#endif
     if (g_shad_file_sink != nullptr) {
         g_shad_file_sink->flush();
     }
@@ -224,8 +232,8 @@ void UpdateSinks() {
         EmitCallback(Level::Error, message.c_str());
     };
 #endif
-    std::initializer_list<spdlog::sink_ptr> async_sink{
-        std::make_shared<spdlog::sinks::async_sink>(std::move(async_config))};
+    async_log_sink = std::make_shared<spdlog::sinks::async_sink>(std::move(async_config));
+    std::initializer_list<spdlog::sink_ptr> async_sink{async_log_sink};
 
     std::initializer_list<spdlog::sink_ptr> dup_filter{
         std::make_shared<spdlog::sinks::dup_filter_sink_mt>(

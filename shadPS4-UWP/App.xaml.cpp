@@ -85,6 +85,22 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 	
 	// Verifique se a janela atual está ativa
 	Window::Current->Activate();
+	if (!m_backNavigationRegistered)
+	{
+		try
+		{
+			Windows::UI::Core::SystemNavigationManager::GetForCurrentView()->BackRequested +=
+				ref new EventHandler<Windows::UI::Core::BackRequestedEventArgs^>(
+					[](Object^, Windows::UI::Core::BackRequestedEventArgs^ args) {
+						args->Handled = true;
+					});
+			m_backNavigationRegistered = true;
+		}
+		catch (Exception^ exception)
+		{
+			OutputDebugStringW(exception->Message->Data());
+		}
+	}
 }
 /// <summary>
 /// Chamado quando a execução do aplicativo está sendo suspensa.  O estado do aplicativo é salvo

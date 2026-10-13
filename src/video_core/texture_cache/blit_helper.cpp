@@ -136,13 +136,21 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         .minDepth = 0.f,
         .maxDepth = 1.f,
     };
-    cmdbuf.setViewportWithCount(viewport);
+    if (instance.IsExtendedDynamicStateSupported()) {
+        cmdbuf.setViewportWithCount(viewport);
+    } else {
+        cmdbuf.setViewport(0, viewport);
+    }
 
     const vk::Rect2D scissor = {
         .offset = {0, 0},
         .extent = {state.width, state.height},
     };
-    cmdbuf.setScissorWithCount(scissor);
+    if (instance.IsExtendedDynamicStateSupported()) {
+        cmdbuf.setScissorWithCount(scissor);
+    } else {
+        cmdbuf.setScissor(0, scissor);
+    }
 
     cmdbuf.draw(3, 1, 0, 0);
 
@@ -239,13 +247,21 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         .minDepth = 0.f,
         .maxDepth = 1.f,
     };
-    cmdbuf.setViewportWithCount(viewport);
+    if (instance.IsExtendedDynamicStateSupported()) {
+        cmdbuf.setViewportWithCount(viewport);
+    } else {
+        cmdbuf.setViewport(0, viewport);
+    }
 
     const vk::Rect2D scissor = {
         .offset = {0, 0},
         .extent = {state.width, state.height},
     };
-    cmdbuf.setScissorWithCount(scissor);
+    if (instance.IsExtendedDynamicStateSupported()) {
+        cmdbuf.setScissorWithCount(scissor);
+    } else {
+        cmdbuf.setScissor(0, scissor);
+    }
 
     cmdbuf.draw(3, 1, 0, 0);
 
@@ -303,8 +319,12 @@ void BlitHelper::CreateColorToMSDepthPipeline(const MsPipelineKey& key) {
         .depthWriteEnable = true,
         .depthCompareOp = vk::CompareOp::eAlways,
     };
-    const std::array dynamic_states = {vk::DynamicState::eViewportWithCount,
-                                       vk::DynamicState::eScissorWithCount};
+    const std::array dynamic_states = {
+        instance.IsExtendedDynamicStateSupported() ? vk::DynamicState::eViewportWithCount
+                                                   : vk::DynamicState::eViewport,
+        instance.IsExtendedDynamicStateSupported() ? vk::DynamicState::eScissorWithCount
+                                                   : vk::DynamicState::eScissor,
+    };
     const vk::PipelineDynamicStateCreateInfo dynamic_info = {
         .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
         .pDynamicStates = dynamic_states.data(),
@@ -330,7 +350,10 @@ void BlitHelper::CreateColorToMSDepthPipeline(const MsPipelineKey& key) {
     };
 
     const vk::PipelineColorBlendStateCreateInfo color_blending{};
-    const vk::PipelineViewportStateCreateInfo viewport_info{};
+    const vk::PipelineViewportStateCreateInfo viewport_info{
+        .viewportCount = instance.IsExtendedDynamicStateSupported() ? 0u : 1u,
+        .scissorCount = instance.IsExtendedDynamicStateSupported() ? 0u : 1u,
+    };
     const vk::PipelineVertexInputStateCreateInfo vertex_input_info{};
     const vk::PipelineRasterizationStateCreateInfo raster_state{.lineWidth = 1.f};
 
@@ -370,8 +393,12 @@ void BlitHelper::CreateMsCopyPipeline(const MsPipelineKey& key) {
         .depthWriteEnable = false,
         .depthCompareOp = vk::CompareOp::eAlways,
     };
-    const std::array dynamic_states = {vk::DynamicState::eViewportWithCount,
-                                       vk::DynamicState::eScissorWithCount};
+    const std::array dynamic_states = {
+        instance.IsExtendedDynamicStateSupported() ? vk::DynamicState::eViewportWithCount
+                                                   : vk::DynamicState::eViewport,
+        instance.IsExtendedDynamicStateSupported() ? vk::DynamicState::eScissorWithCount
+                                                   : vk::DynamicState::eScissor,
+    };
     const vk::PipelineDynamicStateCreateInfo dynamic_info = {
         .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
         .pDynamicStates = dynamic_states.data(),
@@ -408,7 +435,10 @@ void BlitHelper::CreateMsCopyPipeline(const MsPipelineKey& key) {
         .attachmentCount = 1u,
         .pAttachments = &attachment,
     };
-    const vk::PipelineViewportStateCreateInfo viewport_info{};
+    const vk::PipelineViewportStateCreateInfo viewport_info{
+        .viewportCount = instance.IsExtendedDynamicStateSupported() ? 0u : 1u,
+        .scissorCount = instance.IsExtendedDynamicStateSupported() ? 0u : 1u,
+    };
     const vk::PipelineVertexInputStateCreateInfo vertex_input_info{};
     const vk::PipelineRasterizationStateCreateInfo raster_state{.lineWidth = 1.f};
 

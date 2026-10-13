@@ -158,6 +158,10 @@ public:
     }
 
     /// Returns true when VK_EXT_extended_dynamic_state3 is supported
+    bool IsExtendedDynamicStateSupported() const {
+        return dynamic_state;
+    }
+
     bool IsExtendedDynamicState3Supported() const {
         return dynamic_state_3;
     }
@@ -528,6 +532,7 @@ private:
     bool amd_shader_explicit_vertex_parameter{};
     bool depth_clip_control{};
     bool depth_clip_enable{};
+    bool dynamic_state{true};
     bool dynamic_state_3{};
     bool dynamic_color_write_mask_enabled{};
     bool depth_range_unrestricted{};

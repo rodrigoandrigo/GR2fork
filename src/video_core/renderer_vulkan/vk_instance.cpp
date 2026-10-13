@@ -253,9 +253,12 @@ bool Instance::CreateDevice() {
                                  VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
                                  VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME,
                                  VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME,
-                                 VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
                                  VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME}) {
         ASSERT_MSG(add_extension(extension), "Required Dozen extension unavailable: {}", extension);
+    }
+    dynamic_state = add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    if (!dynamic_state) {
+        LOG_WARNING(Render_Vulkan, "Using static pipeline states without extended dynamic state");
     }
 #endif
     // Required
@@ -566,6 +569,9 @@ bool Instance::CreateDevice() {
 #ifdef SHADPS4_UWP
     device_chain.unlink<vk::PhysicalDeviceVulkan13Features>();
     device_chain.unlink<vk::PhysicalDeviceMaintenance4FeaturesKHR>();
+    if (!dynamic_state) {
+        device_chain.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+    }
 #endif
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();

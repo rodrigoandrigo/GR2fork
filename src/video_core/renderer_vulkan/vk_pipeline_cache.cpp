@@ -1207,6 +1207,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 // refresh. The Fragment runtime-info slot must be stamp-current: its rebuild
 // reads the key's color buffers, which the full refresh has already masked.
 bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
+    if (!instance.IsExtendedDynamicStateSupported()) {
+        return false;
+    }
     const u64 stamp = liverpool->GetGfxStateStamp();
     const auto& fs_slot = ri_stamp[static_cast<u32>(SwStage::Fragment)];
     if (!last_graphics_pipeline || pipe_gen != last_graphics_pipe_gen || stamp != last_key_stamp ||
@@ -1454,6 +1457,39 @@ bool PipelineCache::RefreshGraphicsKey() {
     key_is_last = false;
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
+
+    if (!instance.IsExtendedDynamicStateSupported()) {
+        key.viewport_count = std::max(
+            1u, static_cast<u32>(std::ranges::count_if(
+                    regs.viewports, [](const auto& viewport) { return viewport.xscale != 0; })));
+        key.depth_test_enable = regs.depth_control.depth_enable && regs.depth_buffer.DepthValid();
+        key.depth_write_enable = key.depth_test_enable && regs.depth_control.depth_write_enable &&
+                                 !regs.depth_render_control.depth_clear_enable;
+        key.depth_compare_op = key.depth_test_enable
+                                   ? LiverpoolToVK::CompareOp(regs.depth_control.depth_func)
+                                   : vk::CompareOp::eAlways;
+        key.depth_bounds_enable = regs.depth_control.depth_bounds_enable;
+        key.stencil_test_enable =
+            regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid();
+        if (key.stencil_test_enable) {
+            key.stencil_front = {
+                .failOp = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_front),
+                .passOp = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_front),
+                .depthFailOp = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_front),
+                .compareOp = LiverpoolToVK::CompareOp(regs.depth_control.stencil_ref_func),
+            };
+            key.stencil_back = regs.depth_control.backface_enable ? vk::StencilOpState{
+                .failOp = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_back),
+                .passOp = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_back),
+                .depthFailOp = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_back),
+                .compareOp = LiverpoolToVK::CompareOp(regs.depth_control.stencil_bf_func),
+            } : key.stencil_front;
+        }
+        key.cull_mode = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type)
+                            ? LiverpoolToVK::CullMode(regs.polygon_control.CullingMode())
+                            : vk::CullModeFlagBits::eNone;
+        key.front_face = LiverpoolToVK::FrontFace(regs.polygon_control.front_face);
+    }
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
 
@@ -1731,14 +1767,15 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
 
     const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
     if (!instance.IsVertexInputDynamicState() && vs_info && fetch_shader_ref) {
-        // Without vertex input dynamic state, the pipeline needs to specialize on format.
-        // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
         for (const auto& attrib : fetch_shader_ref.Get().attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
                        MaxVertexBufferCount);
+            if (!instance.IsExtendedDynamicStateSupported()) {
+                key.vertex_buffer_strides[vertex_binding] = buffer.GetStride();
+            }
             key.vertex_buffer_formats[vertex_binding++] =
                 Vulkan::LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
         }

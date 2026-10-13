@@ -83,6 +83,8 @@ GraphicsPipeline::GraphicsPipeline(
                                 (!key.depth_clip_enable || instance.IsDepthClipEnableSupported()),
             .rasterizerDiscardEnable = false,
             .polygonMode = LiverpoolToVK::PolygonMode(key.polygon_mode),
+            .cullMode = key.cull_mode,
+            .frontFace = key.front_face,
             .lineWidth = 1.0f,
         },
         vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT{
@@ -118,6 +120,8 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::PipelineViewportStateCreateInfo viewport_info = {
         .pNext = instance.IsDepthClipControlSupported() ? &clip_control : nullptr,
+        .viewportCount = key.viewport_count,
+        .scissorCount = key.viewport_count,
     };
 
     boost::container::static_vector<vk::DynamicState, 32> dynamic_states = {
@@ -132,8 +136,28 @@ GraphicsPipeline::GraphicsPipeline(
         vk::DynamicState::eLineWidth,          vk::DynamicState::ePrimitiveRestartEnable,
     };
 
+    if (!instance.IsExtendedDynamicStateSupported()) {
+        const auto first_static = std::remove_if(
+            dynamic_states.begin(), dynamic_states.end(), [](vk::DynamicState state) {
+                return state == vk::DynamicState::eViewportWithCount ||
+                       state == vk::DynamicState::eScissorWithCount ||
+                       state == vk::DynamicState::eDepthTestEnable ||
+                       state == vk::DynamicState::eDepthWriteEnable ||
+                       state == vk::DynamicState::eDepthCompareOp ||
+                       state == vk::DynamicState::eStencilTestEnable ||
+                       state == vk::DynamicState::eStencilOp ||
+                       state == vk::DynamicState::eCullMode ||
+                       state == vk::DynamicState::eFrontFace;
+            });
+        dynamic_states.erase(first_static, dynamic_states.end());
+        dynamic_states.push_back(vk::DynamicState::eViewport);
+        dynamic_states.push_back(vk::DynamicState::eScissor);
+    }
+
     if (instance.IsDepthBoundsSupported()) {
-        dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+        if (instance.IsExtendedDynamicStateSupported()) {
+            dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+        }
         dynamic_states.push_back(vk::DynamicState::eDepthBounds);
     }
     // A dynamic color write mask makes the driver build a pixel shader epilog
@@ -143,7 +167,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
     if (instance.IsVertexInputDynamicState()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputEXT);
-    } else if (!sdata.vertex_bindings.empty()) {
+    } else if (!sdata.vertex_bindings.empty() && instance.IsExtendedDynamicStateSupported()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputBindingStride);
     }
 
@@ -378,9 +402,15 @@ GraphicsPipeline::GraphicsPipeline(
         .blendConstants = std::array{1.0f, 1.0f, 1.0f, 1.0f},
     };
 
-    // Required by spec unless VK_EXT_extended_dynamic_state3 is supported.
-    // In practice, we use dynamic state for all of it.
-    constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
+    const vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {
+        .depthTestEnable = key.depth_test_enable,
+        .depthWriteEnable = key.depth_write_enable,
+        .depthCompareOp = key.depth_compare_op,
+        .depthBoundsTestEnable = key.depth_bounds_enable && instance.IsDepthBoundsSupported(),
+        .stencilTestEnable = key.stencil_test_enable,
+        .front = key.stencil_front,
+        .back = key.stencil_back,
+    };
 
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
@@ -392,8 +422,10 @@ GraphicsPipeline::GraphicsPipeline(
         .pViewportState = &viewport_info,
         .pRasterizationState = &raster_chain.get(),
         .pMultisampleState = &sdata.multisampling,
-        .pDepthStencilState =
-            !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
+        .pDepthStencilState = !instance.IsExtendedDynamicState3Supported() ||
+                                      !instance.IsExtendedDynamicStateSupported()
+                                  ? &depth_stencil_info
+                                  : nullptr,
         .pColorBlendState = &color_blending,
         .pDynamicState = &dynamic_info,
         .layout = pipeline_layout,

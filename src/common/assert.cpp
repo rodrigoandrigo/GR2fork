@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "core/signals.h"
@@ -24,6 +25,17 @@ void assert_fail_impl() {
 #endif
 }
 
+void assert_fail_msg(const char* file, int line, const char* func, fmt::string_view format,
+                     fmt::format_args args) {
+#ifdef SHADPS4_UWP
+    Common::Log::Flush();
+    throw std::runtime_error(
+        fmt::format("{}:{} {}: {}", file, line, func, fmt::vformat(format, args)));
+#else
+    assert_fail_impl();
+#endif
+}
+
 [[noreturn]] void unreachable_impl() {
     assert_fail_impl();
     throw std::runtime_error("Unreachable code");
@@ -31,5 +43,6 @@ void assert_fail_impl() {
 
 void assert_fail_debug_msg(const char* msg) {
     LOG_CRITICAL(Debug, "Assertion Failed!\n{}", msg);
-    assert_fail_impl();
+    assert_fail_msg(__FILE__, __LINE__, __func__, "Assertion Failed!\n{}",
+                    fmt::make_format_args(msg));
 }

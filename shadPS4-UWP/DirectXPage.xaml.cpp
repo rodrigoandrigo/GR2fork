@@ -86,6 +86,8 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
                 });
     down_token = window->KeyDown += ref new Windows::Foundation::TypedEventHandler < CoreWindow ^,
     KeyEventArgs ^ > ([weak](CoreWindow ^, KeyEventArgs ^ args) {
+                       if (args->VirtualKey == Windows::System::VirtualKey::GamepadB)
+                           args->Handled = true;
                        if (auto page = weak.Resolve<DirectXPage>())
                            if (page->frontend)
                                page->frontend->UpdateInput([&](FrontendInput& input) {
@@ -96,6 +98,8 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
                    });
     up_token = window->KeyUp += ref new Windows::Foundation::TypedEventHandler < CoreWindow ^,
     KeyEventArgs ^ > ([weak](CoreWindow ^, KeyEventArgs ^ args) {
+                       if (args->VirtualKey == Windows::System::VirtualKey::GamepadB)
+                           args->Handled = true;
                        if (auto page = weak.Resolve<DirectXPage>())
                            if (page->frontend)
                                page->frontend->UpdateInput([&](FrontendInput& input) {

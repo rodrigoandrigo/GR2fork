@@ -24,5 +24,6 @@ namespace shadPS4_UWP
 		void OnResuming(Platform::Object ^sender, Platform::Object ^args);
 		void OnNavigationFailed(Platform::Object ^sender, Windows::UI::Xaml::Navigation::NavigationFailedEventArgs ^e);
 		DirectXPage^ m_directXPage;
+		bool m_backNavigationRegistered = false;
 	};
 }

@@ -32,6 +32,17 @@ using VertexInputs = boost::container::static_vector<T, MaxVertexBufferCount>;
 struct GraphicsPipelineKey {
     std::array<size_t, MaxShaderStages> stage_hashes;
     std::array<vk::Format, MaxVertexBufferCount> vertex_buffer_formats;
+    std::array<u32, MaxVertexBufferCount> vertex_buffer_strides;
+    u32 viewport_count;
+    vk::Bool32 depth_test_enable;
+    vk::Bool32 depth_write_enable;
+    vk::Bool32 depth_bounds_enable;
+    vk::Bool32 stencil_test_enable;
+    vk::CompareOp depth_compare_op;
+    vk::StencilOpState stencil_front;
+    vk::StencilOpState stencil_back;
+    vk::CullModeFlags cull_mode;
+    vk::FrontFace front_face;
     u32 patch_control_points;
     u32 num_color_attachments;
     std::array<Shader::PsColorBuffer, AmdGpu::NUM_COLOR_BUFFERS> color_buffers;
