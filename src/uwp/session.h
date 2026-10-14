@@ -1,10 +1,13 @@
 #pragma once
 
 #include <string>
+#include <stop_token>
 
 namespace Core::Uwp {
 bool StopRequested();
 bool PauseRequested();
+void RegisterGuestWorker(std::stop_source source);
+void StopGuestWorkers();
 void SetGuestReady(bool ready);
 void ReportError(std::string message);
 void FailGuestSession(std::string message);

@@ -544,8 +544,15 @@ void ImGuiFrontend::Scan() {
             FrontendGame game{path, path.substr(path.find_last_of('/') + 1), {}, {}};
             if (!level && names.find(path) != names.end())
                 game.title = names.at(path);
+            game.metadata_path = path + "/sce_sys";
+            if (stat((game.metadata_path + "/param.sfo").c_str(), &info) &&
+                path.size() >= 7 && path.compare(path.size() - 7, 7, "/Image0") == 0) {
+                const auto candidate = path.substr(0, path.find_last_of('/')) + "/Sc0";
+                if (!stat((candidate + "/param.sfo").c_str(), &info))
+                    game.metadata_path = candidate;
+            }
             try {
-                const auto metadata = Sfo(ReadFile(path + "/sce_sys/param.sfo", 256 * 1024));
+                const auto metadata = Sfo(ReadFile(game.metadata_path + "/param.sfo", 256 * 1024));
                 if (metadata.find("TITLE") != metadata.end())
                     game.title = metadata.at("TITLE");
                 if (metadata.find("TITLE_ID") != metadata.end())
@@ -592,7 +599,7 @@ void ImGuiFrontend::Scan() {
         failed_images.clear();
         decoded.clear();
         status = std::to_string(result->games.size()) +
-                 " jogos encontrados. Boot guest Vulkan/Dozen ainda indisponível.";
+                 " jogos encontrados. Selecione um jogo para iniciar.";
         scanning.store(false);
         Filter();
     });
@@ -896,7 +903,7 @@ void ImGuiFrontend::DrawLibrary() {
     if (ImGui::InputText("Pesquisar", search, sizeof(search)))
         Filter();
     if (!library || !visible || visible->empty()) {
-        ImGui::TextUnformatted("Selecione uma pasta com jogos PS4.");
+        ImGui::TextUnformatted("Selecione uma pasta com jogos PS4. Para Image0/Sc0, escolha a pasta que contém ambas.");
         return;
     }
     ImGui::Text("%zu jogos | %zu/64 capas residentes", visible->size(), renderer->ImageCount());
@@ -917,7 +924,7 @@ void ImGuiFrontend::DrawLibrary() {
                 ImGui::Image(reinterpret_cast<ImTextureID>(texture), {icon, icon});
             else {
                 ImGui::Dummy({icon, icon});
-                RequestImage(key, game.path + "/sce_sys/icon0.png");
+                RequestImage(key, game.metadata_path + "/icon0.png");
             }
             ImGui::SameLine();
             ImGui::BeginGroup();

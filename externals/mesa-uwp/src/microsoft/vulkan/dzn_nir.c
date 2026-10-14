@@ -413,15 +413,20 @@ dzn_lower_patch_vertices(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 bool
 dzn_nir_lower_patch_vertices(nir_shader *nir, unsigned count)
 {
-   if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
+   bool progress = false;
+   if (nir->info.stage == MESA_SHADER_TESS_CTRL ||
+       nir->info.stage == MESA_SHADER_TESS_EVAL) {
       nir_foreach_shader_in_variable(var, nir) {
-         if (!var->data.patch && glsl_type_is_array(var->type))
+         if (!var->data.patch && glsl_type_is_array(var->type) &&
+             glsl_array_size(var->type) != count) {
             var->type = glsl_array_type(glsl_get_array_element(var->type), count, 0);
+            progress = true;
+         }
       }
       nir_fixup_deref_types(nir);
    }
    return nir_shader_intrinsics_pass(nir, dzn_lower_patch_vertices,
-      nir_metadata_control_flow, &count);
+      nir_metadata_control_flow, &count) || progress;
 }
 
 nir_shader *

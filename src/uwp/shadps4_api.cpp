@@ -8,6 +8,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <SDL3/SDL.h>
 #include <windows.h>
 #include <winrt/base.h>
@@ -34,6 +35,8 @@ std::atomic_bool guest_threads_stopped{true};
 std::atomic_bool session_failed{};
 std::mutex session_mutex;
 std::mutex guest_control_mutex;
+std::mutex worker_stop_mutex;
+std::vector<std::stop_source> worker_stops;
 std::mutex api_mutex;
 std::string last_error;
 std::shared_ptr<Core::Uwp::DozenHost> presentation;
@@ -108,12 +111,30 @@ bool CanExecuteGuestCode() {
 } // namespace
 
 namespace Core::Uwp {
+void RegisterGuestWorker(std::stop_source source) {
+    {
+        std::scoped_lock lock{worker_stop_mutex};
+        worker_stops.push_back(source);
+    }
+    if (StopRequested())
+        source.request_stop();
+}
+void StopGuestWorkers() {
+    std::vector<std::stop_source> sources;
+    {
+        std::scoped_lock lock{worker_stop_mutex};
+        sources = worker_stops;
+    }
+    for (auto& source : sources)
+        source.request_stop();
+}
 void ReportError(std::string message) {
     Fail(std::move(message));
 }
 void FailGuestSession(std::string message) {
     session_failed.store(true);
     stop_requested.store(true);
+    StopGuestWorkers();
     guest_ready.store(false);
     Fail(std::move(message));
 }
@@ -327,6 +348,7 @@ int32_t shadps4_run(const wchar_t* executable) {
 
 void shadps4_request_stop() {
     stop_requested.store(true);
+    Core::Uwp::StopGuestWorkers();
     if (state.load() == SHADPS4_RUNNING) {
         SDL_Event event{};
         event.type = SDL_EVENT_QUIT;

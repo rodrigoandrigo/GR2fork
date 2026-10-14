@@ -60,11 +60,19 @@ bool Missing(const winrt::hresult_error& error) {
 
 class BrokeredDirectory final : public FileSys::IDirectory {
 public:
-    explicit BrokeredDirectory(StorageFolder folder) {
-        for (const auto& item : folder.GetItemsAsync().get()) {
-            const bool directory = item.IsOfType(StorageItemTypes::Folder);
-            const auto size = directory ? 0 : item.GetBasicPropertiesAsync().get().Size();
-            entries.push_back({winrt::to_string(item.Name()), directory, size});
+    explicit BrokeredDirectory(StorageFolder folder, StorageFolder fallback = nullptr) {
+        for (const auto& source : {folder, fallback}) {
+            if (!source)
+                continue;
+            for (const auto& item : source.GetItemsAsync().get()) {
+                const auto name = winrt::to_string(item.Name());
+                if (std::ranges::any_of(entries,
+                                        [&](const auto& entry) { return entry.name == name; }))
+                    continue;
+                const bool directory = item.IsOfType(StorageItemTypes::Folder);
+                const auto size = directory ? 0 : item.GetBasicPropertiesAsync().get().Size();
+                entries.push_back({name, directory, size});
+            }
         }
     }
     bool Next(FileSys::DirEntry& out) override {
@@ -360,32 +368,74 @@ BrokeredFsBackend::BrokeredFsBackend(void* folder, bool read_only) : read_only{r
 }
 StorageFolder BrokeredFsBackend::Folder(std::string_view relative) const {
     const auto path = RelativePath(relative);
-    auto folder = root;
-    size_t start{};
-    while (start < path.size()) {
-        const auto slash = path.find('/', start);
-        const auto part =
-            path.substr(start, slash == std::string::npos ? path.size() - start : slash - start);
-        folder = folder.GetFolderAsync(winrt::to_hstring(part)).get();
-        if (slash == std::string::npos) {
-            break;
+    try {
+        auto folder = root;
+        size_t start{};
+        while (start < path.size()) {
+            const auto slash = path.find('/', start);
+            const auto part = path.substr(start, slash == std::string::npos ? path.size() - start
+                                                                            : slash - start);
+            folder = folder.GetFolderAsync(winrt::to_hstring(part)).get();
+            if (slash == std::string::npos) {
+                break;
+            }
+            start = slash + 1;
         }
-        start = slash + 1;
+        return folder;
+    } catch (const winrt::hresult_error& error) {
+        if (metadata && Missing(error) && (path == "sce_sys" || path.starts_with("sce_sys/")))
+            return metadata->Folder(path == "sce_sys" ? std::string_view{}
+                                                      : std::string_view{path}.substr(8));
+        throw;
     }
-    return folder;
 }
 
 std::shared_ptr<BrokeredFsBackend> BrokeredFsBackend::Subdirectory(
     std::string_view relative) const {
     const auto folder = Folder(relative);
-    return std::make_shared<BrokeredFsBackend>(winrt::get_abi(folder), read_only);
+    auto backend = std::make_shared<BrokeredFsBackend>(winrt::get_abi(folder), read_only);
+    if (relative.empty())
+        backend->metadata = metadata;
+    return backend;
+}
+std::shared_ptr<BrokeredFsBackend> BrokeredFsBackend::GameDirectory(
+    std::string_view relative) const {
+    auto game = Subdirectory(relative);
+    if (game->Exists("sce_sys/param.sfo") || game->root.Name() != L"Image0")
+        return game;
+    try {
+        StorageFolder parent{nullptr};
+        const auto slash = relative.find_last_of('/');
+        if (!relative.empty())
+            parent = Folder(slash == std::string_view::npos ? std::string_view{}
+                                                            : relative.substr(0, slash));
+        else
+            parent = root.GetParentAsync().get();
+        if (parent) {
+            const auto folder = parent.GetFolderAsync(L"Sc0").get();
+            auto candidate = std::make_shared<BrokeredFsBackend>(winrt::get_abi(folder), true);
+            if (candidate->Exists("param.sfo"))
+                game->metadata = std::move(candidate);
+        }
+    } catch (const winrt::hresult_error& error) {
+        if (!Missing(error) && error.code() != E_ACCESSDENIED)
+            throw;
+    }
+    return game;
 }
 IStorageItem BrokeredFsBackend::Item(std::string_view relative) const {
     if (relative.empty()) {
         return root;
     }
     const auto [parent, name] = ParentAndName(relative);
-    return Folder(parent).GetItemAsync(winrt::to_hstring(name)).get();
+    try {
+        return Folder(parent).GetItemAsync(winrt::to_hstring(name)).get();
+    } catch (const winrt::hresult_error& error) {
+        if (metadata && Missing(error) &&
+            (relative == "sce_sys" || relative.starts_with("sce_sys/")))
+            return metadata->Item(relative == "sce_sys" ? std::string_view{} : relative.substr(8));
+        throw;
+    }
 }
 bool BrokeredFsBackend::Exists(std::string_view relative) {
     try {
@@ -410,7 +460,8 @@ bool BrokeredFsBackend::IsDirectory(std::string_view relative) {
 std::unique_ptr<FileSys::IFile> BrokeredFsBackend::Open(std::string_view relative,
                                                         Common::FS::FileAccessMode mode) {
     const bool writable = mode != Common::FS::FileAccessMode::Read;
-    if (writable && read_only) {
+    if (writable &&
+        (read_only || (metadata && (relative == "sce_sys" || relative.starts_with("sce_sys/"))))) {
         winrt::throw_hresult(E_ACCESSDENIED);
     }
     const auto [parent, name] = ParentAndName(relative);
@@ -430,12 +481,22 @@ std::unique_ptr<FileSys::IFile> BrokeredFsBackend::Open(std::string_view relativ
                 .get();
         public_mode = SHADPS4_FILE_APPEND;
     } else {
-        file = folder.GetFileAsync(winrt::to_hstring(name)).get();
+        file = Item(relative).as<StorageFile>();
     }
     return OpenStorageFile(winrt::get_abi(file), public_mode);
 }
 std::unique_ptr<FileSys::IDirectory> BrokeredFsBackend::OpenDir(std::string_view relative) {
-    return std::make_unique<BrokeredDirectory>(Folder(relative));
+    StorageFolder fallback{nullptr};
+    if (metadata && (relative == "sce_sys" || relative.starts_with("sce_sys/"))) {
+        try {
+            fallback =
+                metadata->Folder(relative == "sce_sys" ? std::string_view{} : relative.substr(8));
+        } catch (const winrt::hresult_error& error) {
+            if (!Missing(error))
+                throw;
+        }
+    }
+    return std::make_unique<BrokeredDirectory>(Folder(relative), fallback);
 }
 bool BrokeredFsBackend::IsReadOnly() const {
     return read_only;
@@ -467,7 +528,7 @@ FileSys::FileStat BrokeredFsBackend::Stat(std::string_view relative) const {
     return result;
 }
 void BrokeredFsBackend::CreateSubdirectory(std::string_view relative) {
-    if (read_only) {
+    if (read_only || (metadata && (relative == "sce_sys" || relative.starts_with("sce_sys/")))) {
         winrt::throw_hresult(E_ACCESSDENIED);
     }
     const auto [parent, name] = ParentAndName(relative);
@@ -476,13 +537,16 @@ void BrokeredFsBackend::CreateSubdirectory(std::string_view relative) {
         .get();
 }
 void BrokeredFsBackend::Delete(std::string_view relative) {
-    if (read_only || relative.empty()) {
+    if (read_only || relative.empty() ||
+        (metadata && (relative == "sce_sys" || relative.starts_with("sce_sys/")))) {
         winrt::throw_hresult(E_ACCESSDENIED);
     }
     Item(relative).DeleteAsync(StorageDeleteOption::PermanentDelete).get();
 }
 void BrokeredFsBackend::Rename(std::string_view from, std::string_view to) {
-    if (read_only || from.empty() || to.empty()) {
+    if (read_only || from.empty() || to.empty() ||
+        (metadata && (from == "sce_sys" || from.starts_with("sce_sys/") || to == "sce_sys" ||
+                      to.starts_with("sce_sys/")))) {
         winrt::throw_hresult(E_ACCESSDENIED);
     }
     const auto [source_parent, source_name] = ParentAndName(from);

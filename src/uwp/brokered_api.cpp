@@ -105,9 +105,10 @@ std::string PrepareBootStorage(std::string executable) {
     Require(!filename.empty());
     const auto info = backend->Stat(relative);
     Require(!info.is_directory, HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND));
-    auto game = backend->Subdirectory(parent);
+    auto game = backend->GameDirectory(parent);
     Mounts()->MountBackend(game, "/app0");
     Mounts()->MountBackend(game, "/hostapp");
+    LOG_INFO(Loader, "Boot executable mounted through brokered storage: /app0/{}", filename);
     folders.insert_or_assign("/app0", game);
     folders.insert_or_assign("/hostapp", game);
     return "/app0/" + filename;
@@ -130,6 +131,7 @@ int32_t shadps4_mount_storage_folder(const char* mount, void* folder, int32_t re
         RequireIdle();
         const auto name = MountName(mount);
         auto backend = std::make_shared<BrokeredFsBackend>(folder, read_only != 0);
+        backend = backend->GameDirectory({});
         backend->Stat({});
         Mounts()->MountBackend(backend, name);
         folders.insert_or_assign(name, std::move(backend));

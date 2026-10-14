@@ -607,7 +607,14 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
     s32 samples_sent = 0;
     {
         std::unique_lock lock{port->mutex};
+#ifdef SHADPS4_UWP
+        while (port->output_ready && !port->closing && !Core::Uwp::StopRequested())
+            port->output_cv.wait_for(lock, std::chrono::milliseconds(100));
+        if (Core::Uwp::StopRequested())
+            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+#else
         port->output_cv.wait(lock, [&] { return !port->output_ready || port->closing; });
+#endif
 
         if (port->closing) {
             LOG_DEBUG(Lib_AudioOut, "Port {} closed while waiting for drain", port_id);
@@ -709,8 +716,15 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
 
     // Wait for all ports to be ready
     for (u32 i = 0; i < num; i++) {
+#ifdef SHADPS4_UWP
+        while (ports[i]->output_ready && !ports[i]->closing && !Core::Uwp::StopRequested())
+            ports[i]->output_cv.wait_for(locks[i], std::chrono::milliseconds(100));
+        if (Core::Uwp::StopRequested())
+            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+#else
         ports[i]->output_cv.wait(locks[i],
                                  [&] { return !ports[i]->output_ready || ports[i]->closing; });
+#endif
 
         if (ports[i]->closing) {
             LOG_DEBUG(Lib_AudioOut, "Port closed while waiting for drain");

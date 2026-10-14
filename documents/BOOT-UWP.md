@@ -51,6 +51,33 @@ OpenOrbis de leitura, pthreads e término normal, além da variante de parada pe
 host. O SDK OpenOrbis não está instalado; esse homebrew não foi compilado ou
 executado no PS4.
 
-Build e diagnósticos nativos não comprovam boot de um jogo completo, comportamento
-do frontend instalado, permissões do AppContainer, apresentação física ou Xbox.
-Essas validações permanecem separadas. O pacote não é instalado pelo build.
+Em 14/10/2026, o diagnóstico nativo no PC também iniciou PAC-MAN 256
+(CUSA05026, versão 01.00), usando o StorageFolder do jogo fornecido pelo usuário,
+a DLL Release e Vulkan → Dozen → D3D12. O readback chegou à tela de título
+com “PRESS X TO BEGIN”. Isso comprova o boot até o menu nesse diagnóstico;
+não comprova gameplay, comportamento do frontend instalado, permissões do
+AppContainer, apresentação física ou Xbox. O pacote não é instalado pelo build.
+
+Para dumps separados em `Image0` e `Sc0`, selecione no frontend a pasta que
+contém ambas. O executável fica em `Image0/eboot.bin`; `Sc0/param.sfo` e os
+ícones são expostos como metadados somente para leitura em `sce_sys`.
+A resolução usa StorageFolder e respeita a permissão concedida pelo broker.
+Selecionar apenas `Image0` depende da autorização de acesso à pasta pai.
+
+O boot revelou correções genéricas: os arrays de entrada da tesselação do
+Dozen passam a usar o tamanho real do patch antes do lowering para DXIL;
+buffers sem device address não preenchem a tabela BDA; o encerramento sinaliza
+os workers e interrompe esperas de áudio, semáforos e labels de VideoOut antes
+de destruir os recursos da sessão. Nenhuma correção seleciona um jogo ou shader.
+
+Nos dois testes finais de 25 segundos, o grant da pasta pai apresentou 783
+frames e o grant direto de `Image0`, 812 frames. Ambos retornaram
+`BOOT_RESULT=0`, estado parado, erro vazio e `SHUTDOWN=0`.
+Os quatro ciclos do diagnóstico de sessão também passaram: pausa/retomada,
+parada durante pausa, término normal e falha guest intencional, sempre com
+descarregamento da DLL. São resultados nativos no PC, sem instalação do pacote.
+Os logs e o readback PNG estão no diretório ignorado `Build`.
+Uma execução adicional com a DLL exata do pacote assinado apresentou 768
+frames em 25 segundos, com boot e shutdown retornando zero e erro vazio.
+Os hashes do core, Dozen, SDL3, DXC, DXIL e frontend dentro do pacote
+correspondem aos artefatos Release; a assinatura CMS foi verificada.

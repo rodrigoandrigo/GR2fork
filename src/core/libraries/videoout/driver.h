@@ -7,6 +7,9 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 #include "video_core/presentation_sink.h"
+#ifdef SHADPS4_UWP
+#include "uwp/session.h"
+#endif
 
 #include <condition_variable>
 #include <atomic>
@@ -48,9 +51,18 @@ struct VideoOutPort {
         return address >= start && address <= end;
     }
 
-    void WaitVoLabel(auto&& pred) {
+    bool WaitVoLabel(auto&& pred) {
         std::unique_lock lk{vo_mutex};
+#ifdef SHADPS4_UWP
+        while (!pred()) {
+            if (Core::Uwp::StopRequested())
+                return false;
+            vo_cv.wait_for(lk, std::chrono::milliseconds(100));
+        }
+#else
         vo_cv.wait(lk, pred);
+#endif
+        return true;
     }
 
     void SignalVoLabel() {

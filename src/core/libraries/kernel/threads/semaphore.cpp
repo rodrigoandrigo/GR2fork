@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <limits>
 #include <list>
@@ -176,7 +178,7 @@ public:
 
         // Perform the wait.
         const s32 result = waiter.Wait(lk, timeout);
-        if (result == ORBIS_KERNEL_ERROR_ETIMEDOUT) {
+        if (result == ORBIS_KERNEL_ERROR_ETIMEDOUT || waiter.was_stopped) {
             wait_list.erase(it);
         }
         return result;
@@ -237,6 +239,7 @@ public:
         bool was_signaled{};
         bool was_deleted{};
         bool was_canceled{};
+        bool was_stopped{};
 
         explicit WaitingThread(s32 need_count, bool is_fifo)
             : sem{0}, priority{0}, need_count{need_count} {
@@ -263,6 +266,31 @@ public:
 
         s32 Wait(std::unique_lock<std::mutex>& lk, u32* timeout) {
             lk.unlock();
+#ifdef SHADPS4_UWP
+            const auto start = std::chrono::steady_clock::now();
+            const auto deadline = timeout ? start + std::chrono::microseconds(*timeout)
+                                          : std::chrono::steady_clock::time_point::max();
+            while (!Core::Uwp::StopRequested()) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline)
+                    break;
+                const auto interval = std::min(
+                    deadline - now, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                        std::chrono::milliseconds(100)));
+                if (sem.try_acquire_for(interval))
+                    break;
+            }
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count();
+            lk.lock();
+            was_stopped =
+                Core::Uwp::StopRequested() && !was_signaled && !was_deleted && !was_canceled;
+            if (timeout)
+                *timeout = was_signaled ? *timeout - std::min<uint64_t>(*timeout, elapsed) : 0;
+            if (was_stopped)
+                return ORBIS_KERNEL_ERROR_ECANCELED;
+#else
             if (!timeout) {
                 // Wait indefinitely until we are woken up.
                 sem.acquire();
@@ -281,6 +309,7 @@ public:
                     *timeout = 0;
                 }
             }
+#endif
             return GetResult();
         }
     };
@@ -330,7 +359,12 @@ s32 PS4_SYSV_ABI sceKernelWaitSema(OrbisKernelSema sem, s32 needCount, u32* pTim
     if (!orbis_sems.IsAllocated(sem)) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    return orbis_sems[sem].Wait(true, needCount, pTimeout);
+    const auto result = orbis_sems[sem].Wait(true, needCount, pTimeout);
+#ifdef SHADPS4_UWP
+    if (Core::Uwp::StopRequested())
+        PthreadTestCancel();
+#endif
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceKernelSignalSema(OrbisKernelSema sem, s32 signalCount) {

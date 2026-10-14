@@ -74,6 +74,9 @@ public:
 
     void Run(std::function<void(std::stop_token)>&& func) {
         this->func = std::move(func);
+#ifdef SHADPS4_UWP
+        Core::Uwp::RegisterGuestWorker(stop);
+#endif
         PthreadAttrT attr{};
         posix_pthread_attr_init(&attr);
         posix_pthread_create(&thread, &attr, HOST_CALL(RunWrapper), this);

@@ -13,6 +13,9 @@ class SymbolsResolver;
 namespace Libraries::GnmDriver {
 
 using namespace Kernel;
+#ifdef SHADPS4_UWP
+void StopGpuCommandProcessor();
+#endif
 
 s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata);
 int PS4_SYSV_ABI sceGnmAreSubmitsAllowed();

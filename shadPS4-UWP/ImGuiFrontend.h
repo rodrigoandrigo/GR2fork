@@ -36,6 +36,7 @@ struct FrontendGame {
     std::string title;
     std::string serial;
     std::string version;
+    std::string metadata_path;
 };
 struct FrontendRoot {
     Platform::Agile<Windows::Storage::StorageFolder> folder;

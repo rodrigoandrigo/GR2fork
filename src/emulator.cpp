@@ -52,6 +52,7 @@
 #include "uwp/session.h"
 #include "uwp/shadps4_api.h"
 #include "core/libraries/audio/audioout_backend.h"
+#include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/kernel/threads/thread_state.h"
 #include "core/libraries/ajm/ajm.h"
@@ -840,11 +841,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 #ifdef SHADPS4_UWP
 void Emulator::StopGuest() {
     Uwp::SetGuestReady(false);
+    Uwp::StopGuestWorkers();
     DebugState.ResumeGuestThreads();
     if (linker) {
         Libraries::Kernel::StopGuestThreads();
         linker->Stop();
     }
+    Libraries::GnmDriver::StopGpuCommandProcessor();
     Libraries::VideoOut::ShutdownVideoOut();
     Libraries::AudioOut::ShutdownAudioOut();
     Libraries::Ajm::ShutdownAjm();

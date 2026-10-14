@@ -221,6 +221,7 @@ struct dzn_nir_options {
    bool lower_view_index;
    bool lower_view_index_to_rt_layer;
    bool lower_large_points;
+   unsigned patch_vertices;
    enum pipe_format *vi_conversions;
    const nir_shader_compiler_options *nir_opts;
 };
@@ -266,6 +267,9 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
                                       &spirv_opts, options->nir_opts, NULL, nir);
    if (result != VK_SUCCESS)
       return result;
+
+   if (options->patch_vertices)
+      NIR_PASS(_, *nir, dzn_nir_lower_patch_vertices, options->patch_vertices);
 
    if (!dzn_nir_preserve_xfb_position(*nir))
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -986,8 +990,12 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
    u_foreach_bit(stage, active_stage_mask) {
       blake3_hasher nir_hash_ctx;
 
+      unsigned patch_vertices = stage == MESA_SHADER_TESS_CTRL ? pipeline->patch_control_points :
+         stage == MESA_SHADER_TESS_EVAL ?
+         pipeline->templates.shaders[MESA_SHADER_TESS_CTRL].nir->info.tess.tcs_vertices_out : 0;
       if (cache) {
          _mesa_blake3_init(&nir_hash_ctx);
+         _mesa_blake3_update(&nir_hash_ctx, &patch_vertices, sizeof(patch_vertices));
          _mesa_blake3_update(&nir_hash_ctx, &provoking_compile_key, sizeof(provoking_compile_key));
          _mesa_blake3_update(&nir_hash_ctx, &device->bindless, sizeof(device->bindless));
          _mesa_blake3_update(&nir_hash_ctx, &device->vk.enabled_features.largePoints,
@@ -1018,6 +1026,7 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
       }
 
       struct dzn_nir_options options = {
+         .patch_vertices = patch_vertices,
          .robustness = robustness[stage],
          .yz_flip_mode = stage == last_raster_stage ? yz_flip_mode : DXIL_SPIRV_YZ_FLIP_NONE,
          .y_flip_mask = y_flip_mask,

@@ -85,6 +85,8 @@ public:
         submit_cv.notify_one();
     }
 
+    void StopProcessing();
+
     void WaitGpuIdle() noexcept {
         std::unique_lock lk{submit_mutex};
         submit_cv.wait(lk, [this] { return num_submits == 0; });

@@ -390,9 +390,11 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 #ifdef SHADPS4_UWP
         flip_ready.notify_one();
     } catch (const winrt::hresult_error& error) {
-        Core::Uwp::FailGuestSession("D3D12 flip: " + winrt::to_string(error.message()));
+        if (!Core::Uwp::StopRequested())
+            Core::Uwp::FailGuestSession("D3D12 flip: " + winrt::to_string(error.message()));
     } catch (const std::exception& error) {
-        Core::Uwp::FailGuestSession("D3D12 flip: " + std::string(error.what()));
+        if (!Core::Uwp::StopRequested())
+            Core::Uwp::FailGuestSession("D3D12 flip: " + std::string(error.what()));
     }
 #endif
 }

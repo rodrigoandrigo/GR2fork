@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -308,6 +309,7 @@ Liverpool::Liverpool() {
                 num_submits.store(0);
             }
             submit_cv.notify_all();
+            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
         }
     }};
 #else
@@ -316,8 +318,26 @@ Liverpool::Liverpool() {
 }
 
 Liverpool::~Liverpool() {
+    StopProcessing();
+}
+void Liverpool::StopProcessing() {
     process_thread.request_stop();
-    process_thread.join();
+    if (process_thread.joinable())
+        process_thread.join();
+#ifdef SHADPS4_UWP
+    for (auto& queue : mapped_queues) {
+        std::scoped_lock lock{queue.m_access};
+        while (!queue.submits.empty()) {
+            queue.submits.front().destroy();
+            queue.submits.pop();
+        }
+    }
+    {
+        std::scoped_lock lock{submit_mutex};
+        num_submits.store(0);
+    }
+    submit_cv.notify_all();
+#endif
 }
 void Liverpool::OwnRasterizer(std::unique_ptr<VideoCore::GpuCommandSink> renderer) {
     WaitGpuIdle();
@@ -370,6 +390,10 @@ void Liverpool::Process(std::stop_token stoken) {
         curr_qid = -1;
 
         while (num_submits || num_commands) {
+#ifdef SHADPS4_UWP
+            if (stoken.stop_requested() || Core::Uwp::StopRequested())
+                break;
+#endif
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
@@ -403,6 +427,10 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
+#ifdef SHADPS4_UWP
+        if (stoken.stop_requested() || Core::Uwp::StopRequested())
+            break;
+#endif
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
@@ -464,13 +492,13 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task =
                 ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            const auto task_guard = ::detail::MakeScopeGuard([&] { task.handle.destroy(); });
             RESUME_CE(task);
 
             while (!task.handle.done()) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
-            task.handle.destroy();
             break;
         }
         default:
@@ -1212,6 +1240,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // TODO: potentially, ASCs also can depend on CE and in this case the
     // CE task should be moved into more global scope
     Task ce_task{};
+    const auto ce_guard = ::detail::MakeScopeGuard([&] {
+        if (ce_task.handle)
+            ce_task.handle.destroy();
+    });
 
     if (!ccb.empty()) {
         // In case of CCB provided kick off CE asap to have the constant heap ready to use
@@ -1221,6 +1253,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (true) {
+#ifdef SHADPS4_UWP
+        if (Core::Uwp::StopRequested()) {
+            FIBER_EXIT;
+            co_return;
+        }
+#endif
         dcb = RunGraphicsPackets(dcb, ce_task, base_addr);
         if (dcb.empty()) {
             break;
@@ -1260,7 +1298,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u64* wait_addr = wait_reg_mem->Address<u64*>();
             if (vo_port->IsVoLabel(wait_addr) &&
                 num_submits == mapped_queues[GfxQueueId].submits.size()) {
-                vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                if (!vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); })) {
+                    FIBER_EXIT;
+                    co_return;
+                }
                 break;
             }
             while (!wait_reg_mem->Test(regs.reg_array)) {
@@ -1272,13 +1313,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task = ProcessGraphics(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+            const auto task_guard = ::detail::MakeScopeGuard([&] { task.handle.destroy(); });
             RESUME_GFX(task);
 
             while (!task.handle.done()) {
                 YIELD_GFX();
                 RESUME_GFX(task);
             }
-            task.handle.destroy();
             break;
         }
         default:
@@ -1291,7 +1332,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         while (!ce_task.handle.done()) {
             RESUME_GFX(ce_task);
         }
-        ce_task.handle.destroy();
     }
 
     FIBER_EXIT;
@@ -1364,13 +1404,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task = ProcessCompute<true>(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+            const auto task_guard = ::detail::MakeScopeGuard([&] { task.handle.destroy(); });
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
-            task.handle.destroy();
             break;
         }
         case PM4ItOpcode::DmaData: {

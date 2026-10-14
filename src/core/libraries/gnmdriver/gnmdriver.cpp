@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_presentation_sink.h"
 #ifdef SHADPS4_UWP
 #include "uwp/dozen_host.h"
+#include "uwp/session.h"
 #endif
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -35,6 +36,12 @@ std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace Libraries::GnmDriver {
 
 using namespace AmdGpu;
+#ifdef SHADPS4_UWP
+void StopGpuCommandProcessor() {
+    if (liverpool)
+        liverpool->StopProcessing();
+}
+#endif
 
 enum GnmEventType : u64 {
     Compute0RelMem = 0x00,
@@ -91,7 +98,12 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
 static void WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
+#ifdef SHADPS4_UWP
+    while (submission_lock != 0 && !Core::Uwp::StopRequested())
+        cv_lock.wait_for(lock, std::chrono::milliseconds(100));
+#else
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+#endif
 }
 
 // Write a special NOP packet with N DWs data block

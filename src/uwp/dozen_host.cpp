@@ -119,6 +119,8 @@ struct DozenHost::Bootstrap {
 DozenHost::DozenHost() = default;
 DozenHost::~DozenHost() {
     current_host = nullptr;
+    if (liverpool)
+        liverpool->StopProcessing();
     Libraries::VideoOut::ShutdownVideoOut();
     VideoCore::SetPresentationSink({});
     liverpool.reset();

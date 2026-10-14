@@ -819,6 +819,13 @@ void StopGuestThreads() {
                 if (!handle || WaitForSingleObjectEx(handle, 0, FALSE) == WAIT_OBJECT_0)
                     return;
                 running = true;
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    LOG_ERROR(
+                        Lib_Kernel,
+                        "Guest shutdown timed out: {} (tid {}, critical {}, cancellation point {})",
+                        thread->name, thread->tid.load(), thread->InCritical(),
+                        thread->cancel_point.load());
+                }
                 if (!thread->cancel_pending.exchange(true)) {
                     thread->wake_sema.release();
                     thread->signal_sema.release();

@@ -50,11 +50,13 @@ public:
     void Delete(std::string_view relative);
     void Rename(std::string_view from, std::string_view to);
     std::shared_ptr<BrokeredFsBackend> Subdirectory(std::string_view relative) const;
+    std::shared_ptr<BrokeredFsBackend> GameDirectory(std::string_view relative) const;
 
 private:
     winrt::Windows::Storage::StorageFolder Folder(std::string_view relative) const;
     winrt::Windows::Storage::IStorageItem Item(std::string_view relative) const;
     winrt::Windows::Storage::StorageFolder root{nullptr};
+    std::shared_ptr<BrokeredFsBackend> metadata;
     bool read_only;
 };
 
