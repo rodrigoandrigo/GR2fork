@@ -655,7 +655,7 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &pdev->options,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
                      offsetof(struct dzn_physical_device, options));
-   const uint32_t runtime_layout_version = 4;
+   const uint32_t runtime_layout_version = 7;
    _mesa_blake3_update(&blake3_ctx, &runtime_layout_version, sizeof(runtime_layout_version));
    _mesa_blake3_final(&blake3_ctx, blake3);
    memcpy(pdev->pipeline_cache_uuid, blake3, VK_UUID_SIZE);
@@ -1787,22 +1787,30 @@ dzn_physical_device_get_format_support(struct dzn_physical_device *pdev,
 }
 
 static void
-dzn_physical_device_fill_format_properties3(VkFormatProperties2 *properties)
+dzn_physical_device_fill_format_properties3(VkFormatProperties2 *properties,
+                                           D3D12_FORMAT_SUPPORT2 support)
 {
    vk_foreach_struct(ext, properties->pNext) {
       if (ext->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) {
          VkFormatProperties3 *properties3 = (VkFormatProperties3 *)ext;
 
-         /* The legacy and 64-bit enums share the low-order bit assignments.
-          * Keep the wider extension-only bits clear until each is independently
-          * implemented and validated by Dozen.
-          */
          properties3->linearTilingFeatures =
             (VkFormatFeatureFlags2)properties->formatProperties.linearTilingFeatures;
          properties3->optimalTilingFeatures =
             (VkFormatFeatureFlags2)properties->formatProperties.optimalTilingFeatures;
          properties3->bufferFeatures =
             (VkFormatFeatureFlags2)properties->formatProperties.bufferFeatures;
+         VkFormatFeatureFlags2 unformatted = 0;
+         if (support & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD)
+            unformatted |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
+         if (support & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)
+            unformatted |= VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+         if (properties3->optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT)
+            properties3->optimalTilingFeatures |= unformatted;
+         if (properties3->linearTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT)
+            properties3->linearTilingFeatures |= unformatted;
+         if (properties3->bufferFeatures & VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT)
+            properties3->bufferFeatures |= unformatted;
       } else {
          vk_debug_ignored_stype(ext->sType);
       }
@@ -1825,7 +1833,7 @@ dzn_physical_device_get_format_properties(struct dzn_physical_device *pdev,
          };
       else
          *base_props = (VkFormatProperties) { 0 };
-      dzn_physical_device_fill_format_properties3(properties);
+      dzn_physical_device_fill_format_properties3(properties, 0);
       return;
    }
 
@@ -1947,7 +1955,7 @@ dzn_physical_device_get_format_properties(struct dzn_physical_device *pdev,
    if (vk_format_is_depth_or_stencil(format))
       base_props->bufferFeatures = 0;
 
-   dzn_physical_device_fill_format_properties3(properties);
+   dzn_physical_device_fill_format_properties3(properties, dfmt_info.Support2);
 }
 
 static VkResult
@@ -2382,11 +2390,8 @@ dzn_instance_create(const VkInstanceCreateInfo *pCreateInfo,
       parse_debug_string(os_get_option("DZN_DEBUG"), dzn_debug_options);
 
 #ifdef _XBOX_UWP
-   /* Debug layer, GPU validation, and their DXGI debug dependencies are not
-    * present in the Xbox retail runtime. Ignore host environment requests.
-    */
-   instance->debug_flags &= ~(DZN_DEBUG_D3D12 | DZN_DEBUG_GBV |
-                              DZN_DEBUG_DEBUGGER | DZN_DEBUG_REDIRECTS);
+   /* Interactive debugging and CRT stream redirection are unavailable in UWP. */
+   instance->debug_flags &= ~(DZN_DEBUG_DEBUGGER | DZN_DEBUG_REDIRECTS);
 #endif
 
 #if defined _WIN32 && !defined _XBOX_UWP
@@ -2435,7 +2440,9 @@ dzn_instance_create(const VkInstanceCreateInfo *pCreateInfo,
 
    instance->factory = try_create_device_factory(instance->d3d12_mod);
 
-#ifndef _XBOX_UWP
+#ifdef _XBOX_UWP
+   d3d12_enable_debug_layer(instance->d3d12_mod, instance->factory);
+#else
    if (instance->debug_flags & DZN_DEBUG_D3D12)
       d3d12_enable_debug_layer(instance->d3d12_mod, instance->factory);
    if (instance->debug_flags & DZN_DEBUG_GBV)

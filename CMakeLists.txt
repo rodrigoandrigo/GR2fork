@@ -46,6 +46,7 @@ set(SHADPS4_SDL3_LIBRARY "" CACHE FILEPATH "SDL3 UWP import library")
 set(SHADPS4_SDL3_RUNTIME "" CACHE FILEPATH "SDL3 UWP runtime")
 set(SHADPS4_D3D12_SOURCE_DIR "${CMAKE_SOURCE_DIR}/externals/d3d12-native" CACHE PATH "Native D3D12 source tree")
 set(SHADPS4_UWP_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/shadPS4-UWP/Runtime/${CMAKE_BUILD_TYPE}" CACHE PATH "UWP runtime destination")
+set(SHADPS4_DOZEN_RUNTIME "${CMAKE_SOURCE_DIR}/Build/Dozen-UWP/src/microsoft/vulkan/vulkan_dzn.dll" CACHE FILEPATH "UWP Dozen runtime")
 if(SHADPS4_UWP)
     if(NOT WIN32 OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         message(FATAL_ERROR "The UWP core requires Windows x64 and clang-cl")
@@ -1378,32 +1379,12 @@ if(NOT ENABLE_TESTS)
 
 if(SHADPS4_UWP)
     add_library(shadps4 SHARED src/uwp/shadps4_api.cpp src/uwp/shadps4_api.h)
-    set(SHADPS4_D3D12_PLATFORM "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp")
-    foreach(component IN ITEMS device_context resource_allocator command_encoder pipeline_cache videocore_bridge)
-        if(NOT EXISTS "${SHADPS4_D3D12_PLATFORM}/d3d12_${component}.cpp")
-            message(FATAL_ERROR "Missing native D3D12 source: ${SHADPS4_D3D12_PLATFORM}/d3d12_${component}.cpp")
-        endif()
-        target_sources(shadps4 PRIVATE "${SHADPS4_D3D12_PLATFORM}/d3d12_${component}.cpp")
-    endforeach()
-    target_sources(shadps4 PRIVATE src/uwp/d3d12_presenter.cpp src/uwp/d3d12_presenter.h)
+    if(NOT EXISTS "${SHADPS4_DOZEN_RUNTIME}")
+        message(FATAL_ERROR "Build Dozen first with scripts/build-dozen.ps1 or use scripts/build-uwp.ps1")
+    endif()
+    target_sources(shadps4 PRIVATE src/uwp/dozen_host.cpp src/uwp/dozen_host.h)
     target_sources(shadps4 PRIVATE src/uwp/brokered_fs.cpp src/uwp/brokered_fs.h src/uwp/brokered_api.cpp)
     target_sources(shadps4 PRIVATE src/uwp/settings_api.cpp)
-    add_library(shadps4_spirv_cross STATIC
-        externals/spirv-cross/spirv_cross.cpp externals/spirv-cross/spirv_parser.cpp
-        externals/spirv-cross/spirv_cross_parsed_ir.cpp externals/spirv-cross/spirv_cfg.cpp
-        externals/spirv-cross/spirv_glsl.cpp externals/spirv-cross/spirv_hlsl.cpp)
-    target_include_directories(shadps4_spirv_cross PUBLIC externals/spirv-cross)
-    target_sources(shadps4 PRIVATE
-        src/video_core/renderer_d3d12/shader_cache.cpp
-        src/video_core/renderer_d3d12/command_runtime.cpp
-        src/video_core/renderer_d3d12/image_cache.cpp
-        src/video_core/renderer_d3d12/draw_runtime.cpp
-        src/video_core/renderer_d3d12/d3d12_rasterizer.cpp
-        src/video_core/renderer_d3d12/resource_cache.cpp)
-    target_sources(shadps4 PRIVATE src/video_core/renderer_d3d12/resource_bindings.cpp)
-    target_sources(shadps4 PRIVATE src/video_core/renderer_d3d12/pipeline_cache.cpp)
-    target_sources(shadps4 PRIVATE src/video_core/texture_cache/cpu_tiling.cpp)
-    target_link_libraries(shadps4 PRIVATE shadps4_spirv_cross dxcompiler)
     set(SHADPS4_DXC_RUNTIME_DIR "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64" CACHE PATH "DXC runtime directory")
     target_sources(shadps4 PRIVATE src/uwp/xaudio2_output.cpp
                                   src/core/libraries/audio/xaudio2_audio_out.cpp
@@ -1411,7 +1392,7 @@ if(SHADPS4_UWP)
     set_source_files_properties(src/uwp/xaudio2_output.cpp
                                 src/core/libraries/audio/xaudio2_audio_out.cpp
         PROPERTIES COMPILE_DEFINITIONS "WINAPI_FAMILY=WINAPI_FAMILY_APP")
-    target_include_directories(shadps4 PRIVATE "${SHADPS4_D3D12_PLATFORM}" "${SHADPS4_CPPWINRT_INCLUDE_DIR}")
+    target_include_directories(shadps4 PRIVATE "${SHADPS4_CPPWINRT_INCLUDE_DIR}")
     target_compile_definitions(shadps4 PRIVATE SHADPS4_UWP SHADPS4_API_EXPORTS SDL_BUILDING_WINRT=1)
     set_target_properties(shadps4 PROPERTIES OUTPUT_NAME shadPS4 WINDOWS_EXPORT_ALL_SYMBOLS OFF)
     target_link_options(shadps4 PRIVATE /APPCONTAINER /DYNAMICBASE)
@@ -1610,6 +1591,7 @@ if(SHADPS4_UWP)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:shadps4>" "${SHADPS4_UWP_OUTPUT_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_LINKER_FILE:shadps4>" "${SHADPS4_UWP_OUTPUT_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_SDL3_RUNTIME}" "${SHADPS4_UWP_OUTPUT_DIR}/SDL3.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_DOZEN_RUNTIME}" "${SHADPS4_UWP_OUTPUT_DIR}/vulkan_dzn.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_DXC_RUNTIME_DIR}/dxcompiler.dll" "${SHADPS4_UWP_OUTPUT_DIR}/dxcompiler.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_DXC_RUNTIME_DIR}/dxil.dll" "${SHADPS4_UWP_OUTPUT_DIR}/dxil.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/src/uwp/shadps4_api.h" "${SHADPS4_UWP_OUTPUT_DIR}"

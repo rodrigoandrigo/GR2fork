@@ -1279,7 +1279,25 @@ dzn_EndCommandBuffer(VkCommandBuffer commandBuffer)
       HRESULT hres = ID3D12GraphicsCommandList1_Close(cmdbuf->cmdlist);
       if (FAILED(hres)) {
          debug_printf("DZN: command-list Close failed HRESULT=0x%08x\n", (unsigned)hres);
-         vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
+         ID3D12InfoQueue *queue;
+         if (SUCCEEDED(ID3D12Device1_QueryInterface(device->dev, &IID_ID3D12InfoQueue, (void **)&queue))) {
+            const UINT64 count = ID3D12InfoQueue_GetNumStoredMessages(queue);
+            for (UINT64 i = 0; i < MIN2(count, 32); ++i) {
+               SIZE_T size = 0;
+               ID3D12InfoQueue_GetMessage(queue, i, NULL, &size);
+               D3D12_MESSAGE *message = malloc(size);
+               if (!message)
+                  break;
+               if (SUCCEEDED(ID3D12InfoQueue_GetMessage(queue, i, message, &size)))
+                  debug_printf("DZN: validation %u: %s\n", (unsigned)message->ID, message->pDescription);
+               free(message);
+            }
+            ID3D12InfoQueue_Release(queue);
+         }
+         const HRESULT reason = ID3D12Device_GetDeviceRemovedReason(device->dev);
+         vk_command_buffer_set_error(&cmdbuf->vk, FAILED(reason) ? VK_ERROR_DEVICE_LOST :
+                                     hres == E_OUTOFMEMORY ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_UNKNOWN);
       }
    }
 
@@ -2037,11 +2055,20 @@ dzn_cmd_buffer_get_rtv(struct dzn_cmd_buffer *cmdbuf,
       struct dzn_descriptor_heap *heap;
       uint32_t slot;
 
-      // TODO: error handling
       rtve = vk_alloc(&cmdbuf->vk.pool->alloc, sizeof(*rtve), 8,
                       VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!rtve) {
+         vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return (D3D12_CPU_DESCRIPTOR_HANDLE) { 0 };
+      }
       rtve->key = key;
-      dzn_descriptor_heap_pool_alloc_slots(&cmdbuf->rtvs.pool, device, 1, &heap, &slot);
+      const VkResult result = dzn_descriptor_heap_pool_alloc_slots(
+         &cmdbuf->rtvs.pool, device, 1, &heap, &slot);
+      if (result != VK_SUCCESS) {
+         vk_free(&cmdbuf->vk.pool->alloc, rtve);
+         vk_command_buffer_set_error(&cmdbuf->vk, result);
+         return (D3D12_CPU_DESCRIPTOR_HANDLE) { 0 };
+      }
       rtve->handle = dzn_descriptor_heap_get_cpu_handle(heap, slot);
       ID3D12Device1_CreateRenderTargetView(device->dev, image->res, desc, rtve->handle);
       he = _mesa_hash_table_insert(cmdbuf->rtvs.ht, &rtve->key, rtve);
@@ -2060,7 +2087,12 @@ dzn_cmd_buffer_get_null_rtv(struct dzn_cmd_buffer *cmdbuf)
    if (!cmdbuf->null_rtv.ptr) {
       struct dzn_descriptor_heap *heap;
       uint32_t slot;
-      dzn_descriptor_heap_pool_alloc_slots(&cmdbuf->rtvs.pool, device, 1, &heap, &slot);
+      const VkResult result = dzn_descriptor_heap_pool_alloc_slots(
+         &cmdbuf->rtvs.pool, device, 1, &heap, &slot);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmdbuf->vk, result);
+         return (D3D12_CPU_DESCRIPTOR_HANDLE) { 0 };
+      }
       cmdbuf->null_rtv = dzn_descriptor_heap_get_cpu_handle(heap, slot);
 
       D3D12_RENDER_TARGET_VIEW_DESC desc = { 0 };
@@ -2551,6 +2583,8 @@ dzn_cmd_buffer_clear_attachment(struct dzn_cmd_buffer *cmdbuf,
 
          D3D12_RENDER_TARGET_VIEW_DESC desc = dzn_image_get_rtv_desc(image, &range, 0);
          D3D12_CPU_DESCRIPTOR_HANDLE handle = dzn_cmd_buffer_get_rtv(cmdbuf, image, &desc);
+      if (!handle.ptr)
+         return;
          ID3D12GraphicsCommandList1_ClearRenderTargetView(cmdbuf->cmdlist, handle, vals, rect_count, rects);
 
          if (cmdbuf->enhanced_barriers) {
@@ -2647,6 +2681,8 @@ dzn_cmd_buffer_clear_color(struct dzn_cmd_buffer *cmdbuf,
 
          D3D12_RENDER_TARGET_VIEW_DESC desc = dzn_image_get_rtv_desc(image, &view_range, lvl);
          D3D12_CPU_DESCRIPTOR_HANDLE handle = dzn_cmd_buffer_get_rtv(cmdbuf, image, &desc);
+      if (!handle.ptr)
+         return;
          ID3D12GraphicsCommandList1_ClearRenderTargetView(cmdbuf->cmdlist, handle, clear_vals, 0, NULL);
       }
 
@@ -3123,6 +3159,8 @@ dzn_cmd_buffer_blit_prepare_dst_view(struct dzn_cmd_buffer *cmdbuf,
       if (bit_copy)
          desc.Format = dzn_buffer_get_dxgi_format(dzn_copy_uint_format(img));
       D3D12_CPU_DESCRIPTOR_HANDLE handle = dzn_cmd_buffer_get_rtv(cmdbuf, img, &desc);
+      if (!handle.ptr)
+         return;
       ID3D12GraphicsCommandList1_OMSetRenderTargets(cmdbuf->cmdlist, 1, &handle, false, NULL);
    }
 }
@@ -4673,12 +4711,33 @@ dzn_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(dzn_buffer, src_buffer, info->srcBuffer);
    VK_FROM_HANDLE(dzn_buffer, dst_buffer, info->dstBuffer);
 
+   D3D12_RESOURCE_BARRIER barrier = {
+      .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+      .Transition = {
+         .pResource = dst_buffer->res,
+         .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+         .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+         .StateAfter = D3D12_RESOURCE_STATE_COPY_DEST,
+      },
+   };
+   if (!cmdbuf->enhanced_barriers)
+      ID3D12GraphicsCommandList1_ResourceBarrier(cmdbuf->cmdlist, 1, &barrier);
+
    for (int i = 0; i < info->regionCount; i++) {
       const VkBufferCopy2 *region = info->pRegions + i;
 
       ID3D12GraphicsCommandList1_CopyBufferRegion(cmdbuf->cmdlist, dst_buffer->res, region->dstOffset,
                                         src_buffer->res, region->srcOffset,
                                         region->size);
+   }
+   if (cmdbuf->enhanced_barriers) {
+      dzn_cmd_buffer_buffer_barrier(cmdbuf, dst_buffer->res,
+                                   D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_ALL,
+                                   D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_COMMON);
+   } else {
+      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+      ID3D12GraphicsCommandList1_ResourceBarrier(cmdbuf->cmdlist, 1, &barrier);
    }
 }
 
@@ -5699,11 +5758,15 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
       if (!iview) {
          /* D3D12 permits a pipeline-declared RTV slot to be unused here. */
          rt_handles[i] = dzn_cmd_buffer_get_null_rtv(cmdbuf);
+         if (!rt_handles[i].ptr)
+            return;
          continue;
       }
 
       struct dzn_image *img = container_of(iview->vk.image, struct dzn_image, vk);
       rt_handles[i] = dzn_cmd_buffer_get_rtv(cmdbuf, img, &iview->rtv_desc);
+      if (!rt_handles[i].ptr)
+         return;
       dzn_rendering_attachment_initial_transition(cmdbuf, att,
                                                   VK_IMAGE_ASPECT_COLOR_BIT);
    }
@@ -5759,9 +5822,11 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
       }
    }
 
-   ID3D12GraphicsCommandList1_OMSetRenderTargets(cmdbuf->cmdlist,
-                                                 pRenderingInfo->colorAttachmentCount,
-                                                 pRenderingInfo->colorAttachmentCount ? rt_handles : NULL,
+   uint32_t rt_count = pRenderingInfo->colorAttachmentCount;
+   while (rt_count && !pRenderingInfo->pColorAttachments[rt_count - 1].imageView)
+      rt_count--;
+   ID3D12GraphicsCommandList1_OMSetRenderTargets(cmdbuf->cmdlist, rt_count,
+                                                 rt_count ? rt_handles : NULL,
                                                  false, zs_handle.ptr ? &zs_handle : NULL);
 
    /* Attachments are bound directly, rather than through D3D12 BeginRenderPass.

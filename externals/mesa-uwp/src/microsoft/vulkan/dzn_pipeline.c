@@ -544,7 +544,7 @@ dzn_pipeline_compile_shader(struct dzn_device *device,
 #endif
          ralloc_free(err);
       }
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return vk_errorf(device, VK_ERROR_UNKNOWN, "DXIL validation failed");
    }
 #endif
 
@@ -2565,6 +2565,9 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
       view_mask = ri->viewMask;
    }
 
+   while (color_count && color_fmts[color_count - 1] == VK_FORMAT_UNDEFINED)
+      color_count--;
+
    if (color_count > 0) {
       d3d12_gfx_pipeline_state_stream_new_desc(stream_desc, RENDER_TARGET_FORMATS, struct D3D12_RT_FORMAT_ARRAY, rts);
       rts->NumRenderTargets = color_count;
@@ -3621,12 +3624,26 @@ dzn_compute_pipeline_create(struct dzn_device *device,
    if (ret != VK_SUCCESS)
       goto out;
 
+#ifdef _XBOX_UWP
+   const D3D12_COMPUTE_PIPELINE_STATE_DESC compute_desc = {
+      .pRootSignature = pipeline->base.root.sig,
+      .CS = shader,
+   };
+   HRESULT pso_hr = ID3D12Device4_CreateComputePipelineState(device->dev, &compute_desc,
+                                                           &IID_ID3D12PipelineState,
+                                                           (void **)&pipeline->base.state);
+#else
    HRESULT pso_hr = ID3D12Device4_CreatePipelineState(device->dev, &stream_desc,
                                                      &IID_ID3D12PipelineState,
                                                      (void **)&pipeline->base.state);
+#endif
    if (FAILED(pso_hr)) {
-      _debug_printf("Dozen compute PSO creation failed (HRESULT 0x%08x)\n", (unsigned)pso_hr);
-      ret = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      _debug_printf("Dozen compute PSO creation failed (HRESULT 0x%08x, DXIL %zu bytes)\n",
+                    (unsigned)pso_hr, shader.BytecodeLength);
+      const VkResult error = pso_hr == E_OUTOFMEMORY ? VK_ERROR_OUT_OF_DEVICE_MEMORY :
+         (pso_hr == DXGI_ERROR_DEVICE_REMOVED || pso_hr == DXGI_ERROR_DEVICE_RESET) ?
+            VK_ERROR_DEVICE_LOST : VK_ERROR_UNKNOWN;
+      ret = vk_error(device, error);
    }
 
 out:
