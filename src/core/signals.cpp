@@ -13,6 +13,7 @@
 #include "core/signals.h"
 #include "emulator.h"
 #ifdef SHADPS4_UWP
+#include "core/address_space.h"
 #include "uwp/session.h"
 #endif
 
@@ -62,6 +63,12 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     bool static_protection_exception = false; // Windows static guest red-zone protection
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
+#ifdef SHADPS4_UWP
+        if (AddressSpace::HandleBackingFault(
+                reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]),
+                pExp->ExceptionRecord->ExceptionInformation[0]))
+            return EXCEPTION_CONTINUE_EXECUTION;
+#endif
         guest_info._si_signo = POSIX_SIGSEGV;
         guest_info._si_code = POSIX_SEGV_MAPERR;
         static_protection_exception = true; // Windows static guest red-zone protection

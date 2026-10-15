@@ -12,6 +12,11 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
 #include "video_core/presentation_sink.h"
+#ifdef SHADPS4_UWP
+#include <chrono>
+#include "core/libraries/kernel/threads/pthread.h"
+#include "uwp/session.h"
+#endif
 
 namespace Libraries::VideoOut {
 
@@ -382,7 +387,15 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
 
     std::unique_lock lock{port->vo_mutex};
     const auto prev_counter = port->vblank_status.count;
+#ifdef SHADPS4_UWP
+    while (prev_counter == port->vblank_status.count && !Core::Uwp::StopRequested())
+        port->vblank_cv.wait_for(lock, std::chrono::milliseconds(100));
+    lock.unlock();
+    if (Core::Uwp::StopRequested())
+        Libraries::Kernel::PthreadTestCancel();
+#else
     port->vblank_cv.wait(lock, [&]() { return prev_counter != port->vblank_status.count; });
+#endif
     return ORBIS_OK;
 }
 

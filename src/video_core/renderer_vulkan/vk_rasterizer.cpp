@@ -619,6 +619,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         glue_entry_miss_ += glue_mode_ != 0 && !glue;
         rt_ok = PrepareRenderState(pipeline);
     }
+    if (is_indexed && !buffer_cache.UsesSparseBuffers()) {
+        const u32 index_size =
+            regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
+        buffer_cache.PrepareBufferRange(
+            regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size,
+            u64(std::min(regs.num_indices, regs.max_index_size)) * index_size);
+    }
     if (!BindResources(pipeline)) {
         return;
     }
@@ -827,6 +834,17 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     // pipeline, so the glue is disarmed rather than re-certified here.
     glue_.armed = false;
     PrepareRenderState(pipeline);
+    if (!buffer_cache.UsesSparseBuffers()) {
+        buffer_cache.PrepareBufferRange(arg_address + offset, u64(stride) * max_count);
+        buffer_cache.PrepareBufferRange(count_address, 4);
+        if (is_indexed) {
+            const auto& regs = liverpool->regs;
+            const u32 index_size =
+                regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
+            buffer_cache.PrepareBufferRange(regs.index_base_address.Address<VAddr>(),
+                                            u64(regs.max_index_size) * index_size);
+        }
+    }
     if (!BindResources(pipeline)) {
         return;
     }
@@ -950,6 +968,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         ArmCopyHold();
     }
 
+    buffer_cache.PrepareBufferRange(address + offset, size);
     if (!BindResources(pipeline)) {
         return;
     }
@@ -1441,6 +1460,31 @@ void Rasterizer::BindingSkipProbeBody(const Pipeline* pipeline) {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    if (!buffer_cache.UsesSparseBuffers()) {
+        for (const auto* stage : pipeline->GetStages()) {
+            if (!stage)
+                continue;
+            for (const auto& desc : stage->buffers) {
+                if (desc.IsSpecial())
+                    continue;
+                const auto buffer = desc.GetSharp(*stage);
+                buffer_cache.PrepareBufferRange(buffer.base_address, buffer.GetSize(),
+                                                desc.is_written);
+            }
+        }
+        if (!pipeline->IsCompute()) {
+            VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+            VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+            VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+            VertexInputs<AmdGpu::Buffer> guest_buffers;
+            const auto& regs = liverpool->regs;
+            static_cast<const GraphicsPipeline*>(pipeline)->GetVertexInputs(
+                attributes, bindings, divisors, guest_buffers, regs.vgt_instance_step_rate_0,
+                regs.vgt_instance_step_rate_1);
+            for (const auto& buffer : guest_buffers)
+                buffer_cache.PrepareBufferRange(buffer.base_address, buffer.GetSize());
+        }
+    }
     draw_samples_target_ = false;
     if (pipeline->IsCompute() && TakeComputeShortcut(pipeline)) [[unlikely]] {
         return false;
@@ -2980,6 +3024,10 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         }
     }
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    if (!src_gds)
+        buffer_cache.PrepareBufferRange(src, num_bytes);
+    if (!dst_gds)
+        buffer_cache.PrepareBufferRange(dst, num_bytes, true);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {

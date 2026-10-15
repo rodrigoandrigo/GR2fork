@@ -113,7 +113,7 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
 #ifdef SHADPS4_UWP
         buffer_ci.flags |= vk::BufferCreateFlagBits::eSparseAliased;
 #endif
-        buffer = Vulkan::Check(device.createBuffer(buffer_ci));
+        buffer = Vulkan::Check<"create sparse guest buffer">(device.createBuffer(buffer_ci));
     }
 
     if (with_bda) {

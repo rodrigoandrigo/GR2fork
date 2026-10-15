@@ -5,6 +5,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <boost/container/small_vector.hpp>
 
@@ -49,6 +50,11 @@ public:
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
                          TextureCache& texture_cache, PageManager& tracker);
     ~BufferCache();
+
+    bool UsesSparseBuffers() const {
+        return sparse_buffers;
+    }
+    void PrepareBufferRange(VAddr address, u64 size, bool written = false);
 
     /// Returns a pointer to GDS device local buffer.
     [[nodiscard]] const Buffer* GetGdsBuffer() const noexcept {
@@ -135,6 +141,7 @@ private:
     const Buffer* GetArena(u64 first_block, u64 last_block);
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
+    const Buffer* GetDenseArena(u64 first_block, u64 last_block);
 
     /// True when every block in [first_block, last_block] has its residency bit set.
     bool AllResident(u64 first_block, u64 last_block) const;
@@ -194,6 +201,8 @@ private:
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
+    std::map<VAddr, std::unique_ptr<Buffer>> dense_arenas;
+    bool sparse_buffers{true};
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;
 

@@ -48,7 +48,8 @@ BlitHelper::~BlitHelper() {
 
 void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_samples,
                                            vk::Format src_pixel_format, vk::Format dst_pixel_format,
-                                           vk::Image source, vk::Image dest) {
+                                           vk::Image source, vk::Image dest, u32 src_mip,
+                                           u32 dst_mip, u32 src_layer, u32 dst_layer) {
     const vk::ImageViewUsageCreateInfo color_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
     const vk::ImageViewCreateInfo color_view_ci = {
         .pNext = &color_usage_ci,
@@ -57,9 +58,9 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         .format = src_pixel_format,
         .subresourceRange{
             .aspectMask = vk::ImageAspectFlagBits::eColor,
-            .baseMipLevel = 0U,
+            .baseMipLevel = src_mip,
             .levelCount = 1U,
-            .baseArrayLayer = 0U,
+            .baseArrayLayer = src_layer,
             .layerCount = 1U,
         },
     };
@@ -76,9 +77,9 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         .format = dst_pixel_format,
         .subresourceRange{
             .aspectMask = vk::ImageAspectFlagBits::eDepth,
-            .baseMipLevel = 0U,
+            .baseMipLevel = dst_mip,
             .levelCount = 1U,
-            .baseArrayLayer = 0U,
+            .baseArrayLayer = dst_layer,
             .layerCount = 1U,
         },
     };

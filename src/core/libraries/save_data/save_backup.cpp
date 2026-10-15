@@ -74,6 +74,23 @@ static std::deque<BackupRequest> g_result_queue;
 static std::atomic_int g_backup_progress = 0;
 static std::atomic g_backup_status = WorkerStatus::NotStarted;
 
+u64 GetSaveDataSize(const std::filesystem::path& save_path) {
+    std::scoped_lock lock{g_backup_running_mutex};
+    if (!fs::exists(save_path))
+        return 0;
+    u64 size{};
+    for (const auto& entry : fs::directory_iterator(save_path)) {
+        const auto name = entry.path().filename();
+        if (name == backup_dir || name == backup_dir_tmp || name == backup_dir_old)
+            continue;
+        if (entry.is_directory())
+            size += Common::FS::GetDirectorySize(entry.path());
+        else if (entry.is_regular_file())
+            size += entry.file_size();
+    }
+    return size;
+}
+
 static void backup(const std::filesystem::path& dir_name) {
     std::unique_lock lk{g_backup_running_mutex};
     if (!fs::exists(dir_name)) {

@@ -4,7 +4,9 @@
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "video_core/host_shaders/fsr_easu_comp.h"
+#include "video_core/host_shaders/fsr_easu_fp32_comp.h"
 #include "video_core/host_shaders/fsr_rcas_comp.h"
+#include "video_core/host_shaders/fsr_rcas_fp32_comp.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -27,7 +29,7 @@ struct FSRConstants {
 
 namespace Vulkan::HostPasses {
 
-void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) {
+void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images, bool use_fp16) {
     this->device = device;
     this->num_images = num_images;
 
@@ -78,11 +80,13 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) 
         .size = sizeof(FSRConstants),
     };
 
-    const auto& cs_easu_module = CompileSPV(FSR_EASU_COMP, device);
+    const auto& cs_easu_module =
+        use_fp16 ? CompileSPV(FSR_EASU_COMP, device) : CompileSPV(FSR_EASU_FP32_COMP, device);
     ASSERT(cs_easu_module);
     SetObjectName(device, cs_easu_module, "fsr.comp [EASU]");
 
-    const auto& cs_rcas_module = CompileSPV(FSR_RCAS_COMP, device);
+    const auto& cs_rcas_module =
+        use_fp16 ? CompileSPV(FSR_RCAS_COMP, device) : CompileSPV(FSR_RCAS_FP32_COMP, device);
     ASSERT(cs_rcas_module);
     SetObjectName(device, cs_rcas_module, "fsr.comp [RCAS]");
 

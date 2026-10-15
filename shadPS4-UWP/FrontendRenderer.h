@@ -45,6 +45,7 @@ private:
         uint64_t last_frame{};
         uint64_t ticket{};
     };
+    void Check(HRESULT result, const wchar_t* operation = L"Frontend D3D12") const;
     void GetTargets();
     bool Evict();
     D3D12_CPU_DESCRIPTOR_HANDLE Cpu(uint32_t index) const;

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
 
@@ -15,6 +17,10 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#ifdef SHADPS4_UWP
+#include "core/libraries/kernel/threads/pthread.h"
+#include "uwp/session.h"
+#endif
 
 namespace Libraries::Kernel {
 
@@ -192,6 +198,20 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
         return count > 0;
     };
 
+#ifdef SHADPS4_UWP
+    const auto deadline = micros
+                              ? std::chrono::steady_clock::now() + std::chrono::microseconds(micros)
+                              : std::chrono::steady_clock::time_point::max();
+    std::unique_lock lock{m_mutex};
+    predicate();
+    while (count == 0 && !Core::Uwp::StopRequested()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            break;
+        m_cond.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(100)),
+                          predicate);
+    }
+#else
     if (micros == 0) {
         // Wait indefinitely for events
         std::unique_lock lock{m_mutex};
@@ -201,6 +221,7 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
         std::unique_lock lock{m_mutex};
         m_cond.wait_for(lock, std::chrono::microseconds(micros), predicate);
     }
+#endif
 
     return count;
 }
@@ -299,7 +320,11 @@ int EqueueInternal::WaitForSmallTimer(OrbisKernelEvent* ev, int num, u32 micros)
                 return count;
         }
         std::this_thread::yield();
-    } while (curr_clock < wait_end_us);
+    } while (curr_clock < wait_end_us
+#ifdef SHADPS4_UWP
+             && !Core::Uwp::StopRequested()
+#endif
+    );
 
     return 0;
 }
@@ -481,6 +506,10 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
     }
 
     *out = equeue->WaitForEvents(ev, num, timo);
+#ifdef SHADPS4_UWP
+    if (Core::Uwp::StopRequested())
+        PthreadTestCancel();
+#endif
 
     if (*out == 0) {
         return ORBIS_KERNEL_ERROR_ETIMEDOUT;

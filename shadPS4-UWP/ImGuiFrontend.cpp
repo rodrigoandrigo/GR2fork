@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstring>
 #include <numeric>
+#include <fstream>
+#include <filesystem>
 #include <ppltasks.h>
 #include <roapi.h>
 #include <wincodec.h>
@@ -236,6 +238,23 @@ void ImGuiFrontend::ResolveApi() {
 #undef RESOLVE
 }
 
+void ImGuiFrontend::ReportFailure(const std::wstring& message) noexcept {
+  try {
+    const auto directory = std::filesystem::path(user_root) / L"log";
+    std::filesystem::create_directories(directory);
+    std::ofstream output(directory / L"frontend-d3d12.log", std::ios::app);
+    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    output << timestamp << " " << Utf8(message) << std::endl;
+  } catch (...) {
+  }
+  try {
+    if (failure)
+      failure(message);
+  } catch (...) {
+  }
+}
+
 void ImGuiFrontend::Run(std::wstring root) {
   const auto apartment = RoInitialize(RO_INIT_MULTITHREADED);
   try {
@@ -252,6 +271,7 @@ void ImGuiFrontend::Run(std::wstring root) {
         pending_logs.pop_front();
       pending_logs.push_back(message.substr(0, 4096));
     });
+    D3D12DeviceContext::EnableDiagnostics();
     core->Initialize(root, initial.width, initial.height, true, game_surface);
     ResolveApi();
     IMGUI_CHECKVERSION();
@@ -366,28 +386,24 @@ void ImGuiFrontend::Run(std::wstring root) {
     }
   } catch (const winrt::hresult_error &error) {
     try {
-      if (failure)
-        failure(L"D3D12 HRESULT " +
+      ReportFailure(L"D3D12 HRESULT " +
                 std::to_wstring(static_cast<uint32_t>(error.code().value)) +
                 L": " + std::wstring(error.message()));
     } catch (...) {
     }
   } catch (Platform::Exception ^ error) {
     try {
-      if (failure)
-        failure(error->Message->Data());
+      ReportFailure(error->Message->Data());
     } catch (...) {
     }
   } catch (const std::exception &error) {
     try {
-      if (failure)
-        failure(Wide(error.what()));
+      ReportFailure(Wide(error.what()));
     } catch (...) {
     }
   } catch (...) {
     try {
-      if (failure)
-        failure(L"Falha inesperada no frontend.");
+      ReportFailure(L"Falha inesperada no frontend.");
     } catch (...) {
     }
   }

@@ -200,7 +200,7 @@ void D3D12Presenter::Initialize(const ShadPS4Config& config) {
     description.SampleDesc.Count = 1;
     description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     description.BufferCount = 2;
-    description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     description.Scaling = DXGI_SCALING_STRETCH;
     description.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     ComPtr<IDXGISwapChain1> chain;

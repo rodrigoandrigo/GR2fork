@@ -26,7 +26,8 @@ public:
 
     void ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_samples,
                                    vk::Format src_pixel_format, vk::Format dst_pixel_format,
-                                   vk::Image source, vk::Image dest);
+                                   vk::Image source, vk::Image dest, u32 src_mip = 0,
+                                   u32 dst_mip = 0, u32 src_layer = 0, u32 dst_layer = 0);
 
     void CopyBetweenMsImages(u32 width, u32 height, u32 num_samples, vk::Format pixel_format,
                              bool src_msaa, vk::Image source, vk::Image dest);

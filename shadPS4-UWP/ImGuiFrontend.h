@@ -102,6 +102,7 @@ private:
     void DrawLibrary();
     void DrawSettings();
     void DrawLogs();
+    void ReportFailure(const std::wstring& message) noexcept;
     void SubmitInput(const FrontendInput& input);
     HRESULT Attach(IDXGISwapChain* chain);
     std::shared_ptr<ShadPS4Host> core;

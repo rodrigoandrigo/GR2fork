@@ -91,9 +91,15 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     const auto device = instance.GetDevice();
 #ifdef SHADPS4_UWP
     auto probe_info = probe_ci;
+    sparse_buffers = instance.IsSparseBufferSupported();
+    if (!sparse_buffers)
+        probe_info.flags = {};
     probe_info.usage &= ~vk::BufferUsageFlagBits::eShaderDeviceAddress;
-    const auto probe = Vulkan::Check(device.createBufferUnique(probe_info));
+    const auto probe =
+        Vulkan::Check<"create buffer memory probe">(device.createBufferUnique(probe_info));
     const auto reqs = device.getBufferMemoryRequirements(*probe);
+    LOG_INFO(Render, "Buffer backing: {}, granularity {}", sparse_buffers ? "sparse" : "dense",
+             reqs.alignment);
 #else
     const vk::DeviceBufferMemoryRequirements req_info = {.pCreateInfo = &probe_ci};
     const auto reqs = device.getBufferMemoryRequirements(req_info).memoryRequirements;
@@ -135,6 +141,15 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 }
 
 BufferCache::~BufferCache() = default;
+
+void BufferCache::PrepareBufferRange(VAddr address, u64 size, bool written) {
+    if (sparse_buffers || !address || !size)
+        return;
+    size = memory->ClampRangeSize(address, size);
+    if (!size || (!written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(address, size)))
+        return;
+    GetDenseArena(address >> block_shift, (address + size - 1) >> block_shift);
+}
 
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
@@ -435,11 +450,50 @@ void BufferCache::SynchronizeDmaBuffers() {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
         const VAddr device_addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
-        SynchronizeMemory(address_space[page], device_addr, size, false, false);
+        const auto* arena =
+            sparse_buffers ? address_space[page] : GetArena(range.start, range.end - 1);
+        SynchronizeMemory(arena, device_addr, size, false, false);
     }
 }
 
+const Buffer* BufferCache::GetDenseArena(u64 first_block, u64 last_block) {
+    constexpr u64 DensePageSize = 16_MB;
+    VAddr begin = Common::AlignDown(first_block << block_shift, DensePageSize);
+    VAddr end = Common::AlignUp((last_block + 1) << block_shift, DensePageSize);
+    auto first = dense_arenas.upper_bound(begin);
+    if (first != dense_arenas.begin()) {
+        const auto previous = std::prev(first);
+        if (previous->first + previous->second->size_bytes >= begin)
+            first = previous;
+    }
+    if (first != dense_arenas.end() && first->first <= begin &&
+        first->first + first->second->size_bytes >= end)
+        return first->second.get();
+
+    auto last = first;
+    while (last != dense_arenas.end() && last->first <= end) {
+        begin = std::min(begin, last->first);
+        end = std::max(end, last->first + last->second->size_bytes);
+        ++last;
+    }
+    auto buffer = std::make_unique<Buffer>(instance, begin, end - begin, MemoryType::DeviceLocal,
+                                           "Dense guest buffer arena");
+    runtime.FillBuffer(buffer.get(), 0, end - begin, 0);
+    while (first != last) {
+        auto previous = std::move(first->second);
+        first = dense_arenas.erase(first);
+        const vk::BufferCopy copy{0, previous->cpu_addr - begin, previous->size_bytes};
+        runtime.CopyBuffer(previous.get(), buffer.get(), std::span{&copy, 1});
+        scheduler.DeferOperation([retired = std::move(previous)] {});
+    }
+    const auto* result = buffer.get();
+    dense_arenas.emplace(begin, std::move(buffer));
+    return result;
+}
+
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
+    if (!sparse_buffers)
+        return GetDenseArena(first_block, last_block);
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
     ASSERT_MSG(last_page - first_page <= 1,
@@ -513,6 +567,10 @@ bool BufferCache::AllResident(u64 first_block, u64 last_block) const {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    if (!sparse_buffers) {
+        resident_ranges.Add(Backing{{first_block, last_block + 1}, {}, 0});
+        return;
+    }
     if (!resident_bits.empty()) {
         ++fast_stats.resident_checks;
         if (AllResident(first_block, last_block)) {

@@ -10,6 +10,7 @@
 #include "common/string_util.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
+#include "core/libraries/save_data/save_backup.h"
 #include "core/libraries/save_data/save_instance.h"
 #include "imgui/imgui_std.h"
 #include "savedatadialog_ui.h"
@@ -101,7 +102,7 @@ SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param) {
             auto last_write = std::chrono::system_clock::to_time_t(param_sfo.GetLastWrite());
             std::string date_str = fmt::format("{:%d %b, %Y %R}", *std::localtime(&last_write));
 
-            size_t size = Common::FS::GetDirectorySize(dir_path);
+            size_t size = Backup::GetSaveDataSize(dir_path);
             std::string size_str = SpaceSizeToString(size);
 
             auto icon_path = dir_path / "sce_sys" / "icon0.png";

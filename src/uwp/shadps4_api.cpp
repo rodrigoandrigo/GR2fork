@@ -11,6 +11,7 @@
 #include <vector>
 #include <SDL3/SDL.h>
 #include <windows.h>
+#include <winrt/Windows.System.h>
 #include <winrt/base.h>
 #include "common/key_manager.h"
 #include "common/logging/log.h"
@@ -316,6 +317,15 @@ int32_t shadps4_run(const wchar_t* executable) {
         session_failed.store(false);
         guest_started.store(true);
         guest_threads_stopped.store(false);
+        try {
+            const auto usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
+            const auto limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+            LOG_INFO(Core, "Host app memory: usage {} MiB, limit {} MiB", usage / (1024 * 1024),
+                     limit / (1024 * 1024));
+        } catch (const winrt::hresult_error& error) {
+            LOG_INFO(Core, "Host app memory budget unavailable: {}",
+                     winrt::to_string(error.message()));
+        }
         emulator = Common::Singleton<Core::Emulator>::Instance();
         emulator->Run(std::filesystem::path{path});
         guest_threads_stopped.store(true);

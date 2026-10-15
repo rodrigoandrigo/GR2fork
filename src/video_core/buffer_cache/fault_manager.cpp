@@ -45,8 +45,8 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
         .bindingCount = 2,
         .pBindings = bindings.data(),
     };
-    fault_process_desc_layout =
-        Vulkan::Check(device.createDescriptorSetLayoutUnique(desc_layout_ci));
+    fault_process_desc_layout = Vulkan::Check<"create fault buffer descriptor layout">(
+        device.createDescriptorSetLayoutUnique(desc_layout_ci));
 
     const std::array<u32, 2> spec_data{sparse_pagebits, MaxPageFaults};
     const std::array<vk::SpecializationMapEntry, 2> spec_entries{{
@@ -73,13 +73,15 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
         .setLayoutCount = 1U,
         .pSetLayouts = &(*fault_process_desc_layout),
     };
-    fault_process_pipeline_layout = Vulkan::Check(device.createPipelineLayoutUnique(layout_info));
+    fault_process_pipeline_layout = Vulkan::Check<"create fault buffer pipeline layout">(
+        device.createPipelineLayoutUnique(layout_info));
 
     const vk::ComputePipelineCreateInfo pipeline_info = {
         .stage = shader_ci,
         .layout = *fault_process_pipeline_layout,
     };
-    fault_process_pipeline = Vulkan::Check(device.createComputePipelineUnique({}, pipeline_info));
+    fault_process_pipeline = Vulkan::Check<"create fault buffer compute pipeline">(
+        device.createComputePipelineUnique({}, pipeline_info));
     Vulkan::SetObjectName(device, *fault_process_pipeline, "Fault Buffer Parser Pipeline");
 
     device.destroyShaderModule(module);

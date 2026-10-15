@@ -11,6 +11,10 @@
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/error.h"
+#ifdef SHADPS4_UWP
+#include "core/libraries/kernel/threads/pthread.h"
+#endif
+#include "common/scope_exit.h"
 #include "core/address_space.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
@@ -19,6 +23,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#ifdef SHADPS4_UWP
+#include <winrt/Windows.System.h>
+#endif
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -98,6 +105,19 @@ static u64 BackingSize = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO + ORBIS_KERNEL_FLEXIBLE_
     }
 }
 
+static void* MapHostView(HANDLE backing, HANDLE process, void* address, u64 offset, u64 size,
+                         ULONG flags, ULONG protection, MEM_EXTENDED_PARAMETER* parameters,
+                         ULONG count) {
+#ifdef SHADPS4_UWP
+    if (protection != PAGE_EXECUTE && protection != PAGE_EXECUTE_READ &&
+        protection != PAGE_EXECUTE_READWRITE)
+        return MapViewOfFile3FromApp(backing, process, address, offset, size, flags, protection,
+                                     parameters, count);
+#endif
+    return MapViewOfFile3(backing, process, address, offset, size, flags, protection, parameters,
+                          count);
+}
+
 struct MemoryRegion {
     VAddr base;
     PAddr phys_base;
@@ -105,10 +125,26 @@ struct MemoryRegion {
     u32 prot;
     s32 fd;
     bool is_mapped;
+    bool is_resident{};
+    std::vector<MEMORY_BASIC_INFORMATION> saved_protections;
 };
 
 struct AddressSpace::Impl {
     Impl() : process{GetCurrentProcess()} {
+#ifdef SHADPS4_UWP
+        std::vector<VAddr> reserved_regions;
+        auto rollback = ::detail::MakeScopeGuard([&] {
+            if (backing_base) {
+                VirtualFreeEx(process, backing_base, BackingSize,
+                              MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+                VirtualFreeEx(process, backing_base, 0, MEM_RELEASE);
+            }
+            if (backing_handle)
+                CloseHandle(backing_handle);
+            for (const auto address : reserved_regions)
+                VirtualFreeEx(process, reinterpret_cast<void*>(address), 0, MEM_RELEASE);
+        });
+#endif
         // Determine the system's page alignment
         SYSTEM_INFO sys_info{};
         GetSystemInfo(&sys_info);
@@ -175,6 +211,9 @@ struct AddressSpace::Impl {
         }
 
         // Reserve all detected free regions.
+#ifdef SHADPS4_UWP
+        reserved_regions.reserve(regions.size());
+#endif
         for (auto region : regions) {
             auto addr = static_cast<u8*>(VirtualAlloc2(
                 process, reinterpret_cast<PVOID>(region.second.base), region.second.size,
@@ -182,6 +221,9 @@ struct AddressSpace::Impl {
             // All marked regions should reserve fine since they're free.
             ASSERT_MSG(addr, "Unable to reserve virtual address space: {}",
                        Common::GetLastErrorMsg());
+#ifdef SHADPS4_UWP
+            reserved_regions.push_back(region.second.base);
+#endif
         }
 
         // Set these constants to ensure code relying on them works.
@@ -198,28 +240,193 @@ struct AddressSpace::Impl {
                        EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
 
         // Allocate backing file that represents the total physical memory.
+#ifndef SHADPS4_UWP
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
                                             PAGE_EXECUTE_READWRITE, SEC_COMMIT, BackingSize,
                                             nullptr, nullptr, 0);
+#endif
 
+#ifndef SHADPS4_UWP
         ASSERT_MSG(backing_handle, "{}", Common::GetLastErrorMsg());
+#endif
         // Allocate a virtual memory for the backing file map as placeholder
         backing_base = static_cast<u8*>(VirtualAlloc2(process, nullptr, BackingSize,
                                                       MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
                                                       PAGE_NOACCESS, nullptr, 0));
         ASSERT_MSG(backing_base, "{}", Common::GetLastErrorMsg());
 
-        // Map backing placeholder. This will commit the pages
+#ifdef SHADPS4_UWP
+        backing_views.resize((BackingSize + BackingViewSize - 1) / BackingViewSize);
+        ram_pages.resize(backing_views.size());
+        for (u64 offset = 0; offset + BackingViewSize < BackingSize; offset += BackingViewSize) {
+            ASSERT_MSG(VirtualFreeEx(process, backing_base + offset, BackingViewSize,
+                                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                       "Unable to split physical backing placeholder: {}",
+                       Common::GetLastErrorMsg());
+        }
+        active_backing.store(this);
+        rollback.Cancel();
+        LOG_INFO(Core, "UWP memory: {} MiB reserved, 64 KiB demand commitment, swap disabled",
+                 BackingSize / 1_MB);
+#else
         void* const ret =
             MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
                            MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0);
         ASSERT_MSG(ret == backing_base, "{}", Common::GetLastErrorMsg());
+#endif
     }
+
+#ifdef SHADPS4_UWP
+    static constexpr u64 AppMemoryBudget = 5120_MB;
+    static constexpr u64 HostMemoryReserve = 256_MB;
+    static constexpr u64 BackingViewSize = 16_MB;
+    static constexpr u64 CommitSize = 64_KB;
+    inline static std::atomic<Impl*> active_backing{};
+    std::mutex backing_mutex;
+    std::vector<bool> backing_views;
+    std::vector<HANDLE> ram_pages;
+    u64 committed_bytes{};
+
+    bool MapBackingView(void* address) {
+        const auto offset =
+            reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(backing_base);
+        if (offset >= BackingSize)
+            return false;
+        const u64 index = offset / BackingViewSize;
+        std::scoped_lock lock{backing_mutex};
+        if (backing_views[index])
+            return true;
+        const u64 view_offset = index * BackingViewSize;
+        const u64 view_size = std::min(BackingViewSize, BackingSize - view_offset);
+        auto* base = backing_base + view_offset;
+        const auto handle = GetRamPage(index);
+        const u64 map_offset = 0;
+        if (MapViewOfFile3FromApp(handle, process, base, map_offset, view_size,
+                                  MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != base) {
+            LOG_ERROR(Core, "Unable to map physical backing view at {:#x}: {}", view_offset,
+                      Common::GetLastErrorMsg());
+            return false;
+        }
+        backing_views[index] = true;
+        return true;
+    }
+#endif
+
+#ifdef SHADPS4_UWP
+    bool MapGuestView(void* address, u64 access_type) {
+        const auto addr = reinterpret_cast<VAddr>(address);
+        std::scoped_lock lock{mutex};
+        auto it = regions.upper_bound(addr);
+        if (it == regions.begin())
+            return false;
+        auto& region = std::prev(it)->second;
+        if (!region.is_mapped || region.fd != -1 || region.phys_base == PAddr(-1) ||
+            addr - region.base >= region.size)
+            return false;
+        if (!region.is_resident) {
+            MapRegion(&region, {}, true);
+        }
+        CommitPhysical(region.phys_base + addr - region.base);
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            (info.Protect & PAGE_GUARD))
+            return false;
+        const auto prot = info.Protect & 0xff;
+        if (access_type == 1)
+            return prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE;
+        if (access_type == 8)
+            return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
+                   prot == PAGE_EXECUTE_READWRITE;
+        return prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READ ||
+               prot == PAGE_EXECUTE_READWRITE;
+    }
+
+    void ApplyCommittedProtection(VAddr address, u64 size, DWORD protection) {
+        const auto end = address + size;
+        while (address < end) {
+            MEMORY_BASIC_INFORMATION info{};
+            ASSERT_MSG(VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)),
+                       "Unable to query lazy memory protection");
+            const auto next =
+                std::min(end, reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize);
+            if (info.State == MEM_COMMIT) {
+                DWORD previous{};
+                ASSERT_MSG(VirtualProtect(reinterpret_cast<void*>(address), next - address,
+                                          protection, &previous),
+                           "Unable to protect lazy memory: {}", Common::GetLastErrorMsg());
+            }
+            address = next;
+        }
+    }
+
+    void CommitPhysical(u64 offset) {
+        const auto begin = Common::AlignDown(offset, CommitSize);
+        const auto size = std::min(CommitSize, BackingSize - begin);
+        auto* address = backing_base + begin;
+        ASSERT_MSG(MapBackingView(address), "Unable to map lazy physical memory");
+        MEMORY_BASIC_INFORMATION info{};
+        ASSERT_MSG(VirtualQuery(address, &info, sizeof(info)),
+                   "Unable to query lazy physical memory");
+        if (info.State == MEM_COMMIT)
+            return;
+        try {
+            const u64 limit = std::min<u64>(
+                AppMemoryBudget, winrt::Windows::System::MemoryManager::AppMemoryUsageLimit());
+            const u64 usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
+            if (limit && (usage >= limit || size > limit - usage ||
+                          HostMemoryReserve > limit - usage - size))
+                throw std::runtime_error(fmt::format(
+                    "UWP RAM budget exhausted: usage {} MiB, limit {} MiB, request {} MiB; "
+                    "demand commitment",
+                    usage / 1_MB, limit / 1_MB, size / 1_MB));
+        } catch (const winrt::hresult_error&) {
+        }
+        ASSERT_MSG(VirtualAllocFromApp(address, size, MEM_COMMIT, PAGE_READWRITE) == address,
+                   "Unable to commit physical memory at {:#x}, size {:#x}: {}", begin, size,
+                   Common::GetLastErrorMsg());
+        committed_bytes += size;
+        for (auto& [base, region] : regions) {
+            if (!region.is_resident || region.fd != -1 || region.phys_base == PAddr(-1))
+                continue;
+            const auto first = std::max(begin, region.phys_base);
+            const auto last = std::min(begin + size, region.phys_base + region.size);
+            if (first >= last)
+                continue;
+            const auto virtual_first = base + first - region.phys_base;
+            const auto virtual_last = base + last - region.phys_base;
+            ApplyCommittedProtection(virtual_first, last - first, region.prot);
+            for (const auto& protection : region.saved_protections) {
+                const auto protect_first =
+                    std::max(virtual_first, reinterpret_cast<VAddr>(protection.BaseAddress));
+                const auto protect_last =
+                    std::min(virtual_last, reinterpret_cast<VAddr>(protection.BaseAddress) +
+                                               protection.RegionSize);
+                if (protect_first < protect_last)
+                    ApplyCommittedProtection(protect_first, protect_last - protect_first,
+                                             protection.Protect);
+            }
+        }
+    }
+
+    HANDLE GetRamPage(u64 index) {
+        if (ram_pages[index])
+            return ram_pages[index];
+        const u64 size = std::min(BackingViewSize, BackingSize - index * BackingViewSize);
+        ram_pages[index] =
+            CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
+                               PAGE_EXECUTE_READWRITE, SEC_RESERVE, size, nullptr, nullptr, 0);
+        ASSERT_MSG(ram_pages[index], "Unable to allocate RAM page at {:#x}, size {:#x}: {}",
+                   index * BackingViewSize, size, Common::GetLastErrorMsg());
+        return ram_pages[index];
+    }
+#endif
 
     ~Impl() {
 #ifdef SHADPS4_UWP
+        LOG_INFO(Core, "UWP demand memory: {} KiB committed, swap disabled",
+                 committed_bytes / 1_KB);
         for (const auto& [address, region] : regions) {
-            if (region.is_mapped) {
+            if (region.is_mapped && region.is_resident) {
                 if ((region.fd != -1 && region.prot != PAGE_READONLY) ||
                     (region.fd == -1 && region.phys_base != PAddr(-1))) {
                     if (!UnmapViewOfFile2(process, reinterpret_cast<void*>(address),
@@ -243,22 +450,45 @@ struct AddressSpace::Impl {
             }
         }
         if (backing_base) {
+#ifdef SHADPS4_UWP
+            active_backing.store(nullptr);
+            for (u64 index = 0; index < backing_views.size(); ++index) {
+                if (backing_views[index])
+                    UnmapViewOfFile2(process, backing_base + index * BackingViewSize,
+                                     MEM_PRESERVE_PLACEHOLDER);
+            }
+            VirtualFreeEx(process, backing_base, BackingSize,
+                          MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            VirtualFreeEx(process, backing_base, 0, MEM_RELEASE);
+#else
             if (!UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER)) {
                 LOG_CRITICAL(Core, "Failed to unmap backing memory placeholder");
             }
             if (!VirtualFreeEx(process, backing_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(Core, "Failed to free backing memory");
             }
+#endif
         }
-        if (!CloseHandle(backing_handle)) {
+#ifdef SHADPS4_UWP
+        for (auto page : ram_pages) {
+            if (page)
+                CloseHandle(page);
+        }
+#endif
+        if (backing_handle && !CloseHandle(backing_handle)) {
             LOG_CRITICAL(Core, "Failed to free backing memory file handle");
         }
     }
 
     void* MapRegion(MemoryRegion* region,
-                    std::span<const MEMORY_BASIC_INFORMATION> protections = {}) {
+                    std::span<const MEMORY_BASIC_INFORMATION> protections = {},
+                    bool populate = false) {
         VAddr virtual_addr = region->base;
         PAddr phys_addr = region->phys_base;
+        PAddr map_offset = phys_addr;
+        auto saved_protections = std::move(region->saved_protections);
+        if (protections.empty())
+            protections = saved_protections;
         u64 size = region->size;
         ULONG prot = region->prot;
         s32 fd = region->fd;
@@ -266,6 +496,18 @@ struct AddressSpace::Impl {
         void* ptr = nullptr;
         if (phys_addr != -1) {
             HANDLE backing = fd != -1 ? reinterpret_cast<HANDLE>(fd) : backing_handle;
+#ifdef SHADPS4_UWP
+            if (fd == -1) {
+                ASSERT_MSG(phys_addr <= BackingSize && size <= BackingSize - phys_addr,
+                           "Physical backing range exceeds reserved memory");
+                if (!populate && protections.empty())
+                    return reinterpret_cast<void*>(virtual_addr);
+                ASSERT_MSG(size <= BackingViewSize - phys_addr % BackingViewSize,
+                           "RAM alias crosses resident page boundary");
+                backing = GetRamPage(phys_addr / BackingViewSize);
+                map_offset = phys_addr % BackingViewSize;
+            }
+#endif
             if (fd != -1 && prot == PAGE_READONLY) {
                 // Allocate the memory for the mapping
                 DWORD resultvar;
@@ -294,16 +536,19 @@ struct AddressSpace::Impl {
             } else {
                 if (prot == PAGE_NOACCESS) {
                     DWORD resultvar;
-                    ptr = MapViewOfFile3(backing, process, reinterpret_cast<PVOID>(virtual_addr),
-                                         phys_addr, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
-                                         nullptr, 0);
+                    ptr = MapHostView(backing, process, reinterpret_cast<PVOID>(virtual_addr),
+                                      map_offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+                                      nullptr, 0);
                     ASSERT_MSG(ptr, "MapViewOfFile3 failed. {}", Common::GetLastErrorMsg());
+#ifdef SHADPS4_UWP
+                    ApplyCommittedProtection(virtual_addr, size, prot);
+#else
                     bool ret = VirtualProtect(ptr, size, prot, &resultvar);
                     ASSERT_MSG(ret, "VirtualProtect failed. {}", Common::GetLastErrorMsg());
+#endif
                 } else {
-                    ptr =
-                        MapViewOfFile3(backing, process, reinterpret_cast<PVOID>(virtual_addr),
-                                       phys_addr, size, MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
+                    ptr = MapHostView(backing, process, reinterpret_cast<PVOID>(virtual_addr),
+                                      map_offset, size, MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
                     ASSERT_MSG(ptr, "MapViewOfFile3 failed. {}", Common::GetLastErrorMsg());
                 }
             }
@@ -313,6 +558,7 @@ struct AddressSpace::Impl {
                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
         }
         ASSERT_MSG(ptr, "{}", Common::GetLastErrorMsg());
+        region->is_resident = true;
 
         for (const auto& info : protections) {
             const VAddr info_base = reinterpret_cast<VAddr>(info.BaseAddress);
@@ -321,17 +567,42 @@ struct AddressSpace::Impl {
             if (begin >= end) {
                 continue;
             }
+#ifdef SHADPS4_UWP
+            ApplyCommittedProtection(begin, end - begin, info.Protect);
+#else
             DWORD old_flags{};
             const bool ret =
                 VirtualProtectEx(process, LPVOID(begin), end - begin, info.Protect, &old_flags);
             ASSERT_MSG(ret, "VirtualProtectEx failed. {}", Common::GetLastErrorMsg());
+#endif
         }
+#ifdef SHADPS4_UWP
+        if (fd == -1 && phys_addr != PAddr(-1)) {
+            region->saved_protections.clear();
+            for (auto info : protections) {
+                const auto first =
+                    std::max(virtual_addr, reinterpret_cast<VAddr>(info.BaseAddress));
+                const auto last =
+                    std::min(virtual_addr + size,
+                             reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize);
+                if (first >= last)
+                    continue;
+                info.BaseAddress = reinterpret_cast<void*>(first);
+                info.RegionSize = last - first;
+                region->saved_protections.push_back(info);
+            }
+        }
+#endif
         return ptr;
     }
 
     std::vector<MEMORY_BASIC_INFORMATION> QueryProtections(const MemoryRegion& region,
                                                            VAddr skip_addr, u64 skip_size) {
         std::vector<MEMORY_BASIC_INFORMATION> protections;
+#ifdef SHADPS4_UWP
+        if (!region.is_resident || (region.fd == -1 && region.phys_base != PAddr(-1)))
+            return region.saved_protections;
+#endif
         const VAddr end = region.base + region.size;
         for (VAddr addr = region.base; addr < end;) {
             if (addr >= skip_addr && addr < skip_addr + skip_size) {
@@ -350,6 +621,10 @@ struct AddressSpace::Impl {
     }
 
     void UnmapRegion(MemoryRegion* region) {
+#ifdef SHADPS4_UWP
+        if (!region->is_resident)
+            return;
+#endif
         VAddr virtual_addr = region->base;
         PAddr phys_base = region->phys_base;
         u64 size = region->size;
@@ -366,6 +641,7 @@ struct AddressSpace::Impl {
         }
         ASSERT_MSG(ret, "Unmap on virtual_addr {:#x}, size {:#x} failed: {}", virtual_addr, size,
                    Common::GetLastErrorMsg());
+        region->is_resident = false;
     }
 
     void SplitRegion(VAddr virtual_addr, u64 size) {
@@ -457,6 +733,27 @@ struct AddressSpace::Impl {
     }
 
     void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, ULONG prot, s32 fd = -1) {
+#ifdef SHADPS4_UWP
+        if (fd == -1 && phys_addr != PAddr(-1) &&
+            size > BackingViewSize - phys_addr % BackingViewSize) {
+            const auto first_size = BackingViewSize - phys_addr % BackingViewSize;
+            auto* result = Map(virtual_addr, phys_addr, first_size, prot, fd);
+            Map(virtual_addr + first_size, phys_addr + first_size, size - first_size, prot, fd);
+            return result;
+        }
+        if (fd == -1 && phys_addr != PAddr(-1) && size > BackingViewSize) {
+            void* result{};
+            for (u64 offset = 0; offset < size;) {
+                const auto view_size = std::min(BackingViewSize, size - offset);
+                auto* mapped = Map(virtual_addr + offset, phys_addr + offset, view_size, prot, fd);
+                if (!offset)
+                    result = mapped;
+                offset += view_size;
+            }
+            return result;
+        }
+
+#endif
         std::scoped_lock lk{mutex};
         // Get a pointer to the region containing virtual_addr
         auto it = std::prev(regions.upper_bound(virtual_addr));
@@ -613,9 +910,44 @@ struct AddressSpace::Impl {
             if (!it->second.is_mapped) {
                 continue;
             }
-            const auto& region = it->second;
+            auto& region = it->second;
             const u64 range_addr = std::max(region.base, virtual_addr);
             const u64 range_size = std::min(region.base + region.size, virtual_end) - range_addr;
+#ifdef SHADPS4_UWP
+            if (region.fd == -1 && region.phys_base != PAddr(-1)) {
+                if (range_addr == region.base && range_size == region.size) {
+                    region.prot = new_flags;
+                    region.saved_protections.clear();
+                } else {
+                    MEMORY_BASIC_INFORMATION info{};
+                    info.BaseAddress = reinterpret_cast<void*>(range_addr);
+                    info.RegionSize = range_size;
+                    info.Protect = new_flags;
+                    std::vector<MEMORY_BASIC_INFORMATION> protections;
+                    for (auto previous : region.saved_protections) {
+                        const auto first = reinterpret_cast<VAddr>(previous.BaseAddress);
+                        const auto last = first + previous.RegionSize;
+                        if (first < range_addr) {
+                            auto prefix = previous;
+                            prefix.RegionSize = std::min(last, range_addr) - first;
+                            protections.push_back(prefix);
+                        }
+                        if (last > range_addr + range_size) {
+                            const auto suffix = std::max(first, range_addr + range_size);
+                            previous.BaseAddress = reinterpret_cast<void*>(suffix);
+                            previous.RegionSize = last - suffix;
+                            protections.push_back(previous);
+                        }
+                    }
+                    if (new_flags != region.prot)
+                        protections.push_back(info);
+                    region.saved_protections = std::move(protections);
+                }
+                if (region.is_resident)
+                    ApplyCommittedProtection(range_addr, range_size, new_flags);
+                continue;
+            }
+#endif
             DWORD old_flags{};
             if (!VirtualProtectEx(process, LPVOID(range_addr), range_size, new_flags, &old_flags)) {
                 UNREACHABLE_MSG(
@@ -862,6 +1194,34 @@ AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
 }
 
 AddressSpace::~AddressSpace() = default;
+
+#ifdef SHADPS4_UWP
+bool AddressSpace::HandleBackingFault(void* address, u64 access_type) {
+    auto* thread = Libraries::Kernel::g_curthread;
+    if (thread)
+        thread->critical_count.fetch_add(1, std::memory_order_acq_rel);
+    auto leave_critical = ::detail::MakeScopeGuard([&] {
+        if (thread)
+            thread->critical_count.fetch_sub(1, std::memory_order_acq_rel);
+    });
+    auto* backing = Impl::active_backing.load();
+    if (!backing)
+        return false;
+    const auto offset =
+        reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(backing->backing_base);
+    if (offset < BackingSize) {
+        std::scoped_lock lock{backing->mutex};
+        if (!backing->MapBackingView(address)) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(address, &info, sizeof(info)) || info.Type != MEM_MAPPED)
+                return false;
+        }
+        backing->CommitPhysical(offset);
+        return true;
+    }
+    return backing->MapGuestView(address, access_type);
+}
+#endif
 
 void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_exec) {
     const VAddr end_addr = virtual_addr + size - 1;

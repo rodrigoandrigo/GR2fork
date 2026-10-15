@@ -95,3 +95,42 @@ capacidades ausentes continuam limitadas pelo Dozen.
 
 O fonte OpenOrbis em [hardware/fifo](hardware/fifo/README.md) permite comparar
 IDs de frames com captura física. Ainda não foi compilado nem executado em PS4.
+
+
+## Pipeline de tiling no UWP (15/10/2026)
+
+O log do Xbox atingia o primeiro detiler Display2DThin_32 e terminava com
+HRESULT 0x80070057 na criacao do PSO compute. Esse HRESULT significa
+argumento invalido; nao demonstra esgotamento de memoria. O Dozen antes
+convertia qualquer falha de criacao em VK_ERROR_OUT_OF_HOST_MEMORY.
+
+O uniform buffer de tiling declarava pitch e height como uint16_t. O SPIR-V
+exigia UniformAndStorageBuffer16BitAccess (4434), embora o dispositivo do
+shadPS4 nao habilite uniformAndStorageBuffer16BitAccess. O shader agora le
+o mesmo par de campos como uint de 32 bits e extrai as duas metades. O
+layout de 12 bytes por mip e os dados enviados pelo host sao preservados.
+As variantes de 32/64/96/128 bits passam a exigir apenas Shader; as de
+8/16 bits mantem somente a exigencia correspondente aos storage buffers.
+Essa correcao e comum a tiling/detiling e nao depende de um jogo.
+
+No perfil _XBOX_UWP, pipelines compute usam CreateComputePipelineState com
+o descritor compute direto, root signature e DXIL, em vez do stream generico.
+Os caminhos com cache continuam recebendo o mesmo shader compilado.
+E_OUTOFMEMORY retorna VK_ERROR_OUT_OF_DEVICE_MEMORY, remocao/reset do device
+retorna VK_ERROR_DEVICE_LOST, e demais rejeicoes retornam VK_ERROR_UNKNOWN.
+O log preserva o HRESULT original e o tamanho do DXIL.
+
+Validacao local: Build/detiler-dozen-build.log, Build/tiling-capabilities.log,
+Build/tiling-readback-final.log e Build/detiler-game-final.log. O diagnostico
+GPU nativo usa os shaders compilados de producao e deixa explicitamente
+uniformAndStorageBuffer16BitAccess desabilitado. Houve roundtrip byte a byte
+nas variantes micro 8/16/32/64/96/128 e macro 8/16/32/64/128, mais comparacao
+independente do endereco Display micro de 32 bits. Macro 96 passou somente
+na criacao do pipeline; o caso sintetico nao fornece configuracao valida de
+macro tiles para readback de 96 bits, portanto nao e reportado como roundtrip.
+PAC-MAN 256 chegou a tela inicial e encerrou com BOOT_RESULT=0 e SHUTDOWN=0.
+
+O pacote e registrado em Build/detiler-package.log e sua verificacao de
+conteudo em Build/detiler-package-verification.log. Essas validacoes no PC
+nao comprovam que o driver do Xbox aceitou o novo pipeline. A reproducao
+no console permanece pendente; nao houve instalacao nesta revisao.

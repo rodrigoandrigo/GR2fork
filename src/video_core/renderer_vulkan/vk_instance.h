@@ -75,6 +75,10 @@ public:
         return present_queue;
     }
 
+    bool IsSparseBufferSupported() const {
+        return features.sparseBinding && features.sparseResidencyBuffer;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }

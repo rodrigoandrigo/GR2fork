@@ -175,6 +175,71 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
 
+    if (dst->info.pixel_format == vk::Format::eD16UnormS8Uint &&
+        dst->backing->image.image_ci.format != dst->info.pixel_format &&
+        dst->info.num_samples == 1) {
+        for (const auto& copy : upload_copies) {
+            ASSERT(copy.imageOffset == vk::Offset3D{} && copy.imageExtent.depth == 1);
+            auto color = std::make_shared<VideoCore::UniqueImage>(instance.GetDevice(),
+                                                                  instance.GetAllocator());
+            color->Create(vk::ImageCreateInfo{
+                .imageType = vk::ImageType::e2D,
+                .format = vk::Format::eR16Unorm,
+                .extent = copy.imageExtent,
+                .mipLevels = 1,
+                .arrayLayers = copy.imageSubresource.layerCount,
+                .samples = vk::SampleCountFlagBits::e1,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+            });
+            auto color_copy = copy;
+            color_copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+            color_copy.imageSubresource.mipLevel = 0;
+            color_copy.imageSubresource.baseArrayLayer = 0;
+            const auto copy_size = BufferImageCopySize(color_copy, vk::Format::eR16Unorm);
+            IsBufferAccessed(src, copy.bufferOffset, copy_size);
+            Transit(dst, vk::ImageLayout::eDepthStencilAttachmentOptimal,
+                    vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                        vk::PipelineStageFlagBits2::eLateFragmentTests,
+                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+            FlushBarriers();
+            vk::ImageMemoryBarrier2 color_barrier{
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = color->image,
+                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0,
+                                  copy.imageSubresource.layerCount},
+            };
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &color_barrier});
+            cmdbuf.copyBufferToImage(src->Handle(), color->image,
+                                     vk::ImageLayout::eTransferDstOptimal, color_copy);
+            AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+                         vk::AccessFlagBits2::eTransferRead);
+            color_barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+            color_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+            color_barrier.dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader;
+            color_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+            color_barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+            color_barrier.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &color_barrier});
+            for (u32 layer = 0; layer < copy.imageSubresource.layerCount; ++layer)
+                blit_helper->ReinterpretColorAsMsDepth(
+                    copy.imageExtent.width, copy.imageExtent.height, 1, vk::Format::eR16Unorm,
+                    dst->backing->image.image_ci.format, color->image, dst->GetImage(), 0,
+                    copy.imageSubresource.mipLevel, layer,
+                    copy.imageSubresource.baseArrayLayer + layer);
+            scheduler.DeferOperation([color] {});
+        }
+        return;
+    }
+
     bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
                 vk::AccessFlagBits2::eTransferWrite);

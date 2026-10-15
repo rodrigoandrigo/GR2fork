@@ -44,6 +44,8 @@ void StartThread();
 
 void StopThread();
 
+u64 GetSaveDataSize(const std::filesystem::path& save_path);
+
 bool NewRequest(Libraries::UserService::OrbisUserServiceUserId user_id, std::string_view title_id,
                 std::string_view dir_name, OrbisSaveDataEventType origin);
 

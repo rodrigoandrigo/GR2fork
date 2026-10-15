@@ -25,7 +25,7 @@ void Require(bool valid, HRESULT result = E_INVALIDARG) {
 }
 
 template <typename F>
-int32_t StorageCall(F operation) {
+int32_t StorageCall(F operation, bool allow_missing = false) {
     try {
         APTTYPE type;
         APTTYPEQUALIFIER qualifier;
@@ -35,6 +35,9 @@ int32_t StorageCall(F operation) {
         operation();
         return 0;
     } catch (const winrt::hresult_error& error) {
+        if (allow_missing && (error.code() == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ||
+                              error.code() == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)))
+            return error.code().value;
         Core::Uwp::ReportError("Brokered storage HRESULT " +
                                std::to_string(static_cast<uint32_t>(error.code().value)) + ": " +
                                winrt::to_string(error.message()));
@@ -239,11 +242,13 @@ int32_t shadps4_file_close(uint64_t token) {
         [&] { Require(files.erase(token) != 0, HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)); });
 }
 int32_t shadps4_storage_stat(const char* path, ShadPS4FileInfo* info) {
-    return StorageCall([&] {
-        Require(info && info->size == sizeof(ShadPS4FileInfo));
-        const auto [folder, relative] = Resolve(path);
-        *info = Info(folder->Stat(relative));
-    });
+    return StorageCall(
+        [&] {
+            Require(info && info->size == sizeof(ShadPS4FileInfo));
+            const auto [folder, relative] = Resolve(path);
+            *info = Info(folder->Stat(relative));
+        },
+        true);
 }
 int32_t shadps4_storage_enumerate(const char* path, ShadPS4DirectoryCallback callback,
                                   void* context) {

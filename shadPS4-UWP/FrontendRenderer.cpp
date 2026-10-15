@@ -7,10 +7,6 @@
 #include <imgui_impl_dx12.h>
 
 namespace {
-void Check(HRESULT result) {
-    if (FAILED(result))
-        throw std::runtime_error("D3D12 HRESULT " + std::to_string(static_cast<uint32_t>(result)));
-}
 D3D12_HEAP_PROPERTIES Heap(D3D12_HEAP_TYPE type) {
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = type;
@@ -40,6 +36,10 @@ void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
     list->ResourceBarrier(1, &barrier);
 }
 } // namespace
+
+void FrontendRenderer::Check(HRESULT result, const wchar_t* operation) const {
+    context.CheckResult(result, operation);
+}
 
 FrontendRenderer::~FrontendRenderer() {
     if (initialized) {
@@ -92,7 +92,7 @@ void FrontendRenderer::Initialize(uint32_t new_width, uint32_t new_height,
         description.SampleDesc.Count = 1;
         description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         description.BufferCount = frames.size();
-        description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         description.Scaling = DXGI_SCALING_STRETCH;
         description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
         Microsoft::WRL::ComPtr<IDXGISwapChain1> chain;
@@ -108,7 +108,8 @@ void FrontendRenderer::Initialize(uint32_t new_width, uint32_t new_height,
     Check(context.Device()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
                                               frames[0].allocator.Get(), nullptr,
                                               IID_PPV_ARGS(&commands)));
-    Check(commands->Close());
+    Check(commands->Close(), L"Frontend command list Close");
+    commands->SetName(L"shadPS4 UWP frontend commands");
     if (!ImGui_ImplDX12_Init(context.Device(), frames.size(), DXGI_FORMAT_R8G8B8A8_UNORM, srv.Get(),
                              Cpu(0), Gpu(0)))
         throw std::runtime_error("ImGui DX12 initialization failed");
@@ -237,6 +238,13 @@ bool FrontendRenderer::Upload(const ThumbnailPixels& pixels) {
     commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
     Transition(commands.Get(), image.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = description.Format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = 1;
+    context.Device()->CreateShaderResourceView(image.resource.Get(), &view,
+                                                Cpu(image.descriptor));
     frames[frame_index].uploads.push_back(std::move(upload));
     images.emplace(pixels.key, std::move(image));
     free_descriptors.pop_back();
@@ -271,13 +279,13 @@ void FrontendRenderer::EndFrame() {
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commands.Get());
     Transition(commands.Get(), frame.target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                D3D12_RESOURCE_STATE_COMMON);
-    Check(commands->Close());
+    Check(commands->Close(), L"Frontend command list Close");
     frame.ticket = context.Submit(commands.Get());
     for (auto& [key, image] : images)
         if (image.last_frame == frame_number)
             image.ticket = frame.ticket;
     if (swapchain)
-        Check(swapchain->Present(1, 0));
+        Check(swapchain->Present(1, 0), L"Frontend swapchain Present");
 }
 
 std::vector<uint8_t> FrontendRenderer::Readback() {
@@ -308,7 +316,7 @@ std::vector<uint8_t> FrontendRenderer::Readback() {
     commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
     Transition(commands.Get(), frame.target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                D3D12_RESOURCE_STATE_COMMON);
-    Check(commands->Close());
+    Check(commands->Close(), L"Frontend command list Close");
     context.Wait(context.Submit(commands.Get()));
     uint8_t* mapped{};
     D3D12_RANGE range{0, static_cast<size_t>(bytes)};

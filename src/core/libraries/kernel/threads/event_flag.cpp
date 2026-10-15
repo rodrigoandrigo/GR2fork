@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <list>
 #include <mutex>
@@ -142,6 +144,30 @@ public:
             return waiter.ready || waiter.canceled || waiter.deleted || waiter.timed_out;
         };
 
+#ifdef SHADPS4_UWP
+        const auto deadline =
+            infinite ? std::chrono::steady_clock::time_point::max()
+                     : std::chrono::steady_clock::now() + std::chrono::microseconds(timeout);
+        while (!wake() && !Core::Uwp::StopRequested()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+                break;
+            waiter.cv.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(100)),
+                                 wake);
+        }
+        if (Core::Uwp::StopRequested()) {
+            RemoveWaiter(waiter);
+            return ORBIS_KERNEL_ERROR_ECANCELED;
+        }
+        if (!wake()) {
+            RemoveWaiter(waiter);
+            if (result)
+                *result = m_bits;
+            if (ptr_micros)
+                *ptr_micros = 0;
+            return ORBIS_KERNEL_ERROR_ETIMEDOUT;
+        }
+#else
         if (infinite) {
             waiter.cv.wait(lock, wake);
         } else {
@@ -156,6 +182,7 @@ public:
                 return ORBIS_KERNEL_ERROR_ETIMEDOUT;
             }
         }
+#endif
 
         RemoveWaiter(waiter);
 
@@ -427,6 +454,10 @@ int PS4_SYSV_ABI sceKernelWaitEventFlag(OrbisKernelEventFlag ef, u64 bitPattern,
     }
 
     const int result = ef->Wait(bitPattern, wait, clear, pResultPat, pTimeout);
+#ifdef SHADPS4_UWP
+    if (Core::Uwp::StopRequested())
+        PthreadTestCancel();
+#endif
     if (result != ORBIS_OK && result != ORBIS_KERNEL_ERROR_ETIMEDOUT) {
         LOG_DEBUG(Kernel_Event, "returned {:#x}", result);
     }

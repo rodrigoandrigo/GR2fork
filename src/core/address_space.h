@@ -29,6 +29,9 @@ class AddressSpace {
 public:
     explicit AddressSpace();
     ~AddressSpace();
+#ifdef SHADPS4_UWP
+    static bool HandleBackingFault(void* address, u64 access_type);
+#endif
 
     struct Traits {
         using Entry = u8*;
