@@ -685,12 +685,17 @@ void Instance::CreateAllocator() {
 
     const VmaAllocatorCreateInfo allocator_info = {
 #ifdef SHADPS4_UWP
-        .flags = 0,
+        .flags = supports_memory_budget
+                     ? VmaAllocatorCreateFlags{VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT}
+                     : VmaAllocatorCreateFlags{},
 #else
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
 #endif
         .physicalDevice = physical_device,
         .device = *device,
+#ifdef SHADPS4_UWP
+        .preferredLargeHeapBlockSize = 32_MB,
+#endif
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,

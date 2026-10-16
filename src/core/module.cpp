@@ -270,6 +270,10 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             }
             break;
         }
+        case PT_INTERP:
+        case PT_SCE_COMMENT:
+        case PT_SCE_LIBVERSION:
+            break;
         default:
             LOG_ERROR(Core_Linker, "Unimplemented type {}", header_type);
         }
@@ -448,9 +452,9 @@ void Module::LoadDynamicInfo() {
             break;
         case DT_FLAGS:
             dynamic_info.flags = dyn->d_un.d_val;
-            // This value should always be DF_TEXTREL (0x04)
-            if (dynamic_info.flags != 0x04) {
-                LOG_WARNING(Core_Linker, "DT_FLAGS is NOT 0x04 should check!");
+            if (dynamic_info.flags & ~u64{0x1f}) {
+                LOG_WARNING(Core_Linker, "Unknown DT_FLAGS bits: {:#x}",
+                            dynamic_info.flags & ~u64{0x1f});
             }
             break;
         case DT_NEEDED:

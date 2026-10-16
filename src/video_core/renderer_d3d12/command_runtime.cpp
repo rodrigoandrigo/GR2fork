@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <winrt/base.h>
 #include "video_core/renderer_d3d12/resource_bindings.h"
+#include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
 namespace D3D12 {
@@ -19,6 +20,7 @@ u64 CommandRuntime::Flush() {
 void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write write,
                                 ResourceCache::Resolve resolve) {
     device.Initialize();
+    NativeTemporalJitter().Reset();
     shaders.Initialize(device.Device());
     this->read = read;
     resources.Initialize(device, read, write, std::move(resolve));

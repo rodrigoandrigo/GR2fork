@@ -133,6 +133,12 @@
       <DeploymentContent>true</DeploymentContent>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="$(CoreRuntimeDir)\spirv_to_dxil.dll">
+      <Link>spirv_to_dxil.dll</Link>
+      <TargetPath>spirv_to_dxil.dll</TargetPath>
+      <DeploymentContent>true</DeploymentContent>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="$(CoreRuntimeDir)\dxcompiler.dll">
       <Link>dxcompiler.dll</Link>
       <TargetPath>dxcompiler.dll</TargetPath>

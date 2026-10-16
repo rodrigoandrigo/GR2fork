@@ -182,7 +182,14 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v) {
         v.resize(stat.m_uncomp_size / sizeof(T));
         mz_zip_reader_extract_to_mem(&zip_ar, index, v.data(), stat.m_uncomp_size, 0);
     } else {
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) && !ec) {
+            return;
+        }
         const auto file = IOFile{path, FileAccessMode::Read};
+        if (!file.IsOpen()) {
+            return;
+        }
         v.resize(file.GetSize() / sizeof(T));
         file.Read(v);
     }

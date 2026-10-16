@@ -25,6 +25,13 @@ typedef long(__cdecl* ShadPS4AttachSwapChain)(void* context, void* swapchain);
 typedef void(__cdecl* ShadPS4LogCallback)(void* context, uint32_t level, const char* message);
 typedef void(__cdecl* ShadPS4ErrorCallback)(void* context, const char* message);
 
+enum ShadPS4GraphicsBackend {
+    SHADPS4_GRAPHICS_VULKAN_DOZEN,
+    SHADPS4_GRAPHICS_D3D12_NATIVE,
+};
+SHADPS4_API int32_t __cdecl shadps4_set_graphics_backend(uint32_t backend);
+SHADPS4_API uint32_t __cdecl shadps4_get_graphics_backend(void);
+
 enum ShadPS4FileMode {
     SHADPS4_FILE_READ,
     SHADPS4_FILE_READ_WRITE,
@@ -52,6 +59,24 @@ typedef struct ShadPS4Config {
     ShadPS4AttachSwapChain attach_swapchain;
     void* attach_context;
 } ShadPS4Config;
+
+typedef struct ShadPS4TemporalJitterConfig {
+    uint32_t size;
+    uint32_t render_width, render_height, output_width, output_height, phases;
+    uint64_t target_address;
+} ShadPS4TemporalJitterConfig;
+
+typedef struct ShadPS4TemporalJitterSample {
+    uint32_t size;
+    uint32_t phase, phases, reset, applied;
+    uint64_t frame, generation;
+    float pixels[2], previous_pixels[2], ndc[2];
+} ShadPS4TemporalJitterSample;
+
+SHADPS4_API int32_t __cdecl shadps4_configure_native_temporal_jitter(
+    const ShadPS4TemporalJitterConfig* config);
+SHADPS4_API int32_t __cdecl shadps4_get_native_temporal_jitter(
+    ShadPS4TemporalJitterSample* sample, int32_t completed_frame);
 
 SHADPS4_API uint32_t __cdecl shadps4_get_api_version(void);
 SHADPS4_API void __cdecl shadps4_set_log_callback(ShadPS4LogCallback callback, void* context);

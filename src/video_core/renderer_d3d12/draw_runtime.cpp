@@ -8,7 +8,9 @@
 #include <winrt/base.h>
 #include "d3d12_pipeline_cache.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
+#include "shader_recompiler/frontend/tessellation.h"
 #include "video_core/renderer_d3d12/resource_bindings.h"
+#include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
 namespace D3D12 {
@@ -30,6 +32,9 @@ std::vector<u8> PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D
     bytes(root->GetBufferPointer(), root->GetBufferSize());
     bytes(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
     bytes(desc.PS.pShaderBytecode, desc.PS.BytecodeLength);
+    bytes(desc.GS.pShaderBytecode, desc.GS.BytecodeLength);
+    bytes(desc.HS.pShaderBytecode, desc.HS.BytecodeLength);
+    bytes(desc.DS.pShaderBytecode, desc.DS.BytecodeLength);
     integer(desc.BlendState.AlphaToCoverageEnable);
     integer(desc.BlendState.IndependentBlendEnable);
     for (const auto& blend : desc.BlendState.RenderTarget) {
@@ -105,15 +110,62 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         request.colors.size() > 8 || request.depth.StencilEnable ||
         (request.depth.DepthEnable && !request.depth_image) ||
         request.vertex_runtime.sw_stage != Shader::SwStage::Vertex ||
-        request.fragment_runtime.sw_stage != Shader::SwStage::Fragment)
+        request.fragment_runtime.sw_stage != Shader::SwStage::Fragment ||
+        (request.geometry && request.geometry_runtime.sw_stage != Shader::SwStage::Geometry) ||
+        (!request.converted_indices.empty() && request.count != request.converted_indices.size()) ||
+        request.hull.has_value() != request.domain.has_value())
         throw std::runtime_error("Invalid or unsupported D3D12 guest graphics state");
-    auto vertex = shaders.Compile(request.vertex, request.vertex_runtime, {}, request.flip_y);
+    Shader::Backend::Bindings next_bindings{};
+    auto vertex_runtime = request.vertex_runtime;
+    auto domain_runtime = request.domain_runtime;
+    std::optional<CompiledShader> hull, domain;
+    std::vector<CompiledShader*> stages;
+    if (request.hull) {
+        if (request.hull_runtime.sw_stage != Shader::SwStage::TessellationControl ||
+            domain_runtime.sw_stage != Shader::SwStage::TessellationEval ||
+            vertex_runtime.hw_stage != Shader::HwStage::Local)
+            throw std::runtime_error("Invalid native tessellation stage configuration");
+        TessellationLink link{domain_runtime.sw.tes.tess_type,
+                              domain_runtime.sw.tes.tess_partitioning,
+                              domain_runtime.sw.tes.tess_topology,
+                              request.hull_runtime.sw.tcs.num_input_control_points, 0};
+        auto prepared_hull = shaders.Prepare(*request.hull, request.hull_runtime, next_bindings);
+        next_bindings = prepared_hull.shader.end_bindings;
+        Shader::TessellationDataConstantBuffer constants{};
+        prepared_hull.shader.info.ReadTessConstantBuffer(constants);
+        vertex_runtime.hw.ls.ls_stride = constants.ls_stride;
+        domain_runtime.InitFromTessConstants(constants);
+        link.output_control_points = prepared_hull.shader.runtime.sw.tcs.NumOutputControlPoints();
+        auto prepared_domain = shaders.Prepare(*request.domain, domain_runtime, next_bindings);
+        hull.emplace(
+            shaders.Finalize(prepared_hull, false, false, false, &link, prepared_domain.words));
+        domain.emplace(shaders.Finalize(prepared_domain, !request.geometry && request.flip_y, false,
+                                        false, &link, prepared_hull.words));
+        next_bindings = domain->end_bindings;
+        stages.push_back(&*hull);
+        stages.push_back(&*domain);
+    }
+    auto vertex = shaders.Compile(request.vertex, vertex_runtime, next_bindings,
+                                  !request.geometry && !request.domain && request.flip_y);
     std::optional<CompiledShader> fragment;
-    std::vector<CompiledShader*> stages{&vertex};
+    std::optional<CompiledShader> geometry;
+    std::shared_ptr<const ShaderBinary> rectangle;
+    stages.push_back(&vertex);
+    auto end_bindings = vertex.end_bindings;
+    if (request.rectangles) {
+        if (request.geometry)
+            throw std::runtime_error("Guest geometry cannot precede rectangle expansion");
+        rectangle = shaders.CompileRectangle(*vertex.binary, request.fragment_runtime.hw.fs);
+    }
+    if (request.geometry) {
+        geometry.emplace(shaders.Compile(*request.geometry, request.geometry_runtime, end_bindings,
+                                         request.flip_y));
+        end_bindings = geometry->end_bindings;
+        stages.push_back(&*geometry);
+    }
     if (!request.fragment.code.empty()) {
-        fragment.emplace(shaders.Compile(request.fragment, request.fragment_runtime,
-                                         vertex.end_bindings, false, request.samples > 1,
-                                         request.sample_shading));
+        fragment.emplace(shaders.Compile(request.fragment, request.fragment_runtime, end_bindings,
+                                         false, request.samples > 1, request.sample_shading));
         stages.push_back(&*fragment);
     } else if (!request.colors.empty())
         throw std::runtime_error("D3D12 color rendering requires a fragment shader");
@@ -146,12 +198,10 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     D3D12ResourceAllocator transient;
     transient.Initialize(device.Device(), 64ULL * 1024 * 1024);
     std::vector<D3D12Resource> input_resources;
-    const auto upload_input = [&](VAddr address, u64 size) -> ID3D12Resource* {
-        if (!size || size > 16ULL * 1024 * 1024 || address > UINT64_MAX - size)
-            throw std::runtime_error("Invalid D3D12 guest input buffer");
-        bindings.ValidateInputRange(address, size);
-        std::vector<u8> contents(size);
-        read(address, contents);
+    const auto upload_contents = [&](std::span<const u8> contents) -> ID3D12Resource* {
+        const u64 size = contents.size();
+        if (!size || size > 16ULL * 1024 * 1024)
+            throw std::runtime_error("D3D12 input buffer exceeds upload budget");
         D3D12Resource resource;
         winrt::check_hresult(transient.CreateBuffer(size, D3D12_HEAP_TYPE_UPLOAD,
                                                     D3D12_RESOURCE_STATE_GENERIC_READ, resource));
@@ -164,6 +214,14 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         auto* output = resource.Get();
         input_resources.push_back(std::move(resource));
         return output;
+    };
+    const auto upload_input = [&](VAddr address, u64 size) -> ID3D12Resource* {
+        if (!size || size > 16ULL * 1024 * 1024 || address > UINT64_MAX - size)
+            throw std::runtime_error("Invalid D3D12 guest input buffer");
+        bindings.ValidateInputRange(address, size);
+        std::vector<u8> contents(size);
+        read(address, contents);
+        return upload_contents(contents);
     };
     Shader::Gcn::FetchShaderData fetch;
     Shader::Gcn::ParseFetchShader(vertex.info, fetch);
@@ -203,7 +261,13 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         vertices.push_back({buffer->GetGPUVirtualAddress(), static_cast<UINT>(size), sharp.stride});
     }
     D3D12_INDEX_BUFFER_VIEW index_view{};
-    if (request.index_address) {
+    const bool indexed = request.index_address || !request.converted_indices.empty();
+    if (!request.converted_indices.empty()) {
+        const auto size = request.converted_indices.size() * sizeof(u32);
+        auto* buffer = upload_contents(
+            {reinterpret_cast<const u8*>(request.converted_indices.data()), size});
+        index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(size), DXGI_FORMAT_R32_UINT};
+    } else if (request.index_address) {
         if (request.index_format != DXGI_FORMAT_R16_UINT &&
             request.index_format != DXGI_FORMAT_R32_UINT)
             throw std::runtime_error("Invalid guest index format");
@@ -245,6 +309,14 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors));
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.VS = {vertex.binary->dxil.data(), vertex.binary->dxil.size()};
+    if (hull) {
+        desc.HS = {hull->binary->dxil.data(), hull->binary->dxil.size()};
+        desc.DS = {domain->binary->dxil.data(), domain->binary->dxil.size()};
+    }
+    if (geometry)
+        desc.GS = {geometry->binary->dxil.data(), geometry->binary->dxil.size()};
+    else if (rectangle)
+        desc.GS = {rectangle->dxil.data(), rectangle->dxil.size()};
     if (fragment)
         desc.PS = {fragment->binary->dxil.data(), fragment->binary->dxil.size()};
     else if (request.samples > 1)
@@ -323,7 +395,7 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     std::memcpy(constants.data(), &push, sizeof(push));
     commands->SetGraphicsRoot32BitConstants(0, constants.size(), constants.data(), 0);
     const std::array<u32, 4> base{
-        static_cast<u32>(request.index_address ? request.base_vertex : request.first_vertex),
+        static_cast<u32>(indexed ? request.base_vertex : request.first_vertex),
         request.first_instance, 0, 0};
     commands->SetGraphicsRoot32BitConstants(1, base.size(), base.data(), 0);
     if (request.samples > 1)
@@ -332,12 +404,14 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     bindings.Bind(commands.Get(), true, resource_slot, sampler_slot);
     commands->IASetPrimitiveTopology(request.topology);
     commands->IASetVertexBuffers(0, vertices.size(), vertices.data());
-    commands->RSSetViewports(1, &request.viewport);
+    const auto viewport = NativeTemporalJitter().Apply(
+        request.colors.empty() ? 0 : request.colors.front().guest_address, request.viewport);
+    commands->RSSetViewports(1, &viewport);
     commands->RSSetScissorRects(1, &request.scissor);
     commands->OMSetRenderTargets(colors.size(), color_views.data(), FALSE,
                                  depth ? &depth_view : nullptr);
     commands->OMSetBlendFactor(request.blend_factor.data());
-    if (request.index_address) {
+    if (indexed) {
         commands->IASetIndexBuffer(&index_view);
         commands->DrawIndexedInstanced(request.count, request.instances, 0, request.base_vertex,
                                        request.first_instance);

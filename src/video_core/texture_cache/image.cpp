@@ -12,6 +12,9 @@
 #include "video_core/texture_cache/image.h"
 
 #include <vk_mem_alloc.h>
+#ifdef SHADPS4_UWP
+#include <winrt/Windows.System.h>
+#endif
 
 namespace VideoCore {
 
@@ -36,14 +39,27 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
             // compute clears This sacrifices a bit of performance but is less work. ExtendedUsage
             // flag is also used. The exception here is for multisample images when storage is not
             // supported, where even with ExtendedUsage we may get only one supported sample back.
-            if (info.num_samples == 1 || instance.IsMultisampleStorageImageSupported())
+            if ((info.num_samples == 1 || instance.IsMultisampleStorageImageSupported())
+#ifdef SHADPS4_UWP
+                && instance.IsFormatSupported(info.pixel_format,
+                                              vk::FormatFeatureFlagBits2::eStorageImage)
+#endif
+            ) {
                 usage |= vk::ImageUsageFlagBits::eStorage;
+            }
         }
     } else {
         // Similarly to above, we specify storage usage. This is typically not supported by
         // compressed formats, but may be used for uncompressed views. In order to satisfy this,
         // we will also specify the extended usage bit.
+#ifdef SHADPS4_UWP
+        if (instance.IsFormatSupported(info.pixel_format,
+                                       vk::FormatFeatureFlagBits2::eStorageImage)) {
+            usage |= vk::ImageUsageFlagBits::eStorage;
+        }
+#else
         usage |= vk::ImageUsageFlagBits::eStorage;
+#endif
     }
 
     return usage;
@@ -118,6 +134,34 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result != VK_SUCCESS) {
+        LOG_ERROR(Render_Vulkan,
+                  "Image allocation failed: result={} format={} extent={}x{}x{} mips={} "
+                  "layers={} samples={} usage={:#x} flags={:#x}",
+                  vk::to_string(vk::Result{result}), vk::to_string(image_ci.format),
+                  image_ci.extent.width, image_ci.extent.height, image_ci.extent.depth,
+                  image_ci.mipLevels, image_ci.arrayLayers, u32(image_ci.samples),
+                  u32(image_ci.usage), u32(image_ci.flags));
+        const VkPhysicalDeviceMemoryProperties* properties{};
+        vmaGetMemoryProperties(allocator, &properties);
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+        vmaGetHeapBudgets(allocator, budgets.data());
+        for (u32 i = 0; i < properties->memoryHeapCount; ++i) {
+            const auto& budget = budgets[i];
+            LOG_ERROR(Render_Vulkan,
+                      "Image heap {}: usage={} budget={} blocks={} allocations={} bytes", i,
+                      budget.usage, budget.budget, budget.statistics.blockBytes,
+                      budget.statistics.allocationBytes);
+        }
+#ifdef SHADPS4_UWP
+        try {
+            LOG_ERROR(Render_Vulkan, "UWP app memory: usage={} limit={} bytes",
+                      winrt::Windows::System::MemoryManager::AppMemoryUsage(),
+                      winrt::Windows::System::MemoryManager::AppMemoryUsageLimit());
+        } catch (const winrt::hresult_error&) {
+        }
+#endif
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};

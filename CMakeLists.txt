@@ -47,6 +47,7 @@ set(SHADPS4_SDL3_RUNTIME "" CACHE FILEPATH "SDL3 UWP runtime")
 set(SHADPS4_D3D12_SOURCE_DIR "${CMAKE_SOURCE_DIR}/externals/d3d12-native" CACHE PATH "Native D3D12 source tree")
 set(SHADPS4_UWP_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/shadPS4-UWP/Runtime/${CMAKE_BUILD_TYPE}" CACHE PATH "UWP runtime destination")
 set(SHADPS4_DOZEN_RUNTIME "${CMAKE_SOURCE_DIR}/Build/Dozen-UWP/src/microsoft/vulkan/vulkan_dzn.dll" CACHE FILEPATH "UWP Dozen runtime")
+set(SHADPS4_SPIRV_DXIL_RUNTIME "${CMAKE_SOURCE_DIR}/Build/Dozen-UWP/src/microsoft/spirv_to_dxil/spirv_to_dxil.dll" CACHE FILEPATH "Native SPIR-V to DXIL compiler")
 if(SHADPS4_UWP)
     if(NOT WIN32 OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         message(FATAL_ERROR "The UWP core requires Windows x64 and clang-cl")
@@ -1592,6 +1593,7 @@ if(SHADPS4_UWP)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_LINKER_FILE:shadps4>" "${SHADPS4_UWP_OUTPUT_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_SDL3_RUNTIME}" "${SHADPS4_UWP_OUTPUT_DIR}/SDL3.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_DOZEN_RUNTIME}" "${SHADPS4_UWP_OUTPUT_DIR}/vulkan_dzn.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_SPIRV_DXIL_RUNTIME}" "${SHADPS4_UWP_OUTPUT_DIR}/spirv_to_dxil.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_DXC_RUNTIME_DIR}/dxcompiler.dll" "${SHADPS4_UWP_OUTPUT_DIR}/dxcompiler.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADPS4_DXC_RUNTIME_DIR}/dxil.dll" "${SHADPS4_UWP_OUTPUT_DIR}/dxil.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/src/uwp/shadps4_api.h" "${SHADPS4_UWP_OUTPUT_DIR}"
@@ -1607,6 +1609,45 @@ target_include_directories(shadps4 PRIVATE ${IMGUI_RESOURCES_INCLUDE})
 # Discord RPC
 if (ENABLE_DISCORD_RPC)
     target_link_libraries(shadps4 PRIVATE discord-rpc)
+endif()
+
+if(SHADPS4_UWP)
+    add_library(shadps4_native_d3d12 OBJECT
+        src/video_core/renderer_d3d12/resource_cache.cpp
+        src/video_core/renderer_d3d12/image_cache.cpp
+        src/video_core/renderer_d3d12/msaa_transfer.cpp
+        src/video_core/renderer_d3d12/command_runtime.cpp
+        src/video_core/renderer_d3d12/draw_runtime.cpp
+        src/video_core/renderer_d3d12/pipeline_cache.cpp
+        src/video_core/renderer_d3d12/resource_bindings.cpp
+        src/video_core/renderer_d3d12/shader_cache.cpp
+        src/video_core/renderer_d3d12/d3d12_rasterizer.cpp
+        src/uwp/d3d12_presenter.cpp
+        src/uwp/native_host.cpp
+        src/video_core/texture_cache/cpu_tiling.cpp
+        "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp/d3d12_videocore_bridge.cpp"
+        "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp/d3d12_device_context.cpp"
+        "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp/d3d12_resource_allocator.cpp"
+        "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp/d3d12_command_encoder.cpp"
+        "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp/d3d12_pipeline_cache.cpp")
+    get_target_property(native_dependencies shadps4 LINK_LIBRARIES)
+    target_link_libraries(shadps4_native_d3d12 PRIVATE ${native_dependencies})
+    target_include_directories(shadps4_native_d3d12 PRIVATE
+        $<TARGET_PROPERTY:shadps4,INCLUDE_DIRECTORIES>
+        "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp"
+        "${CMAKE_SOURCE_DIR}/externals/spirv-cross"
+        "${CMAKE_SOURCE_DIR}/externals/mesa-uwp/src/microsoft/compiler")
+    target_compile_definitions(shadps4_native_d3d12 PRIVATE
+        $<TARGET_PROPERTY:shadps4,COMPILE_DEFINITIONS>)
+    add_library(shadps4_native_spirv_cross STATIC
+        externals/spirv-cross/spirv_cross.cpp
+        externals/spirv-cross/spirv_parser.cpp
+        externals/spirv-cross/spirv_cross_parsed_ir.cpp
+        externals/spirv-cross/spirv_cfg.cpp
+        externals/spirv-cross/spirv_glsl.cpp
+        externals/spirv-cross/spirv_hlsl.cpp)
+    target_sources(shadps4 PRIVATE $<TARGET_OBJECTS:shadps4_native_d3d12>)
+    target_link_libraries(shadps4 PRIVATE shadps4_native_spirv_cross dxcompiler)
 endif()
 
 # Install rules

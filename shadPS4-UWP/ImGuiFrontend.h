@@ -146,6 +146,7 @@ private:
     std::atomic<uint64_t> settings_request{};
     char search[256]{};
     std::string status{"Inicializando…"};
+    int next_graphics_backend{-1};
     std::wstring user_root;
     std::vector<FrontendRoot> roots;
     std::vector<std::string> root_mounts;

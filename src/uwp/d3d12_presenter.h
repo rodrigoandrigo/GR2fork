@@ -18,6 +18,7 @@ public:
     static void CheckEnvironment();
     void Initialize(const ShadPS4Config& config);
     void Render();
+    void Drain();
     void Resize(uint32_t width, uint32_t height);
     void RegisterVideoOutSurface(const Libraries::VideoOut::BufferAttributeGroup& group,
                                  VAddr address) override;

@@ -31,16 +31,36 @@ struct CompiledShader {
     Shader::Backend::Bindings end_bindings;
     std::shared_ptr<const ShaderBinary> binary;
 };
+struct TessellationLink {
+    AmdGpu::TessellationType type;
+    AmdGpu::TessellationPartitioning partitioning;
+    AmdGpu::TessellationTopology topology;
+    u32 input_control_points, output_control_points;
+};
+struct PreparedShader {
+    CompiledShader shader;
+    std::vector<u32> words;
+};
 class ShaderCache {
 public:
     void Initialize(ID3D12Device* device);
+    PreparedShader Prepare(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
+                           Shader::Backend::Bindings bindings);
+    CompiledShader Finalize(PreparedShader& shader, bool flip_y, bool sample_mask,
+                            bool sample_shading, const TessellationLink* tessellation,
+                            std::span<const u32> peer = {});
     CompiledShader Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                            Shader::Backend::Bindings bindings = {}, bool flip_y = false,
-                           bool sample_mask = false, bool sample_shading = false);
+                           bool sample_mask = false, bool sample_shading = false,
+                           const TessellationLink* tessellation = nullptr);
     std::shared_ptr<const ShaderBinary> CompileSpirv(std::span<const u32> words,
                                                      Shader::SwStage stage, bool flip_y = false,
                                                      bool sample_mask = false,
-                                                     bool sample_shading = false);
+                                                     bool sample_shading = false,
+                                                     const TessellationLink* tessellation = nullptr,
+                                                     std::span<const u32> peer = {});
+    std::shared_ptr<const ShaderBinary> CompileRectangle(
+        const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment);
     const Shader::Profile& Profile() const {
         return profile;
     }
@@ -52,5 +72,10 @@ private:
     Microsoft::WRL::ComPtr<IDxcCompiler3> compiler;
     std::map<std::vector<u32>, std::shared_ptr<const ShaderBinary>> cache;
     size_t cache_bytes{};
+    bool fixed_graphics_wave64{};
+    void CompileHlsl(ShaderBinary& binary, Shader::SwStage stage);
+    void CompileNativeSpirv(std::span<const u32> words, ShaderBinary& binary,
+                            Shader::SwStage stage, bool flip_y, const TessellationLink* link,
+                            std::span<const u32> peer);
 };
 } // namespace D3D12

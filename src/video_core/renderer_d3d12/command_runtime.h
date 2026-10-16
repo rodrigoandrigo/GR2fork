@@ -13,6 +13,12 @@ public:
     struct DrawRequest {
         Shader::ShaderParams vertex, fragment;
         Shader::RuntimeInfo vertex_runtime, fragment_runtime;
+        std::optional<Shader::ShaderParams> geometry;
+        Shader::RuntimeInfo geometry_runtime{};
+        std::optional<Shader::ShaderParams> hull, domain;
+        Shader::RuntimeInfo hull_runtime{}, domain_runtime{};
+        std::vector<u32> converted_indices;
+        bool rectangles{};
         std::vector<VideoCore::ImageInfo> colors;
         std::optional<VideoCore::ImageInfo> depth_image;
         VAddr depth_read_address{};

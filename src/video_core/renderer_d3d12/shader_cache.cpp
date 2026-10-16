@@ -3,13 +3,54 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
+#include <appmodel.h>
 #include <spirv_hlsl.hpp>
 #include <winrt/base.h>
+#include "externals/mesa-uwp/src/microsoft/spirv_to_dxil/spirv_to_dxil.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 
 namespace D3D12 {
 namespace {
+struct CompilerModule {
+    HMODULE handle{};
+    static void Anchor() {}
+    explicit CompilerModule(const wchar_t* name) {
+        handle = LoadPackagedLibrary(name, 0);
+        UINT32 size{};
+        if (!handle && GetCurrentPackageFullName(&size, nullptr) == APPMODEL_ERROR_NO_PACKAGE) {
+            HMODULE self{};
+            winrt::check_bool(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                 reinterpret_cast<LPCWSTR>(&Anchor), &self));
+            std::wstring path(32768, L'\0');
+            const auto length = GetModuleFileNameW(self, path.data(), path.size());
+            if (!length || length == path.size())
+                throw std::runtime_error("Cannot locate native shader compiler directory");
+            path.resize(length);
+            const auto slash = path.find_last_of(L"\\/");
+            path.resize(slash + 1);
+            path += name;
+            handle =
+                LoadLibraryExW(path.c_str(), nullptr,
+                               LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        }
+        if (!handle)
+            throw std::runtime_error("Cannot load native shader compiler module");
+    }
+    ~CompilerModule() {
+        FreeLibrary(handle);
+    }
+    template <typename T>
+    T Function(const char* name) const {
+        const auto function = reinterpret_cast<T>(GetProcAddress(handle, name));
+        if (!function)
+            throw std::runtime_error("Missing native shader compiler entry point");
+        return function;
+    }
+};
 std::string SemanticMember(const std::string& source, std::string_view structure,
                            std::string_view semantic) {
     const auto begin = source.find("struct " + std::string(structure));
@@ -156,6 +197,7 @@ void ShaderCache::Initialize(ID3D12Device* device) {
         device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options, sizeof(options)));
     if (!options.WaveOps || options.WaveLaneCountMin > 64 || options.WaveLaneCountMax < 64)
         throw std::runtime_error("D3D12 guest shaders require wave64 support");
+    fixed_graphics_wave64 = options.WaveLaneCountMin == 64 && options.WaveLaneCountMax == 64;
     winrt::check_hresult(DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&utils)));
     winrt::check_hresult(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler)));
     profile.supported_spirv = 0x00010300;
@@ -168,7 +210,13 @@ void ShaderCache::Initialize(ID3D12Device* device) {
 }
 CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                                     Shader::Backend::Bindings bindings, bool flip_y,
-                                    bool sample_mask, bool sample_shading) {
+                                    bool sample_mask, bool sample_shading,
+                                    const TessellationLink* tessellation) {
+    auto prepared = Prepare(params, runtime, bindings);
+    return Finalize(prepared, flip_y, sample_mask, sample_shading, tessellation);
+}
+PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
+                                    Shader::Backend::Bindings bindings) {
     if (params.code.empty() || params.code.size() > 1024 * 1024 ||
         runtime.props.num_user_data > Shader::NUM_USER_DATA_REGS ||
         (runtime.sw_stage == Shader::SwStage::Fragment && runtime.hw.fs.num_inputs > 32))
@@ -184,29 +232,83 @@ CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::Runtime
         throw std::runtime_error("D3D12 shader stages exceed push buffer offset capacity");
     const auto words =
         Shader::Backend::SPIRV::EmitSPIRV(profile, result.runtime, program, result.end_bindings);
-    result.binary = CompileSpirv(words, runtime.sw_stage, flip_y, sample_mask, sample_shading);
     result.info.RefreshFlatBuf();
-    return result;
+    return {std::move(result), words};
 }
-std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u32> words,
-                                                              Shader::SwStage stage, bool flip_y,
-                                                              bool sample_mask,
-                                                              bool sample_shading) {
+CompiledShader ShaderCache::Finalize(PreparedShader& prepared, bool flip_y, bool sample_mask,
+                                     bool sample_shading, const TessellationLink* tessellation,
+                                     std::span<const u32> peer) {
+    auto& result = prepared.shader;
+    const auto& words = prepared.words;
+    const auto& runtime = result.runtime;
+    std::optional<TessellationLink> link;
+    if (tessellation) {
+        link = *tessellation;
+        if (runtime.sw_stage == Shader::SwStage::TessellationControl)
+            link->output_control_points = result.runtime.sw.tcs.NumOutputControlPoints();
+    }
+    result.binary = CompileSpirv(words, runtime.sw_stage, flip_y, sample_mask, sample_shading,
+                                 link ? &*link : nullptr, peer);
+    return std::move(result);
+}
+std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
+    std::span<const u32> words, Shader::SwStage stage, bool flip_y, bool sample_mask,
+    bool sample_shading, const TessellationLink* tessellation_link, std::span<const u32> peer) {
     if (words.size() < 5 || words.size() > 4 * 1024 * 1024 || words[0] != spv::MagicNumber)
         throw std::runtime_error("Invalid guest SPIR-V module");
+    bool subgroup{};
+    bool quad_only = stage == Shader::SwStage::Fragment;
     for (size_t offset = 5; offset < words.size();) {
         const u32 length = words[offset] >> 16;
         if (!length || length > words.size() - offset)
             throw std::runtime_error("Invalid guest SPIR-V instruction length");
-        if (stage != Shader::SwStage::Compute && (words[offset] & 0xffff) == spv::OpCapability &&
-            length == 2 && words[offset + 1] >= spv::CapabilityGroupNonUniform &&
-            words[offset + 1] <= spv::CapabilityGroupNonUniformQuad)
-            throw std::runtime_error("D3D12 graphics wave64 lowering is not implemented");
+        const auto opcode = words[offset] & 0xffff;
+        if (opcode == spv::OpCapability && length == 2 &&
+            words[offset + 1] >= spv::CapabilityGroupNonUniform &&
+            words[offset + 1] <= spv::CapabilityGroupNonUniformQuad) {
+            subgroup = true;
+            quad_only &= words[offset + 1] == spv::CapabilityGroupNonUniform ||
+                         words[offset + 1] == spv::CapabilityGroupNonUniformQuad;
+        }
+        if (opcode >= spv::OpGroupNonUniformElect && opcode <= spv::OpGroupNonUniformQuadSwap) {
+            subgroup = true;
+            quad_only &= opcode == spv::OpGroupNonUniformQuadBroadcast ||
+                         opcode == spv::OpGroupNonUniformQuadSwap;
+        }
+        if (opcode == spv::OpDecorate && length == 4 &&
+            words[offset + 2] == spv::DecorationBuiltIn) {
+            const auto builtin = words[offset + 3];
+            if (builtin == spv::BuiltInSubgroupSize ||
+                builtin == spv::BuiltInSubgroupLocalInvocationId ||
+                (builtin >= spv::BuiltInSubgroupEqMask && builtin <= spv::BuiltInSubgroupLtMask)) {
+                subgroup = true;
+                quad_only = false;
+            }
+        }
+        if (opcode == spv::OpCapability && length == 2 &&
+            (words[offset + 1] == spv::CapabilitySubgroupBallotKHR ||
+             words[offset + 1] == spv::CapabilitySubgroupVoteKHR)) {
+            subgroup = true;
+            quad_only = false;
+        }
         offset += length;
     }
+    if (stage != Shader::SwStage::Compute && !fixed_graphics_wave64 && subgroup && !quad_only)
+        throw std::runtime_error(
+            "D3D12 cross-lane graphics operations require a fixed wave64 device; "
+            "variable-width graphics waves require compute emulation");
     std::vector<u32> key{static_cast<u32>(stage), static_cast<u32>(flip_y),
                          static_cast<u32>(sample_mask), static_cast<u32>(sample_shading)};
+    if (tessellation_link) {
+        key.insert(key.end(), {static_cast<u32>(tessellation_link->type),
+                               static_cast<u32>(tessellation_link->partitioning),
+                               static_cast<u32>(tessellation_link->topology),
+                               tessellation_link->input_control_points,
+                               tessellation_link->output_control_points});
+    }
+    key.push_back(static_cast<u32>(words.size()));
     key.insert(key.end(), words.begin(), words.end());
+    key.insert(key.end(), peer.begin(), peer.end());
     if (const auto found = cache.find(key); found != cache.end())
         return found->second;
     spirv_cross::CompilerHLSL cross{words.data(), words.size()};
@@ -279,7 +381,17 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u3
     options.support_nonzero_base_vertex_base_instance = true;
     cross.set_hlsl_aux_buffer_binding(spirv_cross::HLSL_AUX_BINDING_BASE_VERTEX_INSTANCE, 1, 0);
     cross.set_hlsl_options(options);
-    result->hlsl = cross.compile();
+    const bool tessellation =
+        stage == Shader::SwStage::TessellationControl || stage == Shader::SwStage::TessellationEval;
+    const bool native_spirv = tessellation || stage == Shader::SwStage::Geometry;
+    if (!tessellation && tessellation_link)
+        throw std::runtime_error("Tessellation metadata supplied for a different shader stage");
+    if (tessellation && !tessellation_link)
+        throw std::runtime_error("Native tessellation compilation requires linked stage metadata");
+    if (native_spirv)
+        CompileNativeSpirv(words, *result, stage, flip_y, tessellation_link, peer);
+    else
+        result->hlsl = cross.compile();
     if (sample_mask || sample_shading) {
         if (stage != Shader::SwStage::Fragment)
             throw std::runtime_error("Sample masks require a fragment shader");
@@ -291,9 +403,223 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u3
             throw std::runtime_error("Missing guest compute workgroup declaration");
         result->hlsl.insert(entry, "[WaveSize(64)]\n");
     }
+    if (!native_spirv)
+        CompileHlsl(*result, stage);
+    const size_t bytes_used = key.size() * sizeof(u32) + result->dxil.size() + result->hlsl.size();
+    if (bytes_used > 64 * 1024 * 1024)
+        throw std::runtime_error("Guest shader exceeds D3D12 compiler cache budget");
+    while (!cache.empty() && (cache.size() >= 512 || cache_bytes + bytes_used > 64 * 1024 * 1024)) {
+        const auto& oldest = *cache.begin();
+        cache_bytes -= oldest.first.size() * sizeof(u32) + oldest.second->dxil.size() +
+                       oldest.second->hlsl.size();
+        cache.erase(cache.begin());
+    }
+    cache_bytes += bytes_used;
+    cache.emplace(std::move(key), result);
+    return result;
+}
+std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
+    const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment) {
+    const auto first = vertex.hlsl.find("struct SPIRV_Cross_Output");
+    const auto last = vertex.hlsl.find("};", first);
+    if (first == std::string::npos || last == std::string::npos || last - first > 16384)
+        throw std::runtime_error("Invalid rectangle vertex interface");
+    const auto position = SemanticMember(vertex.hlsl, "SPIRV_Cross_Output", "SV_Position");
+    if (position.empty())
+        throw std::runtime_error("Rectangle expansion requires a position export");
+    auto result = std::make_shared<ShaderBinary>();
+    result->hlsl = vertex.hlsl.substr(first, last + 2 - first);
+    result->hlsl += "\n[maxvertexcount(4)]\nvoid main(triangle SPIRV_Cross_Output input[3], "
+                    "inout TriangleStream<SPIRV_Cross_Output> stream) {\n";
+    result->hlsl += "float3 weight; uint corner = 0;\n";
+    for (u32 i = 0; i < 3; ++i) {
+        const auto a = "input[" + std::to_string(i) + "]." + position;
+        const auto b = "input[" + std::to_string((i + 1) % 3) + "]." + position;
+        const auto c = "input[" + std::to_string((i + 2) % 3) + "]." + position;
+        result->hlsl += "bool edge" + std::to_string(i) + " = (" + a + ".x == " + b + ".x && " + a +
+                        ".y == " + c + ".y) || (" + a + ".y == " + b + ".y && " + a + ".x == " + c +
+                        ".x);\nweight[" + std::to_string(i) + "] = edge" + std::to_string(i) +
+                        " ? -1.0 : 1.0;\n";
+    }
+    result->hlsl += "corner = edge1 ? 1 : (edge2 ? 2 : 0);\n"
+                    "SPIRV_Cross_Output v[4];\n"
+                    "v[0] = input[corner]; v[1] = input[(corner+1)%3]; "
+                    "v[2] = input[(corner+2)%3]; v[3] = input[0];\n";
+    const auto body = vertex.hlsl.find('{', first);
+    std::istringstream members(vertex.hlsl.substr(body + 1, last - body - 1));
+    for (std::string member; std::getline(members, member, ';');) {
+        std::istringstream declaration(member);
+        std::string type, name, colon, semantic;
+        if (!(declaration >> type))
+            continue;
+        if (!(declaration >> name >> colon >> semantic) || colon != ":" ||
+            name.find('[') != std::string::npos ||
+            (type != "float" && type != "float2" && type != "float3" && type != "float4"))
+            throw std::runtime_error("Unsupported rectangle stage interface member");
+        bool flat{};
+        for (u32 i = 0; i < fragment.num_inputs; ++i) {
+            const auto& input = fragment.inputs[i];
+            flat |= input.is_flat && semantic == "TEXCOORD" + std::to_string(input.param_index);
+        }
+        if (flat) {
+            result->hlsl += "for(uint i=0;i<4;++i) v[i]." + name + " = input[0]." + name + ";\n";
+        } else {
+            result->hlsl += "v[3]." + name + " = input[0]." + name + " * weight.x + input[1]." +
+                            name + " * weight.y + input[2]." + name + " * weight.z;\n";
+        }
+    }
+    result->hlsl += "for(uint i=0;i<4;++i) stream.Append(v[i]); stream.RestartStrip();\n}\n";
+    std::vector<u32> key{UINT32_MAX};
+    for (const unsigned char character : result->hlsl)
+        key.push_back(character);
+    if (const auto found = cache.find(key); found != cache.end())
+        return found->second;
+    CompileHlsl(*result, Shader::SwStage::Geometry);
+    const auto bytes = key.size() * sizeof(u32) + result->hlsl.size() + result->dxil.size();
+    while (!cache.empty() && (cache.size() >= 512 || cache_bytes + bytes > 64 * 1024 * 1024)) {
+        const auto& oldest = *cache.begin();
+        cache_bytes -= oldest.first.size() * sizeof(u32) + oldest.second->dxil.size() +
+                       oldest.second->hlsl.size();
+        cache.erase(cache.begin());
+    }
+    cache_bytes += bytes;
+    cache.emplace(std::move(key), result);
+    return result;
+}
+void ShaderCache::CompileNativeSpirv(std::span<const u32> words, ShaderBinary& binary,
+                                     Shader::SwStage stage, bool flip_y,
+                                     const TessellationLink* link, std::span<const u32> peer) {
+    static const CompilerModule module{L"spirv_to_dxil.dll"};
+    static const CompilerModule validator_module{L"dxil.dll"};
+    const auto config_size = module.Function<decltype(&spirv_to_dxil_get_runtime_conf_size)>(
+        "spirv_to_dxil_get_runtime_conf_size");
+    if (config_size() != sizeof(dxil_spirv_runtime_conf))
+        throw std::runtime_error("Native shader compiler ABI mismatch");
+    const auto compile = module.Function<decltype(&spirv_to_dxil)>("spirv_to_dxil");
+    const auto release = module.Function<decltype(&spirv_to_dxil_free)>("spirv_to_dxil_free");
+    const auto remap_module = [](std::span<const u32> input, Shader::SwStage model) {
+        if (input.size() < 5 || input[0] != spv::MagicNumber || input.size() > 4 * 1024 * 1024)
+            throw std::runtime_error("Invalid tessellation peer module");
+        std::vector<u32> remapped(input.begin(), input.end());
+        const spirv_cross::Compiler reflection{input.data(), input.size()};
+        const auto buffers = reflection.get_shader_resources().storage_buffers;
+        for (size_t offset = 5; offset < remapped.size();) {
+            const u32 length = remapped[offset] >> 16;
+            if (!length || length > remapped.size() - offset)
+                throw std::runtime_error("Invalid tessellation peer instruction");
+            if ((remapped[offset] & 0xffff) == spv::OpDecorate && length == 4 &&
+                remapped[offset + 2] == spv::DecorationDescriptorSet)
+                remapped[offset + 3] = static_cast<u32>(model) + 1;
+            if ((remapped[offset] & 0xffff) == spv::OpDecorate && length == 3 &&
+                remapped[offset + 2] == spv::DecorationNonWritable &&
+                std::ranges::any_of(buffers, [&](const auto& resource) {
+                    return resource.id == remapped[offset + 1];
+                }))
+                std::fill_n(remapped.begin() + offset, length, (1u << 16) | spv::OpNop);
+            offset += length;
+        }
+        return remapped;
+    };
+    auto remapped = remap_module(words, stage);
+    std::vector<u32> remapped_peer;
+    if (link)
+        remapped_peer = remap_module(peer, stage == Shader::SwStage::TessellationControl
+                                               ? Shader::SwStage::TessellationEval
+                                               : Shader::SwStage::TessellationControl);
+    dxil_spirv_runtime_conf config{};
+    config.fixed_point_size = true;
+    config.push_constant_cbv = {0, 0};
+    config.runtime_data_cbv = {0, 4};
+    config.shader_model_max = SHADER_MODEL_6_6;
+    config.declared_read_only_images_as_srvs = false;
+    config.preserve_generic_io_location_count = 32;
+    if (link) {
+        config.link_tessellation = true;
+        config.tessellation_peer_words = remapped_peer.data();
+        config.tessellation_peer_word_count = remapped_peer.size();
+        switch (link->type) {
+        case AmdGpu::TessellationType::Triangle:
+            config.tessellation_domain = 1;
+            break;
+        case AmdGpu::TessellationType::Quad:
+            config.tessellation_domain = 2;
+            break;
+        case AmdGpu::TessellationType::Isoline:
+            config.tessellation_domain = 3;
+            break;
+        default:
+            throw std::runtime_error("Invalid native tessellation domain");
+        }
+        switch (link->partitioning) {
+        case AmdGpu::TessellationPartitioning::Integer:
+            config.tessellation_spacing = 1;
+            break;
+        case AmdGpu::TessellationPartitioning::FracOdd:
+            config.tessellation_spacing = 2;
+            break;
+        case AmdGpu::TessellationPartitioning::FracEven:
+            config.tessellation_spacing = 3;
+            break;
+        default:
+            throw std::runtime_error("Native tessellation partitioning requires factor emulation");
+        }
+        config.tessellation_input_control_points = link->input_control_points;
+        config.tessellation_output_control_points = link->output_control_points;
+        config.tessellation_ccw = link->topology == AmdGpu::TessellationTopology::TriangleCcw;
+        config.tessellation_point_mode = link->topology == AmdGpu::TessellationTopology::Point;
+        if ((link->type == AmdGpu::TessellationType::Isoline &&
+             link->topology != AmdGpu::TessellationTopology::Line &&
+             !config.tessellation_point_mode) ||
+            (link->type != AmdGpu::TessellationType::Isoline &&
+             link->topology == AmdGpu::TessellationTopology::Line))
+            throw std::runtime_error("Native tessellation topology requires geometry expansion");
+    }
+    config.yz_flip.mode = flip_y ? DXIL_SPIRV_Y_FLIP_UNCONDITIONAL : DXIL_SPIRV_YZ_FLIP_NONE;
+    dxil_spirv_debug_options debug{};
+    std::string messages;
+    dxil_spirv_logger logger{};
+    logger.priv = &messages;
+    logger.log = [](void* context, const char* message) {
+        static_cast<std::string*>(context)->append(message);
+    };
+    dxil_spirv_object output{};
+    const auto free_output = [&](dxil_spirv_object* object) { release(object); };
+    std::unique_ptr<dxil_spirv_object, decltype(free_output)> owner{&output, free_output};
+    const auto model = stage == Shader::SwStage::Geometry ? DXIL_SPIRV_SHADER_GEOMETRY
+                       : stage == Shader::SwStage::TessellationControl
+                           ? DXIL_SPIRV_SHADER_TESS_CTRL
+                           : DXIL_SPIRV_SHADER_TESS_EVAL;
+    if (!compile(remapped.data(), remapped.size(), nullptr, 0, model, "main", DXIL_VALIDATOR_1_6,
+                 &debug, &config, &logger, &output))
+        throw std::runtime_error("Native SPIR-V compilation failed: " + messages);
+    if (output.metadata.requires_runtime_data || output.metadata.lowered_large_points ||
+        !output.binary.buffer || !output.binary.size)
+        throw std::runtime_error("Native SPIR-V shader requires unsupported runtime data");
+    const auto create = validator_module.Function<DxcCreateInstanceProc>("DxcCreateInstance");
+    Microsoft::WRL::ComPtr<IDxcValidator> validator;
+    winrt::check_hresult(create(CLSID_DxcValidator, IID_PPV_ARGS(&validator)));
+    Microsoft::WRL::ComPtr<IDxcBlobEncoding> blob;
+    winrt::check_hresult(utils->CreateBlob(output.binary.buffer, output.binary.size, 0, &blob));
+    Microsoft::WRL::ComPtr<IDxcOperationResult> validation;
+    winrt::check_hresult(
+        validator->Validate(blob.Get(), DxcValidatorFlags_InPlaceEdit, &validation));
+    HRESULT status;
+    winrt::check_hresult(validation->GetStatus(&status));
+    if (FAILED(status)) {
+        Microsoft::WRL::ComPtr<IDxcBlobEncoding> errors;
+        validation->GetErrorBuffer(&errors);
+        throw std::runtime_error(
+            errors ? std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                                 errors->GetBufferSize())
+                   : "Native SPIR-V DXIL validation failed");
+    }
+    const auto* first = static_cast<const u8*>(blob->GetBufferPointer());
+    binary.dxil.assign(first, first + blob->GetBufferSize());
+}
+void ShaderCache::CompileHlsl(ShaderBinary& result, Shader::SwStage stage) {
     const wchar_t* arguments[]{L"-E",  L"main", L"-T",   Target(stage),
                                L"-HV", L"2021", L"-Gis", L"-O3"};
-    const DxcBuffer source{result->hlsl.data(), result->hlsl.size(), DXC_CP_UTF8};
+    const DxcBuffer source{result.hlsl.data(), result.hlsl.size(), DXC_CP_UTF8};
     Microsoft::WRL::ComPtr<IDxcResult> compiled;
     winrt::check_hresult(compiler->Compile(&source, arguments, std::size(arguments), nullptr,
                                            IID_PPV_ARGS(&compiled)));
@@ -308,18 +634,6 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(std::span<const u3
     Microsoft::WRL::ComPtr<IDxcBlob> binary;
     winrt::check_hresult(compiled->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&binary), nullptr));
     const auto* bytes = static_cast<const u8*>(binary->GetBufferPointer());
-    result->dxil.assign(bytes, bytes + binary->GetBufferSize());
-    const size_t bytes_used = key.size() * sizeof(u32) + result->dxil.size() + result->hlsl.size();
-    if (bytes_used > 64 * 1024 * 1024)
-        throw std::runtime_error("Guest shader exceeds D3D12 compiler cache budget");
-    while (!cache.empty() && (cache.size() >= 512 || cache_bytes + bytes_used > 64 * 1024 * 1024)) {
-        const auto& oldest = *cache.begin();
-        cache_bytes -= oldest.first.size() * sizeof(u32) + oldest.second->dxil.size() +
-                       oldest.second->hlsl.size();
-        cache.erase(cache.begin());
-    }
-    cache_bytes += bytes_used;
-    cache.emplace(std::move(key), result);
-    return result;
+    result.dxil.assign(bytes, bytes + binary->GetBufferSize());
 }
 } // namespace D3D12

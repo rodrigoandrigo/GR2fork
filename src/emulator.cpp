@@ -24,6 +24,7 @@
 #include "common/discord_rpc_handler.h"
 #endif
 #include "common/elf_info.h"
+#include "common/key_manager.h"
 #include "common/memory_patcher.h"
 #include "common/ntapi.h"
 #include "common/path_util.h"
@@ -231,6 +232,10 @@ std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
         const auto& trophy_output_dir =
             Common::FS::GetUserPath(Common::FS::PathType::TrophyDir) / np_comm_id;
         if (!std::filesystem::exists(trophy_output_dir)) {
+            if (KeyManager::GetInstance()->GetAllKeys().TrophyKeySet.ReleaseTrophyKey.size() != 16) {
+                LOG_INFO(Loader, "Skipping trophy extraction: configure a trophy decryption key");
+                continue;
+            }
             const std::string entry_guest = std::string(trophy_dir_guest) + "/" + entry.name;
             std::filesystem::path trp_source;
             std::filesystem::path temp_extract;

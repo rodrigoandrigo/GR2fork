@@ -26,11 +26,7 @@ layout(constant_id = 11) const uint MACRO_TILE_ASPECT = 1;
 
 #define BYTES_PER_PIXEL (BITS_PER_PIXEL / 8)
 
-#if BITS_PER_PIXEL == 8
-#define BLOCK_TYPE uint8_t
-#elif BITS_PER_PIXEL == 16
-#define BLOCK_TYPE uint16_t
-#elif BITS_PER_PIXEL == 32
+#if BITS_PER_PIXEL <= 32
 #define BLOCK_TYPE uint32_t
 #elif BITS_PER_PIXEL == 64
 #define BLOCK_TYPE u32vec2
@@ -443,9 +439,25 @@ void main() {
     tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, MICRO_TILE_THICKNESS, 0);
 #endif
 
+#if BITS_PER_PIXEL < 32
+    uint linear_offset = gl_GlobalInvocationID.x * BYTES_PER_PIXEL;
+    uint tiled_shift = (tiled_offset & 3u) * 8u;
+    uint linear_shift = (linear_offset & 3u) * 8u;
+    uint mask = (1u << BITS_PER_PIXEL) - 1u;
+    if (IS_TILER != 0) {
+        uint value = (linear_data[linear_offset / 4u] >> linear_shift) & mask;
+        atomicAnd(tiled_data[tiled_offset / 4u], ~(mask << tiled_shift));
+        atomicOr(tiled_data[tiled_offset / 4u], value << tiled_shift);
+    } else {
+        uint value = (tiled_data[tiled_offset / 4u] >> tiled_shift) & mask;
+        atomicAnd(linear_data[linear_offset / 4u], ~(mask << linear_shift));
+        atomicOr(linear_data[linear_offset / 4u], value << linear_shift);
+    }
+#else
     if (IS_TILER != 0) {
         tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
     } else {
         linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
     }
+#endif
 }

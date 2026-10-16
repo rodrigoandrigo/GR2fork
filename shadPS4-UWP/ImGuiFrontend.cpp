@@ -991,6 +991,25 @@ void ImGuiFrontend::DrawLibrary() {
 }
 
 void ImGuiFrontend::DrawSettings() {
+  if (next_graphics_backend < 0)
+    next_graphics_backend = static_cast<int>(core->GraphicsBackend());
+  const char* backends[] = {"Vulkan / Dozen", "D3D12 nativo (experimental)"};
+  if (ImGui::Combo("Backend grafico", &next_graphics_backend, backends, 2)) {
+    try {
+      ApplicationData::Current->LocalSettings->Values->Insert(
+          L"shadps4.graphics.backend",
+          ref new Platform::String(next_graphics_backend ? L"d3d12" : L"dozen"));
+      status = "Reinicie o aplicativo para usar o backend selecionado.";
+    } catch (Platform::Exception^) {
+      next_graphics_backend = static_cast<int>(core->GraphicsBackend());
+      status = "Nao foi possivel salvar o backend grafico.";
+    }
+  }
+  ImGui::TextWrapped("Backend ativo: %s. A alteracao vale no proximo inicio.",
+                    backends[core->GraphicsBackend()]);
+  if (next_graphics_backend == SHADPS4_GRAPHICS_D3D12_NATIVE)
+    ImGui::TextWrapped("Compatibilidade experimental: alguns jogos ainda nao iniciam.");
+
   if (ImGui::BeginCombo("Perfil", settings_profile.empty()
                                       ? "Global"
                                       : settings_profile.c_str())) {

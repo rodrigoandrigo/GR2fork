@@ -75,6 +75,8 @@ private:
         u64 size;
         u64 epoch;
     };
+    void EnsureSpace(u64 required, bool inserting = false);
+    void EnsureStaging(Buffer& buffer, bool download);
     bool Changed(const Buffer& buffer);
     D3D12DeviceContext* context{};
     D3D12ResourceAllocator allocator;

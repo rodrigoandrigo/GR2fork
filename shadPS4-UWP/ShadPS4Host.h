@@ -18,6 +18,7 @@ public:
                     bool frontend = false, bool game_surface = false);
     void Reload(const std::wstring& user_directory, uint32_t width, uint32_t height,
                 bool frontend, bool game_surface);
+    uint32_t GraphicsBackend() const { return graphics_backend; }
     uint32_t State() const { return state ? state() : SHADPS4_UNINITIALIZED; }
     template <typename T>
     T GetApi(const char* name) {
@@ -47,6 +48,7 @@ private:
         return reinterpret_cast<T>(address);
     }
 
+    uint32_t graphics_backend{SHADPS4_GRAPHICS_VULKAN_DOZEN};
     HMODULE module{};
     Platform::Agile<Windows::UI::Xaml::Controls::SwapChainPanel> panel;
     decltype(&shadps4_initialize) initialize{};

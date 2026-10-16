@@ -86,6 +86,15 @@ void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width,
     close_file = Resolve<decltype(close_file)>("shadps4_file_close");
     set_log_callback(Log, this);
     set_error_callback(ReportError, nullptr);
+    const auto values = Windows::Storage::ApplicationData::Current->LocalSettings->Values;
+    if (values->HasKey(L"shadps4.graphics.backend")) {
+        const auto selected = dynamic_cast<Platform::String^>(values->Lookup(L"shadps4.graphics.backend"));
+        if (selected && selected == L"d3d12")
+            graphics_backend = SHADPS4_GRAPHICS_D3D12_NATIVE;
+    }
+    const auto set_backend = Resolve<decltype(&shadps4_set_graphics_backend)>("shadps4_set_graphics_backend");
+    if (set_backend(graphics_backend))
+        throw ref new Platform::FailureException(ref new Platform::String(Error().c_str()));
     ShadPS4Config config{};
     config.size = sizeof(config);
     config.version = 1;
@@ -303,7 +312,7 @@ long ShadPS4Host::AttachSwapChain(void* context, void* swapchain) {
         if (SUCCEEDED(attachment->result)) {
             attachment->result = native->SetSwapChain(attachment->chain.Get());
         }
-        if (SUCCEEDED(attachment->result)) {
+        if (SUCCEEDED(attachment->result) && attachment->chain.Get()) {
             const auto sdl = LoadPackagedLibrary(L"SDL3.dll", 0);
             if (!sdl) {
                 attachment->result = HRESULT_FROM_WIN32(GetLastError());

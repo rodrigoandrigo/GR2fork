@@ -23,8 +23,10 @@
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "uwp/dozen_host.h"
+#include "uwp/native_host.h"
 #include "uwp/gamepad_input.h"
 #include "uwp/xaudio2_output.h"
+#include "video_core/renderer_d3d12/temporal_jitter.h"
 
 namespace {
 std::atomic<uint32_t> state{SHADPS4_UNINITIALIZED};
@@ -41,6 +43,8 @@ std::vector<std::stop_source> worker_stops;
 std::mutex api_mutex;
 std::string last_error;
 std::shared_ptr<Core::Uwp::DozenHost> presentation;
+std::shared_ptr<Core::Uwp::NativeHost> native_presentation;
+std::atomic<uint32_t> graphics_backend{SHADPS4_GRAPHICS_VULKAN_DOZEN};
 std::mutex presentation_mutex;
 void* panel{};
 ShadPS4ErrorCallback error_callback{};
@@ -191,10 +195,13 @@ int32_t shadps4_shutdown() {
     }
     try {
         stop_requested.store(true);
+        Core::Uwp::StopGamepadInput();
         std::scoped_lock lock{presentation_mutex};
+        if (native_presentation)
+            native_presentation->DetachSurface();
+        native_presentation.reset();
         presentation.reset();
         Core::Uwp::ShutdownDozenDriver();
-        Core::Uwp::StopGamepadInput();
         Libraries::AudioOut::ShutdownAudioOut();
         Core::Uwp::ClearStorage();
         panel = nullptr;
@@ -208,12 +215,30 @@ int32_t shadps4_shutdown() {
     }
 }
 
+bool Core::Uwp::NativeGraphicsSelected() {
+    return graphics_backend.load() == SHADPS4_GRAPHICS_D3D12_NATIVE;
+}
+int32_t shadps4_set_graphics_backend(uint32_t backend) {
+    std::scoped_lock lock{session_mutex};
+    if (state.load() != SHADPS4_UNINITIALIZED || native_presentation || presentation ||
+        backend > SHADPS4_GRAPHICS_D3D12_NATIVE)
+        return Fail("Select a valid graphics backend before initializing the core");
+    graphics_backend.store(backend);
+    return 0;
+}
+uint32_t shadps4_get_graphics_backend() {
+    return graphics_backend.load();
+}
+
 int32_t shadps4_check_environment() {
     if (!CanExecuteGuestCode()) {
         return -1;
     }
     try {
-        Core::Uwp::DozenHost::CheckEnvironment();
+        if (Core::Uwp::NativeGraphicsSelected())
+            Core::Uwp::CheckNativeGraphicsEnvironment();
+        else
+            Core::Uwp::DozenHost::CheckEnvironment();
     } catch (const winrt::hresult_error& exception) {
         return Fail("D3D12 HRESULT " +
                     std::to_string(static_cast<uint32_t>(exception.code().value)) + ": " +
@@ -231,12 +256,22 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
         (!config->panel && config->attach_swapchain)) {
         return Fail("Invalid embedded core configuration");
     }
-    if (state.load() != SHADPS4_UNINITIALIZED) {
-        return Fail("The core has already been initialized");
+    std::unique_lock session_lock{session_mutex};
+    if (state.load() != SHADPS4_UNINITIALIZED || native_presentation || presentation) {
+        return Fail("The core has already been initialized or requires shutdown cleanup");
     }
     SCOPE_EXIT {
         if (state.load() == SHADPS4_UNINITIALIZED) {
+            std::scoped_lock presentation_lock{presentation_mutex};
             stop_requested.store(true);
+            if (native_presentation) {
+                try {
+                    native_presentation->DetachSurface();
+                    native_presentation.reset();
+                } catch (const std::exception& error) {
+                    LOG_ERROR(Core, "Native graphics initialization cleanup failed: {}", error.what());
+                }
+            }
             presentation.reset();
             panel = nullptr;
         }
@@ -247,16 +282,26 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
         stop_requested.store(false);
         pause_requested.store(false);
         LOG_INFO(Core, "Embedded core initialized with host-owned storage");
+        LOG_INFO(Core, "Graphics backend: {}", Core::Uwp::NativeGraphicsSelected()
+                                                    ? "native D3D12" : "Vulkan / Dozen");
         KeyManager::GetInstance()->LoadFromFile();
         EmulatorSettings.Load();
         UserSettings.Load();
+        D3D12::NativeTemporalJitter().Configure({});
+        D3D12::NativeTemporalJitter().Reset();
         if (shadps4_check_environment() != 0) {
             return -1;
         }
         if (config->panel) {
+            std::scoped_lock presentation_lock{presentation_mutex};
             panel = config->panel;
-            presentation = std::make_shared<Core::Uwp::DozenHost>();
-            presentation->Initialize(*config);
+            if (Core::Uwp::NativeGraphicsSelected()) {
+                native_presentation = std::make_shared<Core::Uwp::NativeHost>();
+                native_presentation->Initialize(*config);
+            } else {
+                presentation = std::make_shared<Core::Uwp::DozenHost>();
+                presentation->Initialize(*config);
+            }
         }
         Core::Uwp::SuspendAudio(false);
         Core::Uwp::StartGamepadInput();
@@ -306,7 +351,7 @@ int32_t shadps4_run(const wchar_t* executable) {
         winrt::check_hresult(CoGetApartmentType(&apartment, &qualifier));
         if (apartment != APTTYPE_MTA && apartment != APTTYPE_NA)
             throw std::runtime_error("Guest boot requires an MTA worker");
-        if (!presentation)
+        if (!presentation && !native_presentation)
             throw std::runtime_error("Guest boot requires a host game presentation surface");
         const auto path =
             Core::Uwp::PrepareBootStorage(winrt::to_string(std::wstring_view{executable}));
@@ -356,6 +401,39 @@ int32_t shadps4_run(const wchar_t* executable) {
     return -1;
 }
 
+int32_t shadps4_configure_native_temporal_jitter(const ShadPS4TemporalJitterConfig* config) {
+    if (!config || config->size != sizeof(*config))
+        return Fail("Invalid temporal jitter configuration size");
+    std::scoped_lock lock{session_mutex};
+    if (state.load() != SHADPS4_READY && state.load() != SHADPS4_STOPPED)
+        return Fail("Configure native temporal jitter before starting the guest session");
+    try {
+        D3D12::NativeTemporalJitter().Configure({
+            config->target_address, config->render_width, config->render_height,
+            config->output_width, config->output_height, config->phases});
+        return 0;
+    } catch (const std::exception& error) {
+        return Fail(error.what());
+    }
+}
+int32_t shadps4_get_native_temporal_jitter(ShadPS4TemporalJitterSample* sample,
+                                                int32_t completed_frame) {
+    if (!sample || sample->size != sizeof(*sample))
+        return Fail("Invalid temporal jitter sample size");
+    const auto current = completed_frame ? D3D12::NativeTemporalJitter().LastCompleted()
+                                         : D3D12::NativeTemporalJitter().Current();
+    sample->frame = current.frame;
+    sample->generation = current.generation;
+    sample->phase = current.phase;
+    sample->phases = current.phases;
+    sample->reset = current.reset;
+    sample->applied = current.applied;
+    std::copy(current.pixels.begin(), current.pixels.end(), sample->pixels);
+    std::copy(current.previous_pixels.begin(), current.previous_pixels.end(), sample->previous_pixels);
+    std::copy(current.ndc.begin(), current.ndc.end(), sample->ndc);
+    return 0;
+}
+
 void shadps4_request_stop() {
     stop_requested.store(true);
     Core::Uwp::StopGuestWorkers();
@@ -386,9 +464,10 @@ void shadps4_set_paused(int32_t paused) {
 void shadps4_resize(uint32_t width, uint32_t height) {
     try {
         std::scoped_lock lock{presentation_mutex};
-        if (presentation) {
+        if (native_presentation)
+            native_presentation->Resize(width, height);
+        else if (presentation)
             presentation->Resize(width, height);
-        }
     } catch (const winrt::hresult_error& exception) {
         Fail("D3D12 HRESULT " + std::to_string(static_cast<uint32_t>(exception.code().value)) +
              ": " + winrt::to_string(exception.message()));
@@ -400,10 +479,13 @@ void shadps4_resize(uint32_t width, uint32_t height) {
 int32_t shadps4_render_host_frame() {
     try {
         std::scoped_lock lock{presentation_mutex};
-        if (!presentation || state.load() == SHADPS4_UNINITIALIZED) {
+        if ((!presentation && !native_presentation) || state.load() == SHADPS4_UNINITIALIZED) {
             return Fail("Host presentation is not initialized");
         }
-        presentation->Render();
+        if (native_presentation)
+            native_presentation->Render();
+        else
+            presentation->Render();
         return 0;
     } catch (const winrt::hresult_error& exception) {
         return Fail("D3D12 HRESULT " +

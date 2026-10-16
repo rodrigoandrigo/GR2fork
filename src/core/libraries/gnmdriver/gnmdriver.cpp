@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_presentation_sink.h"
 #ifdef SHADPS4_UWP
 #include "uwp/dozen_host.h"
+#include "uwp/native_host.h"
 #include "uwp/session.h"
 #endif
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -3052,11 +3053,17 @@ int PS4_SYSV_ABI Func_F916890425496553() {
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_GnmDriver, "Initializing presenter");
 #ifdef SHADPS4_UWP
-    Core::Uwp::ReleaseDozenBootstrap();
+    if (Core::Uwp::NativeGraphicsSelected()) {
+        Core::Uwp::InitializeNativeGpu();
+    } else {
+        Core::Uwp::ReleaseDozenBootstrap();
 #endif
-    liverpool = std::make_unique<AmdGpu::Liverpool>();
-    presenter = std::make_unique<Vulkan::Presenter>(*g_window, liverpool.get());
-    VideoCore::SetPresentationSink(Vulkan::CreatePresentationSink(*presenter));
+        liverpool = std::make_unique<AmdGpu::Liverpool>();
+        presenter = std::make_unique<Vulkan::Presenter>(*g_window, liverpool.get());
+        VideoCore::SetPresentationSink(Vulkan::CreatePresentationSink(*presenter));
+#ifdef SHADPS4_UWP
+    }
+#endif
 
     const s32 result = sceKernelGetCompiledSdkVersion(&sdk_version);
     if (result != ORBIS_OK) {

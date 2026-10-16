@@ -252,22 +252,8 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         multisampled ? device->Device()->GetResourceAllocationInfo(0, 1, &staging).SizeInBytes : 0;
     if (allocation == UINT64_MAX || extra == UINT64_MAX || bytes > 256ULL * 1024 * 1024)
         throw std::runtime_error("Unsupported D3D12 image allocation or footprint");
-    const u64 required = allocation + extra + ((bytes + 65535) & ~u64{65535}) * 2;
-    while (images.size() >= 64 ||
-           required >
-               allocator.Stats().budget_bytes - allocator.Stats().live_bytes - native_bytes ||
-           cpu_bytes + u64(info.guest_size) * 2 > 256ULL * 1024 * 1024) {
-        auto oldest = images.end();
-        for (auto it = images.begin(); it != images.end(); ++it)
-            if (it->second->batch != batch && !it->second->written &&
-                (oldest == images.end() || it->second->age < oldest->second->age))
-                oldest = it;
-        if (oldest == images.end())
-            throw std::runtime_error("D3D12 image cache budget exhausted");
-        cpu_bytes -= u64(oldest->second->info.guest_size) * 2;
-        native_bytes -= oldest->second->allocation_bytes;
-        images.erase(oldest);
-    }
+    result->staging_bytes = bytes;
+    EnsureSpace(allocation + extra, u64(info.guest_size) * 2, true);
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_CLEAR_VALUE clear{};
@@ -292,10 +278,6 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         static_cast<void>(resources.targets.Allocate(count));
         static_cast<void>(resources.depth_targets.Allocate(layer_count));
     }
-    winrt::check_hresult(allocator.CreateBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD,
-                                                D3D12_RESOURCE_STATE_GENERIC_READ, result->upload));
-    winrt::check_hresult(allocator.CreateBuffer(bytes, D3D12_HEAP_TYPE_READBACK,
-                                                D3D12_RESOURCE_STATE_COPY_DEST, result->readback));
     result->age = ++age;
     result->batch = batch;
     auto& output = *result;
@@ -303,6 +285,36 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     native_bytes += output.allocation_bytes;
     cpu_bytes += u64(info.guest_size) * 2;
     return output;
+}
+void ImageCache::EnsureSpace(u64 required, u64 cpu_required, bool inserting) {
+    const auto exceeds_budget = [&] {
+        const auto stats = allocator.Stats();
+        return stats.live_bytes > stats.budget_bytes ||
+               native_bytes > stats.budget_bytes - stats.live_bytes ||
+               required > stats.budget_bytes - stats.live_bytes - native_bytes;
+    };
+    while ((inserting && images.size() >= 64) || exceeds_budget() ||
+           cpu_required > 256ULL * 1024 * 1024 - cpu_bytes) {
+        auto oldest = images.end();
+        for (auto it = images.begin(); it != images.end(); ++it)
+            if (it->second->batch != batch && !it->second->written &&
+                (oldest == images.end() || it->second->age < oldest->second->age))
+                oldest = it;
+        if (oldest == images.end())
+            throw std::runtime_error("D3D12 image cache budget exhausted");
+        cpu_bytes -= u64(oldest->second->info.guest_size) * 2;
+        native_bytes -= oldest->second->allocation_bytes;
+        images.erase(oldest);
+    }
+}
+void ImageCache::EnsureStaging(Image& image, bool download) {
+    auto& resource = download ? image.readback : image.upload;
+    if (resource.Get())
+        return;
+    EnsureSpace((image.staging_bytes + 65535) & ~u64{65535});
+    winrt::check_hresult(allocator.CreateBuffer(
+        image.staging_bytes, download ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD,
+        download ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_GENERIC_READ, resource));
 }
 void ImageCache::Barrier(Image& image, ID3D12GraphicsCommandList* commands,
                          D3D12_RESOURCE_STATES state) {
@@ -367,6 +379,7 @@ void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr
     image.guest = std::move(guest);
     image.linear.resize(image.guest.size());
     VideoCore::ConvertTiling(image.guest, image.linear, image.info, false);
+    EnsureStaging(image, false);
     void* mapped;
     const D3D12_RANGE empty{0, 0};
     winrt::check_hresult(image.upload->Map(0, &empty, &mapped));
@@ -398,6 +411,7 @@ void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr
 void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
     for (auto& [key, image] : images) {
         if (image->written) {
+            EnsureStaging(*image, true);
             if (image->msaa) {
                 Barrier(*image, commands, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 SetSamplePositions(commands, 1, {});

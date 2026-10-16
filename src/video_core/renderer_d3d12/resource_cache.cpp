@@ -113,19 +113,7 @@ ResourceCache::Buffer& ResourceCache::GetBuffer(VAddr address, u64 size, bool ph
         if (buffer->physical == physical && buffer->batch == batch &&
             address < buffer->address + buffer->size && buffer->address < address + size)
             throw std::runtime_error("Overlapping D3D12 buffer views require a shared allocation");
-    while (buffers.size() >= 128 ||
-           allocator.Stats().live_bytes + native_bytes + size * 3 + 3 * 65536 >
-               allocator.Stats().budget_bytes) {
-        auto oldest = buffers.end();
-        for (auto it = buffers.begin(); it != buffers.end(); ++it)
-            if (it->second->batch != batch && !it->second->written &&
-                (oldest == buffers.end() || it->second->used < oldest->second->used))
-                oldest = it;
-        if (oldest == buffers.end())
-            throw std::runtime_error("D3D12 guest resource budget exhausted by pending writes");
-        native_bytes -= oldest->second->allocation_bytes;
-        buffers.erase(oldest);
-    }
+    EnsureSpace(0, true);
     auto result = std::make_unique<Buffer>();
     result->address = address;
     result->physical = physical;
@@ -142,16 +130,16 @@ ResourceCache::Buffer& ResourceCache::GetBuffer(VAddr address, u64 size, bool ph
     description.SampleDesc.Count = 1;
     description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     description.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const auto allocation = context->Device()->GetResourceAllocationInfo(0, 1, &description);
+    if (!allocation.SizeInBytes || allocation.SizeInBytes == UINT64_MAX)
+        throw std::runtime_error("Unsupported D3D12 buffer allocation");
+    EnsureSpace(allocation.SizeInBytes);
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     Microsoft::WRL::ComPtr<ID3D12Resource> native;
     winrt::check_hresult(context->Device()->CreateCommittedResource(
         &heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_COMMON, nullptr,
         IID_PPV_ARGS(&native)));
-    winrt::check_hresult(allocator.CreateBuffer(allocation_size, D3D12_HEAP_TYPE_UPLOAD,
-                                                D3D12_RESOURCE_STATE_GENERIC_READ, result->upload));
-    winrt::check_hresult(allocator.CreateBuffer(allocation_size, D3D12_HEAP_TYPE_READBACK,
-                                                D3D12_RESOURCE_STATE_COPY_DEST, result->readback));
     result->native = std::move(native);
     result->allocation_bytes =
         context->Device()->GetResourceAllocationInfo(0, 1, &description).SizeInBytes;
@@ -159,6 +147,35 @@ ResourceCache::Buffer& ResourceCache::GetBuffer(VAddr address, u64 size, bool ph
     buffers.emplace(key, std::move(result));
     native_bytes += output.allocation_bytes;
     return output;
+}
+void ResourceCache::EnsureSpace(u64 required, bool inserting) {
+    const auto exceeds_budget = [&] {
+        const auto stats = allocator.Stats();
+        return stats.live_bytes > stats.budget_bytes ||
+               native_bytes > stats.budget_bytes - stats.live_bytes ||
+               required > stats.budget_bytes - stats.live_bytes - native_bytes;
+    };
+    while ((inserting && buffers.size() >= 128) || exceeds_budget()) {
+        auto oldest = buffers.end();
+        for (auto it = buffers.begin(); it != buffers.end(); ++it)
+            if (it->second->batch != batch && !it->second->written &&
+                (oldest == buffers.end() || it->second->used < oldest->second->used))
+                oldest = it;
+        if (oldest == buffers.end())
+            throw std::runtime_error("D3D12 guest resource budget exhausted by pending writes");
+        native_bytes -= oldest->second->allocation_bytes;
+        buffers.erase(oldest);
+    }
+}
+void ResourceCache::EnsureStaging(Buffer& buffer, bool download) {
+    auto& resource = download ? buffer.readback : buffer.upload;
+    if (resource.Get())
+        return;
+    const u64 size = (buffer.size + 3) & ~u64{3};
+    EnsureSpace((size + 65535) & ~u64{65535});
+    winrt::check_hresult(allocator.CreateBuffer(
+        size, download ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD,
+        download ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_GENERIC_READ, resource));
 }
 void ResourceCache::Barrier(Buffer& buffer, ID3D12GraphicsCommandList* commands,
                             D3D12_RESOURCE_STATES state) {
@@ -189,6 +206,7 @@ void ResourceCache::Upload(Buffer& buffer, ID3D12GraphicsCommandList* commands) 
     else
         read(buffer.address, data);
     if (data != buffer.snapshot || Changed(buffer)) {
+        EnsureStaging(buffer, false);
         void* mapped;
         const D3D12_RANGE empty{0, 0};
         winrt::check_hresult(buffer.upload->Map(0, &empty, &mapped));
@@ -209,6 +227,7 @@ void ResourceCache::PrepareDownload(ID3D12GraphicsCommandList* commands) {
     for (auto& [key, buffer] : buffers) {
         if (!buffer->written)
             continue;
+        EnsureStaging(*buffer, true);
         Barrier(*buffer, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
         commands->CopyBufferRegion(buffer->readback.Get(), 0, buffer->native.Get(), 0,
                                    buffer->size);

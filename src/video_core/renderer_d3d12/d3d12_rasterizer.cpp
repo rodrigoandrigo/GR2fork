@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_d3d12/primitive_conversion.h"
 
 namespace D3D12 {
 namespace {
@@ -233,9 +234,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                         regs.color_buffers[1].BaseSlice());
         return;
     }
-    if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry)) ||
-        regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Local)) ||
-        regs.depth_control.stencil_enable || regs.depth_control.depth_bounds_enable ||
+    if (regs.depth_control.stencil_enable || regs.depth_control.depth_bounds_enable ||
         regs.depth_control.enable_color_writes_on_depth_fail ||
         regs.depth_control.disable_color_writes_on_depth_pass ||
         (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal &&
@@ -243,8 +242,38 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         regs.color_control.rop3 != AmdGpu::ColorControl::LogicOp::Copy ||
         regs.vs_output_control.vs_out_misc_enable || regs.vs_output_control.clip_distance_enable ||
         regs.vs_output_control.cull_distance_enable)
-        throw std::runtime_error("D3D12 advanced guest graphics state is not implemented");
-    auto vs = ReadProgram(memory, regs.vs_program);
+        throw std::runtime_error(fmt::format(
+            "Unsupported native D3D12 graphics: geometry={} local={} stencil={} bounds={} "
+            "depth_fail_color={} depth_pass_disable={} mode={} rop={:#x} misc={} clip={} cull={}",
+            regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry)),
+            regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Local)),
+            bool(regs.depth_control.stencil_enable), bool(regs.depth_control.depth_bounds_enable),
+            bool(regs.depth_control.enable_color_writes_on_depth_fail),
+            bool(regs.depth_control.disable_color_writes_on_depth_pass),
+            u32(regs.color_control.mode), u32(regs.color_control.rop3),
+            bool(regs.vs_output_control.vs_out_misc_enable),
+            u32(regs.vs_output_control.clip_distance_enable),
+            u32(regs.vs_output_control.cull_distance_enable)));
+    const bool has_geometry = regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry));
+    const bool tessellation = regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Local));
+    if (has_geometry && (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw))
+        throw std::runtime_error("D3D12 on-chip geometry and stream output are not implemented");
+    if (has_geometry && (regs.clipper_control.user_clip_plane_enable ||
+                         regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW))
+        throw std::runtime_error("D3D12 geometry clip-plane/depth conversion is not implemented");
+    auto vs =
+        ReadProgram(memory, tessellation ? regs.ls_program
+                                         : (has_geometry ? regs.es_program : regs.vs_program));
+    Program hs{}, ds{};
+    if (tessellation) {
+        hs = ReadProgram(memory, regs.hs_program);
+        ds = ReadProgram(memory, has_geometry ? regs.es_program : regs.vs_program);
+    }
+    Program gs{}, copy{};
+    if (has_geometry) {
+        gs = ReadProgram(memory, regs.gs_program);
+        copy = ReadProgram(memory, regs.vs_program);
+    }
     Program ps{};
     if (regs.ps_program.Address<VAddr>())
         ps = ReadProgram(memory, regs.ps_program);
@@ -285,14 +314,90 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         if (!regs.mode_control.msaa_enable)
             draw.sample_positions.assign(draw.samples, D3D12_SAMPLE_POSITION{0, 0});
     }
-    draw.vertex_runtime.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
+    draw.vertex_runtime.Initialize(
+        tessellation ? Shader::HwStage::Local
+                     : (has_geometry ? Shader::HwStage::Export : Shader::HwStage::Vertex),
+        Shader::SwStage::Vertex);
     draw.fragment_runtime.Initialize(Shader::HwStage::Fragment, Shader::SwStage::Fragment);
-    CommonInfo(draw.vertex_runtime, regs.vs_program);
+    CommonInfo(draw.vertex_runtime,
+               tessellation ? regs.ls_program : (has_geometry ? regs.es_program : regs.vs_program));
     CommonInfo(draw.fragment_runtime, regs.ps_program);
-    draw.vertex_runtime.hw.vs.user_clip_plane_mask = regs.clipper_control.user_clip_plane_enable;
-    draw.vertex_runtime.hw.vs.emulate_depth_negative_one_to_one =
-        regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
-    draw.vertex_runtime.hw.vs.clip_disable = regs.IsClipDisabled();
+    if (has_geometry) {
+        if (!tessellation)
+            draw.vertex_runtime.hw.es.vertex_data_size = regs.vgt_esgs_ring_itemsize;
+        draw.geometry = gs.Params();
+        draw.geometry_runtime.Initialize(Shader::HwStage::Geometry, Shader::SwStage::Geometry);
+        CommonInfo(draw.geometry_runtime, regs.gs_program);
+        auto& geometry = draw.geometry_runtime.hw.gs;
+        geometry.output_vertices = regs.vgt_gs_max_vert_out;
+        geometry.num_invocations =
+            regs.vgt_gs_instance_cnt.IsEnabled() ? regs.vgt_gs_instance_cnt.count : 1;
+        if (!geometry.num_invocations || geometry.num_invocations > D3D12_GS_MAX_INSTANCE_COUNT)
+            throw std::runtime_error("Guest geometry invocation count exceeds D3D12 limits");
+        geometry.in_primitive = regs.primitive_type;
+        if (geometry.in_primitive == AmdGpu::PrimitiveType::LineLoop)
+            geometry.in_primitive = AmdGpu::PrimitiveType::LineList;
+        if (geometry.in_primitive == AmdGpu::PrimitiveType::TriangleFan)
+            geometry.in_primitive = AmdGpu::PrimitiveType::TriangleList;
+        if (tessellation) {
+            switch (regs.tess_config.topology) {
+            case AmdGpu::TessellationTopology::Point:
+                geometry.in_primitive = AmdGpu::PrimitiveType::PointList;
+                break;
+            case AmdGpu::TessellationTopology::Line:
+                geometry.in_primitive = AmdGpu::PrimitiveType::LineList;
+                break;
+            case AmdGpu::TessellationTopology::TriangleCw:
+            case AmdGpu::TessellationTopology::TriangleCcw:
+                geometry.in_primitive = AmdGpu::PrimitiveType::TriangleList;
+                break;
+            default:
+                throw std::runtime_error("Invalid tessellator geometry output topology");
+            }
+        }
+        for (u32 stream = 0; stream < Shader::GsMaxOutputStreams; ++stream)
+            geometry.out_primitive[stream] = regs.vgt_gs_out_prim_type.GetPrimitiveType(stream);
+        geometry.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
+        geometry.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
+        geometry.mode = regs.vgt_gs_mode.mode;
+        geometry.vs_copy = copy.code;
+        geometry.vs_copy_hash = copy.hash;
+    } else if (!tessellation) {
+        draw.vertex_runtime.hw.vs.user_clip_plane_mask =
+            regs.clipper_control.user_clip_plane_enable;
+        draw.vertex_runtime.hw.vs.emulate_depth_negative_one_to_one =
+            regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
+        draw.vertex_runtime.hw.vs.clip_disable = regs.IsClipDisabled();
+    }
+    if (tessellation) {
+        if (regs.primitive_type != AmdGpu::PrimitiveType::PatchPrimitive ||
+            regs.clipper_control.user_clip_plane_enable)
+            throw std::runtime_error("Invalid native tessellation primitive or clip state");
+        draw.hull = hs.Params();
+        draw.domain = ds.Params();
+        draw.hull_runtime.Initialize(Shader::HwStage::Hull, Shader::SwStage::TessellationControl);
+        draw.domain_runtime.Initialize(has_geometry ? Shader::HwStage::Export
+                                                    : Shader::HwStage::Vertex,
+                                       Shader::SwStage::TessellationEval);
+        CommonInfo(draw.hull_runtime, regs.hs_program);
+        CommonInfo(draw.domain_runtime, has_geometry ? regs.es_program : regs.vs_program);
+        auto& control = draw.hull_runtime.sw.tcs;
+        control.num_input_control_points = regs.ls_hs_config.hs_input_control_points;
+        control.num_threads = regs.ls_hs_config.hs_output_control_points;
+        control.tess_type = regs.tess_config.type;
+        control.offchip_lds_enable = regs.hs_program.settings.oc_lds_en;
+        auto& evaluation = draw.domain_runtime.sw.tes;
+        evaluation.tess_type = regs.tess_config.type;
+        evaluation.tess_topology = regs.tess_config.topology;
+        evaluation.tess_partitioning = regs.tess_config.partitioning;
+        if (has_geometry) {
+            draw.domain_runtime.hw.es.vertex_data_size = regs.vgt_esgs_ring_itemsize;
+        } else {
+            draw.domain_runtime.hw.vs.emulate_depth_negative_one_to_one =
+                regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
+            draw.domain_runtime.hw.vs.clip_disable = regs.IsClipDisabled();
+        }
+    }
     draw.vertex_runtime.sw.vs.step_rate_0 = regs.vgt_instance_step_rate_0;
     draw.vertex_runtime.sw.vs.step_rate_1 = regs.vgt_instance_step_rate_1;
     if (indirect) {
@@ -444,6 +549,15 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     static_assert(sizeof(regs.clip_user_data) == sizeof(draw.clip_planes));
     std::memcpy(draw.clip_planes.data(), regs.clip_user_data.data(), sizeof(draw.clip_planes));
     switch (regs.primitive_type) {
+    case AmdGpu::PrimitiveType::PatchPrimitive: {
+        const auto points = regs.ls_hs_config.hs_input_control_points;
+        if (!tessellation || !points || points > 32 || regs.enable_primitive_restart)
+            throw std::runtime_error("Invalid native tessellation patch topology");
+        draw.topology =
+            D3D_PRIMITIVE_TOPOLOGY(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + points - 1);
+        draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        break;
+    }
     case AmdGpu::PrimitiveType::PointList:
         draw.topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
         draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
@@ -457,11 +571,49 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
         break;
     case AmdGpu::PrimitiveType::TriangleList:
+    case AmdGpu::PrimitiveType::RectList:
+        draw.rectangles = regs.primitive_type == AmdGpu::PrimitiveType::RectList;
+        if (draw.rectangles && draw.rasterizer.FillMode == D3D12_FILL_MODE_WIREFRAME)
+            throw std::runtime_error("Rectangle wireframe requires boundary edge emulation");
+        if (draw.rectangles && has_geometry)
+            throw std::runtime_error("D3D12 guest geometry cannot precede rectangle expansion");
         draw.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         break;
     case AmdGpu::PrimitiveType::TriangleStrip:
         draw.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+        draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        break;
+    case AmdGpu::PrimitiveType::AdjLineList:
+        draw.topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
+        draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        break;
+    case AmdGpu::PrimitiveType::AdjLineStrip:
+        draw.topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ;
+        draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        break;
+    case AmdGpu::PrimitiveType::AdjTriangleList:
+        draw.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ;
+        draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        break;
+    case AmdGpu::PrimitiveType::AdjTriangleStrip:
+        draw.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
+        draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        break;
+    case AmdGpu::PrimitiveType::LineLoop:
+        draw.topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+        draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        break;
+    case AmdGpu::PrimitiveType::TriangleFan:
+        draw.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        break;
+    case AmdGpu::PrimitiveType::Polygon:
+    case AmdGpu::PrimitiveType::QuadList:
+    case AmdGpu::PrimitiveType::QuadStrip:
+        if (has_geometry)
+            throw std::runtime_error("D3D12 expanded primitives preceding geometry require lowering");
+        draw.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         break;
     default:
@@ -485,7 +637,9 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         draw.index_address = base + u64(index_offset) * size;
         draw.index_format = size == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
         draw.base_vertex = indirect ? indirect->base_vertex : regs.index_offset;
-        if (regs.enable_primitive_restart) {
+        if (regs.enable_primitive_restart &&
+            (regs.primitive_type == AmdGpu::PrimitiveType::AdjLineStrip ||
+             regs.primitive_type == AmdGpu::PrimitiveType::AdjTriangleStrip)) {
             const u32 cut = size == 2 ? 0xffff : UINT32_MAX;
             if (regs.primitive_restart_index != cut)
                 throw std::runtime_error(
@@ -495,6 +649,49 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         }
     } else
         draw.first_vertex = indirect ? indirect->first : regs.index_offset;
+    const bool convert = regs.primitive_type == AmdGpu::PrimitiveType::LineLoop ||
+                         regs.primitive_type == AmdGpu::PrimitiveType::TriangleFan ||
+                         regs.primitive_type == AmdGpu::PrimitiveType::Polygon ||
+                         regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
+                         regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip ||
+                         (indexed && regs.enable_primitive_restart &&
+                          regs.primitive_type != AmdGpu::PrimitiveType::AdjLineStrip &&
+                          regs.primitive_type != AmdGpu::PrimitiveType::AdjTriangleStrip);
+    if (convert) {
+        if (draw.rasterizer.FillMode == D3D12_FILL_MODE_WIREFRAME &&
+            (regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
+             regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip ||
+             regs.primitive_type == AmdGpu::PrimitiveType::Polygon))
+            throw std::runtime_error("D3D12 polygon wireframe requires edge emulation");
+        if (draw.count > 4 * 1024 * 1024)
+            throw std::runtime_error("Guest index conversion exceeds upload budget");
+        std::vector<u32> indices(draw.count);
+        if (indexed) {
+            if (draw.index_format == DXGI_FORMAT_R32_UINT) {
+                Read(draw.index_address,
+                     {reinterpret_cast<u8*>(indices.data()), indices.size() * sizeof(u32)});
+            } else {
+                std::vector<u16> packed(draw.count);
+                Read(draw.index_address,
+                     {reinterpret_cast<u8*>(packed.data()), packed.size() * sizeof(u16)});
+                std::copy(packed.begin(), packed.end(), indices.begin());
+            }
+        } else {
+            for (u32 i = 0; i < draw.count; ++i)
+                indices[i] = i;
+            draw.base_vertex = draw.first_vertex;
+        }
+        const auto restart = indexed && regs.enable_primitive_restart
+                                 ? std::optional<u32>{regs.primitive_restart_index}
+                                 : std::nullopt;
+        draw.converted_indices = ConvertPrimitiveIndices(regs.primitive_type, indices, restart);
+        draw.count = draw.converted_indices.size();
+        draw.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+        if (draw.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE)
+            draw.topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+        else if (draw.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
+            draw.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    }
     runtime.Draw(draw);
 }
 void Rasterizer::DrawIndirect(bool indexed, VAddr address, u32 offset, u32 stride, u32 count,

@@ -5,8 +5,12 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
+#include <chrono>
 #include <winrt/base.h>
 #include "core/memory.h"
+#include "uwp/session.h"
+#include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/texture_cache/cpu_tiling.h"
 
 using Microsoft::WRL::ComPtr;
@@ -15,6 +19,7 @@ namespace Core::Uwp {
 struct D3D12Presenter::Frame final : VideoCore::PresentationFrame {
     std::vector<u8> pixels;
     D3D12Resource upload;
+    D3D12::TemporalJitter::Sample jitter;
     u32 width{};
     u32 height{};
     u64 charge{};
@@ -52,9 +57,14 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
     constexpr u64 limit = 256ULL * 1024 * 1024;
     if (charge > limit)
         throw std::runtime_error("D3D12 VideoOut frame exceeds budget");
-    if (frame_bytes->fetch_add(charge) > limit - charge) {
-        frame_bytes->fetch_sub(charge);
-        throw std::runtime_error("D3D12 VideoOut frame budget exhausted");
+    auto used = frame_bytes->load();
+    for (;;) {
+        if (used <= limit - charge && frame_bytes->compare_exchange_weak(used, used + charge))
+            break;
+        if (StopRequested())
+            return PrepareBlankFrame(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        used = frame_bytes->load();
     }
     frame->charge = charge;
     frame->budget = frame_bytes;
@@ -105,6 +115,7 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
                 output[3] = (pixel >> 30) * 85;
             }
         }
+    frame->jitter = D3D12::NativeTemporalJitter().CompleteFrame();
     return frame;
 }
 VideoCore::FrameHandle D3D12Presenter::PrepareBlankFrame(bool) {
@@ -278,11 +289,17 @@ void D3D12Presenter::Resize(uint32_t new_width, uint32_t new_height) {
         return;
     ResizeBuffers(new_width, new_height);
 }
+void D3D12Presenter::Drain() {
+    std::scoped_lock lock{mutex};
+    if (context.DirectQueue())
+        context.WaitForGpu();
+}
 void D3D12Presenter::ResizeBuffers(uint32_t new_width, uint32_t new_height) {
     if (!swapchain || !new_width || !new_height || (new_width == width && new_height == height)) {
         return;
     }
     context.WaitForGpu();
+    D3D12::NativeTemporalJitter().Reset();
     for (auto& buffer : buffers) {
         buffer.Reset();
     }

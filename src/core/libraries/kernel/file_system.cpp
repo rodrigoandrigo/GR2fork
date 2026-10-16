@@ -176,7 +176,7 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
         // If we're not creating a file, and it doesn't exist, return ENOENT
         h->DeleteHandle(handle);
         *__Error() = POSIX_ENOENT;
-        LOG_ERROR(Kernel_Fs, "Opening path {} failed, file does not exist", raw_path);
+        LOG_DEBUG(Kernel_Fs, "Opening path {} failed, file does not exist", raw_path);
         return -1;
     }
 
@@ -809,8 +809,13 @@ s32 PS4_SYSV_ABI posix_lstat(const char* path, OrbisKernelStat* sb) {
 s32 PS4_SYSV_ABI sceKernelStat(const char* path, OrbisKernelStat* sb) {
     s32 result = posix_stat(path, sb);
     if (result < 0) {
-        LOG_ERROR(Kernel_Fs, "error = {}", *__Error());
-        return ErrnoToSceKernelError(*__Error());
+        const auto error = *__Error();
+        if (error == POSIX_ENOENT) {
+            LOG_DEBUG(Kernel_Fs, "Stat path {} failed, file does not exist", path);
+        } else {
+            LOG_ERROR(Kernel_Fs, "Stat path {} failed, error = {}", path ? path : "<null>", error);
+        }
+        return ErrnoToSceKernelError(error);
     }
     return result;
 }

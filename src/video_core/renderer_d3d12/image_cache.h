@@ -13,6 +13,7 @@ public:
         D3D12Resource upload, readback;
         Microsoft::WRL::ComPtr<ID3D12Resource> native;
         u64 allocation_bytes{};
+        u64 staging_bytes{};
         std::unique_ptr<MsaaTransfer::Resources> msaa;
         std::vector<D3D12_SAMPLE_POSITION> sample_positions;
         ID3D12Resource* Native() const {
@@ -44,6 +45,8 @@ public:
     }
 
 private:
+    void EnsureSpace(u64 required, u64 cpu_required = 0, bool inserting = false);
+    void EnsureStaging(Image& image, bool download);
     void CopyRows(Image& image, void* data, bool upload);
     D3D12DeviceContext* device{};
     D3D12ResourceAllocator allocator;

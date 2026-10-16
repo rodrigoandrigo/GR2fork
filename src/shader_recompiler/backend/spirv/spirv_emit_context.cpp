@@ -51,8 +51,10 @@ static constexpr u32 NumVertices(AmdGpu::PrimitiveType type) {
     case AmdGpu::PrimitiveType::RectList:
         return 3u;
     case AmdGpu::PrimitiveType::AdjTriangleList:
+    case AmdGpu::PrimitiveType::AdjTriangleStrip:
         return 6u;
     case AmdGpu::PrimitiveType::AdjLineList:
+    case AmdGpu::PrimitiveType::AdjLineStrip:
         return 4u;
     default:
         UNREACHABLE();
