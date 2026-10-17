@@ -1,5 +1,9 @@
 #pragma once
 
+#include <string>
+#include <vector>
+#include <d3d12sdklayers.h>
+#include <fmt/format.h>
 #include <winrt/base.h>
 #include "uwp/session.h"
 #include "video_core/gpu_command_sink.h"
@@ -12,6 +16,29 @@ namespace Core {
 class MemoryManager;
 }
 namespace D3D12 {
+namespace {
+std::string RuntimeErrorTrace(D3D12DeviceContext& device) {
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> queue;
+    if (FAILED(device.Device()->QueryInterface(IID_PPV_ARGS(&queue))))
+        return {};
+    std::string trace;
+    const UINT count = queue->GetNumStoredMessages();
+    for (UINT index = 0; index < count && trace.size() < 4096; ++index) {
+        SIZE_T size{};
+        if (FAILED(queue->GetMessage(index, nullptr, &size)) || size > 4096 - trace.size())
+            continue;
+        std::vector<u8> storage(size);
+        const auto message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if (FAILED(queue->GetMessage(index, message, &size)))
+            continue;
+        fmt::format_to(std::back_inserter(trace), " [id={} sev={} {}]",
+                       static_cast<u32>(message->ID), static_cast<u32>(message->Severity),
+                       message->pDescription ? message->pDescription : "");
+    }
+    return trace;
+}
+} // namespace
+
 class Rasterizer final : public VideoCore::GpuCommandSink, public VideoCore::GpuMemorySink {
 public:
     Rasterizer(AmdGpu::Liverpool& liverpool, Core::MemoryManager& memory);
@@ -48,12 +75,13 @@ private:
             function();
         } catch (const winrt::hresult_error& error) {
             failed = true;
-            Core::Uwp::FailGuestSession(fmt::format("D3D12 HRESULT {:08x}: {}",
-                                                    u32(error.code().value),
-                                                    winrt::to_string(error.message())));
+            Core::Uwp::FailGuestSession(fmt::format(
+                "D3D12 HRESULT {:08x}: {}{}", u32(error.code().value),
+                winrt::to_string(error.message()), RuntimeErrorTrace(runtime.Device())));
         } catch (const std::exception& error) {
             failed = true;
-            Core::Uwp::FailGuestSession(error.what());
+            Core::Uwp::FailGuestSession(
+                fmt::format("{}{}", error.what(), RuntimeErrorTrace(runtime.Device())));
         } catch (...) {
             failed = true;
             Core::Uwp::FailGuestSession("D3D12 guest GPU execution failed");

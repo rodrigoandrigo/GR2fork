@@ -999,13 +999,16 @@ void ImGuiFrontend::DrawSettings() {
       ApplicationData::Current->LocalSettings->Values->Insert(
           L"shadps4.graphics.backend",
           ref new Platform::String(next_graphics_backend ? L"d3d12" : L"dozen"));
-      status = "Reinicie o aplicativo para usar o backend selecionado.";
+      reload_core = next_graphics_backend != static_cast<int>(core->GraphicsBackend());
+      session_pending = reload_core;
+      status = reload_core ? "Aplicando backend grafico e recarregando a biblioteca…"
+                           : "Backend grafico selecionado.";
     } catch (Platform::Exception^) {
       next_graphics_backend = static_cast<int>(core->GraphicsBackend());
       status = "Nao foi possivel salvar o backend grafico.";
     }
   }
-  ImGui::TextWrapped("Backend ativo: %s. A alteracao vale no proximo inicio.",
+  ImGui::TextWrapped("Backend ativo: %s. A selecao sera usada ao iniciar jogos.",
                     backends[core->GraphicsBackend()]);
   if (next_graphics_backend == SHADPS4_GRAPHICS_D3D12_NATIVE)
     ImGui::TextWrapped("Compatibilidade experimental: alguns jogos ainda nao iniciam.");

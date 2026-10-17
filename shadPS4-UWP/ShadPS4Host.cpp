@@ -87,10 +87,11 @@ void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width,
     set_log_callback(Log, this);
     set_error_callback(ReportError, nullptr);
     const auto values = Windows::Storage::ApplicationData::Current->LocalSettings->Values;
+    graphics_backend = SHADPS4_GRAPHICS_D3D12_NATIVE;
     if (values->HasKey(L"shadps4.graphics.backend")) {
         const auto selected = dynamic_cast<Platform::String^>(values->Lookup(L"shadps4.graphics.backend"));
-        if (selected && selected == L"d3d12")
-            graphics_backend = SHADPS4_GRAPHICS_D3D12_NATIVE;
+        if (selected && selected == L"dozen")
+            graphics_backend = SHADPS4_GRAPHICS_VULKAN_DOZEN;
     }
     const auto set_backend = Resolve<decltype(&shadps4_set_graphics_backend)>("shadps4_set_graphics_backend");
     if (set_backend(graphics_backend))
@@ -220,7 +221,7 @@ std::wstring ShadPS4Host::MountFolder(Platform::Agile<Windows::Storage::StorageF
         throw ref new Platform::FailureException(ref new Platform::String(message.c_str()));
     }
     return L"Pasta vinculada por acesso brokered. eboot.bin: " + std::to_wstring(length) +
-           L" bytes. A execução de jogos ainda não está disponível.";
+           L" bytes. Pronto para iniciar o jogo.";
 }
 
 void ShadPS4Host::Run(std::wstring executable,

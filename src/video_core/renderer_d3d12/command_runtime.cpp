@@ -24,9 +24,10 @@ void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write w
     shaders.Initialize(device.Device());
     this->read = read;
     resources.Initialize(device, read, write, std::move(resolve));
-    images.Initialize(device, std::move(read), std::move(write), [this](VAddr address, u64 size) {
-        return resources.Canonicalize(address, size);
-    });
+    images.Initialize(
+        device, std::move(read), std::move(write),
+        [this](VAddr address, u64 size) { return resources.Canonicalize(address, size); },
+        &shaders);
     device.CreateDirectCommands(allocator, commands);
     winrt::check_hresult(commands->Close());
 }

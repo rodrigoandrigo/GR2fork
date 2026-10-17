@@ -1,8 +1,13 @@
 #include "uwp/gamepad_input.h"
 
 #include <algorithm>
+#include <chrono>
 #include <future>
+#include <map>
+#include <stdexcept>
+#include <string>
 #include <thread>
+#include <vector>
 #include <winrt/Windows.Foundation.Collections.h>
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -14,6 +19,55 @@ using namespace winrt::Windows::Gaming::Input;
 std::mutex lifecycle_mutex;
 std::jthread polling;
 std::atomic_bool captured{};
+struct SyntheticEvent {
+    std::chrono::milliseconds when{};
+    std::chrono::milliseconds hold{150};
+    Libraries::Pad::OrbisPadButtonDataOffset button{
+        Libraries::Pad::OrbisPadButtonDataOffset::None};
+};
+std::vector<SyntheticEvent> ParseSchedule(const std::string& schedule) {
+    static const std::map<std::string_view, Libraries::Pad::OrbisPadButtonDataOffset> names{
+        {"l3", Libraries::Pad::OrbisPadButtonDataOffset::L3},
+        {"r3", Libraries::Pad::OrbisPadButtonDataOffset::R3},
+        {"options", Libraries::Pad::OrbisPadButtonDataOffset::Options},
+        {"up", Libraries::Pad::OrbisPadButtonDataOffset::Up},
+        {"right", Libraries::Pad::OrbisPadButtonDataOffset::Right},
+        {"down", Libraries::Pad::OrbisPadButtonDataOffset::Down},
+        {"left", Libraries::Pad::OrbisPadButtonDataOffset::Left},
+        {"l2", Libraries::Pad::OrbisPadButtonDataOffset::L2},
+        {"r2", Libraries::Pad::OrbisPadButtonDataOffset::R2},
+        {"l1", Libraries::Pad::OrbisPadButtonDataOffset::L1},
+        {"r1", Libraries::Pad::OrbisPadButtonDataOffset::R1},
+        {"triangle", Libraries::Pad::OrbisPadButtonDataOffset::Triangle},
+        {"circle", Libraries::Pad::OrbisPadButtonDataOffset::Circle},
+        {"cross", Libraries::Pad::OrbisPadButtonDataOffset::Cross},
+        {"square", Libraries::Pad::OrbisPadButtonDataOffset::Square},
+    };
+    std::vector<SyntheticEvent> events;
+    for (size_t start = 0; start < schedule.size();) {
+        const auto stop = schedule.find(',', start);
+        const auto entry = schedule.substr(start, stop == std::string::npos
+                                                      ? std::string::npos
+                                                      : stop - start);
+        const auto at = entry.find('@');
+        if (at == std::string::npos)
+            throw std::runtime_error("Invalid synthetic pad event");
+        const auto name = names.find(entry.substr(0, at));
+        if (name == names.end())
+            throw std::runtime_error("Unknown synthetic pad button");
+        SyntheticEvent event{};
+        event.when = std::chrono::milliseconds{std::stoll(entry.substr(at + 1))};
+        const auto colon = entry.find(':', at);
+        if (colon != std::string::npos)
+            event.hold = std::chrono::milliseconds{std::stoll(entry.substr(colon + 1))};
+        event.button = name->second;
+        events.push_back(event);
+        if (stop == std::string::npos)
+            break;
+        start = stop + 1;
+    }
+    return events;
+}
 } // namespace
 
 void StartGamepadInput() {
@@ -34,6 +88,9 @@ void StartGamepadInput() {
         bool started{};
         std::array<Gamepad, 4> slots{nullptr, nullptr, nullptr, nullptr};
         std::array<uint16_t, 4> vibration{};
+        std::vector<SyntheticEvent> synthetic;
+        if (const char* schedule = std::getenv("GAME_SYNTH_PAD"); schedule && *schedule)
+            synthetic = ParseSchedule(schedule);
         const auto started_at = std::chrono::steady_clock::now();
         try {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -62,13 +119,29 @@ void StartGamepadInput() {
                 for (const auto& pad : pads) {
                     if (std::ranges::any_of(slots, [&](const auto& item) { return item == pad; }))
                         continue;
-                    auto empty = std::ranges::find(slots, nullptr);
+                    auto empty = std::ranges::find(slots.begin() + (synthetic.empty() ? 0 : 1),
+                                                   slots.end(), nullptr);
                     if (empty != slots.end()) {
                         *empty = pad;
                         pad.Vibration({});
                     }
                 }
                 for (size_t slot = 0; slot < slots.size(); ++slot) {
+                    if (slot == 0 && !synthetic.empty()) {
+                        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started_at);
+                        Input::State state{};
+                        for (const auto& event : synthetic) {
+                            if (elapsed >= event.when && elapsed < event.when + event.hold)
+                                state.buttonsState |= event.button;
+                        }
+                        state.connected = true;
+                        state.time = std::chrono::duration_cast<std::chrono::microseconds>(
+                                         elapsed)
+                                         .count();
+                        (*controllers)[0]->UpdateNativeState(state);
+                        continue;
+                    }
                     if (!slots[slot])
                         continue;
                     auto* controller = (*controllers)[slot];

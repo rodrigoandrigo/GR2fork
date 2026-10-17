@@ -14,6 +14,8 @@ MsaaFormat GetMsaaFormat(DXGI_FORMAT format, bool depth) {
             return {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM};
         if (format == DXGI_FORMAT_D32_FLOAT)
             return {DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT};
+        if (format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+            return {DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT};
         throw std::runtime_error("Unsupported D3D12 multisample depth format");
     }
     switch (format) {
@@ -124,19 +126,28 @@ std::vector<u8> MsaaTransfer::Compile(std::string_view source, const wchar_t* ta
     return {bytes, bytes + binary->GetBufferSize()};
 }
 MsaaTransfer::Pipeline& MsaaTransfer::GetPipeline(DXGI_FORMAT format, u32 samples, bool integer,
-                                                  bool depth, bool upload) {
-    const auto key = std::tuple{format, samples, integer, depth, upload};
+                                                  bool depth, bool upload, bool stencil,
+                                                  DXGI_FORMAT dsv_format) {
+    const auto key = std::tuple{format, samples, integer, depth, upload, stencil, dsv_format};
     if (const auto found = pipelines.find(key); found != pipelines.end())
         return found->second;
     if (pipelines.size() >= 128)
         throw std::runtime_error("MSAA transfer pipeline budget exhausted");
-    const std::string type = integer ? "uint4" : "float4";
+    const std::string type = (integer || stencil) ? "uint4" : "float4";
     std::string source = fmt::format(
         "Texture2DArray<{}> planes : register(t0);\nTexture2DMSArray<{}> image : register(t1);\n",
         type, type);
     source += "cbuffer State : register(b0) { uint layer; uint samples; uint selectedSample; uint "
               "unused; };\n";
-    if (upload)
+    if (stencil && upload)
+        source += "uint main(float4 p : SV_Position, uint sample : SV_SampleIndex) : "
+                  "SV_StencilRef { return planes.Load(int4(int2(p.xy), layer * samples + sample, "
+                  "0)).x; }";
+    else if (stencil)
+        source +=
+            "uint main(float4 p : SV_Position) : SV_Target0 { return image.Load(int3(int2(p.xy), "
+            "layer), selectedSample).y; }";
+    else if (upload)
         source += fmt::format(
             "{} main(float4 p : SV_Position, uint sample : SV_SampleIndex) : {} {{ return "
             "planes.Load(int4(int2(p.xy), layer * samples + sample, 0)){}; }}",
@@ -176,15 +187,23 @@ MsaaTransfer::Pipeline& MsaaTransfer::GetPipeline(DXGI_FORMAT format, u32 sample
     desc.DepthStencilState.DepthEnable = depth && upload;
     desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    desc.DepthStencilState.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
-                                        D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
-    desc.DepthStencilState.BackFace = desc.DepthStencilState.FrontFace;
+    desc.DepthStencilState.StencilEnable = stencil && upload;
+    desc.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    desc.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    if (stencil && upload) {
+        desc.DepthStencilState.FrontFace = {D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_REPLACE,
+                                            D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_ALWAYS};
+        desc.DepthStencilState.BackFace = desc.DepthStencilState.FrontFace;
+    } else {
+        desc.DepthStencilState.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                            D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
+        desc.DepthStencilState.BackFace = desc.DepthStencilState.FrontFace;
+    }
     desc.SampleMask = UINT_MAX;
     desc.SampleDesc.Count = upload ? samples : 1;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    if (depth && upload)
-        desc.DSVFormat =
-            format == DXGI_FORMAT_R16_UNORM ? DXGI_FORMAT_D16_UNORM : DXGI_FORMAT_D32_FLOAT;
+    if ((depth || stencil) && upload)
+        desc.DSVFormat = dsv_format;
     else {
         desc.NumRenderTargets = 1;
         desc.RTVFormats[0] = format;
@@ -203,12 +222,29 @@ void MsaaTransfer::Barrier(Resources& resources, ID3D12GraphicsCommandList* comm
     commands->ResourceBarrier(1, &barrier);
     resources.state = state;
 }
+void MsaaTransfer::StencilBarrier(Resources& resources, ID3D12GraphicsCommandList* commands,
+                                  D3D12_RESOURCE_STATES state) {
+    if (resources.stencil_state == state)
+        return;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {resources.stencil_planes.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          resources.stencil_state, state};
+    commands->ResourceBarrier(1, &barrier);
+    resources.stencil_state = state;
+}
 void MsaaTransfer::Record(ID3D12GraphicsCommandList* commands, ID3D12Resource* image,
                           Resources& resources, DXGI_FORMAT format, bool depth, bool upload) {
     const auto desc = image->GetDesc();
     const auto formats = GetMsaaFormat(format, depth);
-    auto& pipeline =
-        GetPipeline(formats.transfer, desc.SampleDesc.Count, formats.integer, depth, upload);
+    const bool stencil_res = depth && (format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+                                       format == DXGI_FORMAT_D24_UNORM_S8_UINT);
+    const DXGI_FORMAT upload_dsv =
+        stencil_res ? format
+                    : (formats.transfer == DXGI_FORMAT_R16_UNORM ? DXGI_FORMAT_D16_UNORM
+                                                                 : DXGI_FORMAT_D32_FLOAT);
+    auto& pipeline = GetPipeline(formats.transfer, desc.SampleDesc.Count, formats.integer, depth,
+                                 upload, false, upload_dsv);
     Barrier(resources, commands,
             upload ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                    : D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -220,6 +256,9 @@ void MsaaTransfer::Record(ID3D12GraphicsCommandList* commands, ID3D12Resource* i
     device->CreateShaderResourceView(resources.planes.Get(), &srv, resources.descriptors.Cpu(0));
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
     srv.Texture2DMSArray = {0, desc.DepthOrArraySize};
+    if (stencil_res) {
+        srv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    }
     device->CreateShaderResourceView(image, &srv, resources.descriptors.Cpu(1));
     commands->SetPipelineState(pipeline.state.Get());
     commands->SetGraphicsRootSignature(pipeline.root.Get());
@@ -239,8 +278,7 @@ void MsaaTransfer::Record(ID3D12GraphicsCommandList* commands, ID3D12Resource* i
             commands->SetGraphicsRoot32BitConstants(0, 4, constants.data(), 0);
             if (depth && upload) {
                 D3D12_DEPTH_STENCIL_VIEW_DESC view{};
-                view.Format = formats.transfer == DXGI_FORMAT_R16_UNORM ? DXGI_FORMAT_D16_UNORM
-                                                                        : DXGI_FORMAT_D32_FLOAT;
+                view.Format = upload_dsv;
                 view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
                 view.Texture2DMSArray = {layer, 1};
                 const auto target = resources.depth_targets.Cpu(index);
@@ -260,6 +298,65 @@ void MsaaTransfer::Record(ID3D12GraphicsCommandList* commands, ID3D12Resource* i
                 const auto target = resources.targets.Cpu(index);
                 device->CreateRenderTargetView(upload ? image : resources.planes.Get(), &view,
                                                target);
+                commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
+            }
+            commands->DrawInstanced(3, 1, 0, 0);
+        }
+    }
+}
+void MsaaTransfer::RecordStencil(ID3D12GraphicsCommandList* commands, ID3D12Resource* image,
+                                 Resources& resources, DXGI_FORMAT dsv_format, bool upload) {
+    const auto desc = image->GetDesc();
+    auto& pipeline = GetPipeline(DXGI_FORMAT_R8_UINT, desc.SampleDesc.Count, true, false, upload,
+                                 true, upload ? dsv_format : DXGI_FORMAT_UNKNOWN);
+    if (upload)
+        StencilBarrier(resources, commands, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    else
+        StencilBarrier(resources, commands, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = DXGI_FORMAT_R8_UINT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv.Texture2DArray = {0, 1, 0, u32(desc.DepthOrArraySize) * desc.SampleDesc.Count, 0, 0};
+    device->CreateShaderResourceView(resources.stencil_planes.Get(), &srv,
+                                     resources.stencil_descriptors.Cpu(0));
+    srv.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+    srv.Texture2DMSArray = {0, desc.DepthOrArraySize};
+    device->CreateShaderResourceView(image, &srv, resources.stencil_descriptors.Cpu(1));
+    commands->SetPipelineState(pipeline.state.Get());
+    commands->SetGraphicsRootSignature(pipeline.root.Get());
+    ID3D12DescriptorHeap* heaps[]{resources.stencil_descriptors.Heap()};
+    commands->SetDescriptorHeaps(1, heaps);
+    commands->SetGraphicsRootDescriptorTable(1, resources.stencil_descriptors.Gpu(0));
+    commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport{0, 0, float(desc.Width), float(desc.Height), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(desc.Width), LONG(desc.Height)};
+    commands->RSSetViewports(1, &viewport);
+    commands->RSSetScissorRects(1, &scissor);
+    for (u32 layer = 0; layer < desc.DepthOrArraySize; ++layer) {
+        const u32 count = upload ? 1 : desc.SampleDesc.Count;
+        for (u32 sample = 0; sample < count; ++sample) {
+            const u32 index = upload ? layer : layer * desc.SampleDesc.Count + sample;
+            const std::array<u32, 4> constants{layer, desc.SampleDesc.Count, sample, 0};
+            commands->SetGraphicsRoot32BitConstants(0, 4, constants.data(), 0);
+            if (upload) {
+                D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+                view.Format = dsv_format;
+                view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+                view.Texture2DMSArray = {layer, 1};
+                const auto target = resources.depth_targets.Cpu(index);
+                device->CreateDepthStencilView(image, &view, target);
+                commands->ClearDepthStencilView(target, D3D12_CLEAR_FLAG_STENCIL, 1.f, 0, 0,
+                                                nullptr);
+                commands->OMSetRenderTargets(0, nullptr, FALSE, &target);
+            } else {
+                D3D12_RENDER_TARGET_VIEW_DESC view{};
+                view.Format = DXGI_FORMAT_R8_UINT;
+                view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                view.Texture2DArray = {0, index, 1, 0};
+                const auto target = resources.targets.Cpu(index);
+                device->CreateRenderTargetView(resources.stencil_planes.Get(), &view, target);
                 commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
             }
             commands->DrawInstanced(3, 1, 0, 0);

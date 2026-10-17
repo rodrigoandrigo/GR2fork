@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -79,6 +80,63 @@ void AddSemanticMember(std::string& source, std::string_view structure,
         throw std::runtime_error("Missing HLSL stage interface structure");
     source.insert(end, std::string(declaration) + "\n");
 }
+void AlignSemanticRows(std::string& source, std::string_view structure) {
+    const auto begin = source.find("struct " + std::string(structure));
+    if (begin == std::string::npos)
+        return;
+    const auto brace = source.find('{', begin);
+    const auto end = source.find("};", brace);
+    if (brace == std::string::npos || end == std::string::npos)
+        throw std::runtime_error("Invalid HLSL stage interface structure");
+    std::map<u32, std::string> slots;
+    std::vector<std::string> others;
+    u32 span{};
+    for (size_t start = brace + 1; start < end;) {
+        const auto stop = source.find(";\n", start);
+        if (stop == std::string::npos || stop >= end)
+            break;
+        const auto member = source.substr(start, stop - start);
+        const auto colon = member.rfind(" : ");
+        if (colon != std::string::npos &&
+            member.compare(colon + 3, std::char_traits<char>::length("TEXCOORD"), "TEXCOORD") ==
+                0) {
+            const auto digits =
+                member.substr(colon + 3 + std::char_traits<char>::length("TEXCOORD"));
+            u32 index = 0;
+            bool valid = !digits.empty();
+            for (const char character : digits) {
+                if (!std::isdigit(static_cast<unsigned char>(character))) {
+                    valid = false;
+                    break;
+                }
+                index = index * 10 + u32(character - '0');
+            }
+            if (!valid || index >= 32)
+                throw std::runtime_error("Invalid HLSL stage texcoord semantic index");
+            if (const auto [iter, inserted] = slots.try_emplace(index, member); !inserted)
+                throw std::runtime_error("Duplicate HLSL stage texcoord semantic index");
+            span = std::max(span, index + 1);
+        } else {
+            others.push_back(member);
+        }
+        start = stop + 2;
+    }
+    if (!span)
+        return;
+    std::string body;
+    for (u32 index = 0; index < span; ++index) {
+        if (const auto found = slots.find(index); found != slots.end()) {
+            body += found->second + ";\n";
+        } else {
+            body += "    float4 shadRow" + std::to_string(index) + " : TEXCOORD" +
+                    std::to_string(index) + ";\n";
+        }
+    }
+    for (const auto& member : others) {
+        body += member + ";\n";
+    }
+    source.replace(brace + 2, end - brace - 2, body);
+}
 void ApplySampleMasks(std::string& source, bool sample_shading) {
     auto entry = source.find(" main(");
     if (entry == std::string::npos)
@@ -149,6 +207,47 @@ void ApplySampleMasks(std::string& source, bool sample_shading) {
         source += "ShadMsaaOutput output;\n";
     source += "output." + coverage + "\nreturn output;\n}\n";
 }
+void ApplyDepthBounds(std::string& source) {
+    auto entry = source.find(" main(");
+    if (entry == std::string::npos)
+        throw std::runtime_error("Missing HLSL fragment entry point");
+    const auto close = source.find(')', entry);
+    if (close == std::string::npos)
+        throw std::runtime_error("Invalid HLSL fragment entry point");
+    std::string position;
+    if (source.find("struct SPIRV_Cross_Input") != std::string::npos) {
+        const auto member = SemanticMember(source, "SPIRV_Cross_Input", "SV_Position");
+        if (!member.empty())
+            position = "input." + member;
+    }
+    if (position.empty()) {
+        const auto semantic = source.find(": SV_Position", entry);
+        if (semantic != std::string::npos && semantic < close) {
+            size_t last = semantic;
+            while (last > entry && std::isspace(static_cast<unsigned char>(source[last - 1])))
+                --last;
+            size_t first = last;
+            while (first > entry && (std::isalnum(static_cast<unsigned char>(source[first - 1])) ||
+                                     source[first - 1] == '_'))
+                --first;
+            if (first != last)
+                position = source.substr(first, last - first);
+        }
+    }
+    if (position.empty()) {
+        position = "shadDepthPosition";
+        source.insert(close, "float4 shadDepthPosition : SV_Position");
+    }
+    const auto bol = source.rfind('\n', entry);
+    source.insert(bol == std::string::npos ? 0 : bol + 1,
+                  "cbuffer ShadDepthBounds : register(b4, space0) { float2 shadDepthBounds; };\n");
+    const auto reopened = source.find(" main(");
+    const auto body = source.find('{', source.find(')', reopened));
+    if (body == std::string::npos)
+        throw std::runtime_error("Invalid HLSL fragment entry point");
+    source.insert(body + 1, "\nif (" + position + ".z < shadDepthBounds.x || " + position +
+                                ".z > shadDepthBounds.y) discard;\n");
+}
 const wchar_t* Target(Shader::SwStage stage) {
     switch (stage) {
     case Shader::SwStage::Vertex:
@@ -206,14 +305,15 @@ void ShaderCache::Initialize(ID3D12Device* device) {
     profile.max_viewport_height = D3D12_VIEWPORT_BOUNDS_MAX;
     profile.max_shared_memory_size = D3D12_CS_TGSM_REGISTER_COUNT * sizeof(u32);
     profile.support_int64 = options.Int64ShaderOps;
+    profile.supports_shader_stencil_export = true;
     profile.needs_buffer_offsets = true;
 }
 CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                                     Shader::Backend::Bindings bindings, bool flip_y,
                                     bool sample_mask, bool sample_shading,
-                                    const TessellationLink* tessellation) {
+                                    const TessellationLink* tessellation, bool depth_bounds) {
     auto prepared = Prepare(params, runtime, bindings);
-    return Finalize(prepared, flip_y, sample_mask, sample_shading, tessellation);
+    return Finalize(prepared, flip_y, sample_mask, sample_shading, tessellation, {}, depth_bounds);
 }
 PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                                     Shader::Backend::Bindings bindings) {
@@ -237,7 +337,7 @@ PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::Runtime
 }
 CompiledShader ShaderCache::Finalize(PreparedShader& prepared, bool flip_y, bool sample_mask,
                                      bool sample_shading, const TessellationLink* tessellation,
-                                     std::span<const u32> peer) {
+                                     std::span<const u32> peer, bool depth_bounds) {
     auto& result = prepared.shader;
     const auto& words = prepared.words;
     const auto& runtime = result.runtime;
@@ -248,12 +348,13 @@ CompiledShader ShaderCache::Finalize(PreparedShader& prepared, bool flip_y, bool
             link->output_control_points = result.runtime.sw.tcs.NumOutputControlPoints();
     }
     result.binary = CompileSpirv(words, runtime.sw_stage, flip_y, sample_mask, sample_shading,
-                                 link ? &*link : nullptr, peer);
+                                 link ? &*link : nullptr, peer, depth_bounds);
     return std::move(result);
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     std::span<const u32> words, Shader::SwStage stage, bool flip_y, bool sample_mask,
-    bool sample_shading, const TessellationLink* tessellation_link, std::span<const u32> peer) {
+    bool sample_shading, const TessellationLink* tessellation_link, std::span<const u32> peer,
+    bool depth_bounds) {
     if (words.size() < 5 || words.size() > 4 * 1024 * 1024 || words[0] != spv::MagicNumber)
         throw std::runtime_error("Invalid guest SPIR-V module");
     bool subgroup{};
@@ -298,7 +399,8 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
             "D3D12 cross-lane graphics operations require a fixed wave64 device; "
             "variable-width graphics waves require compute emulation");
     std::vector<u32> key{static_cast<u32>(stage), static_cast<u32>(flip_y),
-                         static_cast<u32>(sample_mask), static_cast<u32>(sample_shading)};
+                         static_cast<u32>(sample_mask), static_cast<u32>(sample_shading),
+                         static_cast<u32>(depth_bounds)};
     if (tessellation_link) {
         key.insert(key.end(), {static_cast<u32>(tessellation_link->type),
                                static_cast<u32>(tessellation_link->partitioning),
@@ -392,10 +494,19 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
         CompileNativeSpirv(words, *result, stage, flip_y, tessellation_link, peer);
     else
         result->hlsl = cross.compile();
+    if (!native_spirv) {
+        AlignSemanticRows(result->hlsl, "SPIRV_Cross_Input");
+        AlignSemanticRows(result->hlsl, "SPIRV_Cross_Output");
+    }
     if (sample_mask || sample_shading) {
         if (stage != Shader::SwStage::Fragment)
             throw std::runtime_error("Sample masks require a fragment shader");
         ApplySampleMasks(result->hlsl, sample_shading);
+    }
+    if (depth_bounds) {
+        if (stage != Shader::SwStage::Fragment)
+            throw std::runtime_error("Depth bounds require a fragment shader");
+        ApplyDepthBounds(result->hlsl);
     }
     if (stage == Shader::SwStage::Compute) {
         const auto entry = result->hlsl.find("[numthreads(");
@@ -635,5 +746,32 @@ void ShaderCache::CompileHlsl(ShaderBinary& result, Shader::SwStage stage) {
     winrt::check_hresult(compiled->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&binary), nullptr));
     const auto* bytes = static_cast<const u8*>(binary->GetBufferPointer());
     result.dxil.assign(bytes, bytes + binary->GetBufferSize());
+}
+
+std::shared_ptr<const ShaderBinary> ShaderCache::CompileHlslRaw(
+    const std::string& hlsl, std::wstring_view target, std::span<const std::wstring> defines) {
+    std::vector<const wchar_t*> arguments{L"-E",  L"main", L"-T",   target.data(),
+                                          L"-HV", L"2021", L"-Gis", L"-O3"};
+    for (const auto& define : defines)
+        arguments.push_back(define.c_str());
+    const DxcBuffer source{hlsl.data(), hlsl.size(), DXC_CP_UTF8};
+    Microsoft::WRL::ComPtr<IDxcResult> compiled;
+    winrt::check_hresult(compiler->Compile(&source, arguments.data(),
+                                           static_cast<u32>(arguments.size()), nullptr,
+                                           IID_PPV_ARGS(&compiled)));
+    HRESULT status;
+    winrt::check_hresult(compiled->GetStatus(&status));
+    if (FAILED(status)) {
+        Microsoft::WRL::ComPtr<IDxcBlobUtf8> errors;
+        compiled->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+        throw std::runtime_error(errors ? errors->GetStringPointer()
+                                        : "Compute DXIL compilation failed");
+    }
+    Microsoft::WRL::ComPtr<IDxcBlob> binary;
+    winrt::check_hresult(compiled->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&binary), nullptr));
+    auto result = std::make_shared<ShaderBinary>();
+    const auto* bytes = static_cast<const u8*>(binary->GetBufferPointer());
+    result->dxil.assign(bytes, bytes + binary->GetBufferSize());
+    return result;
 }
 } // namespace D3D12

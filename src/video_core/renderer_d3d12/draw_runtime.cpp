@@ -4,17 +4,49 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <winrt/base.h>
 #include "d3d12_pipeline_cache.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/tessellation.h"
+#include "video_core/renderer_d3d12/primitive_conversion.h"
+#include "video_core/renderer_d3d12/profile.h"
 #include "video_core/renderer_d3d12/resource_bindings.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
 namespace D3D12 {
 namespace {
+Profile profile;
+bool IsIntegerTarget(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_R8_SINT:
+    case DXGI_FORMAT_R8G8_UINT:
+    case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R32G32B32_UINT:
+    case DXGI_FORMAT_R32G32B32_SINT:
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_SINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+        return true;
+    default:
+        return false;
+    }
+}
 std::vector<u8> PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3DBlob* root) {
     std::vector<u8> key{1};
     const auto integer = [&](u64 value) {
@@ -100,6 +132,9 @@ std::vector<u8> PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D
 }
 } // namespace
 void CommandRuntime::Draw(const DrawRequest& request) {
+    ProfileSample(profile, "runtime_draw", 128, [&] { DrawImpl(request); });
+}
+void CommandRuntime::DrawImpl(const DrawRequest& request) {
     std::scoped_lock lock{mutex};
     if (failed)
         throw std::runtime_error(
@@ -107,13 +142,16 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     if (!request.count || !request.instances)
         return;
     if (!std::has_single_bit(request.samples) || request.samples > 16 ||
-        request.colors.size() > 8 || request.depth.StencilEnable ||
-        (request.depth.DepthEnable && !request.depth_image) ||
+        request.colors.size() > 8 || request.color_slots.size() != request.colors.size() ||
+        request.color_base_slice.size() != request.colors.size() ||
+        ((request.depth.DepthEnable || request.depth.StencilEnable) && !request.depth_image) ||
+        (!request.depth.DepthEnable && !request.depth.StencilEnable && request.depth_image) ||
         request.vertex_runtime.sw_stage != Shader::SwStage::Vertex ||
         request.fragment_runtime.sw_stage != Shader::SwStage::Fragment ||
         (request.geometry && request.geometry_runtime.sw_stage != Shader::SwStage::Geometry) ||
         (!request.converted_indices.empty() && request.count != request.converted_indices.size()) ||
-        request.hull.has_value() != request.domain.has_value())
+        request.hull.has_value() != request.domain.has_value() ||
+        (request.depth_bounds && request.fragment.code.empty()))
         throw std::runtime_error("Invalid or unsupported D3D12 guest graphics state");
     Shader::Backend::Bindings next_bindings{};
     auto vertex_runtime = request.vertex_runtime;
@@ -145,8 +183,10 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         stages.push_back(&*hull);
         stages.push_back(&*domain);
     }
-    auto vertex = shaders.Compile(request.vertex, vertex_runtime, next_bindings,
-                                  !request.geometry && !request.domain && request.flip_y);
+    auto vertex = ProfileSample(profile, "pso_compile", 128, [&] {
+        return shaders.Compile(request.vertex, vertex_runtime, next_bindings,
+                               !request.geometry && !request.domain && request.flip_y);
+    });
     std::optional<CompiledShader> fragment;
     std::optional<CompiledShader> geometry;
     std::shared_ptr<const ShaderBinary> rectangle;
@@ -165,7 +205,8 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     }
     if (!request.fragment.code.empty()) {
         fragment.emplace(shaders.Compile(request.fragment, request.fragment_runtime, end_bindings,
-                                         false, request.samples > 1, request.sample_shading));
+                                         false, request.samples > 1, request.sample_shading,
+                                         nullptr, request.depth_bounds));
         stages.push_back(&*fragment);
     } else if (!request.colors.empty())
         throw std::runtime_error("D3D12 color rendering requires a fragment shader");
@@ -173,27 +214,52 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     resources.BeginBatch();
     images.BeginBatch();
 
-    std::vector<ImageCache::Image*> colors;
-    for (const auto& info : request.colors) {
+    std::array<ImageCache::Image*, 8> colors{};
+    u32 num_render_targets = 0;
+    VAddr jitter_address{};
+    for (u32 bound = 0; bound < request.colors.size(); ++bound) {
+        const auto& info = request.colors[bound];
+        const u32 slot = request.color_slots[bound];
+        if (slot >= 8 || bound >= request.color_base_slice.size())
+            throw std::runtime_error("Invalid D3D12 guest color slot mapping");
         if (info.num_samples != request.samples)
             throw std::runtime_error(
                 "Guest raster and color sample counts require unsupported EQAA");
         bindings.ValidateTargetRange(info.guest_address, info.guest_size);
-        colors.push_back(&images.GetImage(info, ConvertFormat(info.pixel_format),
-                                          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
+        colors[slot] = &images.GetImage(info, ConvertFormat(info.pixel_format),
+                                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                        request.color_base_slice[bound]);
+        num_render_targets = std::max(num_render_targets, slot + 1);
+        if (!jitter_address) {
+            jitter_address = info.guest_address;
+        }
     }
     ImageCache::Image* depth{};
     if (request.depth_image) {
         if (request.depth_image->num_samples != request.samples)
             throw std::runtime_error("Guest raster and depth sample counts do not match");
-        bindings.ValidateTargetRange(request.depth_image->guest_address,
-                                     request.depth_image->guest_size);
-        if (request.depth_read_address)
+        if (request.depth_image->guest_address) {
+            bindings.ValidateTargetRange(request.depth_image->guest_address,
+                                         request.depth_image->guest_size);
+        }
+        if (request.depth_read_address) {
             bindings.ValidateTargetRange(request.depth_read_address,
                                          request.depth_image->guest_size);
+        }
+        if (request.depth_image->stencil_addr) {
+            bindings.ValidateTargetRange(request.depth_image->stencil_addr,
+                                         request.depth_image->stencil_size);
+        }
+        if (request.stencil_read_address) {
+            bindings.ValidateTargetRange(request.stencil_read_address,
+                                         request.depth_image->stencil_size);
+        }
         depth =
             &images.GetImage(*request.depth_image, ConvertFormat(request.depth_image->pixel_format),
                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, request.depth_base_layer);
+        if (request.depth.StencilEnable && !depth->has_stencil) {
+            throw std::runtime_error("D3D12 stencil test requires stencil plane");
+        }
     }
     D3D12ResourceAllocator transient;
     transient.Initialize(device.Device(), 64ULL * 1024 * 1024);
@@ -264,16 +330,23 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     const bool indexed = request.index_address || !request.converted_indices.empty();
     if (!request.converted_indices.empty()) {
         const auto size = request.converted_indices.size() * sizeof(u32);
-        auto* buffer = upload_contents(
-            {reinterpret_cast<const u8*>(request.converted_indices.data()), size});
-        index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(size), DXGI_FORMAT_R32_UINT};
+        auto* buffer =
+            upload_contents({reinterpret_cast<const u8*>(request.converted_indices.data()), size});
+        index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(size),
+                      DXGI_FORMAT_R32_UINT};
     } else if (request.index_address) {
         if (request.index_format != DXGI_FORMAT_R16_UINT &&
             request.index_format != DXGI_FORMAT_R32_UINT)
             throw std::runtime_error("Invalid guest index format");
         const u64 size =
             u64(request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4);
-        auto* buffer = upload_input(request.index_address, size);
+        if (!size || size > 16ULL * 1024 * 1024 || request.index_address > UINT64_MAX - size)
+            throw std::runtime_error("Invalid D3D12 guest input buffer");
+        bindings.ValidateInputRange(request.index_address, size);
+        std::vector<u8> contents(size);
+        read(request.index_address, contents);
+        SwapIndexBytes(contents, request.index_swap);
+        auto* buffer = upload_contents(contents);
         index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(size),
                       request.index_format};
     }
@@ -287,6 +360,14 @@ void CommandRuntime::Draw(const DrawRequest& request) {
         masks.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         masks.Constants = {3, 0, 4};
         parameters.push_back(masks);
+    }
+    u32 bounds_slot = UINT32_MAX;
+    if (request.depth_bounds) {
+        D3D12_ROOT_PARAMETER bounds{};
+        bounds.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        bounds.Constants = {4, 0, 2};
+        bounds_slot = u32(parameters.size());
+        parameters.push_back(bounds);
     }
     const auto add_table = [&](const auto& ranges) {
         const u32 slot = parameters.size();
@@ -322,6 +403,7 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     else if (request.samples > 1)
         desc.PS = {images.MaskShader().data(), images.MaskShader().size()};
     desc.BlendState = request.blend;
+    desc.BlendState.AlphaToCoverageEnable = request.alpha_to_coverage;
     desc.RasterizerState = request.rasterizer;
     desc.DepthStencilState = request.depth;
     desc.SampleMask = UINT_MAX;
@@ -330,15 +412,44 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     desc.InputLayout = {elements.data(), static_cast<UINT>(elements.size())};
     desc.PrimitiveTopologyType = request.topology_type;
     desc.IBStripCutValue = request.strip_cut;
-    desc.NumRenderTargets = colors.size();
-    for (u32 i = 0; i < colors.size(); ++i)
-        desc.RTVFormats[i] = ConvertFormat(colors[i]->info.pixel_format);
-    desc.DSVFormat = depth ? ConvertFormat(depth->info.pixel_format) : DXGI_FORMAT_UNKNOWN;
+    desc.NumRenderTargets = num_render_targets;
+    for (u32 i = 0; i < num_render_targets; ++i) {
+        desc.RTVFormats[i] =
+            colors[i] ? ConvertFormat(colors[i]->info.pixel_format) : DXGI_FORMAT_UNKNOWN;
+        if (colors[i] && request.blend.RenderTarget[i].LogicOpEnable &&
+            !IsIntegerTarget(desc.RTVFormats[i])) {
+            throw std::runtime_error("D3D12 guest logic operation requires integer render target");
+        }
+    }
+    desc.DSVFormat =
+        depth ? (depth->has_stencil ? depth->dsv_format : ConvertFormat(depth->info.pixel_format))
+              : DXGI_FORMAT_UNKNOWN;
+    if (const char* dump = std::getenv("GAME_SHADER_DUMP"); dump) {
+        std::ofstream vs{std::string(dump) + "\\draw-vs.hlsl", std::ios::binary};
+        vs << vertex.binary->hlsl;
+        if (fragment) {
+            std::ofstream ps{std::string(dump) + "\\draw-ps.hlsl", std::ios::binary};
+            ps << fragment->binary->hlsl;
+        }
+        if (geometry) {
+            std::ofstream gs{std::string(dump) + "\\draw-gs.hlsl", std::ios::binary};
+            gs << geometry->binary->hlsl;
+        }
+        if (hull) {
+            std::ofstream hs{std::string(dump) + "\\draw-hull.hlsl", std::ios::binary};
+            hs << hull->binary->hlsl;
+            std::ofstream ds{std::string(dump) + "\\draw-domain.hlsl", std::ios::binary};
+            ds << domain->binary->hlsl;
+        }
+    }
     auto& cached =
         GetPipeline(PipelineKey(desc, blob.Get()), blob.Get(), [&](auto* root, auto** state) {
             desc.pRootSignature = root;
-            return device.Device()->CreateGraphicsPipelineState(
-                &desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(state));
+            const HRESULT created = ProfileSample(profile, "pso_create", 128, [&] {
+                return device.Device()->CreateGraphicsPipelineState(
+                    &desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(state));
+            });
+            return created;
         });
     auto& pipeline = cached.state;
     auto& root = cached.root;
@@ -350,13 +461,17 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), pipeline.Get()));
     RecordingGuard recording{failed};
-    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> color_views{};
-    for (u32 i = 0; i < colors.size(); ++i) {
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> color_handles{};
+    for (u32 i = 0; i < num_render_targets; ++i) {
+        if (!colors[i]) {
+            continue;
+        }
         colors[i]->sample_positions = request.sample_positions;
-        images.Upload(*colors[i], commands.Get());
+        ProfileSample(profile, "color_upload", 128,
+                      [&] { images.Upload(*colors[i], commands.Get()); });
         images.Barrier(*colors[i], commands.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
         colors[i]->written = true;
-        color_views[i] = rtv.Cpu(i);
+        color_handles[i] = rtv.Cpu(i);
         D3D12_RENDER_TARGET_VIEW_DESC view{};
         view.Format = desc.RTVFormats[i];
         if (request.samples > 1) {
@@ -366,17 +481,29 @@ void CommandRuntime::Draw(const DrawRequest& request) {
             view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
             view.Texture2DArray = {0, 0, colors[i]->native_layers, 0};
         }
-        device.Device()->CreateRenderTargetView(colors[i]->Native(), &view, color_views[i]);
+        device.Device()->CreateRenderTargetView(colors[i]->Native(), &view, color_handles[i]);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE depth_view{};
     if (depth) {
         depth->sample_positions = request.sample_positions;
-        images.Upload(*depth, commands.Get(), request.depth_read_address);
+        images.Upload(*depth, commands.Get(), request.depth_read_address,
+                      request.stencil_read_address);
         images.Barrier(*depth, commands.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        depth->written = request.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+        const bool clear_depth = request.clear_depth && depth->has_depth;
+        const bool clear_stencil = request.clear_stencil && depth->has_stencil;
+        if (clear_depth && (request.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH)) {
+            throw std::runtime_error("D3D12 guest depth clear with read-only view");
+        }
+        if (clear_stencil && (request.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL)) {
+            throw std::runtime_error("D3D12 guest stencil clear with read-only view");
+        }
+        depth->written = request.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL || clear_depth;
+        depth->stencil_written =
+            (request.depth.StencilEnable && request.depth.StencilWriteMask != 0) || clear_stencil;
         depth_view = dsv.Cpu(0);
         D3D12_DEPTH_STENCIL_VIEW_DESC view{};
         view.Format = desc.DSVFormat;
+        view.Flags = request.dsv_flags;
         if (request.samples > 1) {
             view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
             view.Texture2DMSArray = {0, depth->native_layers};
@@ -385,6 +512,13 @@ void CommandRuntime::Draw(const DrawRequest& request) {
             view.Texture2DArray = {0, 0, depth->native_layers};
         }
         device.Device()->CreateDepthStencilView(depth->Native(), &view, depth_view);
+        if (clear_depth || clear_stencil) {
+            const D3D12_CLEAR_FLAGS flags =
+                (clear_depth ? D3D12_CLEAR_FLAG_DEPTH : D3D12_CLEAR_FLAGS(0)) |
+                (clear_stencil ? D3D12_CLEAR_FLAG_STENCIL : D3D12_CLEAR_FLAGS(0));
+            commands->ClearDepthStencilView(depth_view, flags, request.depth_clear,
+                                            static_cast<UINT8>(request.stencil_clear), 0, nullptr);
+        }
     }
     Shader::PushData push = request.push;
     bindings.Upload(commands.Get(), push, request.clip_planes, request.border_colors, read, gds);
@@ -401,16 +535,22 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     if (request.samples > 1)
         commands->SetGraphicsRoot32BitConstants(2, request.sample_masks.size(),
                                                 request.sample_masks.data(), 0);
+    if (request.depth_bounds) {
+        const std::array<u32, 2> bounds{std::bit_cast<u32>(request.bounds_min),
+                                        std::bit_cast<u32>(request.bounds_max)};
+        commands->SetGraphicsRoot32BitConstants(bounds_slot, bounds.size(), bounds.data(), 0);
+    }
     bindings.Bind(commands.Get(), true, resource_slot, sampler_slot);
     commands->IASetPrimitiveTopology(request.topology);
     commands->IASetVertexBuffers(0, vertices.size(), vertices.data());
-    const auto viewport = NativeTemporalJitter().Apply(
-        request.colors.empty() ? 0 : request.colors.front().guest_address, request.viewport);
+    const auto viewport = NativeTemporalJitter().Apply(jitter_address, request.viewport);
     commands->RSSetViewports(1, &viewport);
     commands->RSSetScissorRects(1, &request.scissor);
-    commands->OMSetRenderTargets(colors.size(), color_views.data(), FALSE,
+    commands->OMSetRenderTargets(num_render_targets,
+                                 num_render_targets ? color_handles.data() : nullptr, FALSE,
                                  depth ? &depth_view : nullptr);
     commands->OMSetBlendFactor(request.blend_factor.data());
+    commands->OMSetStencilRef(request.stencil_ref);
     if (indexed) {
         commands->IASetIndexBuffer(&index_view);
         commands->DrawIndexedInstanced(request.count, request.instances, 0, request.base_vertex,
@@ -421,7 +561,17 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     resources.PrepareDownload(commands.Get());
     images.PrepareDownloads(commands.Get());
     winrt::check_hresult(commands->Close());
-    device.Wait(device.Submit(commands.Get()));
+    if (profile.enabled) {
+        const auto wait_start = std::chrono::steady_clock::now();
+        device.Wait(device.Submit(commands.Get()));
+        const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - wait_start)
+                                .count();
+        if (waited > 3000)
+            std::fprintf(stderr, "WAIT_SLOW %llu us\n", static_cast<unsigned long long>(waited));
+    } else {
+        device.Wait(device.Submit(commands.Get()));
+    }
     resources.CommitDownloads();
     bindings.CommitGds(gds);
     images.CommitDownloads();

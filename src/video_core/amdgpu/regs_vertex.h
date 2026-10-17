@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bit>
 #include "common/assert.h"
 #include "common/types.h"
 

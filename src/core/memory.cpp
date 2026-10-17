@@ -3,6 +3,8 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <thread>
 
 #include <shared_mutex>
@@ -146,6 +148,8 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
+    const auto measured = getenv("GAME_PROFILE") != nullptr;
+    const auto start = std::chrono::steady_clock::now();
     const auto& backing_pages = impl.BackingPages();
     while (size) {
         const u64 page = virtual_addr >> 14;
@@ -159,6 +163,15 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
         size -= copy_size;
         virtual_addr += copy_size;
         dest += copy_size;
+    }
+    if (measured) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+        if (elapsed > 5000)
+            std::fprintf(stderr, "SPARSE_SLOW %llu bytes %llu us\n",
+                         static_cast<unsigned long long>(size),
+                         static_cast<unsigned long long>(elapsed));
     }
 }
 

@@ -44,7 +44,7 @@ std::mutex api_mutex;
 std::string last_error;
 std::shared_ptr<Core::Uwp::DozenHost> presentation;
 std::shared_ptr<Core::Uwp::NativeHost> native_presentation;
-std::atomic<uint32_t> graphics_backend{SHADPS4_GRAPHICS_VULKAN_DOZEN};
+std::atomic<uint32_t> graphics_backend{SHADPS4_GRAPHICS_D3D12_NATIVE};
 std::mutex presentation_mutex;
 void* panel{};
 ShadPS4ErrorCallback error_callback{};

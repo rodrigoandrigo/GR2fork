@@ -578,7 +578,12 @@ s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
 }
 
 s64 PS4_SYSV_ABI posix_read(s32 fd, void* buf, u64 nbytes) {
-    return read(fd, buf, nbytes);
+    const s64 result = read(fd, buf, nbytes);
+    static const bool trace_io = getenv("GAME_FS_TRACE") != nullptr;
+    if (trace_io) {
+        LOG_INFO(Kernel_Fs, "read fd={} bytes={} -> {}", fd, nbytes, result);
+    }
+    return result;
 }
 
 s64 PS4_SYSV_ABI sceKernelRead(s32 fd, void* buf, u64 nbytes) {
@@ -1349,6 +1354,11 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
         *__Error() = POSIX_EBADF;
         return -1;
     }
+    static const bool trace_io = getenv("GAME_FS_TRACE") != nullptr;
+    if (trace_io) {
+        LOG_INFO(Kernel_Fs, "preadv fd={} file={} iov={} offset={} len={}", fd, file->m_guest_name,
+                 iovcnt, offset, iovcnt > 0 ? iov[0].iov_len : 0);
+    }
 
     std::scoped_lock lk{file->m_mutex};
     if (file->type == Core::FileSys::FileType::Device) {
@@ -1383,6 +1393,9 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
     s64 total_read = 0;
     for (s32 i = 0; i < iovcnt; i++) {
         total_read += ReadFile(file, iov[i].iov_base, iov[i].iov_len);
+    }
+    if (trace_io) {
+        LOG_INFO(Kernel_Fs, "preadv -> {} total={}", total_read, file->m_guest_name);
     }
     return total_read;
 }

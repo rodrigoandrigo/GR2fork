@@ -48,19 +48,24 @@ public:
                            Shader::Backend::Bindings bindings);
     CompiledShader Finalize(PreparedShader& shader, bool flip_y, bool sample_mask,
                             bool sample_shading, const TessellationLink* tessellation,
-                            std::span<const u32> peer = {});
+                            std::span<const u32> peer = {}, bool depth_bounds = false);
     CompiledShader Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                            Shader::Backend::Bindings bindings = {}, bool flip_y = false,
                            bool sample_mask = false, bool sample_shading = false,
-                           const TessellationLink* tessellation = nullptr);
+                           const TessellationLink* tessellation = nullptr,
+                           bool depth_bounds = false);
     std::shared_ptr<const ShaderBinary> CompileSpirv(std::span<const u32> words,
                                                      Shader::SwStage stage, bool flip_y = false,
                                                      bool sample_mask = false,
                                                      bool sample_shading = false,
                                                      const TessellationLink* tessellation = nullptr,
-                                                     std::span<const u32> peer = {});
+                                                     std::span<const u32> peer = {},
+                                                     bool depth_bounds = false);
     std::shared_ptr<const ShaderBinary> CompileRectangle(
         const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment);
+    std::shared_ptr<const ShaderBinary> CompileHlslRaw(const std::string& hlsl,
+                                                       std::wstring_view target,
+                                                       std::span<const std::wstring> defines);
     const Shader::Profile& Profile() const {
         return profile;
     }
@@ -74,8 +79,7 @@ private:
     size_t cache_bytes{};
     bool fixed_graphics_wave64{};
     void CompileHlsl(ShaderBinary& binary, Shader::SwStage stage);
-    void CompileNativeSpirv(std::span<const u32> words, ShaderBinary& binary,
-                            Shader::SwStage stage, bool flip_y, const TessellationLink* link,
-                            std::span<const u32> peer);
+    void CompileNativeSpirv(std::span<const u32> words, ShaderBinary& binary, Shader::SwStage stage,
+                            bool flip_y, const TessellationLink* link, std::span<const u32> peer);
 };
 } // namespace D3D12

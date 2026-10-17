@@ -11,6 +11,7 @@
 #include "d3d12_resource_allocator.h"
 #include "uwp/shadps4_api.h"
 #include "video_core/presentation_sink.h"
+#include "video_core/renderer_d3d12/profile.h"
 
 namespace Core::Uwp {
 class D3D12Presenter final : public VideoCore::PresentationSink {
@@ -50,6 +51,7 @@ private:
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> commands_allocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commands;
+    D3D12::Profile presenter_profile;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> buffers;
     uint32_t width{};
     uint32_t height{};

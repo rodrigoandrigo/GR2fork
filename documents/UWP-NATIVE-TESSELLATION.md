@@ -61,7 +61,8 @@ Permanecem rejeitados: partitioning Pow2, topologia de linhas de tessellation
 fora de isolines, wireframe de rects/quads/polygon, polygon mode point,
 geometry on-chip, stream output e conversoes adicionais de clip/depth no GS.
 Interfaces e recursos complexos de shaders guest ainda precisam de cobertura
-de runtime. O backend continua experimental e a selecao padrao permanece Dozen.
+de runtime. O backend continua experimental. D3D12 nativo e o padrao quando
+nao ha preferencia salva; uma escolha explicita de Dozen continua respeitada.
 
 ## Build e pacote
 
@@ -86,3 +87,18 @@ terminou durante o carregamento, com dois frames; a janela maior confirmou
 o progresso. Esse resultado valida o caminho padrao no probe desktop,
 nao o gameplay nativo D3D12 nem o AppContainer/Xbox. A comparacao em hardware
 PS4 com homebrew OpenOrbis continua pendente.
+
+## Selecao no frontend
+
+Em Configuracoes, Backend grafico permite escolher D3D12 nativo. A alteracao
+salva a preferencia, recarrega o nucleo e remonta a biblioteca antes de liberar
+Iniciar jogo, sem exigir reiniciar o aplicativo. A troca e bloqueada durante
+uma sessao. Voltar para Dozen restaura explicitamente o backend na recarga.
+
+`Build/native-backend-settings-package.log` registra build e assinatura;
+`Build/native-backend-settings-package-verification.log` registra os hashes
+do pacote. No probe desktop com D3D12 nativo, Pac-Man 256 chegou a tela inicial
+em `Build/native-backend-settings-game.log`: `BOOT_RESULT=0`, `SHUTDOWN=0`,
+`PROCESS_EXIT_CODE=0`. A captura apresenta artefatos no texto e o debug layer
+registra avisos de sampler. Esse boot nao comprova renderizacao correta,
+desempenho, uso do seletor no AppContainer ou funcionamento no Xbox.

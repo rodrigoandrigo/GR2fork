@@ -153,3 +153,56 @@ Build/bgra-srv-game-final.log registra boot nativo real com debug D3D12.
 Build/bgra-srv-package.log e Build/bgra-srv-package-verification.log registram
 build, assinatura e hashes do pacote final. A operacao ilegal registrada foi
 corrigida; a confirmacao em hardware Xbox continua pendente.
+
+## Imagem compactada de 16 bits e uso opcional de storage
+
+O log seguinte falhou em B4G4R4A4UnormPack16, 640x539, usage 0x1f,
+com apenas 1478262784 bytes usados pelo app. Nao era esgotamento dos 5 GiB.
+Sem RelaxedFormatCastingSupported, o D3D12 retorna tamanho de recurso invalido
+para essa imagem com ALLOW_UNORDERED_ACCESS. Sem storage ela aloca normalmente.
+
+O core UWP agora acrescenta storage opcional a imagens de cor nao comprimidas
+somente quando o formato suporta storage. A consulta EXTENDED_USAGE do Dozen
+so consulta outra familia DXGI quando ha RelaxedFormatCastingSupported;
+sem esse recurso, exige a mesma familia typeless. Assim nao anuncia UAV para
+uma familia que o recurso D3D12 nao permite acessar dessa forma.
+
+Build/packed-image-after.log verifica alocacao e bind da imagem com casting
+restrito e rejeicao de storage incompatível pela consulta de formato.
+Build/packed-image-package-final.log registra o pacote reconstruido.
+A validacao nativa no PC nao substitui a confirmacao no Xbox.
+
+## Detiler Thin1DThin de 8/16 bits
+
+O log de 15/10/2026 registra falha de CreateComputePipelineState (0x80070057)
+no detiler Thin1DThin_16. O shader usava arrays de uint8_t/uint16_t nos SSBOs.
+Agora as variantes de 8/16 bits leem palavras de 32 bits e extraem o pixel;
+as escritas usam atomicAnd/atomicOr com mascaras disjuntas, preservando pixels
+vizinhos escritos por outras invocacoes. Os enderecos e o layout guest permanecem
+iguais. Nao ha selecao por jogo ou shader guest.
+
+Build/packed-detiler-capabilities.log confirma apenas Shader nos capabilities
+SPIR-V, sem Int8/Int16 ou armazenamento estreito. Build/packed-detiler-readback.log
+registra roundtrip na GPU para micro/macro 8,16,32,64,128 e micro 96 bits;
+macro 96 verifica somente criacao de pipeline, pois o probe nao tem uma
+configuracao macro valida para esse tamanho.
+
+O frontend tambem registrou ErrorInitializationFailed na swapchain, sem HRESULT.
+O WSI agora registra o HRESULT separadamente na criacao, QueryInterface e
+anexacao UWP, liberando a interface temporaria mesmo quando QueryInterface falha.
+Nao ha evidencia suficiente nesse log para afirmar a causa da falha da swapchain.
+
+## BC1 com mipmaps no Xbox
+
+O novo log chega ao carregamento de texturas BC1 de 32x32 com seis mipmaps.
+A alocacao falhava com storage opcional apesar de a consulta de formato rejeitar
+esse uso. A verificacao de storage no core UWP passa a cobrir imagens comprimidas,
+preservando a politica desktop. No Dozen, os flags auxiliares de render target/UAV
+para TRANSFER_DST sao escolhidos pelas capacidades do formato original, sem
+EXTENDED_USAGE: capacidades de uma view de outra familia nao autorizam esses
+flags no recurso comprimido nativo.
+
+Build/bc-image-probe.log registra consulta, alocacao e bind da imagem exata do
+log, tanto no driver normal quanto com RelaxedFormatCastingSupported desativado.
+No modo restrito, storage e rejeitado pela consulta e a imagem sem esse uso
+aloca 65536 bytes. Build/bc-image-package.log registra o pacote assinado.

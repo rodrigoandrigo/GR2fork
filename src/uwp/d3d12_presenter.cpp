@@ -10,6 +10,7 @@
 #include <winrt/base.h>
 #include "core/memory.h"
 #include "uwp/session.h"
+#include "video_core/renderer_d3d12/profile.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/texture_cache/cpu_tiling.h"
 
@@ -234,7 +235,7 @@ void D3D12Presenter::GetBuffers() {
 
 void D3D12Presenter::Render() {
     std::scoped_lock lock{mutex};
-    RenderFrame();
+    ProfileSample(presenter_profile, "presenter_render", 128, [&] { RenderFrame(); });
 }
 void D3D12Presenter::RenderFrame() {
     if (last_frame && last_frame->width && last_frame->height)

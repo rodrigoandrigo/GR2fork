@@ -1,6 +1,7 @@
 #include "video_core/renderer_d3d12/resource_bindings.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <stdexcept>
 #include <winrt/base.h>
@@ -384,9 +385,17 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                                            : array  ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY
                                                     : D3D12_SRV_DIMENSION_TEXTURE2D;
                 const auto mapping = sharp.DstSelect();
+                std::array<UINT, 4> components{Component(mapping.r), Component(mapping.g),
+                                               Component(mapping.b), Component(mapping.a)};
+                if (format == DXGI_FORMAT_B4G4R4A4_UNORM) {
+                    constexpr UINT remap[]{1, 0, 3, 2};
+                    for (auto& component : components) {
+                        if (component < 4)
+                            component = remap[component];
+                    }
+                }
                 descriptor.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
-                    Component(mapping.r), Component(mapping.g), Component(mapping.b),
-                    Component(mapping.a));
+                    components[0], components[1], components[2], components[3]);
                 if (multisampled && array)
                     descriptor.Texture2DMSArray = {sharp.base_array,
                                                    sharp.NumViewLayers(resource.is_array)};

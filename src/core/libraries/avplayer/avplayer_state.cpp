@@ -312,10 +312,14 @@ bool AvPlayerState::GetVideoData(AvPlayerFrameInfoEx& video_info) {
 
 bool AvPlayerState::GetAudioData(AvPlayerFrameInfo& audio_info) {
     std::shared_lock lock(m_source_mutex);
-    if (m_up_source == nullptr) {
-        return false;
+    const bool result = m_up_source != nullptr && m_up_source->GetAudioData(audio_info);
+    static const bool trace_av = getenv("GAME_AUDIO_TRACE") != nullptr;
+    if (trace_av) {
+        LOG_INFO(Lib_AvPlayer, "GetAudioData -> {} rate={} channels={} size={} ts={}", result,
+                 audio_info.details.audio.sample_rate, audio_info.details.audio.channel_count,
+                 audio_info.details.audio.size, audio_info.timestamp);
     }
-    return m_up_source->GetAudioData(audio_info);
+    return result;
 }
 
 bool AvPlayerState::IsActive() {

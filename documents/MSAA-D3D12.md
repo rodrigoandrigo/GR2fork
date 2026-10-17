@@ -72,11 +72,19 @@ Readbacks sem debug não haviam detectado a incompatibilidade dos descritores.
 ## Limites
 
 MSAA comprimido com FMASK/CMASK/HTILE, EQAA com quantidades diferentes de
-samples/fragments, alpha-to-mask, frequência parcial de shading e stencil
-ainda não estão implementados. Essas configurações são rejeitadas no caminho
-correspondente. Resolve de profundidade e formatos sem suporte nativo a resolve
-não são anunciados como implementados. A contagem 16× tem checagem de capacidade,
-mas não foi executada na validação de GPU deste ambiente.
+samples/fragments e frequência parcial de shading ainda não estão
+implementados. Essas configurações são rejeitadas no caminho correspondente.
+Depth/stencil MSAA sem compressão está implementado com transfers por plano e
+coberto por `Build/native-stencil-msaa-validation.log`; alpha-to-mask usa
+`AlphaToCoverageEnable`. O stencil MSAA é lido no canal G (`.y`) do typeless
+R32G8X24; cada plano possui heap de descritores shader-visible próprio, pois
+draws da mesma lista enxergam o último conteúdo do heap. Logic ops exigem
+render target inteiro: neste PC, criar PSO com XOR em UNORM derruba o
+processo, então formatos não inteiros são rejeitados com erro explícito.
+Resolve de profundidade e formatos sem suporte nativo a resolve não são
+anunciados como implementados. A contagem 8× foi validada em roundtrip
+depth/stencil; 16× tem checagem de capacidade e é pulada quando o dispositivo
+não anuncia quality levels para D32FS8, como neste ambiente.
 
 A fonte [OpenOrbis de leitura MSAA](hardware/msaa/main.cpp) permite comparar
 samples, arrays, wrap e microtiling em PS4. Não foi compilada ou executada por

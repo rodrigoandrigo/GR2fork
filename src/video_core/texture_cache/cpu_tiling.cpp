@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstring>
 #include <stdexcept>
+#include <fmt/format.h>
 #include "video_core/texture_cache/cpu_tiling.h"
 #include "video_core/texture_cache/tile.h"
 namespace VideoCore {
@@ -408,7 +409,16 @@ void Convert(std::span<const u8> source, std::span<u8> destination, const ImageI
                                              std::min(address.MICRO_TILE_THICKNESS, 4u), sample));
             const u64 from = encode ? linear : tiled, to = encode ? tiled : linear;
             if (from + block > source.size() || to + block > destination.size())
-                throw std::runtime_error("Guest tiled image exceeds backing range");
+                throw std::runtime_error(fmt::format(
+                    "Guest tiled image exceeds backing range: {}x{} pitch={} height={} "
+                    "levels={} layers={} samples={} bits={} tile={} array={} guest={} mip={} "
+                    "texel={} x={} y={} plane={} sample={} slice={} tiled={} linear={} "
+                    "source={} destination={} encode={}",
+                    info.size.width, info.size.height, info.pitch, layout.height,
+                    info.resources.levels, info.resources.layers, info.num_samples, Bits,
+                    u64(info.tile_mode), u64(info.array_mode), info.guest_size, mip, texel, x, y,
+                    plane, sample, slice, tiled, linear, source.size(), destination.size(),
+                    encode));
             std::memcpy(destination.data() + to, source.data() + from, block);
             linear += block;
         }

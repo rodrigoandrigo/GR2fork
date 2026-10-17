@@ -8,6 +8,27 @@
 #include "video_core/amdgpu/regs_vertex.h"
 
 namespace D3D12 {
+inline void SwapIndexBytes(std::span<u8> bytes, AmdGpu::IndexSwapMode swap) {
+    using S = AmdGpu::IndexSwapMode;
+    if (swap == S::None) {
+        return;
+    }
+    const u64 unit = swap == S::Swap16 ? 2 : 4;
+    if (bytes.size() % unit) {
+        throw std::runtime_error("Guest swapped index range is not a multiple of swap unit");
+    }
+    for (u64 base = 0; base < bytes.size(); base += unit) {
+        if (swap == S::Swap16) {
+            std::swap(bytes[base], bytes[base + 1]);
+        } else if (swap == S::Swap32) {
+            std::swap(bytes[base], bytes[base + 3]);
+            std::swap(bytes[base + 1], bytes[base + 2]);
+        } else {
+            std::swap(bytes[base], bytes[base + 2]);
+            std::swap(bytes[base + 1], bytes[base + 3]);
+        }
+    }
+}
 inline std::vector<u32> ConvertPrimitiveIndices(AmdGpu::PrimitiveType primitive,
                                                 std::span<const u32> input,
                                                 std::optional<u32> restart = {}) {
