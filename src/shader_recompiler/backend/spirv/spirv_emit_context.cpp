@@ -818,7 +818,8 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     Decorate(id, spv::Decoration::DescriptorSet, 0U);
     if (!is_written) {
         Decorate(id, spv::Decoration::NonWritable);
-    } else if (is_coherent) {
+    }
+    if (is_coherent) {
         // The guest V# MTYPE marks this buffer as shared between invocations;
         // Coherent forbids caching its accesses in registers across barriers.
         Decorate(id, spv::Decoration::Coherent);
@@ -832,6 +833,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
         break;
     case BufferType::ClipPlanes:
         Name(id, "clip_planes");
+        break;
+    case BufferType::Strmout:
+        Name(id, fmt::format("strmout_buffer{}", strmout_buffers.size()));
         break;
     case BufferType::BdaPagetable:
         Name(id, "bda_pagetable");
@@ -855,8 +859,8 @@ void EmitContext::DefineBuffers() {
         const auto buf_sharp = desc.GetSharp(info);
         // MTYPE class 3 marks guest buffers shared between invocations; shared
         // memory lowered to a storage buffer needs the same guarantee.
-        const bool is_coherent =
-            desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 3;
+        const bool is_coherent = desc.is_coherent || desc.buffer_type == BufferType::SharedMemory ||
+                                 buf_sharp.mtype == 3;
 
         // Set indexes for special buffers.
         if (desc.buffer_type == BufferType::Flatbuf) {
@@ -869,11 +873,25 @@ void EmitContext::DefineBuffers() {
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
+        if (desc.buffer_type == BufferType::Strmout) {
+            if (True(desc.used_types & IR::Type::U32)) {
+                spv_buffer.Alias(PointerType::U32) =
+                    DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
+            }
+            strmout_buffers.push_back(u32(buffers.size() - 1));
+            if (!Sirit::ValidId(strmout_vertex)) {
+                strmout_vertex = DefineVar(U32[1], spv::StorageClass::Private, ConstU32(0u));
+            }
+            ++binding.unified;
+            continue;
+        }
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);
         }
-        if (True(desc.used_types & IR::Type::U32)) {
+        if (True(desc.used_types & IR::Type::U32) ||
+            (profile.needs_subword_buffer_emulation &&
+             True(desc.used_types & (IR::Type::U8 | IR::Type::U16)))) {
             spv_buffer.Alias(PointerType::U32) =
                 DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
         }
@@ -881,11 +899,11 @@ void EmitContext::DefineBuffers() {
             spv_buffer.Alias(PointerType::F32) =
                 DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, F32[1]);
         }
-        if (True(desc.used_types & IR::Type::U16)) {
+        if (!profile.needs_subword_buffer_emulation && True(desc.used_types & IR::Type::U16)) {
             spv_buffer.Alias(PointerType::U16) =
                 DefineBuffer(desc.is_written, is_coherent, 1, desc.buffer_type, U16);
         }
-        if (True(desc.used_types & IR::Type::U8)) {
+        if (!profile.needs_subword_buffer_emulation && True(desc.used_types & IR::Type::U8)) {
             spv_buffer.Alias(PointerType::U8) =
                 DefineBuffer(desc.is_written, is_coherent, 0, desc.buffer_type, U8);
         }
@@ -974,7 +992,7 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto image = desc.GetSharp(ctx.info);
     const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
     const auto type = image.GetViewType(desc.is_array);
-    const u32 sampled = desc.is_written ? 2 : 1;
+    const u32 sampled = desc.is_written || desc.is_feedback ? 2 : 1;
     switch (type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color2D:
@@ -1001,7 +1019,7 @@ void EmitContext::DefineImagesAndSamplers() {
         const auto sharp = image_desc.GetSharp(info);
         const auto nfmt = sharp.GetNumberFmt();
         const bool is_integer = AmdGpu::IsInteger(nfmt);
-        const bool is_storage = image_desc.is_written;
+        const bool is_storage = image_desc.is_written || image_desc.is_feedback;
         const MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const VectorIds& data_types = GetAttributeType(*this, nfmt);
         const Id sampled_type = data_types[1];
@@ -1019,6 +1037,10 @@ void EmitContext::DefineImagesAndSamplers() {
         binding.unified += num_bindings;
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, fmt::format("{}_{}{}", hw_stage, "img", images.size()));
+        if (image_desc.is_feedback) {
+            Decorate(id, spv::Decoration::Coherent);
+            Decorate(id, spv::Decoration::Volatile);
+        }
         images.push_back({
             .data_types = &data_types,
             .id = id,

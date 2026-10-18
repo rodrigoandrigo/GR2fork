@@ -141,7 +141,14 @@ void FrontendRenderer::GetTargets() {
     }
 }
 
-void FrontendRenderer::Resize(uint32_t new_width, uint32_t new_height) {
+void FrontendRenderer::Resize(uint32_t new_width, uint32_t new_height, float scale_x, float scale_y) {
+    if (swapchain && scale_x > 0 && scale_y > 0 &&
+        (scale_x != composition_scale_x || scale_y != composition_scale_y)) {
+        const DXGI_MATRIX_3X2_F transform{1.0f / scale_x, 0, 0, 1.0f / scale_y, 0, 0};
+        Check(swapchain->SetMatrixTransform(&transform));
+        composition_scale_x = scale_x;
+        composition_scale_y = scale_y;
+    }
     if (!new_width || !new_height || (new_width == width && new_height == height))
         return;
     context.WaitForGpu();

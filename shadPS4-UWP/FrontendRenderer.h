@@ -22,7 +22,7 @@ public:
     ~FrontendRenderer();
     void Initialize(uint32_t width, uint32_t height, std::function<HRESULT(IDXGISwapChain*)> attach,
                     IUnknown* adapter = nullptr);
-    void Resize(uint32_t width, uint32_t height);
+    void Resize(uint32_t width, uint32_t height, float scale_x = 1.0f, float scale_y = 1.0f);
     void BeginFrame(float delta);
     void EndFrame();
     void SetTransparent(bool value) { transparent = value; }
@@ -62,6 +62,7 @@ private:
     uint32_t rtv_stride{};
     uint32_t width{};
     uint32_t height{};
+    float composition_scale_x{}, composition_scale_y{};
     uint32_t frame_index{};
     uint64_t frame_number{};
     bool initialized{};

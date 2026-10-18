@@ -11,6 +11,7 @@
 #include "shader_recompiler/recompiler.h"
 
 namespace D3D12 {
+class ResourceCache;
 enum class ResourceKind { Buffer, Image, Sampler, Constants };
 struct ShaderBinding {
     ResourceKind kind;
@@ -30,6 +31,7 @@ struct CompiledShader {
     Shader::Backend::Bindings start_bindings;
     Shader::Backend::Bindings end_bindings;
     std::shared_ptr<const ShaderBinary> binary;
+    std::map<u32, std::vector<u32>> image_address_tables{};
 };
 struct TessellationLink {
     AmdGpu::TessellationType type;
@@ -43,26 +45,35 @@ struct PreparedShader {
 };
 class ShaderCache {
 public:
-    void Initialize(ID3D12Device* device);
+    void Initialize(ID3D12Device* device, const ResourceCache* resources = nullptr);
     PreparedShader Prepare(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                            Shader::Backend::Bindings bindings);
     CompiledShader Finalize(PreparedShader& shader, bool flip_y, bool sample_mask,
                             bool sample_shading, const TessellationLink* tessellation,
-                            std::span<const u32> peer = {}, bool depth_bounds = false);
+                            std::span<const u32> peer = {}, bool depth_bounds = false,
+                            bool flip_x = false);
     CompiledShader Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                            Shader::Backend::Bindings bindings = {}, bool flip_y = false,
                            bool sample_mask = false, bool sample_shading = false,
                            const TessellationLink* tessellation = nullptr,
-                           bool depth_bounds = false);
-    std::shared_ptr<const ShaderBinary> CompileSpirv(std::span<const u32> words,
-                                                     Shader::SwStage stage, bool flip_y = false,
-                                                     bool sample_mask = false,
-                                                     bool sample_shading = false,
-                                                     const TessellationLink* tessellation = nullptr,
-                                                     std::span<const u32> peer = {},
-                                                     bool depth_bounds = false);
+                           bool depth_bounds = false, bool flip_x = false);
+    std::shared_ptr<const ShaderBinary> CompileSpirv(
+        std::span<const u32> words, Shader::SwStage stage, bool flip_y = false,
+        bool sample_mask = false, bool sample_shading = false,
+        const TessellationLink* tessellation = nullptr, std::span<const u32> peer = {},
+        bool depth_bounds = false, bool flip_x = false);
+    std::shared_ptr<const ShaderBinary> CompileLogicOp(
+        const ShaderBinary& fragment, const std::array<DXGI_FORMAT, 8>& formats,
+        const std::array<u32, 8>& masks);
     std::shared_ptr<const ShaderBinary> CompileRectangle(
         const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment);
+    std::shared_ptr<const ShaderBinary> CompilePointFill(const ShaderBinary& vertex,
+                                                         bool keep_front, bool front_ccw);
+    std::shared_ptr<const ShaderBinary> CompileLineExpand(
+        const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool keep_front,
+        bool front_ccw, D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type, bool adjacency, float width_px,
+        u16 pattern, u16 repeat, bool pattern_msb_first, float pattern_scale,
+        const std::array<f32, 32>& viewport_dims);
     std::shared_ptr<const ShaderBinary> CompileHlslRaw(const std::string& hlsl,
                                                        std::wstring_view target,
                                                        std::span<const std::wstring> defines);
@@ -78,8 +89,10 @@ private:
     std::map<std::vector<u32>, std::shared_ptr<const ShaderBinary>> cache;
     size_t cache_bytes{};
     bool fixed_graphics_wave64{};
+    const ResourceCache* resources{};
     void CompileHlsl(ShaderBinary& binary, Shader::SwStage stage);
     void CompileNativeSpirv(std::span<const u32> words, ShaderBinary& binary, Shader::SwStage stage,
-                            bool flip_y, const TessellationLink* link, std::span<const u32> peer);
+                            bool flip_y, const TessellationLink* link, std::span<const u32> peer,
+                            bool flip_x);
 };
 } // namespace D3D12

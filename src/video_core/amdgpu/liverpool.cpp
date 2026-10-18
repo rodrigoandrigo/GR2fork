@@ -1200,12 +1200,50 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         }
         case PM4ItOpcode::StrmoutBufferUpdate: {
             const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
-            LOG_WARNING(Render_Vulkan,
-                        "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
-                        "source_select = {}, buffer_select = {}",
-                        strmout->update_memory.Value(),
-                        magic_enum::enum_name(strmout->source_select.Value()),
-                        strmout->buffer_select.Value());
+            const u32 buffer = strmout->buffer_select.Value();
+            if (buffer >= std::size(regs.vgt_strmout_buffers)) {
+                LOG_WARNING(Render_Vulkan, "STRMOUT_BUFFER_UPDATE with invalid buffer {}",
+                            buffer);
+                break;
+            }
+            auto& buffers = regs.vgt_strmout_buffers[buffer];
+            if (strmout->update_memory.Value() == 0) {
+                buffers.offset = strmout->buffer_offset;
+                break;
+            }
+            u32 value = 0;
+            switch (strmout->source_select.Value()) {
+            case SourceSelect::BufferOffset:
+                value = buffers.offset;
+                break;
+            case SourceSelect::VgtStrmoutBufferFilledSize:
+                value = regs.vgt_strmout_buffer_filled_size[buffer];
+                break;
+            case SourceSelect::SrcAddress:
+                value = *reinterpret_cast<const u32*>(strmout->SrcAddress());
+                break;
+            case SourceSelect::None:
+                LOG_WARNING(Render_Vulkan, "STRMOUT_BUFFER_UPDATE with no source");
+                break;
+            }
+            if (strmout->source_select.Value() == SourceSelect::None) {
+                break;
+            }
+            switch (strmout->swap_dst.Value()) {
+            case 1:
+                value = ((value & 0x00FF00FFU) << 8) | ((value >> 8) & 0x00FF00FFU);
+                break;
+            case 2:
+                value = std::byteswap(value);
+                break;
+            case 3:
+                LOG_WARNING(Render_Vulkan, "STRMOUT_BUFFER_UPDATE reserved swap mode");
+                break;
+            default:
+                break;
+            }
+            CpWriteOrCopy(rasterizer, reinterpret_cast<void*>(strmout->DstAddress()), &value,
+                          sizeof(value));
             break;
         }
         case PM4ItOpcode::GetLodStats: {

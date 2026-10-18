@@ -35,8 +35,8 @@ ConstantBuffer<TilingInfo> info : register(b0);
 #define NUM_PIPE_INTERLEAVE_BITS 8
 
 #if IS_MACRO_TILED
-#define NUM_PIPES (PIPE_CONFIG == 0 ? 2u : 8u)
-#define NUM_PIPE_BITS (PIPE_CONFIG == 0 ? 1u : 3u)
+#define NUM_PIPES (PIPE_CONFIG == 0 ? 2u : PIPE_CONFIG == 16 ? 16u : 8u)
+#define NUM_PIPE_BITS (PIPE_CONFIG == 0 ? 1u : PIPE_CONFIG == 16 ? 4u : 3u)
 #endif
 
 #define ADDR_SURF_DISPLAY_MICRO_TILING 0
@@ -149,7 +149,14 @@ uint ComputePipeFromCoord(uint x, uint y, uint slice) {
         p1 = x4 ^ y4;
         p2 = x5 ^ y5;
     }
-    uint pipe = p0 | (p1 << 1u) | (p2 << 2u);
+    uint p3 = 0;
+    if (PIPE_CONFIG == 16) {
+        p0 = x4 ^ y3;
+        p1 = x3 ^ y4;
+        p2 = x5 ^ BITOF(ty, 3);
+        p3 = BITOF(tx, 3) ^ y5;
+    }
+    uint pipe = p0 | (p1 << 1u) | (p2 << 2u) | (p3 << 3u);
     uint pipe_swizzle = 0;
     if (ARRAY_MODE == ARRAY_3D_TILED_THIN1 || ARRAY_MODE == ARRAY_3D_TILED_THICK ||
         ARRAY_MODE == ARRAY_3D_TILED_XTHICK) {
@@ -241,9 +248,7 @@ uint ComputeSurfaceAddrFromCoordMacroTiled(uint x, uint y, uint slice, uint pitc
     uint tile_offset = tile_index * micro_tile_bytes;
     uint total_offset = slice_offset + macro_tile_offset + element_offset + tile_offset;
 
-    if (ARRAY_MODE == ARRAY_PRT_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_TILED_THICK ||
-        ARRAY_MODE == ARRAY_PRT_2D_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_2D_TILED_THICK ||
-        ARRAY_MODE == ARRAY_PRT_3D_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_3D_TILED_THICK) {
+    if (ARRAY_MODE == ARRAY_PRT_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_TILED_THICK) {
         x %= macro_tile_pitch;
         y %= macro_tile_height;
     }
@@ -308,6 +313,10 @@ void main(uint dispatch : SV_DispatchThreadID) {
     const uint height = info.entries_a[entry].z;
     const uint x = texel % pitch;
     const uint y = (texel / pitch) % height;
+    const uint extent = info.entries_b[entry].w;
+    if (x >= (extent & 0xffffu) || y >= (extent >> 16u)) {
+        return;
+    }
 
 #if IS_MACRO_TILED
     uint tiled_offset = info.entries_a[entry].w;
@@ -412,14 +421,18 @@ std::array<u32, 14> SpecValues(const VideoCore::ImageInfo& info, bool is_tiler) 
     if (macro) {
         const auto macro_tile_mode =
             AmdGpu::CalculateMacrotileMode(info.tile_mode, info.num_bits, info.num_samples);
-        specs[6] = u32(AmdGpu::GetPipeConfig(info.tile_mode));
+        specs[6] = u32(info.alt_tile ? AmdGpu::GetAltPipeConfig(info.tile_mode)
+                                     : AmdGpu::GetPipeConfig(info.tile_mode));
         specs[7] = AmdGpu::GetBankWidth(macro_tile_mode);
-        specs[8] = AmdGpu::GetBankHeight(macro_tile_mode);
-        specs[9] = AmdGpu::GetNumBanks(macro_tile_mode);
+        specs[8] = info.alt_tile ? AmdGpu::GetAltBankHeight(macro_tile_mode)
+                                 : AmdGpu::GetBankHeight(macro_tile_mode);
+        specs[9] = info.alt_tile ? AmdGpu::GetAltNumBanks(macro_tile_mode)
+                                 : AmdGpu::GetNumBanks(macro_tile_mode);
         specs[10] = u32(std::bit_width(specs[9]) - 1);
         specs[11] = AmdGpu::CalculateTileSplit(info.tile_mode, info.array_mode, micro_tile_mode,
                                                info.num_bits);
-        specs[12] = AmdGpu::GetMacrotileAspect(macro_tile_mode);
+        specs[12] = info.alt_tile ? AmdGpu::GetAltMacrotileAspect(macro_tile_mode)
+                                  : AmdGpu::GetMacrotileAspect(macro_tile_mode);
     }
     return specs;
 }
@@ -470,9 +483,9 @@ bool TilingRuntime::Supported(const VideoCore::ImageInfo& info, size_t entries) 
     return true;
 }
 
-std::vector<TilingEntry> TilingRuntime::Entries(
-    const VideoCore::ImageInfo& info,
-    std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints) {
+std::vector<TilingEntry>
+TilingRuntime::Entries(const VideoCore::ImageInfo& info,
+                       std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints) {
     std::vector<TilingEntry> entries;
     for (u32 mip = 0; mip < info.resources.levels; ++mip) {
         const auto& layout = info.mips_layout[mip];
@@ -484,6 +497,8 @@ std::vector<TilingEntry> TilingRuntime::Entries(
         entry.tiled_offset = u32(layout.offset);
         entry.linear_offset = u32(footprints[mip].Offset);
         entry.row_pitch = u32(footprints[mip].Footprint.RowPitch);
+        entry.width = footprints[mip].Footprint.Width;
+        entry.visible_height = footprints[mip].Footprint.Height;
         entries.push_back(entry);
     }
     return entries;
@@ -518,8 +533,30 @@ void TilingRuntime::Initialize(D3D12DeviceContext& device_context, ShaderCache& 
     shaders = &cache;
     allocator.Initialize(device->Device(), 64ULL * 1024 * 1024);
     root = CreateRootSignature(device->Device());
-    RequestBuffer(params, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
-                  heap_state);
+}
+
+void TilingRuntime::BeginBatch() {
+    operations.clear();
+    active = nullptr;
+}
+
+bool TilingRuntime::CanRecord(const VideoCore::ImageInfo& info,
+                              std::span<const TilingEntry> entries, bool tile) const {
+    const auto aligned = [](u64 size) { return (size + 65535) & ~u64{65535}; };
+    const u64 bytes = aligned(info.guest_size);
+    const u64 scratch = aligned(std::max(FootprintBytes(entries), u64(info.guest_size)));
+    const u64 required = 65536 + bytes + scratch * 2 + ((tile || info.num_bits < 32) ? bytes : 0);
+    const auto stats = allocator.Stats();
+    return stats.live_bytes <= stats.budget_bytes &&
+           required <= stats.budget_bytes - stats.live_bytes;
+}
+
+void TilingRuntime::BeginOperation() {
+    auto operation = std::make_unique<Operation>();
+    active = operation.get();
+    operations.push_back(std::move(operation));
+    RequestBuffer(active->params, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+                  active->heap_state);
 }
 
 ID3D12PipelineState* TilingRuntime::Pipeline(const VideoCore::ImageInfo& info, bool is_tiler) {
@@ -544,17 +581,20 @@ ID3D12PipelineState* TilingRuntime::Pipeline(const VideoCore::ImageInfo& info, b
 void TilingRuntime::Dispatch(ID3D12GraphicsCommandList* commands, const VideoCore::ImageInfo& info,
                              std::span<const TilingEntry> entries, u32 texels, bool is_tiler,
                              u64 zero_size) {
-    Transition(commands, input, input_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(commands, active->input, active->input_state,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (zero_size) {
-        Transition(commands, output, output_state, D3D12_RESOURCE_STATE_COPY_DEST);
-        commands->CopyBufferRegion(output.Get(), 0, zeros.Get(), 0, zero_size);
-        Transition(commands, output, output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        commands->CopyBufferRegion(active->output.Get(), 0, active->zeros.Get(), 0, zero_size);
+        Transition(commands, active->output, active->output_state,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     } else {
-        Transition(commands, output, output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(commands, active->output, active->output_state,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     void* mapped;
     constexpr D3D12_RANGE empty{0, 0};
-    winrt::check_hresult(params->Map(0, &empty, &mapped));
+    winrt::check_hresult(active->params->Map(0, &empty, &mapped));
     TilingInfoCB translation{};
     translation.bank_swizzle = u32(info.bank_swizzle);
     translation.micro_tiled_mips = info.micro_tiled_mips;
@@ -574,50 +614,52 @@ void TilingRuntime::Dispatch(ID3D12GraphicsCommandList* commands, const VideoCor
         b[0] = entry.linear_offset;
         b[1] = entry.row_pitch;
         b[2] = entry.texels;
-        b[3] = 0;
+        b[3] = entry.width | (entry.visible_height << 16);
     }
     std::memcpy(mapped, &translation, sizeof(translation));
-    params->Unmap(0, nullptr);
+    active->params->Unmap(0, nullptr);
     commands->SetComputeRootSignature(root.Get());
     commands->SetPipelineState(Pipeline(info, is_tiler));
-    commands->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
-    commands->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
-    commands->SetComputeRootConstantBufferView(2, params->GetGPUVirtualAddress());
+    commands->SetComputeRootShaderResourceView(0, active->input->GetGPUVirtualAddress());
+    commands->SetComputeRootUnorderedAccessView(1, active->output->GetGPUVirtualAddress());
+    commands->SetComputeRootConstantBufferView(2, active->params->GetGPUVirtualAddress());
     commands->Dispatch((texels + 63) / 64, 1, 1);
 }
 
 void TilingRuntime::CopyFromGuest(ID3D12GraphicsCommandList* commands, std::span<const u8> bytes) {
-    RequestBuffer(staging, bytes.size_bytes(), D3D12_HEAP_TYPE_UPLOAD,
-                  D3D12_RESOURCE_STATE_GENERIC_READ, heap_state);
-    RequestBuffer(input, bytes.size_bytes(), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
-                  input_state, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    RequestBuffer(active->staging, bytes.size_bytes(), D3D12_HEAP_TYPE_UPLOAD,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, active->heap_state);
+    RequestBuffer(active->input, bytes.size_bytes(), D3D12_HEAP_TYPE_DEFAULT,
+                  D3D12_RESOURCE_STATE_COMMON, active->input_state,
+                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     void* mapped;
     constexpr D3D12_RANGE empty{0, 0};
-    winrt::check_hresult(staging->Map(0, &empty, &mapped));
+    winrt::check_hresult(active->staging->Map(0, &empty, &mapped));
     std::memcpy(mapped, bytes.data(), bytes.size_bytes());
-    staging->Unmap(0, &empty);
-    Transition(commands, input, input_state, D3D12_RESOURCE_STATE_COPY_DEST);
-    commands->CopyBufferRegion(input.Get(), 0, staging.Get(), 0, bytes.size_bytes());
+    active->staging->Unmap(0, &empty);
+    Transition(commands, active->input, active->input_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    commands->CopyBufferRegion(active->input.Get(), 0, active->staging.Get(), 0,
+                               bytes.size_bytes());
 }
 
 void TilingRuntime::EnsureZeroed() {
-    if (!zeros.Get() || zeros_zeroed == zeros.AllocationBytes())
+    if (!active->zeros.Get() || active->zeros_zeroed == active->zeros.AllocationBytes())
         return;
     void* mapped;
     constexpr D3D12_RANGE empty{0, 0};
-    winrt::check_hresult(zeros->Map(0, &empty, &mapped));
-    std::memset(mapped, 0, zeros.AllocationBytes());
-    zeros->Unmap(0, nullptr);
-    zeros_zeroed = zeros.AllocationBytes();
+    winrt::check_hresult(active->zeros->Map(0, &empty, &mapped));
+    std::memset(mapped, 0, active->zeros.AllocationBytes());
+    active->zeros->Unmap(0, nullptr);
+    active->zeros_zeroed = active->zeros.AllocationBytes();
 }
 
 void TilingRuntime::OutputToImage(ID3D12GraphicsCommandList* commands,
                                   std::span<const TilingEntry> entries, ID3D12Resource* image,
                                   std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints) {
-    Transition(commands, output, output_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     for (u32 subresource = 0; subresource < entries.size(); ++subresource) {
         D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
-        source.pResource = output.Get();
+        source.pResource = active->output.Get();
         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint = footprints[subresource];
         destination.pResource = image;
@@ -628,63 +670,81 @@ void TilingRuntime::OutputToImage(ID3D12GraphicsCommandList* commands,
 }
 
 void TilingRuntime::OutputToBuffer(ID3D12GraphicsCommandList* commands, u64 bytes) {
-    Transition(commands, output, output_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    commands->CopyBufferRegion(tile_readback.Get(), 0, output.Get(), 0, bytes);
+    Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commands->CopyBufferRegion(active->tile_readback.Get(), 0, active->output.Get(), 0, bytes);
 }
 
 void TilingRuntime::Detile(ID3D12GraphicsCommandList* commands, const VideoCore::ImageInfo& info,
                            std::span<const TilingEntry> entries, std::span<const u8> tiled_bytes,
                            ID3D12Resource* image,
                            std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints) {
+    BeginOperation();
     u32 texels = 0;
     for (const auto& entry : entries)
         texels += entry.texels;
-    CopyFromGuest(commands, tiled_bytes);
-    RequestBuffer(output, std::max(FootprintBytes(entries), u64(info.guest_size)),
-                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, output_state,
+    RequestBuffer(active->input, std::max(FootprintBytes(entries), u64(info.guest_size)),
+                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->input_state,
                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    RequestBuffer(input, std::max(FootprintBytes(entries), u64(info.guest_size)),
-                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, input_state);
-    RequestBuffer(zeros, info.guest_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
-                  heap_state);
-    EnsureZeroed();
+    CopyFromGuest(commands, tiled_bytes);
+    RequestBuffer(active->output, std::max(FootprintBytes(entries), u64(info.guest_size)),
+                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->output_state,
+                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    RequestBuffer(active->input, std::max(FootprintBytes(entries), u64(info.guest_size)),
+                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->input_state);
+    if (info.num_bits < 32) {
+        RequestBuffer(active->zeros, info.guest_size, D3D12_HEAP_TYPE_UPLOAD,
+                      D3D12_RESOURCE_STATE_GENERIC_READ, active->heap_state);
+        EnsureZeroed();
+    }
     Dispatch(commands, info, entries, texels, false, info.num_bits < 32 ? info.guest_size : 0);
     OutputToImage(commands, entries, image, footprints);
-    Transition(commands, input, input_state, D3D12_RESOURCE_STATE_COMMON);
-    Transition(commands, output, output_state, D3D12_RESOURCE_STATE_COMMON);
+    Transition(commands, active->input, active->input_state, D3D12_RESOURCE_STATE_COMMON);
+    Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COMMON);
 }
 
-void TilingRuntime::Tile(ID3D12GraphicsCommandList* commands, const VideoCore::ImageInfo& info,
-                         std::span<const TilingEntry> entries, ID3D12Resource* image,
-                         std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints) {
+ID3D12Resource* TilingRuntime::Tile(ID3D12GraphicsCommandList* commands,
+                                    const VideoCore::ImageInfo& info,
+                                    std::span<const TilingEntry> entries, ID3D12Resource* image,
+                                    std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints,
+                                    std::span<const u8> guest) {
+    if (guest.size() != info.guest_size)
+        throw std::runtime_error("Invalid D3D12 tiled image backing snapshot");
+    BeginOperation();
     u32 texels = 0;
     for (const auto& entry : entries)
         texels += entry.texels;
-    RequestBuffer(input, std::max(FootprintBytes(entries), u64(info.guest_size)),
-                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, input_state,
+    RequestBuffer(active->input, std::max(FootprintBytes(entries), u64(info.guest_size)),
+                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->input_state,
                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    RequestBuffer(output, std::max(FootprintBytes(entries), u64(info.guest_size)),
-                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, output_state,
+    RequestBuffer(active->output, std::max(FootprintBytes(entries), u64(info.guest_size)),
+                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->output_state,
                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    RequestBuffer(zeros, info.guest_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
-                  heap_state);
-    EnsureZeroed();
-    Transition(commands, input, input_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    RequestBuffer(active->staging, guest.size(), D3D12_HEAP_TYPE_UPLOAD,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, active->heap_state);
+    void* mapped;
+    const D3D12_RANGE empty{0, 0};
+    winrt::check_hresult(active->staging->Map(0, &empty, &mapped));
+    std::memcpy(mapped, guest.data(), guest.size());
+    active->staging->Unmap(0, nullptr);
+    Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    commands->CopyBufferRegion(active->output.Get(), 0, active->staging.Get(), 0, guest.size());
+    Transition(commands, active->input, active->input_state, D3D12_RESOURCE_STATE_COPY_DEST);
     for (u32 subresource = 0; subresource < entries.size(); ++subresource) {
         D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
         source.pResource = image;
         source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         source.SubresourceIndex = subresource;
-        destination.pResource = input.Get();
+        destination.pResource = active->input.Get();
         destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         destination.PlacedFootprint = footprints[subresource];
         commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
     }
-    Dispatch(commands, info, entries, texels, true, info.num_bits < 32 ? info.guest_size : 0);
-    RequestBuffer(tile_readback, u64(texels) * (info.num_bits / 8), D3D12_HEAP_TYPE_READBACK,
-                  D3D12_RESOURCE_STATE_COPY_DEST, heap_state);
-    OutputToBuffer(commands, u64(texels) * (info.num_bits / 8));
-    Transition(commands, input, input_state, D3D12_RESOURCE_STATE_COMMON);
-    Transition(commands, output, output_state, D3D12_RESOURCE_STATE_COMMON);
+    Dispatch(commands, info, entries, texels, true, 0);
+    RequestBuffer(active->tile_readback, info.guest_size, D3D12_HEAP_TYPE_READBACK,
+                  D3D12_RESOURCE_STATE_COPY_DEST, active->heap_state);
+    OutputToBuffer(commands, info.guest_size);
+    Transition(commands, active->input, active->input_state, D3D12_RESOURCE_STATE_COMMON);
+    Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COMMON);
+    return active->tile_readback.Get();
 }
 } // namespace D3D12

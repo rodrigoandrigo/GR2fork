@@ -52,6 +52,8 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    bool needs_image_load_feedback{};
+    bool needs_subword_buffer_emulation{};
 
     bool operator==(const Profile&) const = default;
 };

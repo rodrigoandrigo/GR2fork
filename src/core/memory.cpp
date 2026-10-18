@@ -59,7 +59,9 @@ MemoryManager::MemoryManager() {
                "Failed to get compiled SDK version");
 }
 
-MemoryManager::~MemoryManager() = default;
+MemoryManager::~MemoryManager() {
+    DetachGpuAccess();
+}
 
 void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1,
                                        bool use_extended_mem2) {
@@ -148,6 +150,8 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
+    GuestCopyScope scope{this};
+    auto access_lock = LockGpuAccess();
     const auto measured = getenv("GAME_PROFILE") != nullptr;
     const auto start = std::chrono::steady_clock::now();
     const auto& backing_pages = impl.BackingPages();
@@ -302,6 +306,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     if (!tls_in_guest_copy_scope) {
         lk.lock();
     }
+    auto access_lock = LockGpuAccess();
     // The observer runs before any byte moves, so an epoch consumer that reads
     // its counters after the bytes always sees the advanced value.
     if (const auto observer = g_backing_observer.load(std::memory_order_acquire)) {
@@ -1131,12 +1136,53 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
 
             // Create a new dmem area reflecting the pooled region
             if (vma_type == VMAType::Direct) {
-                const auto new_dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dma);
-                auto& new_dmem_area = new_dmem_handle->second;
-                new_dmem_area.dma_type = PhysicalMemoryType::Allocated;
-
-                // Coalesce with nearby direct memory areas.
-                MergeAdjacent(dmem_map, new_dmem_handle);
+                std::vector<std::pair<PAddr, PAddr>> aliases;
+                const auto retain = [&](PAddr start, u64 length) {
+                    const auto begin = std::max(start, phys_addr);
+                    const auto end = std::min(start + length, phys_addr + size_in_dma);
+                    if (begin < end)
+                        aliases.emplace_back(begin, end);
+                };
+                const auto removed_end = virtual_addr + size_in_vma;
+                for (const auto& [base, mapping] : vma_map) {
+                    if (mapping.type != VMAType::Direct)
+                        continue;
+                    for (const auto& [offset, area] : mapping.phys_areas) {
+                        const auto begin = base + offset;
+                        const auto end = begin + area.size;
+                        if (begin < virtual_addr)
+                            retain(area.base, std::min(end, virtual_addr) - begin);
+                        if (end > removed_end) {
+                            const auto suffix = std::max(begin, removed_end);
+                            retain(area.base + suffix - begin, end - suffix);
+                        }
+                    }
+                }
+                std::ranges::sort(aliases);
+                std::vector<std::pair<PAddr, PAddr>> merged;
+                for (const auto& alias : aliases) {
+                    if (merged.empty() || alias.first > merged.back().second)
+                        merged.push_back(alias);
+                    else
+                        merged.back().second = std::max(merged.back().second, alias.second);
+                }
+                auto alias = merged.begin();
+                PAddr current = phys_addr;
+                while (current < phys_addr + size_in_dma) {
+                    while (alias != merged.end() && alias->second <= current)
+                        ++alias;
+                    const auto area = FindDmemArea(current);
+                    auto end = std::min(area->second.GetEnd(), phys_addr + size_in_dma);
+                    const bool mapped = alias != merged.end() && alias->first <= current;
+                    if (alias != merged.end())
+                        end = std::min(end, mapped ? alias->second : alias->first);
+                    ASSERT(end > current);
+                    const auto carved = CarvePhysArea(dmem_map, current, end - current);
+                    carved->second.dma_type = mapped ? PhysicalMemoryType::Mapped
+                                                   : PhysicalMemoryType::Allocated;
+                    MergeAdjacent(dmem_map, carved);
+                    current = end;
+                }
             } else if (vma_type == VMAType::Flexible) {
                 // Update fmem_map
                 const auto new_fmem_handle = CarvePhysArea(fmem_map, phys_addr, size_in_dma);

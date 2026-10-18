@@ -120,6 +120,18 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
                                                      input.characters.push_back(args->KeyCode);
                                              });
                                  });
+    try {
+        display_information = Windows::Graphics::Display::DisplayInformation::GetForCurrentView();
+        color_token = display_information->AdvancedColorInfoChanged +=
+            ref new Windows::Foundation::TypedEventHandler<Windows::Graphics::Display::DisplayInformation ^, Object ^>(
+                [weak](Windows::Graphics::Display::DisplayInformation ^ sender, Object ^ args) {
+                    if (auto page = weak.Resolve<DirectXPage>())
+                        page->OnAdvancedColorChanged(sender, args);
+                });
+        OnAdvancedColorChanged(display_information, nullptr);
+    } catch (Platform::Exception ^) {
+        display_information = nullptr;
+    }
     OnPanelSizeChanged(nullptr, nullptr);
     frontend->Start(std::wstring(ApplicationData::Current->LocalFolder->Path->Data()) +
                     L"\\shadPS4");
@@ -164,6 +176,10 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
         task_continuation_context::use_current());
 }
 void DirectXPage::OnUnloaded(Object ^, RoutedEventArgs ^) {
+    if (display_information) {
+        display_information->AdvancedColorInfoChanged -= color_token;
+        display_information = nullptr;
+    }
     if (window) {
         window->KeyDown -= down_token;
         window->KeyUp -= up_token;
@@ -209,12 +225,30 @@ void DirectXPage::OnPointerLost(Object ^, Windows::UI::Xaml::Input::PointerRoute
             input.x = input.y = -FLT_MAX;
         });
 }
+void DirectXPage::OnAdvancedColorChanged(Windows::Graphics::Display::DisplayInformation ^ sender, Object ^) {
+    bool hdr = false;
+    float white_nits = 80.0f;
+    try {
+        const auto info = sender->GetAdvancedColorInfo();
+        white_nits = info->SdrWhiteLevelInNits;
+        hdr = info->CurrentAdvancedColorKind ==
+              Windows::Graphics::Display::AdvancedColorKind::HighDynamicRange;
+    } catch (Platform::Exception ^) {
+    }
+    if (frontend)
+        frontend->UpdateInput([&](FrontendInput& input) {
+            input.hdr_output = hdr;
+            input.sdr_white_nits = white_nits;
+        });
+}
 void DirectXPage::OnCompositionScaleChanged(Controls::SwapChainPanel ^, Object ^) {
     OnPanelSizeChanged(nullptr, nullptr);
 }
 void DirectXPage::OnPanelSizeChanged(Object ^, SizeChangedEventArgs ^) {
     if (frontend)
         frontend->UpdateInput([&](FrontendInput& input) {
+            input.scale_x = swapChainPanel->CompositionScaleX;
+            input.scale_y = swapChainPanel->CompositionScaleY;
             input.width = static_cast<uint32_t>(
                 std::max(1.0, swapChainPanel->ActualWidth * swapChainPanel->CompositionScaleX));
             input.height = static_cast<uint32_t>(

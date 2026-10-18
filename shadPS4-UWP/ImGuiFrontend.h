@@ -27,8 +27,11 @@ struct FrontendInput {
     bool captured{};
     bool suspended{};
     bool active{true};
+    bool hdr_output{};
+    float sdr_white_nits{80.0f};
     uint32_t width{1280};
     uint32_t height{720};
+    float scale_x{1.0f}, scale_y{1.0f};
 };
 
 struct FrontendGame {
@@ -152,6 +155,7 @@ private:
     std::vector<std::string> root_mounts;
     decltype(&shadps4_unmount_storage_folder) unmount{};
     decltype(&shadps4_get_settings) get_settings{};
+    decltype(&shadps4_set_hdr_output) set_hdr_output{};
     decltype(&shadps4_set_host_state) set_host_state{};
     decltype(&shadps4_set_setting) set_setting{};
     decltype(&shadps4_reset_settings) reset_settings{};

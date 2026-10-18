@@ -402,7 +402,56 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     return result;
 }
 
+static std::pair<Id, Id> SubwordBufferAddress(EmitContext& ctx, u32 handle, Id address, u32 bits) {
+    const auto& buffer = ctx.buffers[handle];
+    address = ctx.OpShiftLeftLogical(ctx.U32[1], address, ctx.ConstU32(bits == 8 ? 0u : 1u));
+    if (const Id offset = buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
+        address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
+    const Id index = ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.ConstU32(2u));
+    const Id shift = ctx.OpIMul(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], address, ctx.ConstU32(3u)),
+                                ctx.ConstU32(8u));
+    const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
+    return {ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index), shift};
+}
+
+static Id LoadSubwordBuffer(EmitContext& ctx, u32 handle, Id address, u32 bits) {
+    const auto [pointer, shift] = SubwordBufferAddress(ctx, handle, address, bits);
+    const Id word = ctx.OpLoad(ctx.U32[1], pointer);
+    const Id value = ctx.OpBitFieldUExtract(ctx.U32[1], word, shift, ctx.ConstU32(bits));
+    return value;
+}
+
+static void StoreSubwordBuffer(EmitContext& ctx, u32 handle, Id address, Id value, u32 bits) {
+    const auto [pointer, shift] = SubwordBufferAddress(ctx, handle, address, bits);
+    const Id scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+    const Id semantics = ctx.u32_zero_value;
+    const Id converted = value;
+    const Id header = ctx.OpLabel();
+    const Id body = ctx.OpLabel();
+    const Id retry = ctx.OpLabel();
+    const Id merge = ctx.OpLabel();
+    ctx.OpBranch(header);
+    ctx.AddLabel(header);
+    ctx.OpLoopMerge(merge, retry, spv::LoopControlMask::MaskNone);
+    ctx.OpBranch(body);
+    ctx.AddLabel(body);
+    const Id expected = ctx.OpAtomicOr(ctx.U32[1], pointer, scope, semantics, ctx.u32_zero_value);
+    const Id replacement =
+        ctx.OpBitFieldInsert(ctx.U32[1], expected, converted, shift, ctx.ConstU32(bits));
+    const Id observed = ctx.OpAtomicCompareExchange(ctx.U32[1], pointer, scope, semantics,
+                                                    semantics, replacement, expected);
+    const Id success = ctx.OpIEqual(ctx.U1[1], observed, expected);
+    ctx.OpBranchConditional(success, merge, retry);
+    ctx.AddLabel(retry);
+    ctx.OpBranch(header);
+    ctx.AddLabel(merge);
+}
+
 Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if (ctx.profile.needs_subword_buffer_emulation) {
+        return LoadSubwordBuffer(ctx, handle, address, 8);
+    }
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
@@ -414,6 +463,9 @@ Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
 }
 
 Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if (ctx.profile.needs_subword_buffer_emulation) {
+        return LoadSubwordBuffer(ctx, handle, address, 16);
+    }
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
@@ -490,6 +542,10 @@ static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, I
 }
 
 void EmitStoreBufferU8(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id value) {
+    if (ctx.profile.needs_subword_buffer_emulation) {
+        StoreSubwordBuffer(ctx, handle, address, value, 8);
+        return;
+    }
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
@@ -500,6 +556,10 @@ void EmitStoreBufferU8(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id v
 }
 
 void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id value) {
+    if (ctx.profile.needs_subword_buffer_emulation) {
+        StoreSubwordBuffer(ctx, handle, address, value, 16);
+        return;
+    }
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);

@@ -29,6 +29,8 @@ static vk::Format ConvertPixelFormat(const VideoOutFormat format) {
     // frame image view.
     case VideoOutFormat::A8R8G8B8Srgb:
         return vk::Format::eR8G8B8A8Srgb;
+    case VideoOutFormat::A16R16G16B16Float:
+        return vk::Format::eR16G16B16A16Sfloat;
     case VideoOutFormat::A2R10G10B10:
     case VideoOutFormat::A2R10G10B10Srgb:
     case VideoOutFormat::A2R10G10B10Bt2020Pq:
@@ -56,7 +58,6 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group, VAd
     size.depth = 1;
     pitch = attrib.tiling_mode == TilingMode::Linear ? size.width : (size.width + 127) & (~127);
     num_bits = attrib.pixel_format != VideoOutFormat::A16R16G16B16Float ? 32 : 64;
-    ASSERT(num_bits == 32);
 
     guest_address = cpu_address;
     UpdateSize();
@@ -91,6 +92,11 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
         mips_layout[0] = MipInfo(guest_size, pitch, size.height, 0);
     }
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && buffer.info.alt_tile_mode;
+    if (alt_tile && AmdGpu::IsMacroTiled(array_mode)) {
+        const auto macro = AmdGpu::CalculateMacrotileMode(tile_mode, num_bits, num_samples);
+        bank_swizzle = (guest_address >> 12) & (AmdGpu::GetAltNumBanks(macro) - 1);
+        guest_address &= ~(u64(bank_swizzle) << 12);
+    }
 }
 
 ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
@@ -205,9 +211,10 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, bool is_depth) {
     num_samples = image.NumSamples();
     num_bits = NumBitsPerBlock(data_fmt);
     guest_address = image.Address();
-    if (image.alt_tile_mode) {
+    alt_tile = image.alt_tile_mode && Libraries::Kernel::sceKernelIsNeoMode();
+    if (alt_tile) {
         bank_swizzle = sharp.GetBankSwizzle();
-        alt_tile = Libraries::Kernel::sceKernelIsNeoMode();
+        guest_address &= ~(u64(bank_swizzle) << 12);
     }
     UpdateSize();
 

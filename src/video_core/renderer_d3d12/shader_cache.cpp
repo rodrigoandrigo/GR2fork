@@ -5,6 +5,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <appmodel.h>
@@ -12,6 +13,9 @@
 #include <winrt/base.h>
 #include "externals/mesa-uwp/src/microsoft/spirv_to_dxil/spirv_to_dxil.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
+#include "video_core/renderer_d3d12/image_buffer_alias.h"
+#include "video_core/renderer_d3d12/logic_op_format.h"
 
 namespace D3D12 {
 namespace {
@@ -285,7 +289,8 @@ spv::ExecutionModel Model(Shader::SwStage stage) {
     }
 }
 } // namespace
-void ShaderCache::Initialize(ID3D12Device* device) {
+void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resources) {
+    this->resources = resources;
     D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
     winrt::check_hresult(
         device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)));
@@ -306,14 +311,18 @@ void ShaderCache::Initialize(ID3D12Device* device) {
     profile.max_shared_memory_size = D3D12_CS_TGSM_REGISTER_COUNT * sizeof(u32);
     profile.support_int64 = options.Int64ShaderOps;
     profile.supports_shader_stencil_export = true;
+    profile.needs_image_load_feedback = true;
+    profile.needs_subword_buffer_emulation = true;
     profile.needs_buffer_offsets = true;
 }
 CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                                     Shader::Backend::Bindings bindings, bool flip_y,
                                     bool sample_mask, bool sample_shading,
-                                    const TessellationLink* tessellation, bool depth_bounds) {
+                                    const TessellationLink* tessellation, bool depth_bounds,
+                                    bool flip_x) {
     auto prepared = Prepare(params, runtime, bindings);
-    return Finalize(prepared, flip_y, sample_mask, sample_shading, tessellation, {}, depth_bounds);
+    return Finalize(prepared, flip_y, sample_mask, sample_shading, tessellation, {}, depth_bounds,
+                    flip_x);
 }
 PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                                     Shader::Backend::Bindings bindings) {
@@ -324,8 +333,13 @@ PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::Runtime
     CompiledShader result{
         Shader::Info{runtime.hw_stage, runtime.sw_stage, params}, runtime, bindings, bindings, {}};
     pools.ReleaseContents();
-    const auto program =
+    auto program =
         Shader::TranslateProgram(params.code, pools, result.info, result.runtime, profile);
+    if (LowerImageBufferAliases(result, program, resources)) {
+        Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+        Shader::Optimization::DeadCodeEliminationPass(program);
+        Shader::Optimization::CollectShaderInfoPass(program, profile);
+    }
     result.info.ResolveDirectReads();
     if (result.info.buffers.size() >
         Shader::NUM_BUFFERS - std::min(bindings.buffer, Shader::NUM_BUFFERS))
@@ -337,7 +351,7 @@ PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::Runtime
 }
 CompiledShader ShaderCache::Finalize(PreparedShader& prepared, bool flip_y, bool sample_mask,
                                      bool sample_shading, const TessellationLink* tessellation,
-                                     std::span<const u32> peer, bool depth_bounds) {
+                                     std::span<const u32> peer, bool depth_bounds, bool flip_x) {
     auto& result = prepared.shader;
     const auto& words = prepared.words;
     const auto& runtime = result.runtime;
@@ -348,17 +362,17 @@ CompiledShader ShaderCache::Finalize(PreparedShader& prepared, bool flip_y, bool
             link->output_control_points = result.runtime.sw.tcs.NumOutputControlPoints();
     }
     result.binary = CompileSpirv(words, runtime.sw_stage, flip_y, sample_mask, sample_shading,
-                                 link ? &*link : nullptr, peer, depth_bounds);
+                                 link ? &*link : nullptr, peer, depth_bounds, flip_x);
     return std::move(result);
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     std::span<const u32> words, Shader::SwStage stage, bool flip_y, bool sample_mask,
     bool sample_shading, const TessellationLink* tessellation_link, std::span<const u32> peer,
-    bool depth_bounds) {
+    bool depth_bounds, bool flip_x) {
     if (words.size() < 5 || words.size() > 4 * 1024 * 1024 || words[0] != spv::MagicNumber)
         throw std::runtime_error("Invalid guest SPIR-V module");
     bool subgroup{};
-    bool quad_only = stage == Shader::SwStage::Fragment;
+    bool quad_only = true;
     for (size_t offset = 5; offset < words.size();) {
         const u32 length = words[offset] >> 16;
         if (!length || length > words.size() - offset)
@@ -396,11 +410,11 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     }
     if (stage != Shader::SwStage::Compute && !fixed_graphics_wave64 && subgroup && !quad_only)
         throw std::runtime_error(
-            "D3D12 cross-lane graphics operations require a fixed wave64 device; "
-            "variable-width graphics waves require compute emulation");
-    std::vector<u32> key{static_cast<u32>(stage), static_cast<u32>(flip_y),
-                         static_cast<u32>(sample_mask), static_cast<u32>(sample_shading),
-                         static_cast<u32>(depth_bounds)};
+            "D3D12 graphics stages cannot force 64-lane waves (WaveSize is compute-only); "
+            "guest cross-lane operations require a fixed wave64 device");
+    std::vector<u32> key{static_cast<u32>(stage),        static_cast<u32>(flip_y),
+                         static_cast<u32>(sample_mask),  static_cast<u32>(sample_shading),
+                         static_cast<u32>(depth_bounds), static_cast<u32>(flip_x)};
     if (tessellation_link) {
         key.insert(key.end(), {static_cast<u32>(tessellation_link->type),
                                static_cast<u32>(tessellation_link->partitioning),
@@ -420,6 +434,7 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     cross.set_entry_point(entries.front().name, Model(stage));
     auto common_options = cross.get_common_options();
     common_options.vertex.flip_vert_y = flip_y;
+    common_options.vertex.flip_pos_x = flip_x;
     cross.set_common_options(common_options);
     auto result = std::make_shared<ShaderBinary>();
     const auto resources = cross.get_shader_resources();
@@ -491,7 +506,7 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     if (tessellation && !tessellation_link)
         throw std::runtime_error("Native tessellation compilation requires linked stage metadata");
     if (native_spirv)
-        CompileNativeSpirv(words, *result, stage, flip_y, tessellation_link, peer);
+        CompileNativeSpirv(words, *result, stage, flip_y, tessellation_link, peer, flip_x);
     else
         result->hlsl = cross.compile();
     if (!native_spirv) {
@@ -527,6 +542,350 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     }
     cache_bytes += bytes_used;
     cache.emplace(std::move(key), result);
+    return result;
+}
+std::shared_ptr<const ShaderBinary> ShaderCache::CompilePointFill(const ShaderBinary& vertex,
+                                                                  bool keep_front, bool front_ccw) {
+    const auto first = vertex.hlsl.find("struct SPIRV_Cross_Output");
+    const auto last = vertex.hlsl.find("};", first);
+    if (first == std::string::npos || last == std::string::npos || last - first > 16384)
+        throw std::runtime_error("Invalid point fill vertex interface");
+    const auto position = SemanticMember(vertex.hlsl, "SPIRV_Cross_Output", "SV_Position");
+    if (position.empty())
+        throw std::runtime_error("Point fill requires a position export");
+    auto result = std::make_shared<ShaderBinary>();
+    result->hlsl = vertex.hlsl.substr(first, last + 2 - first);
+    result->hlsl += "\n[maxvertexcount(3)]\nvoid main(triangle SPIRV_Cross_Output input[3], "
+                    "inout PointStream<SPIRV_Cross_Output> stream) {\n";
+    for (u32 i = 0; i < 3; ++i)
+        result->hlsl += "float4 h" + std::to_string(i) + " = input[" + std::to_string(i) + "]." +
+                        position + ";\n";
+    result->hlsl += "float det = h0.x * (h1.y * h2.w - h1.w * h2.y) - h0.y * (h1.x * h2.w - h1.w * "
+                    "h2.x) + h0.w * (h1.x * h2.y - h1.y * h2.x);\n";
+    result->hlsl +=
+        std::string("bool frontfacing = ") + (front_ccw ? "det < 0.0" : "det > 0.0") + ";\n";
+    result->hlsl +=
+        std::string("if (!(") + (keep_front ? "frontfacing" : "!frontfacing") + ")) return;\n";
+    for (u32 i = 0; i < 3; ++i)
+        result->hlsl += "stream.Append(input[" + std::to_string(i) + "]);\n";
+    result->hlsl += "}\n";
+    const std::vector<u32> key{UINT32_MAX - 1, keep_front ? 1u : 0u, front_ccw ? 1u : 0u};
+    if (const auto found = cache.find(key); found != cache.end())
+        return found->second;
+    CompileHlsl(*result, Shader::SwStage::Geometry);
+    const auto bytes = key.size() * sizeof(u32) + result->hlsl.size() + result->dxil.size();
+    while (!cache.empty() && (cache.size() >= 512 || cache_bytes + bytes > 64 * 1024 * 1024)) {
+        const auto& oldest = *cache.begin();
+        cache_bytes -= oldest.first.size() * sizeof(u32) + oldest.second->dxil.size() +
+                       oldest.second->hlsl.size();
+        cache.erase(cache.begin());
+    }
+    cache_bytes += bytes;
+    cache.emplace(std::move(key), result);
+    return result;
+}
+std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
+    const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool keep_front,
+    bool front_ccw, D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type, bool adjacency, float width_px,
+    u16 pattern, u16 repeat, bool pattern_msb_first, float pattern_scale,
+    const std::array<f32, 32>& viewport_dims) {
+    const auto first = vertex.hlsl.find("struct SPIRV_Cross_Output");
+    const auto last = vertex.hlsl.find("};", first);
+    if (first == std::string::npos || last == std::string::npos || last - first > 16384)
+        throw std::runtime_error("Invalid line expansion vertex interface");
+    const auto position = SemanticMember(vertex.hlsl, "SPIRV_Cross_Output", "SV_Position");
+    if (position.empty())
+        throw std::runtime_error("Line expansion requires a position export");
+    const auto viewport_index =
+        SemanticMember(vertex.hlsl, "SPIRV_Cross_Output", "SV_ViewportArrayIndex");
+    const bool stipple = pattern_scale > 0.f && pattern != u16(0xFFFF);
+    const bool wire = topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    if (topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE && !wire)
+        throw std::runtime_error("Unsupported topology for line expansion");
+    auto result = std::make_shared<ShaderBinary>();
+    result->hlsl = vertex.hlsl.substr(first, last + 2 - first);
+    std::string input_type;
+    u32 input_count{}, pair_count{};
+    std::array<u32, 3> bases{};
+    if (!wire && !adjacency) {
+        input_type = "line";
+        input_count = 2;
+        pair_count = 1;
+        bases = {0u, 1u, 0u};
+    } else if (!wire) {
+        input_type = "lineadj";
+        input_count = 4;
+        pair_count = 1;
+        bases = {1u, 2u, 0u};
+    } else if (!adjacency) {
+        input_type = "triangle";
+        input_count = 3;
+        pair_count = 3;
+        bases = {0u, 1u, 2u};
+    } else {
+        input_type = "triangleadj";
+        input_count = 4;
+        pair_count = 3;
+        bases = {1u, 2u, 3u};
+    }
+    const u32 windows_per_instance = stipple ? 128u : 1u;
+    result->hlsl += "\n[maxvertexcount(" + std::to_string(stipple ? 512u : 4u) +
+                    ")]\n[instance(32)]\nvoid main(" + input_type + " SPIRV_Cross_Output input[" +
+                    std::to_string(input_count) +
+                    "], uint inst : SV_GSInstanceID, inout TriangleStream<SPIRV_Cross_Output> "
+                    "stream) {\n";
+    if (wire) {
+        const u32 a = adjacency ? 1u : 0u;
+        const auto at = [&](u32 offset) {
+            return "input[" + std::to_string(a + offset) + "]." + position;
+        };
+        result->hlsl += "float4 h0 = " + at(0) + "; float4 h1 = " + at(1) +
+                        "; float4 h2 = " + at(2) +
+                        ";\nfloat det = h0.x * (h1.y * h2.w - h1.w * "
+                        "h2.y) - h0.y * (h1.x * h2.w - h1.w * h2.x) + h0.w * (h1.x * h2.y - h1.y * "
+                        "h2.x);\nbool frontfacing = " +
+                        (front_ccw ? "det < 0.0" : "det > 0.0") + ";\nif (!(" +
+                        (keep_front ? "frontfacing" : "!frontfacing") + ")) return;\n";
+    }
+    result->hlsl += "SPIRV_Cross_Output vset[2];\nfor (uint seg = 0; seg < " +
+                    std::to_string(pair_count) + "; ++seg) {\n";
+    result->hlsl += "if (seg == 0) { vset[0] = input[" + std::to_string(bases[0]) +
+                    "]; vset[1] = input[" + std::to_string(bases[1]) + "]; }\n";
+    if (pair_count == 3) {
+        result->hlsl += "else if (seg == 1) { vset[0] = input[" + std::to_string(bases[1]) +
+                        "]; vset[1] = input[" + std::to_string(bases[2]) + "]; }\n";
+        result->hlsl += "else { vset[0] = input[" + std::to_string(bases[2]) +
+                        "]; vset[1] = input[" + std::to_string(bases[0]) + "]; }\n";
+    }
+    result->hlsl += "float4 ha = vset[0]." + position + "; float4 hb = vset[1]." + position + ";\n";
+    result->hlsl += "if (!(ha.w > 0.0 && hb.w > 0.0)) continue;\n"
+                    "float inv_w0 = 1.0 / ha.w; float inv_w1 = 1.0 / hb.w;\n"
+                    "float3 ndc0 = float3(ha.xy * inv_w0, ha.z * inv_w0);\n"
+                    "float3 ndc1 = float3(hb.xy * inv_w1, hb.z * inv_w1);\n";
+    std::string vp_table;
+    for (u32 k = 0; k < 32; ++k) {
+        if (k) {
+            vp_table += ", ";
+        }
+        vp_table += std::to_string(viewport_dims[k]);
+    }
+    result->hlsl += "float vp_dim[32] = {" + vp_table + "};\n";
+    if (viewport_index.empty()) {
+        result->hlsl += "uint vp_idx = 0;\n";
+    } else {
+        result->hlsl += "uint vp_idx = uint(vset[0]." + viewport_index + ");\n";
+    }
+    result->hlsl += "float2 vp = float2(vp_dim[vp_idx * 2], vp_dim[vp_idx * 2 + 1]);\n";
+    result->hlsl += "float2 dp = (ndc1.xy - ndc0.xy) * 0.5 * vp;\nfloat seg_len = length(dp);\n"
+                    "if (!(seg_len > 0.0001)) continue;\n"
+                    "float2 dir = dp / seg_len;\nfloat2 perp = float2(dir.y, -dir.x);\n"
+                    "float2 off = perp / (0.5 * vp) * " +
+                    std::to_string(width_px * 0.5f) + ";\n";
+    std::string emit_body =
+        "SPIRV_Cross_Output dash[4];\nfor (uint corner = 0; corner < 4; ++corner) {\n"
+        "float tsel = (corner == 0 || corner == 1) ? t0 : t1;\n"
+        "float2 pdir = (corner == 0 || corner == 3) ? off : -off;\n"
+        "float2 pos_ndc = ndc0.xy + tsel * (ndc1.xy - ndc0.xy) + pdir;\n"
+        "float w = 1.0 / (inv_w0 + tsel * (inv_w1 - inv_w0));\n"
+        "dash[corner]." +
+        position +
+        " = float4(pos_ndc.x * w, pos_ndc.y * w, (ndc0.z + tsel * (ndc1.z - ndc0.z)) * w, w);\n";
+    const auto body = vertex.hlsl.find('{', first);
+    std::istringstream members(vertex.hlsl.substr(body + 1, last - body - 1));
+    for (std::string member; std::getline(members, member, ';');) {
+        std::istringstream declaration(member);
+        std::string type, name, colon, semantic;
+        if (!(declaration >> type))
+            continue;
+        if (!(declaration >> name >> colon >> semantic) || colon != ":" ||
+            name.find('[') != std::string::npos)
+            throw std::runtime_error("Unsupported line expansion stage interface member");
+        bool flat{};
+        for (u32 i = 0; i < fragment.num_inputs; ++i) {
+            const auto& input = fragment.inputs[i];
+            flat |= input.is_flat && semantic == "TEXCOORD" + std::to_string(input.param_index);
+        }
+        if (semantic == "SV_Position") {
+            continue;
+        }
+        if (flat || (type != "float" && type != "float2" && type != "float3" && type != "float4")) {
+            emit_body += "dash[corner]." + name + " = vset[0]." + name + ";\n";
+        } else {
+            emit_body += "dash[corner]." + name + " = vset[0]." + name + " + tsel * (vset[1]." +
+                         name + " - vset[0]." + name + ");\n";
+        }
+    }
+    emit_body += "}\nstream.Append(dash[0]); stream.Append(dash[1]); stream.Append(dash[2]); "
+                 "stream.Append(dash[3]); stream.RestartStrip();\n";
+    if (stipple) {
+        result->hlsl += "const float bit_len = " + std::to_string(pattern_scale) +
+                        ";\n"
+                        "const uint pattern_u = " +
+                        std::to_string(u32(pattern)) +
+                        ";\n"
+                        "const uint pattern_cap = " +
+                        std::to_string(u32(repeat) * 16u + 15u) +
+                        ";\n"
+                        "const float win_eps = 0.01;\n"
+                        "for (uint bit = inst * " +
+                        std::to_string(windows_per_instance) + "; bit < (inst + 1) * " +
+                        std::to_string(windows_per_instance) +
+                        "; ++bit) {\n"
+                        "float win_start = float(bit) * bit_len;\n"
+                        "if (win_start >= seg_len) break;\n"
+                        "uint sel = min(bit, pattern_cap) % 16;\nsel = " +
+                        std::string(pattern_msb_first ? "15 - sel" : "sel") +
+                        ";\nif (!((pattern_u >> sel) & 1)) continue;\n"
+                        "float t0 = (win_start + win_eps) / seg_len;\n"
+                        "float t1 = (min(win_start + bit_len, seg_len) - win_eps) / seg_len;\n" +
+                        emit_body + "}\n";
+    } else {
+        result->hlsl += "{ float t0 = 0.0; float t1 = 1.0;\n" + emit_body + "}\n";
+    }
+    result->hlsl += "}\n}\n";
+    std::vector<u32> key{UINT32_MAX - 2};
+    for (const unsigned char character : result->hlsl)
+        key.push_back(character);
+    if (const auto found = cache.find(key); found != cache.end())
+        return found->second;
+    CompileHlsl(*result, Shader::SwStage::Geometry);
+    const auto bytes = key.size() * sizeof(u32) + result->hlsl.size() + result->dxil.size();
+    while (!cache.empty() && (cache.size() >= 512 || cache_bytes + bytes > 64 * 1024 * 1024)) {
+        const auto& oldest = *cache.begin();
+        cache_bytes -= oldest.first.size() * sizeof(u32) + oldest.second->dxil.size() +
+                       oldest.second->hlsl.size();
+        cache.erase(cache.begin());
+    }
+    cache_bytes += bytes;
+    cache.emplace(std::move(key), result);
+    return result;
+}
+std::shared_ptr<const ShaderBinary> ShaderCache::CompileLogicOp(
+    const ShaderBinary& fragment, const std::array<DXGI_FORMAT, 8>& formats,
+    const std::array<u32, 8>& masks) {
+    std::vector<u32> key{0x4c4f4749};
+    for (const auto format : formats)
+        key.push_back(u32(format));
+    key.insert(key.end(), masks.begin(), masks.end());
+    key.push_back(u32(fragment.dxil.size()));
+    for (u32 offset = 0; offset < fragment.dxil.size(); offset += 4) {
+        u32 word{};
+        std::memcpy(&word, fragment.dxil.data() + offset,
+                    std::min<size_t>(4, fragment.dxil.size() - offset));
+        key.push_back(word);
+    }
+    if (const auto found = cache.find(key); found != cache.end())
+        return found->second;
+    auto result = std::make_shared<ShaderBinary>(fragment);
+    std::string helpers = R"(
+uint LogicUnsignedFloat(float v, uint mantissa) {
+    if (isnan(v)) return (31u << mantissa) | 1u;
+    v = clamp(v, 0.0, (2.0 - exp2(-float(mantissa))) * 32768.0);
+    uint word = asuint(v);
+    if ((word >> 23u) < 113u) return uint(round(v * exp2(14.0 + float(mantissa))));
+    uint shift = 23u - mantissa;
+    return ((word + ((1u << (shift - 1u)) - 1u) + ((word >> shift) & 1u)) >> shift) - (112u << mantissa);
+}
+)";
+    const std::regex declaration(
+        R"(((?:float|uint|int)[1-4]?)\s+(\w+)\s*:\s*SV_Target([0-7])\s*;)");
+    const auto start = result->hlsl.find("struct SPIRV_Cross_Output");
+    const auto end = result->hlsl.find("};", start);
+    if (start == std::string::npos || end == std::string::npos)
+        throw std::runtime_error("Logic operation requires fragment output structure");
+    std::string structure = result->hlsl.substr(start, end + 2 - start);
+    const std::string original = structure;
+    for (std::sregex_iterator it(original.begin(), original.end(), declaration), last; it != last;
+         ++it) {
+        const auto& match = *it;
+        const u32 slot = u32(match[3].str()[0] - '0');
+        if (formats[slot] == DXGI_FORMAT_UNKNOWN)
+            continue;
+        const auto format = GetLogicOpFormat(formats[slot]);
+        const auto name = match[2].str();
+        const auto type = match[1].str();
+        const u32 count = std::isdigit(type.back()) ? u32(type.back() - '0') : 1;
+        const auto base_type = type.substr(0, type.size() - (std::isdigit(type.back()) ? 1 : 0));
+        const std::string function = "LogicPack" + std::to_string(slot);
+        helpers += "uint4 " + function + "(" + base_type + "4 v) { uint4 r = 0;\n";
+        u32 packed_component = 0;
+        for (u32 c = 0; c < 4; ++c) {
+            const u32 bits = format.bits[c];
+            if (!bits || !(masks[slot] & (1u << c)))
+                continue;
+            const auto component = "v[" + std::to_string(c) + "]";
+            std::string value = component;
+            if (format.srgb && c < 3)
+                value = "(" + component + " <= 0.0031308 ? " + component +
+                        " * 12.92 : 1.055 * pow(max(" + component + ", 0.0), 1.0 / 2.4) - 0.055)";
+            using Encoding = LogicOpFormat::Encoding;
+            if (format.encoding == Encoding::Uint) {
+                value = bits == 32
+                            ? "uint(" + value + ")"
+                            : "min(uint(" + value + "), " + std::to_string((1u << bits) - 1) + "u)";
+            } else if (format.encoding == Encoding::Sint) {
+                if (bits < 32)
+                    value = "clamp(int(" + value + "), -" + std::to_string(1u << (bits - 1)) +
+                            ", " + std::to_string((1u << (bits - 1)) - 1) + ")";
+                value = "asuint(" + value + ")";
+            } else if (format.encoding == Encoding::Float)
+                value = bits == 32 ? "asuint(" + value + ")"
+                                   : "f32tof16(clamp(" + value + ", -65504.0, 65504.0))";
+            else if (format.encoding == Encoding::UnsignedFloat)
+                value = "LogicUnsignedFloat(" + value + ", " + std::to_string(bits - 5) + "u)";
+            else if (format.encoding == Encoding::Snorm) {
+                const auto maximum = std::to_string((1u << (bits - 1)) - 1) + ".0";
+                value = "(asuint(int(sign(" + value + ") * floor(abs(clamp(" + value +
+                        ", -1.0, 1.0)) * " + maximum + " + 0.5))) & " +
+                        std::to_string((1u << bits) - 1) + "u)";
+            } else
+                value = "uint(floor(saturate(" + value + ") * " + std::to_string((1u << bits) - 1) +
+                        ".0 + 0.5))";
+            helpers += "r[" + std::to_string(packed_component++) + "] = " + value + ";\n";
+        }
+        helpers += "return r; }\n";
+        const auto declaration_at = structure.find(match.str());
+        structure.replace(declaration_at, match.length(),
+                          "uint4 " + name + " : SV_Target" + std::to_string(slot) + ";");
+        const std::regex assignment("(\\b\\w+\\." + name + "\\s*=\\s*)([^;]+);");
+        std::string rewritten;
+        size_t previous = 0;
+        bool assigned = false;
+        for (std::sregex_iterator item(result->hlsl.begin(), result->hlsl.end(), assignment),
+             finish;
+             item != finish; ++item) {
+            rewritten += result->hlsl.substr(previous, item->position() - previous);
+            std::string expression = (*item)[2].str();
+            if (count < 4) {
+                expression = base_type + "4(" + expression;
+                for (u32 c = count; c < 4; ++c)
+                    expression += c == 3 ? ", 1.0" : ", 0.0";
+                expression += ")";
+            }
+            rewritten += (*item)[1].str() + function + "(" + expression + ");";
+            previous = item->position() + item->length();
+            assigned = true;
+        }
+        if (!assigned)
+            throw std::runtime_error("Missing logic operation color export assignment");
+        rewritten += result->hlsl.substr(previous);
+        result->hlsl = std::move(rewritten);
+    }
+    const auto structure_end = result->hlsl.find("};", start);
+    result->hlsl.replace(start, structure_end + 2 - start, structure);
+    result->hlsl.insert(0, helpers);
+    CompileHlsl(*result, Shader::SwStage::Fragment);
+    const auto bytes = key.size() * sizeof(u32) + result->hlsl.size() + result->dxil.size();
+    if (bytes > 64 * 1024 * 1024)
+        throw std::runtime_error("Logic operation shader exceeds cache budget");
+    while (!cache.empty() && (cache.size() >= 512 || cache_bytes + bytes > 64 * 1024 * 1024)) {
+        const auto& oldest = *cache.begin();
+        cache_bytes -= oldest.first.size() * sizeof(u32) + oldest.second->dxil.size() +
+                       oldest.second->hlsl.size();
+        cache.erase(cache.begin());
+    }
+    cache.emplace(std::move(key), result);
+    cache_bytes += bytes;
     return result;
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
@@ -599,7 +958,8 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
 }
 void ShaderCache::CompileNativeSpirv(std::span<const u32> words, ShaderBinary& binary,
                                      Shader::SwStage stage, bool flip_y,
-                                     const TessellationLink* link, std::span<const u32> peer) {
+                                     const TessellationLink* link, std::span<const u32> peer,
+                                     bool flip_x) {
     static const CompilerModule module{L"spirv_to_dxil.dll"};
     static const CompilerModule validator_module{L"dxil.dll"};
     const auto config_size = module.Function<decltype(&spirv_to_dxil_get_runtime_conf_size)>(
@@ -686,6 +1046,9 @@ void ShaderCache::CompileNativeSpirv(std::span<const u32> words, ShaderBinary& b
             throw std::runtime_error("Native tessellation topology requires geometry expansion");
     }
     config.yz_flip.mode = flip_y ? DXIL_SPIRV_Y_FLIP_UNCONDITIONAL : DXIL_SPIRV_YZ_FLIP_NONE;
+    if (flip_x)
+        config.yz_flip.mode = static_cast<enum dxil_spirv_yz_flip_mode>(
+            config.yz_flip.mode | DXIL_SPIRV_X_FLIP_UNCONDITIONAL);
     dxil_spirv_debug_options debug{};
     std::string messages;
     dxil_spirv_logger logger{};

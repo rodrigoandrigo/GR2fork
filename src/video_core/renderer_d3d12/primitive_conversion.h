@@ -100,4 +100,65 @@ inline std::vector<u32> ConvertPrimitiveIndices(AmdGpu::PrimitiveType primitive,
     segment(input.subspan(first));
     return output;
 }
+inline std::vector<u32> ConvertPolygonPoints(AmdGpu::PrimitiveType primitive,
+                                             std::span<const u32> input,
+                                             std::optional<u32> restart = {}) {
+    const std::vector<u32> triangles = ConvertPrimitiveIndices(primitive, input, restart);
+    std::vector<u32> points;
+    points.reserve(triangles.size());
+    for (size_t i = 0; i + 2 < triangles.size(); i += 3)
+        points.insert(points.end(), triangles.begin() + static_cast<ptrdiff_t>(i),
+                      triangles.begin() + static_cast<ptrdiff_t>(i) + 3);
+    return points;
+}
+inline std::vector<u32> ConvertPolygonEdges(AmdGpu::PrimitiveType primitive,
+                                            std::span<const u32> input,
+                                            std::optional<u32> restart = {}) {
+    std::vector<u32> edges;
+    const auto emit_edge = [&](u32 a, u32 b) {
+        if (edges.size() + 2 > 4 * 1024 * 1024)
+            throw std::runtime_error("Converted D3D12 edge indices exceed upload budget");
+        edges.push_back(a);
+        edges.push_back(b);
+    };
+    const auto segment = [&](std::span<const u32> indices) {
+        using P = AmdGpu::PrimitiveType;
+        switch (primitive) {
+        case P::RectList:
+        case P::QuadList:
+            for (size_t i = 0; i + 3 < indices.size(); i += 4) {
+                emit_edge(indices[i], indices[i + 1]);
+                emit_edge(indices[i + 1], indices[i + 2]);
+                emit_edge(indices[i + 2], indices[i + 3]);
+                emit_edge(indices[i + 3], indices[i]);
+            }
+            break;
+        case P::QuadStrip:
+            for (size_t i = 0; i + 3 < indices.size(); i += 2) {
+                emit_edge(indices[i], indices[i + 1]);
+                emit_edge(indices[i + 1], indices[i + 3]);
+                emit_edge(indices[i + 3], indices[i + 2]);
+                emit_edge(indices[i + 2], indices[i]);
+            }
+            break;
+        case P::Polygon:
+            for (size_t i = 1; i < indices.size(); ++i)
+                emit_edge(indices[i - 1], indices[i]);
+            if (indices.size() > 2)
+                emit_edge(indices.back(), indices.front());
+            break;
+        default:
+            throw std::runtime_error("Unsupported D3D12 polygon edge conversion");
+        }
+    };
+    size_t first{};
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (restart && input[i] == *restart) {
+            segment(input.subspan(first, i - first));
+            first = i + 1;
+        }
+    }
+    segment(input.subspan(first));
+    return edges;
+}
 } // namespace D3D12

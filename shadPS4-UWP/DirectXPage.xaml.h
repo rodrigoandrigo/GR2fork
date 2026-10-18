@@ -16,6 +16,10 @@ private:
                    Windows::UI::Xaml::Input::PointerRoutedEventArgs ^ args);
     void OnPanelSizeChanged(Platform::Object ^ sender,
                             Windows::UI::Xaml::SizeChangedEventArgs ^ args);
+    void OnAdvancedColorChanged(Windows::Graphics::Display::DisplayInformation ^ sender,
+                                Platform::Object ^ args);
+    Windows::Graphics::Display::DisplayInformation ^ display_information;
+    Windows::Foundation::EventRegistrationToken color_token;
     void PickFolder(std::wstring purpose);
     void EditText(std::string label, std::string value, bool secret,
                   std::function<void(std::string)> completed);

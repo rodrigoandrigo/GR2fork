@@ -462,10 +462,14 @@ void shadps4_set_paused(int32_t paused) {
 }
 
 void shadps4_resize(uint32_t width, uint32_t height) {
+    shadps4_resize_surface(width, height, 1.0f, 1.0f);
+}
+
+void shadps4_resize_surface(uint32_t width, uint32_t height, float scale_x, float scale_y) {
     try {
         std::scoped_lock lock{presentation_mutex};
         if (native_presentation)
-            native_presentation->Resize(width, height);
+            native_presentation->Resize(width, height, scale_x, scale_y);
         else if (presentation)
             presentation->Resize(width, height);
     } catch (const winrt::hresult_error& exception) {
@@ -474,6 +478,12 @@ void shadps4_resize(uint32_t width, uint32_t height) {
     } catch (const std::exception& exception) {
         Fail(exception.what());
     }
+}
+
+void shadps4_set_hdr_output(int32_t enabled, float sdr_white_nits) {
+    std::scoped_lock lock{presentation_mutex};
+    if (native_presentation)
+        native_presentation->SetHDROutput(enabled != 0, sdr_white_nits);
 }
 
 int32_t shadps4_render_host_frame() {

@@ -149,6 +149,10 @@ struct HwGeometryRuntimeInfo {
     AmdGpu::PrimitiveType in_primitive;
     GsOutputPrimTypes out_primitive;
     AmdGpu::GsScenario mode;
+    bool emulate_depth_negative_one_to_one{};
+    u32 user_clip_plane_mask{};
+    u32 strmout_buffer_mask{};
+    u32 strmout_stride{};
     std::span<const u32> vs_copy;
     u64 vs_copy_hash;
 
@@ -157,7 +161,10 @@ struct HwGeometryRuntimeInfo {
                num_invocations == other.num_invocations &&
                output_vertices == other.output_vertices && in_primitive == other.in_primitive &&
                std::ranges::equal(out_primitive, other.out_primitive) &&
-               vs_copy_hash == other.vs_copy_hash;
+               emulate_depth_negative_one_to_one == other.emulate_depth_negative_one_to_one &&
+               user_clip_plane_mask == other.user_clip_plane_mask &&
+               strmout_buffer_mask == other.strmout_buffer_mask &&
+               strmout_stride == other.strmout_stride && vs_copy_hash == other.vs_copy_hash;
     }
 };
 
@@ -231,9 +238,11 @@ struct HwComputeRuntimeInfo {
     u32 shared_memory_size;
     std::array<u32, 3> workgroup_size;
     std::array<bool, 3> tgid_enable;
+    std::array<u32, 3> start_offsets;
 
     bool operator==(const HwComputeRuntimeInfo& other) const noexcept {
-        return workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable;
+        return workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable &&
+               start_offsets == other.start_offsets;
     }
 };
 

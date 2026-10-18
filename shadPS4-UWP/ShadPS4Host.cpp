@@ -73,7 +73,7 @@ void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width,
     run = Resolve<decltype(run)>("shadps4_run");
     stop = Resolve<decltype(stop)>("shadps4_request_stop");
     pause = Resolve<decltype(pause)>("shadps4_set_paused");
-    resize = Resolve<decltype(resize)>("shadps4_resize");
+    resize = Resolve<decltype(resize)>("shadps4_resize_surface");
     render = Resolve<decltype(render)>("shadps4_render_host_frame");
     error = Resolve<decltype(error)>("shadps4_get_error");
     shutdown = Resolve<decltype(shutdown)>("shadps4_shutdown");
@@ -123,12 +123,13 @@ void ShadPS4Host::PresentationLoop() {
         }
         const auto width = pending_width;
         const auto height = pending_height;
+        const auto scale_x = pending_scale_x, scale_y = pending_scale_y;
         const bool frame = frame_pending;
         pending_width = 0;
         frame_pending = false;
         lock.unlock();
         if (width) {
-            resize(width, height);
+            resize(width, height, scale_x, scale_y);
         }
         if (frame && render() != 0) {
             presentation_failed.store(true);
@@ -261,16 +262,29 @@ void ShadPS4Host::Stop() {
   }
 }
 
-void ShadPS4Host::Resize(uint32_t width, uint32_t height) {
+void ShadPS4Host::Resize(uint32_t width, uint32_t height, float scale_x, float scale_y) {
+  if (graphics_backend == SHADPS4_GRAPHICS_VULKAN_DOZEN && scale_x > 0 && scale_y > 0) {
+    std::scoped_lock lock{chain_mutex};
+    if (composition_chain && (chain_scale_x != scale_x || chain_scale_y != scale_y)) {
+      const DXGI_MATRIX_3X2_F transform{1.0f / scale_x, 0, 0, 1.0f / scale_y, 0, 0};
+      const auto result = composition_chain->SetMatrixTransform(&transform);
+      if (FAILED(result))
+        throw ref new Platform::Exception(result);
+      chain_scale_x = scale_x;
+      chain_scale_y = scale_y;
+    }
+  }
   if (!presentation_thread.joinable()) {
     if (resize && width && height)
-      resize(width, height);
+      resize(width, height, scale_x, scale_y);
     return;
   }
   if (width && height) {
     std::lock_guard<std::mutex> lock{work_mutex};
     pending_width = width;
     pending_height = height;
+    pending_scale_x = scale_x;
+    pending_scale_y = scale_y;
   }
   work_ready.notify_one();
 }
@@ -306,12 +320,26 @@ long ShadPS4Host::AttachSwapChain(void* context, void* swapchain) {
     }
     attachment->chain = static_cast<IDXGISwapChain*>(swapchain);
     auto target = self->panel;
-    const auto attach = [target, attachment] {
+    const auto attach = [self, target, attachment] {
         ComPtr<ISwapChainPanelNative> native;
         attachment->result =
             reinterpret_cast<IInspectable*>(target.Get())->QueryInterface(IID_PPV_ARGS(&native));
         if (SUCCEEDED(attachment->result)) {
             attachment->result = native->SetSwapChain(attachment->chain.Get());
+            if (SUCCEEDED(attachment->result)) {
+                std::scoped_lock lock{self->chain_mutex};
+                self->composition_chain.Reset();
+                if (attachment->chain)
+                    attachment->result = attachment->chain.As(&self->composition_chain);
+                if (SUCCEEDED(attachment->result) && self->composition_chain) {
+                    const DXGI_MATRIX_3X2_F transform{
+                        1.0f / target->CompositionScaleX, 0, 0,
+                        1.0f / target->CompositionScaleY, 0, 0};
+                    attachment->result = self->composition_chain->SetMatrixTransform(&transform);
+                    self->chain_scale_x = target->CompositionScaleX;
+                    self->chain_scale_y = target->CompositionScaleY;
+                }
+            }
         }
         if (SUCCEEDED(attachment->result) && attachment->chain.Get()) {
             const auto sdl = LoadPackagedLibrary(L"SDL3.dll", 0);

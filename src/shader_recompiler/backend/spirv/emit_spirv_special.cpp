@@ -91,7 +91,53 @@ void EmitDiscardCond(EmitContext& ctx, Id condition) {
     ctx.AddLabel(merge_label);
 }
 
+static void EmitStreamOutCapture(EmitContext& ctx) {
+    const auto& gs = ctx.runtime_info.hw.gs;
+    const Id position{ctx.OpLoad(ctx.F32[4], ctx.output_position)};
+    std::array<Id, 4> positions;
+    for (u32 comp = 0; comp < 4; ++comp) {
+        positions[comp] =
+            ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], position, comp));
+    }
+    const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
+    const u32 window = std::min(gs.out_vertex_data_size, 4u + ctx.info.gs_copy_data.num_attrs * 4u);
+    for (u32 slot = 0; slot < ctx.strmout_buffers.size(); ++slot) {
+        const auto& buffer = ctx.buffers[ctx.strmout_buffers[slot]];
+        const auto& buffer_alias = buffer.Alias(EmitContext::PointerType::U32);
+        Id base_address = ctx.OpLoad(ctx.U32[1], ctx.strmout_vertex);
+        base_address = ctx.OpIMul(ctx.U32[1], base_address, ctx.ConstU32(gs.strmout_stride));
+        if (const Id offset = buffer.Offset(EmitContext::PointerSize::B32);
+            Sirit::ValidId(offset)) {
+            base_address = ctx.OpIAdd(ctx.U32[1], base_address, offset);
+        }
+        for (u32 dword = 0; dword < window; ++dword) {
+            Id value = ctx.u32_zero_value;
+            if (dword < 4) {
+                value = positions[dword];
+            } else if (const u32 attr = (dword - 4) / 4; attr < ctx.info.gs_copy_data.num_attrs) {
+                const auto& output = ctx.output_params.at(attr);
+                const Id ptr =
+                    ctx.OpAccessChain(component_ptr, output.id, ctx.ConstU32((dword - 4) % 4));
+                value = ctx.OpBitcast(ctx.U32[1], ctx.OpLoad(ctx.F32[1], ptr));
+            }
+            const Id address = ctx.OpIAdd(ctx.U32[1], base_address, ctx.ConstU32(dword));
+            const Id ptr = ctx.OpAccessChain(buffer_alias.pointer_type, buffer_alias.id,
+                                             ctx.u32_zero_value, address);
+            ctx.OpStore(ptr, value);
+        }
+    }
+    const Id counter = ctx.OpLoad(ctx.U32[1], ctx.strmout_vertex);
+    ctx.OpStore(ctx.strmout_vertex, ctx.OpIAdd(ctx.U32[1], counter, ctx.u32_one_value));
+}
+
 void EmitEmitVertex(EmitContext& ctx) {
+    if (ctx.hw_stage == HwStage::Geometry && !ctx.strmout_buffers.empty()) {
+        EmitStreamOutCapture(ctx);
+    }
+    if (ctx.hw_stage == HwStage::Geometry &&
+        ctx.runtime_info.hw.gs.emulate_depth_negative_one_to_one) {
+        ConvertDepthMode(ctx);
+    }
     ctx.OpEmitVertex();
 }
 

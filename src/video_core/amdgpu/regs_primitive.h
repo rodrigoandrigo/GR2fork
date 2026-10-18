@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <bit>
+
 #include "common/types.h"
 
 namespace AmdGpu {
@@ -125,6 +127,39 @@ struct LineControl {
 
     float Width() const {
         return static_cast<float>(width_fixed_point) / 8.0;
+    }
+};
+
+struct LineStippleCntl {
+    u32 line_stipple_reset : 2;
+    u32 expand_full_length : 1;
+    u32 fractional_accum : 1;
+    u32 diamond_adjust : 1;
+    u32 : 27;
+};
+
+struct LineStipple {
+    u32 line_pattern;
+
+    u32 Pattern() const {
+        return line_pattern & 0xFFFF;
+    }
+    u32 RepeatCount() const {
+        return (line_pattern >> 16) & 0xFF;
+    }
+    u32 PatternBitOrder() const {
+        return (line_pattern >> 28) & 1;
+    }
+    u32 AutoReset() const {
+        return (line_pattern >> 29) & 3;
+    }
+};
+
+struct LineStippleScale {
+    u32 raw;
+
+    float Scale() const {
+        return std::bit_cast<float>(raw);
     }
 };
 

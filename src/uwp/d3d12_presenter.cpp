@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <bit>
+#include <half.hpp>
+#include "core/emulator_settings.h"
 #include <stdexcept>
 #include <thread>
 #include <chrono>
@@ -23,6 +26,10 @@ struct D3D12Presenter::Frame final : VideoCore::PresentationFrame {
     D3D12::TemporalJitter::Sample jitter;
     u32 width{};
     u32 height{};
+    Libraries::VideoOut::PixelFormat format{};
+    float gamma{1.0f};
+    bool upload_hdr{};
+    float upload_sdr_white{};
     u64 charge{};
     std::shared_ptr<std::atomic<u64>> budget;
     ~Frame() override {
@@ -39,9 +46,11 @@ void D3D12Presenter::RegisterVideoOutSurface(const Libraries::VideoOut::BufferAt
     if (attr.pixel_format != Libraries::VideoOut::PixelFormat::A8R8G8B8Srgb &&
         attr.pixel_format != Libraries::VideoOut::PixelFormat::A8B8G8R8Srgb &&
         attr.pixel_format != Libraries::VideoOut::PixelFormat::A2R10G10B10 &&
-        attr.pixel_format != Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb)
+        attr.pixel_format != Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb &&
+        attr.pixel_format != Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq &&
+        attr.pixel_format != Libraries::VideoOut::PixelFormat::A16R16G16B16Float)
         throw std::runtime_error(
-            "D3D12 VideoOut HDR/float format requires native color conversion");
+            "Unsupported D3D12 VideoOut pixel format");
 }
 VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
     const Libraries::VideoOut::BufferAttributeGroup& group, VAddr address) {
@@ -54,7 +63,8 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
     if (info.guest_size > 64ULL * 1024 * 1024)
         throw std::runtime_error("D3D12 VideoOut surface exceeds staging budget");
     auto frame = std::make_shared<Frame>();
-    const u64 charge = u64(group.attrib.width) * group.attrib.height * 8;
+    const u32 pixel_bytes = info.num_bits / 8;
+    const u64 charge = u64(group.attrib.width) * group.attrib.height * (pixel_bytes + 8);
     constexpr u64 limit = 256ULL * 1024 * 1024;
     if (charge > limit)
         throw std::runtime_error("D3D12 VideoOut frame exceeds budget");
@@ -78,46 +88,124 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
         memory->CopySparseMemory(address, guest.data(), guest.size());
     }
     VideoCore::ConvertTiling(guest, linear, info, false);
-    frame->pixels.resize(u64(frame->width) * frame->height * 4);
-    const float adjustment = gamma.load();
-    const auto encode = [&](float value, bool srgb) -> u8 {
-        if (srgb)
-            value = value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f);
-        value = value > 0.0031308f ? 1.055f * std::pow(value, 1.0f / (3.4f - adjustment)) - 0.055f
-                                   : 12.92f * value / adjustment;
-        return static_cast<u8>(std::clamp(value * 255.0f + 0.5f, 0.0f, 255.0f));
-    };
-    std::array<u8, 256> srgb8;
-    std::array<u8, 1024> encoded10;
-    for (u32 i = 0; i < srgb8.size(); ++i)
-        srgb8[i] = encode(float(i) / 255, true);
-    for (u32 i = 0; i < encoded10.size(); ++i)
-        encoded10[i] =
-            encode(float(i) / 1023,
-                   group.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb);
-    using Format = Libraries::VideoOut::PixelFormat;
-    for (u32 y = 0; y < frame->height; ++y)
-        for (u32 x = 0; x < frame->width; ++x) {
-            u32 pixel;
-            const u64 source = (u64(y) * info.mips_layout[0].pitch + x) * 4;
-            if (source + 4 > linear.size())
-                throw std::runtime_error("D3D12 VideoOut row exceeds guest backing");
-            std::memcpy(&pixel, linear.data() + source, 4);
-            auto* output = frame->pixels.data() + (u64(y) * frame->width + x) * 4;
-            const auto format = group.attrib.pixel_format;
-            if (format == Format::A8R8G8B8Srgb || format == Format::A8B8G8R8Srgb) {
-                output[0] = srgb8[(pixel >> (format == Format::A8R8G8B8Srgb ? 0 : 16)) & 255];
-                output[1] = srgb8[(pixel >> 8) & 255];
-                output[2] = srgb8[(pixel >> (format == Format::A8R8G8B8Srgb ? 16 : 0)) & 255];
-                output[3] = pixel >> 24;
-            } else {
-                for (u32 channel = 0; channel < 3; ++channel)
-                    output[channel] = encoded10[(pixel >> (channel * 10)) & 1023];
-                output[3] = (pixel >> 30) * 85;
-            }
-        }
+    frame->format = group.attrib.pixel_format;
+    frame->gamma = gamma.load();
+    frame->pixels.resize(u64(frame->width) * frame->height * pixel_bytes);
+    for (u32 row = 0; row < frame->height; ++row) {
+        const u64 source = u64(row) * info.mips_layout[0].pitch * pixel_bytes;
+        const u64 bytes = u64(frame->width) * pixel_bytes;
+        if (source + bytes > linear.size())
+            throw std::runtime_error("D3D12 VideoOut row exceeds guest backing");
+        std::memcpy(frame->pixels.data() + u64(row) * bytes, linear.data() + source, bytes);
+    }
     frame->jitter = D3D12::NativeTemporalJitter().CompleteFrame();
     return frame;
+}
+std::vector<u8> D3D12Presenter::ConvertPixels(const Frame& frame, bool floating_point) const {
+    using Format = Libraries::VideoOut::PixelFormat;
+    const bool fp16 = frame.format == Format::A16R16G16B16Float;
+    const bool srgb = frame.format == Format::A8R8G8B8Srgb ||
+                      frame.format == Format::A8B8G8R8Srgb ||
+                      frame.format == Format::A2R10G10B10Srgb;
+    const bool pq = frame.format == Format::A2R10G10B10Bt2020Pq ||
+                    (hdr_enabled && (frame.format == Format::A2R10G10B10 ||
+                                     frame.format == Format::A2R10G10B10Srgb));
+    const auto degamma = [](float value) {
+        return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f);
+    };
+    const auto encode = [&](float value) {
+        return value > 0.0031308f ? 1.055f * std::pow(value, 1.0f / (3.4f - frame.gamma)) - 0.055f
+                                  : 12.92f * value / frame.gamma;
+    };
+    const auto decode_pq = [](float value) {
+        constexpr float m1 = 2610.0f / 16384.0f, m2 = 2523.0f / 32.0f;
+        constexpr float c1 = 3424.0f / 4096.0f, c2 = 2413.0f / 128.0f;
+        constexpr float c3 = 2392.0f / 128.0f;
+        const float p = std::pow(std::clamp(value, 0.0f, 1.0f), 1.0f / m2);
+        return 125.0f * std::pow(std::max(p - c1, 0.0f) / (c2 - c3 * p), 1.0f / m1);
+    };
+    const bool eight_bit =
+        frame.format == Format::A8R8G8B8Srgb || frame.format == Format::A8B8G8R8Srgb;
+    const u32 maximum = eight_bit ? 255 : 1023;
+    std::array<float, 1024> components{};
+    if (!fp16) {
+        for (u32 i = 0; i <= maximum; ++i) {
+            float value = float(i) / maximum;
+            if (pq) {
+                value = decode_pq(value);
+            } else {
+                if (srgb)
+                    value = degamma(value);
+                if (!floating_point || (!hdr_enabled && frame.gamma != 1.0f))
+                    value = floating_point ? degamma(encode(value)) : encode(value);
+            }
+            components[i] = value;
+        }
+    }
+    const u32 input_bytes = fp16 ? 8 : 4, output_bytes = floating_point ? 8 : 4;
+    std::vector<u8> pixels(u64(frame.width) * frame.height * output_bytes);
+    for (u64 i = 0; i < u64(frame.width) * frame.height; ++i) {
+        std::array<float, 4> rgba{};
+        const auto* input = frame.pixels.data() + i * input_bytes;
+        if (fp16) {
+            std::array<u16, 4> bgra;
+            std::memcpy(bgra.data(), input, sizeof(bgra));
+            for (u32 c = 0; c < 4; ++c)
+                rgba[c] = static_cast<float>(std::bit_cast<half_float::half>(bgra[c == 0   ? 2
+                                                                                  : c == 2 ? 0
+                                                                                           : c]));
+        } else {
+            u32 value;
+            std::memcpy(&value, input, sizeof(value));
+            if (frame.format == Format::A8R8G8B8Srgb || frame.format == Format::A8B8G8R8Srgb) {
+                rgba = {float((value >> 16) & 255) / 255, float((value >> 8) & 255) / 255,
+                        float(value & 255) / 255, float(value >> 24) / 255};
+                if (frame.format == Format::A8B8G8R8Srgb)
+                    std::swap(rgba[0], rgba[2]);
+            } else {
+                rgba = {float((value >> 20) & 1023) / 1023, float((value >> 10) & 1023) / 1023,
+                        float(value & 1023) / 1023, float(value >> 30) / 3};
+            }
+        }
+        for (auto& value : rgba)
+            if (!std::isfinite(value))
+                value = 0;
+        if (!fp16)
+            for (u32 c = 0; c < 3; ++c)
+                rgba[c] = components[static_cast<u32>(rgba[c] * maximum + 0.5f)];
+        if (pq) {
+            const float r = rgba[0], g = rgba[1], b = rgba[2];
+            rgba[0] = 1.660491f * r - 0.587641f * g - 0.072850f * b;
+            rgba[1] = -0.124550f * r + 1.132900f * g - 0.008349f * b;
+            rgba[2] = -0.018151f * r - 0.100579f * g + 1.118730f * b;
+        } else if (fp16) {
+            for (u32 c = 0; c < 3; ++c) {
+                if (!floating_point || (!hdr_enabled && frame.gamma != 1.0f))
+                    rgba[c] = floating_point ? degamma(encode(rgba[c])) : encode(rgba[c]);
+            }
+        }
+        if (fp16 && !hdr_enabled)
+            for (u32 c = 0; c < 3; ++c)
+                rgba[c] *= sdr_white_nits / 80.0f;
+        auto* output = pixels.data() + i * output_bytes;
+        if (floating_point) {
+            std::array<u16, 4> packed;
+            for (u32 c = 0; c < 4; ++c)
+                packed[c] = std::bit_cast<u16>(
+                    half_float::half_cast<half_float::half, std::round_to_nearest>(
+                        std::clamp(rgba[c], -65504.0f, 65504.0f)));
+            std::memcpy(output, packed.data(), sizeof(packed));
+        } else {
+            for (u32 c = 0; c < 4; ++c)
+                output[c] = static_cast<u8>(std::clamp(rgba[c == 0   ? 2
+                                                            : c == 2 ? 0
+                                                                     : c] *
+                                                               255 +
+                                                           0.5f,
+                                                       0.0f, 255.0f));
+        }
+    }
+    return pixels;
 }
 VideoCore::FrameHandle D3D12Presenter::PrepareBlankFrame(bool) {
     return std::make_shared<Frame>();
@@ -134,9 +222,17 @@ void D3D12Presenter::Present(const VideoCore::FrameHandle& frame, bool, bool) {
     last_frame = native;
     RenderFrame();
 }
+bool D3D12Presenter::IsHDRSupported() const {
+    return float_supported && hdr_display.load() && EmulatorSettings.IsHdrAllowed();
+}
+void D3D12Presenter::SetHDROutput(bool enabled, float white_nits) {
+    std::scoped_lock lock{mutex};
+    hdr_display.store(enabled);
+    sdr_white_nits = enabled && std::isfinite(white_nits) && white_nits > 0 ? white_nits : 80.0f;
+}
 void D3D12Presenter::SetHDR(bool enabled) {
-    if (enabled)
-        throw std::runtime_error("D3D12 VideoOut HDR is not implemented");
+    std::scoped_lock lock{mutex};
+    hdr_enabled = enabled;
 }
 void D3D12Presenter::SetGamma(float value) {
     if (!std::isfinite(value) || value < 0.1f || value > 2.0f)
@@ -203,12 +299,15 @@ void D3D12Presenter::Initialize(const ShadPS4Config& config) {
     static_cast<void>(descriptors.Allocate(2));
     width = config.width;
     height = config.height;
+    display_width = width;
+    display_height = height;
     ComPtr<IDXGIFactory2> factory;
     winrt::check_hresult(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
     DXGI_SWAP_CHAIN_DESC1 description{};
     description.Width = width;
     description.Height = height;
-    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    description.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    format = description.Format;
     description.SampleDesc.Count = 1;
     description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     description.BufferCount = 2;
@@ -219,6 +318,13 @@ void D3D12Presenter::Initialize(const ShadPS4Config& config) {
     winrt::check_hresult(factory->CreateSwapChainForComposition(context.DirectQueue(), &description,
                                                                 nullptr, &chain));
     winrt::check_hresult(chain.As(&swapchain));
+    UINT support{};
+    winrt::check_hresult(swapchain->CheckColorSpaceSupport(
+        DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support));
+    float_supported = (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0;
+    if (!float_supported)
+        throw std::runtime_error("D3D12 VideoOut scRGB presentation is not supported");
+    winrt::check_hresult(swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709));
     GetBuffers();
     context.CreateDirectCommands(commands_allocator, commands);
     winrt::check_hresult(commands->Close());
@@ -239,7 +345,22 @@ void D3D12Presenter::Render() {
 }
 void D3D12Presenter::RenderFrame() {
     if (last_frame && last_frame->width && last_frame->height)
-        ResizeBuffers(last_frame->width, last_frame->height);
+        ResizeBuffers(last_frame->width, last_frame->height,
+                      last_frame->format == Libraries::VideoOut::PixelFormat::A16R16G16B16Float ||
+                              last_frame->format ==
+                                  Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq ||
+                              hdr_enabled
+                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                          : DXGI_FORMAT_B8G8R8A8_UNORM);
+    else
+        ResizeBuffers(display_width, display_height, hdr_enabled ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                               : DXGI_FORMAT_B8G8R8A8_UNORM);
+    const float scale = std::min(float(display_width) / width, float(display_height) / height);
+    const DXGI_MATRIX_3X2_F transform{
+        scale / composition_scale_x, 0, 0, scale / composition_scale_y,
+        (display_width - width * scale) * 0.5f / composition_scale_x,
+        (display_height - height * scale) * 0.5f / composition_scale_y};
+    winrt::check_hresult(swapchain->SetMatrixTransform(&transform));
     winrt::check_hresult(commands_allocator->Reset());
     winrt::check_hresult(commands->Reset(commands_allocator.Get(), nullptr));
     const auto index = swapchain->GetCurrentBackBufferIndex();
@@ -251,7 +372,15 @@ void D3D12Presenter::RenderFrame() {
         u64 bytes;
         context.Device()->GetCopyableFootprints(&description, 0, 1, 0, &footprint, nullptr, nullptr,
                                                 &bytes);
+        if (last_frame->upload.Get() && (last_frame->upload_hdr != hdr_enabled ||
+                                         last_frame->upload_sdr_white != sdr_white_nits))
+            last_frame->upload = {};
         if (!last_frame->upload.Get()) {
+            const auto pixels =
+                ConvertPixels(*last_frame, format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+            const u32 pixel_bytes = format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+            last_frame->upload_hdr = hdr_enabled;
+            last_frame->upload_sdr_white = sdr_white_nits;
             winrt::check_hresult(resources.CreateBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD,
                                                         D3D12_RESOURCE_STATE_GENERIC_READ,
                                                         last_frame->upload));
@@ -260,7 +389,8 @@ void D3D12Presenter::RenderFrame() {
             winrt::check_hresult(last_frame->upload->Map(0, &empty, &mapped));
             for (u32 row = 0; row < height; ++row)
                 std::memcpy(static_cast<u8*>(mapped) + row * footprint.Footprint.RowPitch,
-                            last_frame->pixels.data() + u64(row) * width * 4, u64(width) * 4);
+                            pixels.data() + u64(row) * width * pixel_bytes,
+                            u64(width) * pixel_bytes);
             const D3D12_RANGE contents{0, static_cast<SIZE_T>(bytes)};
             last_frame->upload->Unmap(0, &contents);
         }
@@ -284,19 +414,27 @@ void D3D12Presenter::RenderFrame() {
     context.Wait(ticket);
 }
 
-void D3D12Presenter::Resize(uint32_t new_width, uint32_t new_height) {
+void D3D12Presenter::Resize(uint32_t new_width, uint32_t new_height, float scale_x, float scale_y) {
     std::scoped_lock lock{mutex};
-    if (last_frame && last_frame->width && last_frame->height)
+    if (!new_width || !new_height || !std::isfinite(scale_x) || !std::isfinite(scale_y) ||
+        scale_x <= 0 || scale_y <= 0)
         return;
-    ResizeBuffers(new_width, new_height);
+    if (display_width == new_width && display_height == new_height &&
+        composition_scale_x == scale_x && composition_scale_y == scale_y)
+        return;
+    display_width = new_width;
+    display_height = new_height;
+    composition_scale_x = scale_x;
+    composition_scale_y = scale_y;
+    RenderFrame();
 }
 void D3D12Presenter::Drain() {
     std::scoped_lock lock{mutex};
     if (context.DirectQueue())
         context.WaitForGpu();
 }
-void D3D12Presenter::ResizeBuffers(uint32_t new_width, uint32_t new_height) {
-    if (!swapchain || !new_width || !new_height || (new_width == width && new_height == height)) {
+void D3D12Presenter::ResizeBuffers(uint32_t new_width, uint32_t new_height, DXGI_FORMAT new_format) {
+    if (!swapchain || !new_width || !new_height || (new_width == width && new_height == height && new_format == format)) {
         return;
     }
     context.WaitForGpu();
@@ -304,8 +442,16 @@ void D3D12Presenter::ResizeBuffers(uint32_t new_width, uint32_t new_height) {
     for (auto& buffer : buffers) {
         buffer.Reset();
     }
-    winrt::check_hresult(
-        swapchain->ResizeBuffers(2, new_width, new_height, DXGI_FORMAT_B8G8R8A8_UNORM, 0));
+    winrt::check_hresult(swapchain->ResizeBuffers(2, new_width, new_height, new_format, 0));
+    const auto color_space = new_format == DXGI_FORMAT_R16G16B16A16_FLOAT
+                                 ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                                 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    UINT support{};
+    winrt::check_hresult(swapchain->CheckColorSpaceSupport(color_space, &support));
+    if (!(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
+        throw std::runtime_error("D3D12 VideoOut color space is not supported");
+    winrt::check_hresult(swapchain->SetColorSpace1(color_space));
+    format = new_format;
     width = new_width;
     height = new_height;
     GetBuffers();

@@ -90,6 +90,9 @@ SHADPS4_API void __cdecl shadps4_request_stop(void);
 SHADPS4_API void __cdecl shadps4_set_paused(int32_t paused);
 SHADPS4_API int32_t __cdecl shadps4_set_host_state(int32_t active, int32_t input_captured);
 SHADPS4_API void __cdecl shadps4_resize(uint32_t width, uint32_t height);
+SHADPS4_API void __cdecl shadps4_resize_surface(uint32_t width, uint32_t height,
+                                               float scale_x, float scale_y);
+SHADPS4_API void __cdecl shadps4_set_hdr_output(int32_t enabled, float sdr_white_nits);
 SHADPS4_API int32_t __cdecl shadps4_render_host_frame(void);
 SHADPS4_API uint32_t __cdecl shadps4_get_state(void);
 SHADPS4_API uint32_t __cdecl shadps4_get_error(char* destination, uint32_t capacity);

@@ -10,6 +10,7 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/libraries/kernel/threads/pthread.h"
+#include "core/memory.h"
 #include "core/signals.h"
 #include "emulator.h"
 #ifdef SHADPS4_UWP
@@ -397,6 +398,10 @@ SignalDispatch::~SignalDispatch() {
 }
 
 bool SignalDispatch::DispatchAccessViolation(void* context, void* fault_address) const {
+#ifdef _WIN32
+    if (MemoryManager::GpuAccessFault(context, fault_address))
+        return true;
+#endif
     for (const auto& [handler, _] : access_violation_handlers) {
         if (handler(context, fault_address)) {
             return true;

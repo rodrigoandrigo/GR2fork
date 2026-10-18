@@ -238,6 +238,13 @@ struct StreamOutBufferConfig {
     u32 stream_3_buf_en : 4;
 };
 
+struct StreamOutBuffer {
+    u32 size;
+    u32 vtx_stride;
+    u32 : 32;
+    u32 offset;
+};
+
 struct LsHsConfig {
     u32 num_patches : 8;
     u32 hs_input_control_points : 6;

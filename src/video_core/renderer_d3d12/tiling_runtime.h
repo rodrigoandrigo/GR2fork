@@ -16,10 +16,15 @@ struct TilingEntry {
     u32 tiled_offset;
     u32 linear_offset;
     u32 row_pitch;
+    u32 width;
+    u32 visible_height;
 };
 class TilingRuntime {
 public:
     void Initialize(D3D12DeviceContext& device, class ShaderCache& shaders);
+    void BeginBatch();
+    bool CanRecord(const VideoCore::ImageInfo& info, std::span<const TilingEntry> entries,
+                   bool tile) const;
     static bool Supported(const VideoCore::ImageInfo& info, size_t entries);
     static std::vector<TilingEntry> Entries(
         const VideoCore::ImageInfo& info,
@@ -28,12 +33,10 @@ public:
                 std::span<const TilingEntry> entries, std::span<const u8> tiled_bytes,
                 ID3D12Resource* image,
                 std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints);
-    void Tile(ID3D12GraphicsCommandList* commands, const VideoCore::ImageInfo& info,
+    ID3D12Resource* Tile(ID3D12GraphicsCommandList* commands, const VideoCore::ImageInfo& info,
               std::span<const TilingEntry> entries, ID3D12Resource* image,
-              std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints);
-    D3D12Resource& TiledReadback() {
-        return tile_readback;
-    }
+              std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints,
+              std::span<const u8> guest);
 
 private:
     ID3D12PipelineState* Pipeline(const VideoCore::ImageInfo& info, bool is_tiler);
@@ -48,6 +51,7 @@ private:
                                  D3D12_RESOURCE_STATES initial_state, D3D12_RESOURCE_STATES& state,
                                  D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);
     void EnsureZeroed();
+    void BeginOperation();
     void Transition(ID3D12GraphicsCommandList* commands, D3D12Resource& buffer,
                     D3D12_RESOURCE_STATES& state, D3D12_RESOURCE_STATES next);
     D3D12DeviceContext* device{};
@@ -55,9 +59,12 @@ private:
     D3D12ResourceAllocator allocator;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
     std::unordered_map<u64, Microsoft::WRL::ComPtr<ID3D12PipelineState>> pipelines;
-    D3D12Resource params, staging, input, output, zeros, tile_readback;
-    u64 zeros_zeroed{};
-    D3D12_RESOURCE_STATES heap_state{}, input_state{D3D12_RESOURCE_STATE_UNORDERED_ACCESS},
-        output_state{D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    struct Operation {
+        D3D12Resource params, staging, input, output, zeros, tile_readback;
+        u64 zeros_zeroed{};
+        D3D12_RESOURCE_STATES heap_state{}, input_state{}, output_state{};
+    };
+    std::vector<std::unique_ptr<Operation>> operations;
+    Operation* active{};
 };
 } // namespace D3D12

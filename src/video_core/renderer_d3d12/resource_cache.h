@@ -17,6 +17,7 @@ public:
     using Read = std::function<void(VAddr, std::span<u8>)>;
     using Write = std::function<void(VAddr, std::span<const u8>)>;
     using Resolve = std::function<std::optional<VAddr>(VAddr, u64)>;
+    using Overlaps = std::function<bool(VAddr, u64, VAddr, u64)>;
     struct Identity {
         VAddr address;
         bool physical;
@@ -41,29 +42,36 @@ public:
             u64 offset, size;
         };
         std::vector<WriteTarget> targets;
+        std::vector<WriteTarget> sources;
         std::vector<u8> host_data;
     };
     struct Range {
         VAddr address;
         u64 size;
     };
+    using ResolveBacking = std::function<std::vector<Range>(VAddr, u64)>;
+    void SetBackingResolver(ResolveBacking resolver) {
+        resolve_backing = std::move(resolver);
+    }
     struct View {
         Buffer* buffer;
         u64 offset;
         u64 size;
         VAddr guest_address{};
     };
-    void Initialize(D3D12DeviceContext& device, Read read, Write write, Resolve resolve = {});
+    void Initialize(D3D12DeviceContext& device, Read read, Write write, Resolve resolve = {},
+                    Overlaps overlaps = {});
     Identity Canonicalize(VAddr address, u64 size) const;
+    bool Aliases(VAddr first, u64 first_size, VAddr second, u64 second_size) const;
     void MarkWritten(const View& view);
     void BeginBatch();
-    Buffer& GetBuffer(VAddr address, u64 size, bool physical = false);
+    Buffer& GetBuffer(VAddr address, u64 size, bool physical = false, bool gathered = false);
     Buffer& GetHostBuffer(VAddr identity, std::span<const u8> data);
     std::vector<View> GetViews(std::span<const Range> ranges);
     void Upload(Buffer& buffer, ID3D12GraphicsCommandList* commands);
     void Barrier(Buffer& buffer, ID3D12GraphicsCommandList* commands, D3D12_RESOURCE_STATES state);
     void PrepareDownload(ID3D12GraphicsCommandList* commands);
-    void CommitDownloads();
+    void CommitDownloads(bool mapping_stable = false);
     void MapMemory(VAddr address, u64 size) override;
     void RegisterMemory(VAddr address, u64 size) override;
     void UnmapMemory(VAddr address, u64 size) override;
@@ -74,15 +82,20 @@ private:
         VAddr address;
         u64 size;
         u64 epoch;
+        bool mapping;
     };
     void EnsureSpace(u64 required, bool inserting = false);
+    std::vector<View> GetBackingViews(std::span<const Range> ranges);
     void EnsureStaging(Buffer& buffer, bool download);
-    bool Changed(const Buffer& buffer);
+    bool Changed(const Buffer& buffer, bool mappings_only = false);
+    bool InvalidateRange(VAddr address, u64 size, bool mapping);
     D3D12DeviceContext* context{};
     D3D12ResourceAllocator allocator;
     Read read;
     Write write;
     Resolve resolve;
+    Overlaps overlaps;
+    ResolveBacking resolve_backing;
     std::map<std::tuple<bool, VAddr, u64>, std::unique_ptr<Buffer>> buffers;
     std::mutex invalidation_mutex;
     std::vector<Invalidation> invalidations;
@@ -91,5 +104,6 @@ private:
     u64 batch{};
     u64 native_bytes{};
     u64 invalidation_floor{};
+    u64 mapping_floor{};
 };
 } // namespace D3D12

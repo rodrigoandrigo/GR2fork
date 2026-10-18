@@ -55,9 +55,10 @@ struct TileAddress {
         MICRO_TILE_MODE = u32(AmdGpu::GetMicroTileMode(info.tile_mode));
         MICRO_TILE_THICKNESS = AmdGpu::GetMicroTileThickness(info.array_mode);
         ARRAY_MODE = u32(info.array_mode);
-        PIPE_CONFIG = u32(AmdGpu::GetPipeConfig(info.tile_mode));
-        NUM_PIPES = PIPE_CONFIG == 0 ? 2 : 8;
-        NUM_PIPE_BITS = PIPE_CONFIG == 0 ? 1 : 3;
+        PIPE_CONFIG = u32(info.alt_tile ? AmdGpu::GetAltPipeConfig(info.tile_mode)
+                                        : AmdGpu::GetPipeConfig(info.tile_mode));
+        NUM_PIPES = AmdGpu::GetPipeCount(AmdGpu::PipeConfig(PIPE_CONFIG));
+        NUM_PIPE_BITS = std::bit_width(NUM_PIPES) - 1;
         MICRO_TILE_BITS = 64 * MICRO_TILE_THICKNESS * BITS_PER_PIXEL * NUM_SAMPLES;
         MICRO_TILE_BYTES = MICRO_TILE_BITS / 8;
         bank_swizzle = info.bank_swizzle;
@@ -65,13 +66,15 @@ struct TileAddress {
             const auto macro =
                 AmdGpu::CalculateMacrotileMode(info.tile_mode, BITS_PER_PIXEL, NUM_SAMPLES);
             BANK_WIDTH = AmdGpu::GetBankWidth(macro);
-            BANK_HEIGHT = AmdGpu::GetBankHeight(macro);
-            NUM_BANKS = AmdGpu::GetNumBanks(macro);
+            BANK_HEIGHT =
+                info.alt_tile ? AmdGpu::GetAltBankHeight(macro) : AmdGpu::GetBankHeight(macro);
+            NUM_BANKS = info.alt_tile ? AmdGpu::GetAltNumBanks(macro) : AmdGpu::GetNumBanks(macro);
             NUM_BANK_BITS = std::bit_width(NUM_BANKS) - 1;
             TILE_SPLIT_BYTES =
                 AmdGpu::CalculateTileSplit(info.tile_mode, info.array_mode,
                                            AmdGpu::MicroTileMode(MICRO_TILE_MODE), BITS_PER_PIXEL);
-            MACRO_TILE_ASPECT = AmdGpu::GetMacrotileAspect(macro);
+            MACRO_TILE_ASPECT = info.alt_tile ? AmdGpu::GetAltMacrotileAspect(macro)
+                                              : AmdGpu::GetMacrotileAspect(macro);
         }
     }
     u32 ComputePixelIndexWithinMicroTile(u32 x, u32 y, u32 z, u32 thickness) const {
@@ -211,6 +214,7 @@ struct TileAddress {
         u32 p0 = 0;
         u32 p1 = 0;
         u32 p2 = 0;
+        u32 p3 = 0;
 
         u32 tx = x / MICRO_TILE_WIDTH;
         u32 ty = y / MICRO_TILE_HEIGHT;
@@ -233,7 +237,13 @@ struct TileAddress {
             p2 = x5 ^ y5;
         }
 
-        u32 pipe = p0 | (p1 << 1) | (p2 << 2);
+        if (PIPE_CONFIG == u32(AmdGpu::PipeConfig::P16_32x32_8x16)) {
+            p0 = x4 ^ y3;
+            p1 = x3 ^ y4;
+            p2 = x5 ^ _BIT(ty, 3);
+            p3 = _BIT(tx, 3) ^ y5;
+        }
+        u32 pipe = p0 | (p1 << 1) | (p2 << 2) | (p3 << 3);
 
         u32 pipe_swizzle = 0;
         if (ARRAY_MODE == ARRAY_3D_TILED_THIN1 || ARRAY_MODE == ARRAY_3D_TILED_THICK ||
@@ -355,9 +365,7 @@ struct TileAddress {
 
         u32 total_offset = slice_offset + macro_tile_offset + element_offset + tile_offset;
 
-        if (ARRAY_MODE == ARRAY_PRT_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_TILED_THICK ||
-            ARRAY_MODE == ARRAY_PRT_2D_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_2D_TILED_THICK ||
-            ARRAY_MODE == ARRAY_PRT_3D_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_3D_TILED_THICK) {
+        if (ARRAY_MODE == ARRAY_PRT_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_TILED_THICK) {
             x %= macro_tile_pitch;
             y %= macro_tile_height;
         }
@@ -424,9 +432,67 @@ void Convert(std::span<const u8> source, std::span<u8> destination, const ImageI
         }
     }
 }
+template <u32 Bits>
+std::vector<u32> BuildAddresses(const ImageInfo& info) {
+    TileAddress<Bits> address{info};
+    constexpr u32 block = Bits / 8;
+    std::vector<u32> offsets(info.guest_size / block, UINT32_MAX);
+    u32 index{};
+    for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+        const auto& layout = info.mips_layout[mip];
+        if (!layout.pitch || !layout.height || layout.size % block)
+            throw std::runtime_error("Invalid image address table layout");
+        const bool macro =
+            AmdGpu::IsMacroTiled(info.array_mode) && !(info.micro_tiled_mips & (1u << mip));
+        for (u32 texel = 0; texel < layout.size / block; ++texel) {
+            const u32 x = texel % layout.pitch, y = (texel / layout.pitch) % layout.height;
+            const u32 plane = texel / (u32(layout.pitch) * layout.height);
+            const u32 sample = plane % info.num_samples, slice = plane / info.num_samples;
+            const u64 offset = layout.offset +
+                (!info.props.is_tiled ? u64(texel) * block
+                 : macro ? address.ComputeSurfaceAddrFromCoordMacroTiled(
+                               x, y, slice, layout.pitch, layout.height, sample)
+                         : address.ComputeSurfaceAddrFromCoordMicroTiled(
+                               x, y, slice, layout.pitch, layout.height,
+                               std::min(address.MICRO_TILE_THICKNESS, 4u), sample));
+            if (offset + block > info.guest_size || index >= offsets.size())
+                throw std::runtime_error("Image address table exceeds guest allocation");
+            offsets[index++] = u32(offset);
+        }
+    }
+    return offsets;
+}
 } // namespace
+
+std::vector<u32> BuildImageAddressTable(const ImageInfo& info) {
+    if (info.num_bits == 96 && info.props.is_tiled)
+        throw std::runtime_error("RGB96 guest images require linear tiling");
+    if (info.props.is_block || !std::has_single_bit(info.num_samples) || info.num_samples > 16 ||
+        !info.resources.levels || info.resources.levels > MAX_MIPS ||
+        info.guest_size > 16 * 1024 * 1024)
+        throw std::runtime_error("Unsupported shared image address table allocation");
+    switch (info.num_bits) {
+    case 8:
+        return BuildAddresses<8>(info);
+    case 16:
+        return BuildAddresses<16>(info);
+    case 32:
+        return BuildAddresses<32>(info);
+    case 64:
+        return BuildAddresses<64>(info);
+    case 96:
+        return BuildAddresses<96>(info);
+    case 128:
+        return BuildAddresses<128>(info);
+    default:
+        throw std::runtime_error("Unsupported shared image texel width");
+    }
+}
+
 void ConvertTiling(std::span<const u8> source, std::span<u8> destination, const ImageInfo& info,
                    bool encode) {
+    if (info.num_bits == 96 && info.props.is_tiled)
+        throw std::runtime_error("RGB96 guest images require linear tiling");
     if (!std::has_single_bit(info.num_samples) || info.num_samples > 16 ||
         info.resources.levels > MAX_MIPS || info.guest_size > source.size() ||
         info.guest_size > destination.size())

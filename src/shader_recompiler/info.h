@@ -115,6 +115,7 @@ struct Info : InfoPersistent {
     ReadConstType readconst_types{};
     CopyShaderData gs_copy_data;
     u32 uses_patches{};
+    u32 gs_emit_vertices{};
 
     VAddr pgm_base;
     bool has_storage_images{};

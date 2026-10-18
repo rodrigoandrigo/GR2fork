@@ -3,10 +3,16 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
@@ -287,6 +293,7 @@ public:
     static inline thread_local bool tls_in_guest_copy_scope = false;
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
+    std::shared_ptr<void> AcquireGpuAccess(std::span<const std::pair<VAddr, u64>> ranges);
 
     /// A contiguous run of the never-protected physical backing view.
     struct BackingSpan {
@@ -368,6 +375,24 @@ public:
     void InvalidateMemory(VAddr addr, u64 size) const;
 
 private:
+    struct GpuAccessLease;
+    struct GpuProtectedRange {
+        VAddr address;
+        u64 size;
+        MemoryPermission permissions;
+    };
+    std::shared_lock<Common::SharedFirstMutex> LockGpuAccess();
+    void ReleaseGpuAccess();
+    bool HandleGpuAccessFault(void* context, VAddr address);
+    static bool GpuAccessFault(void* context, void* address);
+    void DetachGpuAccess();
+    std::recursive_mutex gpu_access_mutex;
+    Common::SharedFirstMutex gpu_copy_mutex;
+    static inline thread_local MemoryManager* gpu_access_memory{};
+    std::condition_variable_any gpu_access_cv;
+    std::thread::id gpu_access_owner;
+    std::vector<GpuProtectedRange> gpu_protected_ranges;
+    u64 gpu_access_epoch{};
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));
     }
@@ -443,6 +468,7 @@ private:
     std::array<PrtArea, 3> prt_areas{};
 
     friend class ::Core::Devtools::Widget::MemoryMapViewer;
+    friend class SignalDispatch;
 };
 
 using Memory = Common::Singleton<MemoryManager>;

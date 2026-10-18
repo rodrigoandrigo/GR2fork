@@ -8,9 +8,6 @@
 
 namespace D3D12 {
 namespace {
-bool Overlap(VAddr first, u64 first_size, VAddr second, u64 second_size) {
-    return first_size && second_size && first < second + second_size && second < first + first_size;
-}
 D3D12_TEXTURE_ADDRESS_MODE AddressMode(AmdGpu::ClampMode mode) {
     switch (mode) {
     case AmdGpu::ClampMode::Wrap:
@@ -59,12 +56,11 @@ DXGI_FORMAT TypelessFormat(DXGI_FORMAT format) {
 }
 } // namespace
 ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& buffer_cache,
-                                   ImageCache& image_cache, std::span<CompiledShader*> shaders)
+                                   ImageCache& image_cache, std::span<CompiledShader*> shaders,
+                                   std::span<const StreamOutSlot> strmout_slots)
     : device{context}, buffers{buffer_cache}, images{image_cache} {
-    u32 resource_count{}, sampler_count{};
+    u32 resource_count{}, sampler_count{}, strmout_used{};
     for (auto* shader : shaders) {
-        if (!shader->info.fmasks.empty())
-            throw std::runtime_error("D3D12 FMASK shader resources are not implemented");
         for (const auto& binding : shader->binary->bindings) {
             if (binding.binding < shader->start_bindings.unified)
                 throw std::runtime_error("Invalid guest shader binding base");
@@ -109,9 +105,17 @@ ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& b
                                  u64(sharp.num_records) * std::max<u32>(1, sharp.stride)};
                         if (range.address > UINT64_MAX - range.size)
                             throw std::runtime_error("Guest shader buffer address overflow");
+                    } else if (resource.buffer_type == Shader::BufferType::Strmout) {
+                        if (strmout_used >= 4)
+                            throw std::runtime_error(
+                                "D3D12 stream-out capture binding count exceeds slots");
+                        range = {strmout_slots[strmout_used].address,
+                                 strmout_slots[strmout_used].size};
+                        ++strmout_used;
                     } else if (resource.buffer_type != Shader::BufferType::Flatbuf &&
                                resource.buffer_type != Shader::BufferType::ClipPlanes &&
                                resource.buffer_type != Shader::BufferType::GdsBuffer &&
+                               resource.buffer_type != Shader::BufferType::ImageAddressTable &&
                                resource.buffer_type != Shader::BufferType::SharedMemory)
                         throw std::runtime_error(
                             "D3D12 shader special buffer requires additional execution state");
@@ -130,11 +134,31 @@ ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& b
     static_cast<void>(samplers.Allocate(std::max(1u, sampler_count)));
 }
 bool ResourceBindings::Aliases(VAddr first, u64 first_size, VAddr second, u64 second_size) const {
-    if (!first_size || !second_size)
-        return false;
-    const auto a = buffers.Canonicalize(first, first_size);
-    const auto b = buffers.Canonicalize(second, second_size);
-    return a.physical == b.physical && Overlap(a.address, first_size, b.address, second_size);
+    return buffers.Aliases(first, first_size, second, second_size);
+}
+std::vector<ResourceCache::Range> ResourceBindings::AccessRanges(VAddr border_colors) const {
+    auto ranges = guest_ranges;
+    for (const auto& entry : entries) {
+        if (entry.binding.kind == ResourceKind::Image) {
+            const auto& resource = entry.shader->info.images[entry.index];
+            const auto sharp = resource.GetSharp(entry.shader->info);
+            if (sharp) {
+                const VideoCore::ImageInfo info{sharp, resource};
+                ranges.push_back({info.guest_address, info.guest_size});
+                ranges.push_back({info.stencil_addr, info.stencil_size});
+            }
+        } else if (entry.binding.kind == ResourceKind::Sampler) {
+            const auto sharp =
+                entry.shader->info.samplers[entry.index].GetSharp(entry.shader->info);
+            if (sharp.border_color_type.Value() == AmdGpu::BorderColor::Custom) {
+                const u64 offset = sharp.border_color_ptr.Value() * 16;
+                if (!border_colors || border_colors > UINT64_MAX - offset - 16)
+                    throw std::runtime_error("Invalid guest custom sampler border table");
+                ranges.push_back({border_colors + offset, 16});
+            }
+        }
+    }
+    return ranges;
 }
 void ResourceBindings::ValidateInputRange(VAddr address, u64 size) const {
     if (address > UINT64_MAX - size)
@@ -182,6 +206,21 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                               const ResourceCache::Read& read, std::span<const u8, 65536> gds,
                               std::span<const u8> shared_memory) {
     const auto views = buffers.GetViews(guest_ranges);
+    for (u32 i = 0; i < entries.size(); ++i) {
+        if (entries[i].binding.kind != ResourceKind::Buffer || !views[i].buffer)
+            continue;
+        for (u32 j = 0; j < i; ++j) {
+            if (entries[j].binding.kind != ResourceKind::Buffer || !views[j].buffer ||
+                views[i].buffer == views[j].buffer)
+                continue;
+            if ((entries[i].shader->info.buffers[entries[i].index].is_written ||
+                 entries[j].shader->info.buffers[entries[j].index].is_written) &&
+                Aliases(guest_ranges[i].address, guest_ranges[i].size, guest_ranges[j].address,
+                        guest_ranges[j].size))
+                throw std::runtime_error(
+                    "D3D12 segmented writable aliases require a shared allocation");
+        }
+    }
     std::vector<ResourceCache::Buffer*> uploaded_buffers;
     std::vector<ImageCache::Image*> uploaded_images;
     struct BoundImage {
@@ -205,6 +244,13 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                                                {reinterpret_cast<const u8*>(info.flat_ud),
                                                 static_cast<size_t>(bytes)}),
                         0, bytes};
+            } else if (resource.buffer_type == Shader::BufferType::ImageAddressTable) {
+                const auto& table = entry.shader->image_address_tables.at(entry.index);
+                const u64 identity =
+                    0xfffa000000000000ULL + (u64(info.sw_stage) << 32) + entry.index;
+                view = {&buffers.GetHostBuffer(identity, {reinterpret_cast<const u8*>(table.data()),
+                                                          table.size() * sizeof(u32)}),
+                        0, table.size() * sizeof(u32)};
             } else if (resource.buffer_type == Shader::BufferType::ClipPlanes)
                 view = {&buffers.GetHostBuffer(0xfffd000000000000ULL,
                                                {reinterpret_cast<const u8*>(clip_planes.data()),
@@ -220,13 +266,13 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                 scratch.snapshot.clear();
                 view = {&scratch, 0, shared_memory.size()};
             } else
-                push.AddOffset(entry.shader->start_bindings.buffer + entry.index, view.offset & 3);
+                push.AddOffset(entry.shader->start_bindings.buffer + entry.index, view.offset & 15);
             D3D12_UNORDERED_ACCESS_VIEW_DESC descriptor{};
             descriptor.Format = DXGI_FORMAT_R32_TYPELESS;
             descriptor.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            descriptor.Buffer.FirstElement = view.offset / 4;
+            descriptor.Buffer.FirstElement = (view.offset & ~u64{15}) / 4;
             descriptor.Buffer.NumElements =
-                view.buffer ? (view.size + (view.offset & 3) + 3) / 4 : 1;
+                view.buffer ? (view.size + (view.offset & 15) + 3) / 4 : 1;
             descriptor.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
             device.Device()->CreateUnorderedAccessView(
                 view.buffer ? view.buffer->native.Get() : nullptr, nullptr, &descriptor,
@@ -314,6 +360,14 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                                                                             : DXGI_FORMAT_R32_FLOAT;
             if (writable && format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
                 format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            if (resource.is_feedback) {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+                winrt::check_hresult(device.Device()->CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)));
+                if (!(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD))
+                    throw std::runtime_error(
+                        "D3D12 image feedback requires typed UAV load support");
+            }
             ImageCache::Image* image{};
             if (sharp) {
                 const VideoCore::ImageInfo image_info{sharp, resource};
@@ -322,12 +376,18 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                                 bound.size) &&
                         bound.writable != writable)
                         throw std::runtime_error(
-                            "D3D12 simultaneous SRV/UAV image aliases require feedback emulation");
-                for (const auto& range : guest_ranges)
-                    if (Aliases(image_info.guest_address, image_info.guest_size, range.address,
+                            "D3D12 SRV/UAV image alias was not lowered to shared storage");
+                for (u32 buffer_index = 0; buffer_index < entries.size(); ++buffer_index) {
+                    const auto& buffer_entry = entries[buffer_index];
+                    const auto& range = guest_ranges[buffer_index];
+                    if (buffer_entry.binding.kind == ResourceKind::Buffer &&
+                        (writable || resource.is_written || resource.is_atomic ||
+                         buffer_entry.shader->info.buffers[buffer_entry.index].is_written) &&
+                        Aliases(image_info.guest_address, image_info.guest_size, range.address,
                                 range.size))
                         throw std::runtime_error(
                             "D3D12 simultaneous image/buffer aliases require coherent views");
+                }
                 image = &images.GetImage(image_info, TypelessFormat(format),
                                          writable ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
                                                   : D3D12_RESOURCE_FLAG_NONE,

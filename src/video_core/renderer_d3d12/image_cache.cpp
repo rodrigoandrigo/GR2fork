@@ -8,6 +8,7 @@
 #include <winrt/base.h>
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_d3d12/profile.h"
+#include "video_core/renderer_d3d12/logic_op_format.h"
 #include "video_core/renderer_d3d12/shader_cache.h"
 #include "video_core/texture_cache/cpu_tiling.h"
 
@@ -168,11 +169,17 @@ void ImageCache::Initialize(D3D12DeviceContext& context, ResourceCache::Read rea
 }
 void ImageCache::BeginBatch() {
     device->WaitForGpu();
+    if (tilizer)
+        tilizer->BeginBatch();
     ++batch;
 }
 ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_FORMAT format,
                                         D3D12_RESOURCE_FLAGS flags, u32 base_layer,
-                                        u32 layer_count) {
+                                        u32 layer_count, bool logic_op, u32 logic_mask) {
+    if (info.num_bits == 96 && info.props.is_tiled)
+        throw std::runtime_error("RGB96 guest images require linear tiling");
+    if (!logic_op)
+        logic_mask = 0;
     const bool has_stencil =
         info.props.is_depth && info.props.has_stencil && info.stencil_addr != 0;
     const bool has_depth = !info.props.is_depth || info.guest_address != 0;
@@ -203,8 +210,7 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         info.size.height > 16384 || !info.size.depth || info.size.depth > 2048 ||
         (!info.props.is_volume && info.size.depth != 1) || !info.resources.levels ||
         info.resources.levels > 16 || !info.resources.layers || info.resources.layers > 2048 ||
-        !std::has_single_bit(info.num_samples) || info.num_samples > 16 || info.alt_tile ||
-        (info.meta_info.fmask_addr && info.num_samples > 1))
+        !std::has_single_bit(info.num_samples) || info.num_samples > 16)
         throw std::runtime_error(
             "D3D12 guest image requires unsupported metadata, samples or layout");
     if (base_layer >= info.resources.layers)
@@ -216,7 +222,12 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     if (info.props.is_volume && (base_layer || layer_count != 1 || info.resources.layers != 1))
         throw std::runtime_error("Invalid D3D12 volume image layer selection");
     const bool multisampled = info.num_samples > 1;
-    const DXGI_FORMAT view_format = ConvertFormat(info.pixel_format);
+    const DXGI_FORMAT view_format =
+        logic_op ? DXGI_FORMAT_R32G32B32A32_UINT : ConvertFormat(info.pixel_format);
+    if (logic_op) {
+        GetLogicOpFormat(ConvertFormat(info.pixel_format));
+        format = view_format;
+    }
     const bool promoted_depth = has_stencil && info.pixel_format == vk::Format::eD16UnormS8Uint;
     DXGI_FORMAT dsv_format = view_format;
     DXGI_FORMAT resource_format = format;
@@ -262,11 +273,13 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
                               ? (canonicalize ? canonicalize(info.guest_address, info.guest_size)
                                               : ResourceCache::Identity{info.guest_address, false})
                               : ResourceCache::Identity{0, false};
-    std::vector<u64> key{identity.address,      info.guest_size,  info.size.width,
-                         info.size.height,      info.pitch,       info.resources.levels,
-                         info.resources.layers, u64(format),      u64(flags),
-                         u64(info.tile_mode),   info.bank_swizzle};
-    key.insert(key.end(), {base_layer, layer_count});
+    std::vector<u64> key{identity.address,      info.guest_size,   info.size.width,
+                         info.size.height,      info.pitch,        info.resources.levels,
+                         info.resources.layers, u64(format),       u64(flags),
+                         u64(info.tile_mode),   info.bank_swizzle, u64(info.alt_tile)};
+    key.insert(key.end(), {base_layer, layer_count, u64(logic_op), logic_mask});
+    if (logic_op)
+        key.push_back(u64(info.pixel_format));
     key.insert(key.end(), {info.size.depth, u64(info.type), info.props.is_volume});
     key.insert(key.end(), {info.num_samples, u64(view_format)});
     key.push_back(identity.physical);
@@ -301,6 +314,8 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     desc.Flags = flags;
     auto result = std::make_unique<Image>();
     result->info = info;
+    result->logic_op = logic_op;
+    result->logic_mask = logic_mask;
     result->base_layer = base_layer;
     result->native_layers = layer_count;
     result->has_stencil = has_stencil;
@@ -504,6 +519,8 @@ void ImageCache::Barrier(Image& image, ID3D12GraphicsCommandList* commands,
     image.state = state;
 }
 void ImageCache::CopyRows(Image& image, void* data, bool upload) {
+    const auto logic_format =
+        image.logic_op ? GetLogicOpFormat(ConvertFormat(image.info.pixel_format)) : LogicOpFormat{};
     u64 mip_offset{};
     for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
         const auto& layout = image.info.mips_layout[mip];
@@ -515,7 +532,10 @@ void ImageCache::CopyRows(Image& image, void* data, bool upload) {
         for (u32 layer = 0; layer < image.native_layers * image.info.num_samples; ++layer) {
             const u32 subresource = mip + layer * image.info.resources.levels;
             const auto& footprint = image.footprints[subresource];
-            if (image.row_bytes[subresource] > pitch || image.rows[subresource] > height)
+            const u64 guest_row_bytes = image.logic_op
+                                            ? u64(footprint.Footprint.Width) * logic_format.bytes
+                                            : image.row_bytes[subresource];
+            if (guest_row_bytes > pitch || image.rows[subresource] > height)
                 throw std::runtime_error("D3D12 footprint exceeds guest mip layout");
             for (u32 slice = 0; slice < footprint.Footprint.Depth; ++slice) {
                 for (u32 row = 0; row < image.rows[subresource]; ++row) {
@@ -524,14 +544,20 @@ void ImageCache::CopyRows(Image& image, void* data, bool upload) {
                         (image.base_layer * image.info.num_samples + layer + slice) * pitch *
                             height +
                         row * pitch;
-                    if (guest_offset + image.row_bytes[subresource] > image.linear.size())
+                    if (guest_offset + guest_row_bytes > image.linear.size())
                         throw std::runtime_error("D3D12 image row exceeds guest backing");
                     auto* guest = image.linear.data() + guest_offset;
                     auto* host =
                         static_cast<u8*>(data) + footprint.Offset +
                         (slice * image.rows[subresource] + row) * footprint.Footprint.RowPitch;
-                    std::memcpy(upload ? host : guest, upload ? guest : host,
-                                image.row_bytes[subresource]);
+                    if (image.logic_op) {
+                        for (u32 x = 0; x < footprint.Footprint.Width; ++x)
+                            CopyLogicOpTexel(logic_format, guest + u64(x) * logic_format.bytes,
+                                             host + u64(x) * 16, upload, image.logic_mask);
+                    } else {
+                        std::memcpy(upload ? host : guest, upload ? guest : host,
+                                    image.row_bytes[subresource]);
+                    }
                 }
             }
         }
@@ -613,7 +639,8 @@ void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr
             return;
         image.guest = image.guest_scratch;
         const auto entries = TilingRuntime::Entries(image.info, image.footprints);
-        if (TilingRuntime::Supported(image.info, entries.size())) {
+        if (!image.logic_op && tilizer && TilingRuntime::Supported(image.info, entries.size()) &&
+            tilizer->CanRecord(image.info, entries, false)) {
             gpu_detile = true;
             return;
         }
@@ -659,8 +686,9 @@ void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr
                     image.info.props.is_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE
                                               : D3D12_RESOURCE_STATE_RENDER_TARGET);
             transfers.Record(commands, image.Native(), *image.msaa,
-                             ConvertFormat(image.info.pixel_format), image.info.props.is_depth,
-                             true);
+                             image.logic_op ? DXGI_FORMAT_R32G32B32A32_UINT
+                                            : ConvertFormat(image.info.pixel_format),
+                             image.info.props.is_depth, true);
         }
     });
 }
@@ -906,10 +934,18 @@ void ImageCache::PrepareStencilDownloads(Image& image, ID3D12GraphicsCommandList
 }
 void ImageCache::CommitStencilDownloads(Image& image) {
     if (image.has_depth && image.written) {
+        image.guest.resize(image.info.guest_size);
+        image.linear.resize(image.guest.size());
+        read(image.info.guest_address, image.guest);
+        VideoCore::ConvertTiling(image.guest, image.linear, image.info, false);
         void* mapped;
         winrt::check_hresult(image.readback->Map(0, nullptr, &mapped));
         if (image.promoted_depth) {
             std::vector<u8> float_bytes(image.info.stencil_size * 4);
+            const auto* depth = reinterpret_cast<const u16*>(image.linear.data());
+            auto* initial = reinterpret_cast<float*>(float_bytes.data());
+            for (size_t i = 0; i < image.info.stencil_size; ++i)
+                initial[i] = float(depth[i]) * (1.f / 65535.f);
             u64 mip_offset = 0;
             for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
                 const auto& layout = image.info.mips_layout[mip];
@@ -945,12 +981,16 @@ void ImageCache::CommitStencilDownloads(Image& image) {
         image.written = false;
     }
     if (image.has_stencil && image.stencil_written) {
+        image.stencil_guest.resize(image.info.stencil_size);
+        image.stencil_linear.resize(image.stencil_guest.size());
+        read(image.info.stencil_addr, image.stencil_guest);
+        const VideoCore::ImageInfo stencil_info = StencilImageInfo(image.info);
+        VideoCore::ConvertTiling(image.stencil_guest, image.stencil_linear, stencil_info, false);
         void* mapped;
         winrt::check_hresult(image.stencil_readback->Map(0, nullptr, &mapped));
         CopyStencilRows(image, mapped, false);
         const D3D12_RANGE empty{0, 0};
         image.stencil_readback->Unmap(0, &empty);
-        const VideoCore::ImageInfo stencil_info = StencilImageInfo(image.info);
         VideoCore::ConvertTiling(image.stencil_linear, image.stencil_guest, stencil_info, true);
         write(image.info.stencil_addr, image.stencil_guest);
         image.stencil_written = false;
@@ -996,10 +1036,18 @@ void ImageCache::PrepareMsaaStencilDownloads(Image& image, ID3D12GraphicsCommand
 }
 void ImageCache::CommitMsaaStencilDownloads(Image& image) {
     if (image.has_depth && image.written) {
+        image.guest.resize(image.info.guest_size);
+        image.linear.resize(image.guest.size());
+        read(image.info.guest_address, image.guest);
+        VideoCore::ConvertTiling(image.guest, image.linear, image.info, false);
         void* mapped;
         winrt::check_hresult(image.readback->Map(0, nullptr, &mapped));
         if (image.promoted_depth) {
             std::vector<u8> float_bytes(image.info.stencil_size * 4);
+            const auto* depth = reinterpret_cast<const u16*>(image.linear.data());
+            auto* initial = reinterpret_cast<float*>(float_bytes.data());
+            for (size_t i = 0; i < image.info.stencil_size; ++i)
+                initial[i] = float(depth[i]) * (1.f / 65535.f);
             const auto& layout = image.info.mips_layout[0];
             const u64 pitch = u64(layout.pitch) * 4;
             for (u32 ls = 0; ls < image.native_layers * image.info.num_samples; ++ls) {
@@ -1030,12 +1078,16 @@ void ImageCache::CommitMsaaStencilDownloads(Image& image) {
         image.written = false;
     }
     if (image.has_stencil && image.stencil_written) {
+        image.stencil_guest.resize(image.info.stencil_size);
+        image.stencil_linear.resize(image.stencil_guest.size());
+        read(image.info.stencil_addr, image.stencil_guest);
+        const VideoCore::ImageInfo stencil_info = StencilImageInfo(image.info);
+        VideoCore::ConvertTiling(image.stencil_guest, image.stencil_linear, stencil_info, false);
         void* mapped;
         winrt::check_hresult(image.stencil_readback->Map(0, nullptr, &mapped));
         CopyStencilRows(image, mapped, false);
         const D3D12_RANGE empty{0, 0};
         image.stencil_readback->Unmap(0, &empty);
-        const VideoCore::ImageInfo stencil_info = StencilImageInfo(image.info);
         VideoCore::ConvertTiling(image.stencil_linear, image.stencil_guest, stencil_info, true);
         write(image.info.stencil_addr, image.stencil_guest);
         image.stencil_written = false;
@@ -1058,7 +1110,8 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
                 Barrier(*image, commands, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 SetSamplePositions(commands, 1, {});
                 transfers.Record(commands, image->Native(), *image->msaa,
-                                 ConvertFormat(image->info.pixel_format),
+                                 image->logic_op ? DXGI_FORMAT_R32G32B32A32_UINT
+                                                 : ConvertFormat(image->info.pixel_format),
                                  image->info.props.is_depth, false);
                 MsaaTransfer::Barrier(*image->msaa, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
             } else
@@ -1075,10 +1128,14 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
             }
             if (!image->msaa) {
                 const auto entries = TilingRuntime::Entries(image->info, image->footprints);
-                if (TilingRuntime::Supported(image->info, entries.size())) {
+                if (!image->logic_op && tilizer && TilingRuntime::Supported(image->info, entries.size()) &&
+                    tilizer->CanRecord(image->info, entries, true)) {
                     image->gpu_tiled = true;
-                    tilizer->Tile(commands, image->info, entries, image->Native(),
-                                  image->footprints);
+                    image->guest_scratch.resize(image->info.guest_size);
+                    read(image->info.guest_address, image->guest_scratch);
+                    image->tiled_readback = tilizer->Tile(commands, image->info, entries,
+                                                         image->Native(), image->footprints,
+                                                         image->guest_scratch);
                 }
             }
         }
@@ -1127,27 +1184,25 @@ void ImageCache::CommitDownloads() {
         const bool tiled =
             image->gpu_tiled && TilingRuntime::Supported(image->info, entries.size());
         if (tiled) {
-            winrt::check_hresult(tilizer->TiledReadback()->Map(0, nullptr, &mapped));
+            winrt::check_hresult(image->tiled_readback->Map(0, nullptr, &mapped));
         } else {
             winrt::check_hresult(image->readback->Map(0, nullptr, &mapped));
         }
         if (tiled) {
-            u64 texel_bytes = 0;
-            for (const auto& entry : entries)
-                texel_bytes += u64(entry.texels) * (image->info.num_bits / 8);
             image->guest.resize(image->info.guest_size);
-            std::memcpy(image->guest.data(), mapped, texel_bytes);
-            if (texel_bytes < image->guest.size())
-                std::memset(image->guest.data() + texel_bytes, 0,
-                            image->guest.size() - texel_bytes);
+            std::memcpy(image->guest.data(), mapped, image->guest.size());
         } else {
+            image->guest.resize(image->info.guest_size);
+            read(image->info.guest_address, image->guest);
+            image->linear.resize(image->guest.size());
+            VideoCore::ConvertTiling(image->guest, image->linear, image->info, false);
             CopyRows(*image, mapped, false);
             VideoCore::ConvertTiling(image->linear, image->guest, image->info, true);
         }
         image->gpu_tiled = false;
         const D3D12_RANGE empty{0, 0};
         if (tiled)
-            tilizer->TiledReadback()->Unmap(0, &empty);
+            image->tiled_readback->Unmap(0, &empty);
         else
             image->readback->Unmap(0, &empty);
         write(image->info.guest_address, image->guest);

@@ -18,12 +18,12 @@ u64 CommandRuntime::Flush() {
     return device.LastSignaledValue();
 }
 void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write write,
-                                ResourceCache::Resolve resolve) {
+                                ResourceCache::Resolve resolve, ResourceCache::Overlaps overlaps) {
     device.Initialize();
     NativeTemporalJitter().Reset();
-    shaders.Initialize(device.Device());
+    shaders.Initialize(device.Device(), &resources);
     this->read = read;
-    resources.Initialize(device, read, write, std::move(resolve));
+    resources.Initialize(device, read, write, std::move(resolve), std::move(overlaps));
     images.Initialize(
         device, std::move(read), std::move(write),
         [this](VAddr address, u64 size) { return resources.Canonicalize(address, size); },
@@ -91,6 +91,8 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     auto& pipeline = cached.state;
     resources.BeginBatch();
     images.BeginBatch();
+    const auto access_ranges = bindings.AccessRanges(border_colors);
+    const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), pipeline.Get()));
     RecordingGuard recording{failed};
@@ -120,7 +122,7 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     images.PrepareDownloads(commands.Get());
     winrt::check_hresult(commands->Close());
     device.Wait(device.Submit(commands.Get()));
-    resources.CommitDownloads();
+    resources.CommitDownloads(bool(memory_access));
     bindings.CommitGds(gds);
     images.CommitDownloads();
     recording.completed = true;
@@ -133,6 +135,10 @@ void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
     images.BeginBatch();
+    const std::array<ResourceCache::Range, 2> access_ranges{{
+        {source.guest_address, source.guest_size},
+        {destination.guest_address, destination.guest_size}}};
+    const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
     auto& input = images.GetImage(source, ConvertFormat(source.pixel_format),
                                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, source_layer, layers);
     auto& output =

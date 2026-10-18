@@ -63,6 +63,7 @@ Os quinze casos anteriores e dezessete casos MSAA passaram, totalizando 32:
 | Cor microtiled 4× e posições programáveis | 1.024 samples corretos contra endereço Morton independente |
 | Depth 4× com gradiente e posições não padrão | 1.024 profundidades corretas |
 | Atomics GCN em pixel/sample shading 4× | 256/1.024 invocações |
+| IMAGE_GET_RESINFO sobre sharp FMASK 4× | 256 pixels com dimensões (15,15,1,1) do stub |
 | Validação D3D12 | Zero erros; sem avisos na última execução |
 
 Também foi corrigida uma incompatibilidade anterior das views 1D: agora o
@@ -71,16 +72,29 @@ Readbacks sem debug não haviam detectado a incompatibilidade dos descritores.
 
 ## Limites
 
-MSAA comprimido com FMASK/CMASK/HTILE, EQAA com quantidades diferentes de
-samples/fragments e frequência parcial de shading ainda não estão
-implementados. Essas configurações são rejeitadas no caminho correspondente.
+MSAA com FMASK roda com os dados de cor sempre em storage MSAA plano (o mesmo
+design do Vulkan de produção, que também não implementa compressão FMASK):
+o image cache aceita o par fmask+MSAA, o decompress é no-op e as leituras de
+recursos FMASK no shader são stubadas no recompiler (ImageRead/SampleRaw
+retornam constantes, resinfo retorna as dimensões do sharp, QueryLod
+retorna 1), com especialização própria no backend. EQAA verdadeiro (fragments
+diferente de samples) e HTILE/CMASK com MSAA continuam rejeitados no caminho
+correspondente. A frequência parcial de shading (com
+mais de uma iteração e menos que as amostras do raster) despacha o pixel
+shader por amostra, como no shading por amostra completo: cada amostra recebe
+a própria execução, então o número de invocações com efeitos colaterais é
+maior que no hardware guest (S em vez de L por pixel) e a máscara de amostras
+de entrada cobre uma amostra por invocação. Escalas zero-degeneradas de
+iteração continuam rejeitadas.
 Depth/stencil MSAA sem compressão está implementado com transfers por plano e
 coberto por `Build/native-stencil-msaa-validation.log`; alpha-to-mask usa
 `AlphaToCoverageEnable`. O stencil MSAA é lido no canal G (`.y`) do typeless
 R32G8X24; cada plano possui heap de descritores shader-visible próprio, pois
-draws da mesma lista enxergam o último conteúdo do heap. Logic ops exigem
-render target inteiro: neste PC, criar PSO com XOR em UNORM derruba o
-processo, então formatos não inteiros são rejeitados com erro explícito.
+draws da mesma lista enxergam o último conteúdo do heap. Logic ops em formatos
+não inteiros usam representação temporária UINT por componente, conversão no
+export do PS e recomposição dos bits guest no writeback, evitando PSO lógico
+com RTV UNORM. O caminho preserva máscaras por MRT e opera por amostra;
+detalhes e validação em [D3D12-RENDERER.md](D3D12-RENDERER.md#logic-ops-em-render-targets).
 Resolve de profundidade e formatos sem suporte nativo a resolve não são
 anunciados como implementados. A contagem 8× foi validada em roundtrip
 depth/stencil; 16× tem checagem de capacidade e é pulada quando o dispositivo

@@ -275,21 +275,30 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         // V3 is the actual PrimitiveID as intended by the shader author.
         ir.SetVectorReg(IR::VectorReg::V3, ir.GetAttributeU32(IR::Attribute::PrimitiveId));
         break;
-    case SwStage::Compute:
+    case SwStage::Compute: {
         ir.SetVectorReg(dst_vreg++, ir.GetAttributeU32(IR::Attribute::LocalInvocationId, 0));
         ir.SetVectorReg(dst_vreg++, ir.GetAttributeU32(IR::Attribute::LocalInvocationId, 1));
         ir.SetVectorReg(dst_vreg++, ir.GetAttributeU32(IR::Attribute::LocalInvocationId, 2));
 
+        const auto relative_workgroup = [&](u32 index) -> IR::U32 {
+            const auto group = ir.GetAttributeU32(IR::Attribute::WorkgroupId, index);
+            const u32 start = runtime_info.hw.cs.start_offsets[index];
+            if (!start) {
+                return group;
+            }
+            return IR::U32{ir.IAdd(group, ir.Imm32(start))};
+        };
         if (runtime_info.hw.cs.tgid_enable[0]) {
-            ir.SetScalarReg(dst_sreg++, ir.GetAttributeU32(IR::Attribute::WorkgroupId, 0));
+            ir.SetScalarReg(dst_sreg++, relative_workgroup(0));
         }
         if (runtime_info.hw.cs.tgid_enable[1]) {
-            ir.SetScalarReg(dst_sreg++, ir.GetAttributeU32(IR::Attribute::WorkgroupId, 1));
+            ir.SetScalarReg(dst_sreg++, relative_workgroup(1));
         }
         if (runtime_info.hw.cs.tgid_enable[2]) {
-            ir.SetScalarReg(dst_sreg++, ir.GetAttributeU32(IR::Attribute::WorkgroupId, 2));
+            ir.SetScalarReg(dst_sreg++, relative_workgroup(2));
         }
         break;
+    }
     case SwStage::Geometry:
         // The GS wave receives one ES vertex offset per input primitive vertex in V0-V6, with
         // the primitive id in V2. The offset count is a property of the input primitive type;

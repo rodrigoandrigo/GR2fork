@@ -7,8 +7,13 @@
 namespace D3D12 {
 class ResourceBindings {
 public:
+    struct StreamOutSlot {
+        VAddr address{};
+        u64 size{};
+    };
     ResourceBindings(D3D12DeviceContext& device, ResourceCache& buffers, ImageCache& images,
-                     std::span<CompiledShader*> shaders);
+                     std::span<CompiledShader*> shaders,
+                     std::span<const StreamOutSlot> strmout_slots = {});
     void Upload(ID3D12GraphicsCommandList* commands, Shader::PushData& push,
                 std::span<const float, 24> clip_planes, VAddr border_colors,
                 const ResourceCache::Read& read, std::span<const u8, 65536> gds,
@@ -24,6 +29,7 @@ public:
               u32 sampler_slot);
     void ValidateInputRange(VAddr address, u64 size) const;
     void ValidateTargetRange(VAddr address, u64 size) const;
+    std::vector<ResourceCache::Range> AccessRanges(VAddr border_colors) const;
 
 private:
     bool Aliases(VAddr first, u64 first_size, VAddr second, u64 second_size) const;

@@ -8,6 +8,8 @@
 #include <memory>
 #include <string>
 #include <agile.h>
+#include <dxgi1_3.h>
+#include <wrl/client.h>
 #include "../src/uwp/shadps4_api.h"
 
 class ShadPS4Host : public std::enable_shared_from_this<ShadPS4Host> {
@@ -29,7 +31,7 @@ public:
     void Pause(bool paused);
     void Stop();
     void Wait();
-    void Resize(uint32_t width, uint32_t height);
+    void Resize(uint32_t width, uint32_t height, float scale_x = 1.0f, float scale_y = 1.0f);
     bool Render();
     std::wstring Error() const;
     std::wstring MountFolder(Platform::Agile<Windows::Storage::StorageFolder> folder);
@@ -56,7 +58,7 @@ private:
     decltype(&shadps4_run) run{};
     decltype(&shadps4_request_stop) stop{};
     decltype(&shadps4_set_paused) pause{};
-    decltype(&shadps4_resize) resize{};
+    decltype(&shadps4_resize_surface) resize{};
     decltype(&shadps4_render_host_frame) render{};
     decltype(&shadps4_get_error) error{};
     decltype(&shadps4_shutdown) shutdown{};
@@ -77,6 +79,10 @@ private:
     bool frame_pending{};
     uint32_t pending_width{};
     uint32_t pending_height{};
+    float pending_scale_x{1.0f}, pending_scale_y{1.0f};
+    std::mutex chain_mutex;
+    Microsoft::WRL::ComPtr<IDXGISwapChain2> composition_chain;
+    float chain_scale_x{}, chain_scale_y{};
     std::atomic_bool presentation_failed{};
     std::mutex log_mutex;
     std::function<void(std::string)> log_consumer;

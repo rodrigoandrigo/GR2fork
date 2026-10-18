@@ -107,6 +107,8 @@ enum class BufferType : u8 {
     GdsBuffer,
     SharedMemory,
     ClipPlanes,
+    ImageAddressTable,
+    Strmout,
 };
 
 struct BufferResource {
@@ -115,6 +117,7 @@ struct BufferResource {
     BufferType buffer_type{};
     bool is_written{};
     bool is_formatted{};
+    bool is_coherent{};
     SharpFetchPostOp post_op{};
     u32 post_op_dw1_mask{};
     u32 post_op_dw2_shift{};
@@ -167,6 +170,7 @@ struct ImageResource {
     bool is_array{};
     bool is_written{};
     bool is_r128{};
+    bool is_feedback{};
     u8 constant_mip_index{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};

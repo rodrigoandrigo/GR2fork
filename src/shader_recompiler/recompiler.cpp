@@ -114,6 +114,15 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::SharedMemorySimplifyPass(program, profile);
     Shader::Optimization::SharedMemoryToStoragePass(program, runtime_info, profile);
     Shader::Optimization::LowerUserClipPlanes(program, runtime_info);
+    if (info.sw_stage == SwStage::Geometry && runtime_info.hw.gs.strmout_buffer_mask) {
+        for (u32 slot = 0; slot < std::popcount(runtime_info.hw.gs.strmout_buffer_mask); ++slot) {
+            Shader::BufferResource buffer;
+            buffer.used_types = IR::Type::U32;
+            buffer.buffer_type = Shader::BufferType::Strmout;
+            buffer.is_written = true;
+            program.info.buffers.push_back(buffer);
+        }
+    }
     Shader::Optimization::PhiSimplificationPass(program);
     Shader::Optimization::InverseBallotEliminationPass(program);
     Shader::IR::DumpProgram(program, info, "pre-lower-phi.");
@@ -142,6 +151,12 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::CollectShaderInfoPass(program, profile);
     Shader::IR::DumpProgram(program, info);
+    if (info.sw_stage == SwStage::Geometry) {
+        for (const auto* ir_block : program.post_order_blocks)
+            for (const IR::Inst& inst : ir_block->Instructions())
+                if (inst.GetOpcode() == Shader::IR::Opcode::EmitVertex)
+                    ++info.gs_emit_vertices;
+    }
 
     return program;
 }

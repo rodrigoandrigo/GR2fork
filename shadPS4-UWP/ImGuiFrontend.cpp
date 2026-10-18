@@ -222,6 +222,7 @@ void ImGuiFrontend::ResolveApi() {
 #define RESOLVE(member, name) member = core->GetApi<decltype(member)>(name)
   RESOLVE(get_settings, "shadps4_get_settings");
   RESOLVE(set_host_state, "shadps4_set_host_state");
+  RESOLVE(set_hdr_output, "shadps4_set_hdr_output");
   RESOLVE(set_setting, "shadps4_set_setting");
   RESOLVE(reset_settings, "shadps4_reset_settings");
   RESOLVE(mount, "shadps4_mount_storage_folder");
@@ -274,6 +275,7 @@ void ImGuiFrontend::Run(std::wstring root) {
     D3D12DeviceContext::EnableDiagnostics();
     core->Initialize(root, initial.width, initial.height, true, game_surface);
     ResolveApi();
+    set_hdr_output(initial.hdr_output, initial.sdr_white_nits);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     auto &io = ImGui::GetIO();
@@ -360,9 +362,10 @@ void ImGuiFrontend::Run(std::wstring root) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
       }
-      renderer->Resize(snapshot.width, snapshot.height);
+      set_hdr_output(snapshot.hdr_output, snapshot.sdr_white_nits);
+      renderer->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
       if (game_surface)
-        core->Resize(snapshot.width, snapshot.height);
+        core->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
       renderer->SetTransparent(game_running);
       const auto now = std::chrono::steady_clock::now();
       const auto delta = std::chrono::duration<float>(now - last).count();

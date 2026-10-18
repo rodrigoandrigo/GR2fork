@@ -28,7 +28,10 @@ public:
         std::vector<u8> guest_scratch;
         std::vector<u8> stencil_guest, stencil_linear;
         std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+        bool logic_op{};
+        u32 logic_mask{};
         bool gpu_tiled{};
+        ID3D12Resource* tiled_readback{};
         std::vector<UINT> rows;
         std::vector<UINT64> row_bytes;
         std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> stencil_footprints;
@@ -52,7 +55,7 @@ public:
                     class ShaderCache* shader_cache = nullptr);
     void BeginBatch();
     Image& GetImage(const VideoCore::ImageInfo& info, DXGI_FORMAT format,
-                    D3D12_RESOURCE_FLAGS flags, u32 base_layer = 0, u32 layer_count = 0);
+                    D3D12_RESOURCE_FLAGS flags, u32 base_layer = 0, u32 layer_count = 0, bool logic_op = false, u32 logic_mask = 15);
     void Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr read_address = 0,
                 VAddr stencil_read_address = 0);
     void Barrier(Image& image, ID3D12GraphicsCommandList* commands, D3D12_RESOURCE_STATES state);

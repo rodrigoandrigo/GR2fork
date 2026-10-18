@@ -71,15 +71,20 @@ pendentes de validação.
    WaveLaneCountMin == WaveLaneCountMax == 64. Compute tem um caminho distinto.
 4. Recursos: coerencia com remapeamentos/descontinuidades de backing, aliases/formatos
    e views ainda rejeitados pelo cache. Metadata HTILE/CMASK/FMASK sem MSAA
-   passa a ser ignorada (superfície tratada como plana); MSAA com FMASK segue
-   rejeitado e fast clears via metadata sem flag explícita têm risco
+   passa a ser ignorada (superfície tratada como plana); MSAA com FMASK roda
+   com dados de cor em storage plano e leituras FMASK stubadas no recompiler,
+   e fast clears via metadata sem flag explícita têm risco
    documentado de leitura stale. Footprints por plano usam flags neutras e o
    detiling de stencil usa layout de mip por plano. B4G4R4A4 é mapeado com
    remap de swizzle `[1,0,3,2]` nos SRVs, validado por amostragem em GPU.
-5. MSAA: casos EQAA e parcial sample shading ainda rejeitados. MSAA
-   depth/stencil sem compressão, alpha-to-mask e logic ops em inteiros estão
-   implementados e validados em GPU no PC; logic ops em formatos não inteiros
-   são rejeitados porque a criação do PSO derruba o driver neste ambiente.
+5. MSAA: EQAA verdadeiro (fragments diferente de samples) continua rejeitado.
+   Parcial sample shading despacha o pixel shader por amostra (superset do
+   hardware guest, divergência documentada em MSAA-D3D12.md). MSAA
+   depth/stencil sem compressão, alpha-to-mask e logic ops estão implementados
+   e validados em GPU no PC. Formatos não inteiros usam representação UINT
+   temporária, conversão de exports e recomposição do backing guest; máscaras
+   por MRT e transferências por amostra são preservadas. A comparação de ROP
+   e arredondamento com PS4 físico continua pendente; veja D3D12-RENDERER.md.
 6. VideoOut permanece com snapshot CPU e upload; falta compartilhamento direto
    de recursos/fences entre renderer e apresentacao para reduzir essas copias.
 7. FSR/XeSS: jitter e metadados existem, mas falta selecao de entradas da cena,

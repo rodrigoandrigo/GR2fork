@@ -19,34 +19,6 @@
 namespace D3D12 {
 namespace {
 Profile profile;
-bool IsIntegerTarget(DXGI_FORMAT format) {
-    switch (format) {
-    case DXGI_FORMAT_R8_UINT:
-    case DXGI_FORMAT_R8_SINT:
-    case DXGI_FORMAT_R8G8_UINT:
-    case DXGI_FORMAT_R8G8_SINT:
-    case DXGI_FORMAT_R8G8B8A8_UINT:
-    case DXGI_FORMAT_R8G8B8A8_SINT:
-    case DXGI_FORMAT_R16_UINT:
-    case DXGI_FORMAT_R16_SINT:
-    case DXGI_FORMAT_R16G16_UINT:
-    case DXGI_FORMAT_R16G16_SINT:
-    case DXGI_FORMAT_R16G16B16A16_UINT:
-    case DXGI_FORMAT_R16G16B16A16_SINT:
-    case DXGI_FORMAT_R32_UINT:
-    case DXGI_FORMAT_R32_SINT:
-    case DXGI_FORMAT_R32G32_UINT:
-    case DXGI_FORMAT_R32G32_SINT:
-    case DXGI_FORMAT_R32G32B32_UINT:
-    case DXGI_FORMAT_R32G32B32_SINT:
-    case DXGI_FORMAT_R32G32B32A32_UINT:
-    case DXGI_FORMAT_R32G32B32A32_SINT:
-    case DXGI_FORMAT_R10G10B10A2_UINT:
-        return true;
-    default:
-        return false;
-    }
-}
 std::vector<u8> PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3DBlob* root) {
     std::vector<u8> key{1};
     const auto integer = [&](u64 value) {
@@ -131,11 +103,38 @@ std::vector<u8> PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D
     return key;
 }
 } // namespace
+u64 CommandRuntime::GsInvocations(D3D_PRIMITIVE_TOPOLOGY topology, u64 count) {
+    if (!count)
+        return 0;
+    switch (topology) {
+    case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+        return count;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+        return count / 2;
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+        return count - 1;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
+        return count / 4;
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
+        return count > 3 ? count - 3 : 0;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+        return count / 3;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+        return count > 2 ? count - 2 : 0;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:
+        return count / 6;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
+        return count > 3 ? (count - 2) / 2 : 0;
+    default:
+        throw std::runtime_error("Unsupported D3D12 topology for geometry invocation count");
+    }
+}
 void CommandRuntime::Draw(const DrawRequest& request) {
     ProfileSample(profile, "runtime_draw", 128, [&] { DrawImpl(request); });
 }
 void CommandRuntime::DrawImpl(const DrawRequest& request) {
     std::scoped_lock lock{mutex};
+    strmout_filled = 0;
     if (failed)
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
@@ -178,18 +177,35 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         hull.emplace(
             shaders.Finalize(prepared_hull, false, false, false, &link, prepared_domain.words));
         domain.emplace(shaders.Finalize(prepared_domain, !request.geometry && request.flip_y, false,
-                                        false, &link, prepared_hull.words));
+                                        false, &link, prepared_hull.words, false,
+                                        !request.geometry && request.flip_x));
         next_bindings = domain->end_bindings;
         stages.push_back(&*hull);
         stages.push_back(&*domain);
     }
     auto vertex = ProfileSample(profile, "pso_compile", 128, [&] {
         return shaders.Compile(request.vertex, vertex_runtime, next_bindings,
-                               !request.geometry && !request.domain && request.flip_y);
+                               !request.geometry && !request.domain && request.flip_y, false, false,
+                               nullptr, false,
+                               !request.geometry && !request.domain && request.flip_x);
     });
+    std::array<DXGI_FORMAT, 8> logic_formats{};
+    std::array<u32, 8> logic_masks{};
+    for (u32 bound = 0; bound < request.colors.size(); ++bound) {
+        const auto slot = request.color_slots[bound];
+        if (slot >= 8)
+            throw std::runtime_error("Invalid logic operation target slot");
+        const auto format = ConvertFormat(request.colors[bound].pixel_format);
+        if (request.blend.RenderTarget[slot].LogicOpEnable) {
+            logic_formats[slot] = format;
+            logic_masks[slot] = request.blend.RenderTarget[slot].RenderTargetWriteMask;
+        }
+    }
     std::optional<CompiledShader> fragment;
     std::optional<CompiledShader> geometry;
     std::shared_ptr<const ShaderBinary> rectangle;
+    std::shared_ptr<const ShaderBinary> point_fill;
+    std::shared_ptr<const ShaderBinary> line_expand;
     stages.push_back(&vertex);
     auto end_bindings = vertex.end_bindings;
     if (request.rectangles) {
@@ -197,20 +213,109 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             throw std::runtime_error("Guest geometry cannot precede rectangle expansion");
         rectangle = shaders.CompileRectangle(*vertex.binary, request.fragment_runtime.hw.fs);
     }
+    if (request.point_fill) {
+        if (request.geometry)
+            throw std::runtime_error("Guest geometry cannot precede point fill expansion");
+        point_fill = shaders.CompilePointFill(*vertex.binary, request.point_keep_front,
+                                              request.rasterizer.FrontCounterClockwise != 0);
+    }
+    if (request.line_expand) {
+        if (request.geometry)
+            throw std::runtime_error("Guest geometry cannot precede line expansion");
+        const auto& source_binary = (domain ? domain->binary : vertex.binary);
+        const bool adjacency = request.topology == D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ ||
+                               request.topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ ||
+                               request.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ ||
+                               request.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
+        const auto input_topology = [&]() {
+            if (request.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
+                return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+            return request.topology_type;
+        }();
+        line_expand = shaders.CompileLineExpand(
+            *source_binary, request.fragment_runtime.hw.fs, request.line_keep_front,
+            request.rasterizer.FrontCounterClockwise != 0, input_topology, adjacency,
+            request.line_width, request.line_pattern, request.line_pattern_repeat,
+            request.line_pattern_msb, request.line_pattern_scale, request.line_viewport_dims);
+    }
     if (request.geometry) {
         geometry.emplace(shaders.Compile(*request.geometry, request.geometry_runtime, end_bindings,
-                                         request.flip_y));
+                                         request.flip_y, false, false, nullptr, false,
+                                         request.flip_x));
         end_bindings = geometry->end_bindings;
         stages.push_back(&*geometry);
+        const bool strmout_active = std::any_of(request.strmout.begin(), request.strmout.end(),
+                                                [](const auto& slot) { return slot.address != 0; });
+        if (strmout_active) {
+            if (!geometry->info.gs_emit_vertices)
+                throw std::runtime_error("D3D12 stream-out capture requires vertex emissions");
+            const u64 partitions = GsInvocations(request.topology, request.count);
+            if (!partitions)
+                throw std::runtime_error("Guest stream-out draw has no geometry partitions");
+            const auto& gs_info = request.geometry_runtime.hw.gs;
+            const u64 written =
+                partitions * u64(request.instances) * u64(gs_info.num_invocations) *
+                std::min(u64(geometry->info.gs_emit_vertices), u64(gs_info.output_vertices));
+            strmout_filled = u32(std::min<u64>(written, request.strmout[0].size /
+                                                            (u64(gs_info.strmout_stride) * 4)));
+        }
     }
     if (!request.fragment.code.empty()) {
         fragment.emplace(shaders.Compile(request.fragment, request.fragment_runtime, end_bindings,
                                          false, request.samples > 1, request.sample_shading,
                                          nullptr, request.depth_bounds));
+        if (std::any_of(logic_formats.begin(), logic_formats.end(),
+                        [](auto format) { return format != DXGI_FORMAT_UNKNOWN; }))
+            fragment->binary = shaders.CompileLogicOp(*fragment->binary, logic_formats, logic_masks);
         stages.push_back(&*fragment);
     } else if (!request.colors.empty())
         throw std::runtime_error("D3D12 color rendering requires a fragment shader");
-    ResourceBindings bindings{device, resources, images, stages};
+    if (request.depth_gated) {
+        const auto writes_memory = [](const CompiledShader& shader) {
+            const auto& info = shader.info;
+            return info.uses_dma || info.has_storage_images ||
+                   info.uses_buffer_atomic_float_min_max || info.uses_image_atomic_float_min_max ||
+                   std::any_of(info.buffers.begin(), info.buffers.end(),
+                               [](const auto& buffer) {
+                                   // Stream-out capture only writes in the final pass; the
+                                   // depth-fail pass binds a null UAV for it.
+                                   return buffer.is_written &&
+                                          buffer.buffer_type != Shader::BufferType::Strmout;
+                               }) ||
+                   std::any_of(info.images.begin(), info.images.end(), [](const auto& image) {
+                       return image.is_written || image.is_atomic;
+                   });
+        };
+        if (std::any_of(stages.begin(), stages.end(),
+                        [&](const CompiledShader* shader) { return writes_memory(*shader); }))
+            throw std::runtime_error(
+                "Guest depth-result color write gating requires side-effect-free shaders");
+    }
+    ResourceBindings bindings{device, resources, images, stages, request.strmout};
+    Shader::Gcn::FetchShaderData fetch;
+    Shader::Gcn::ParseFetchShader(vertex.info, fetch);
+    std::vector<AmdGpu::Buffer> vertex_sharps;
+    auto access_ranges = bindings.AccessRanges(request.border_colors);
+    for (const auto& attribute : fetch.attributes) {
+        const auto sharp = attribute.GetSharp(vertex.info);
+        vertex_sharps.push_back(sharp);
+        access_ranges.push_back(
+            {sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
+    }
+    if (request.index_address)
+        access_ranges.push_back(
+            {request.index_address,
+             u64(request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
+    for (const auto& color : request.colors)
+        access_ranges.push_back({color.guest_address, color.guest_size});
+    if (request.depth_image) {
+        const auto& depth = *request.depth_image;
+        access_ranges.push_back({depth.guest_address, depth.guest_size});
+        access_ranges.push_back({depth.stencil_addr, depth.stencil_size});
+        access_ranges.push_back({request.depth_read_address, depth.guest_size});
+        access_ranges.push_back({request.stencil_read_address, depth.stencil_size});
+    }
+    const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
     resources.BeginBatch();
     images.BeginBatch();
 
@@ -226,9 +331,10 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             throw std::runtime_error(
                 "Guest raster and color sample counts require unsupported EQAA");
         bindings.ValidateTargetRange(info.guest_address, info.guest_size);
-        colors[slot] = &images.GetImage(info, ConvertFormat(info.pixel_format),
-                                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                                        request.color_base_slice[bound]);
+        colors[slot] = &images.GetImage(
+            info, ConvertFormat(info.pixel_format), D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            request.color_base_slice[bound], 0, logic_formats[slot] != DXGI_FORMAT_UNKNOWN,
+            logic_masks[slot]);
         num_render_targets = std::max(num_render_targets, slot + 1);
         if (!jitter_address) {
             jitter_address = info.guest_address;
@@ -289,15 +395,13 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         read(address, contents);
         return upload_contents(contents);
     };
-    Shader::Gcn::FetchShaderData fetch;
-    Shader::Gcn::ParseFetchShader(vertex.info, fetch);
     if (fetch.attributes.size() > D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT)
         throw std::runtime_error("Guest fetch shader exceeds D3D12 input slots");
     std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
     std::vector<D3D12_VERTEX_BUFFER_VIEW> vertices;
     for (u32 index = 0; index < fetch.attributes.size(); ++index) {
         const auto& attribute = fetch.attributes[index];
-        const auto sharp = attribute.GetSharp(vertex.info);
+        const auto sharp = vertex_sharps[index];
         const u64 size = u64(sharp.num_records) * std::max<u32>(1, sharp.stride);
         auto* buffer = upload_input(sharp.base_address, size);
         u32 step{};
@@ -398,11 +502,34 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         desc.GS = {geometry->binary->dxil.data(), geometry->binary->dxil.size()};
     else if (rectangle)
         desc.GS = {rectangle->dxil.data(), rectangle->dxil.size()};
+    else if (point_fill)
+        desc.GS = {point_fill->dxil.data(), point_fill->dxil.size()};
+    else if (line_expand)
+        desc.GS = {line_expand->dxil.data(), line_expand->dxil.size()};
     if (fragment)
         desc.PS = {fragment->binary->dxil.data(), fragment->binary->dxil.size()};
     else if (request.samples > 1)
         desc.PS = {images.MaskShader().data(), images.MaskShader().size()};
     desc.BlendState = request.blend;
+    const auto logic_target = std::ranges::find_if(request.colors, [&](const auto& info) {
+        const auto bound = &info - request.colors.data();
+        return request.blend.RenderTarget[request.color_slots[bound]].LogicOpEnable != FALSE;
+    });
+    if (logic_target != request.colors.end()) {
+        const auto bound = std::distance(request.colors.begin(), logic_target);
+        const auto state = request.blend.RenderTarget[request.color_slots[bound]];
+        for (const auto slot : request.color_slots)
+            if (!request.blend.RenderTarget[slot].LogicOpEnable ||
+                request.blend.RenderTarget[slot].LogicOp != state.LogicOp)
+                throw std::runtime_error(
+                    "Guest logic operation must be shared by all color targets");
+        desc.BlendState.IndependentBlendEnable = FALSE;
+        for (auto& target : desc.BlendState.RenderTarget) {
+            target = state;
+            target.BlendEnable = FALSE;
+            target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+    }
     desc.BlendState.AlphaToCoverageEnable = request.alpha_to_coverage;
     desc.RasterizerState = request.rasterizer;
     desc.DepthStencilState = request.depth;
@@ -415,11 +542,9 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     desc.NumRenderTargets = num_render_targets;
     for (u32 i = 0; i < num_render_targets; ++i) {
         desc.RTVFormats[i] =
-            colors[i] ? ConvertFormat(colors[i]->info.pixel_format) : DXGI_FORMAT_UNKNOWN;
-        if (colors[i] && request.blend.RenderTarget[i].LogicOpEnable &&
-            !IsIntegerTarget(desc.RTVFormats[i])) {
-            throw std::runtime_error("D3D12 guest logic operation requires integer render target");
-        }
+            colors[i] ? (colors[i]->logic_op ? DXGI_FORMAT_R32G32B32A32_UINT
+                                             : ConvertFormat(colors[i]->info.pixel_format))
+                      : DXGI_FORMAT_UNKNOWN;
     }
     desc.DSVFormat =
         depth ? (depth->has_stencil ? depth->dsv_format : ConvertFormat(depth->info.pixel_format))
@@ -464,6 +589,12 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> color_handles{};
     for (u32 i = 0; i < num_render_targets; ++i) {
         if (!colors[i]) {
+            D3D12_RENDER_TARGET_VIEW_DESC view{};
+            view.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+            view.ViewDimension = request.samples > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS
+                                                    : D3D12_RTV_DIMENSION_TEXTURE2D;
+            color_handles[i] = rtv.Cpu(i);
+            device.Device()->CreateRenderTargetView(nullptr, &view, color_handles[i]);
             continue;
         }
         colors[i]->sample_positions = request.sample_positions;
@@ -543,9 +674,11 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     bindings.Bind(commands.Get(), true, resource_slot, sampler_slot);
     commands->IASetPrimitiveTopology(request.topology);
     commands->IASetVertexBuffers(0, vertices.size(), vertices.data());
-    const auto viewport = NativeTemporalJitter().Apply(jitter_address, request.viewport);
-    commands->RSSetViewports(1, &viewport);
-    commands->RSSetScissorRects(1, &request.scissor);
+    std::array<D3D12_VIEWPORT, AmdGpu::NUM_VIEWPORTS> viewports = request.viewports;
+    for (u32 index = 0; index < request.viewport_count; ++index)
+        viewports[index] = NativeTemporalJitter().Apply(jitter_address, viewports[index]);
+    commands->RSSetViewports(request.viewport_count, viewports.data());
+    commands->RSSetScissorRects(request.viewport_count, request.scissors.data());
     commands->OMSetRenderTargets(num_render_targets,
                                  num_render_targets ? color_handles.data() : nullptr, FALSE,
                                  depth ? &depth_view : nullptr);
@@ -572,7 +705,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     } else {
         device.Wait(device.Submit(commands.Get()));
     }
-    resources.CommitDownloads();
+    resources.CommitDownloads(bool(memory_access));
     bindings.CommitGds(gds);
     images.CommitDownloads();
     recording.completed = true;

@@ -20,7 +20,7 @@ public:
     void Initialize(const ShadPS4Config& config);
     void Render();
     void Drain();
-    void Resize(uint32_t width, uint32_t height);
+    void Resize(uint32_t width, uint32_t height, float scale_x = 1.0f, float scale_y = 1.0f);
     void RegisterVideoOutSurface(const Libraries::VideoOut::BufferAttributeGroup& group,
                                  VAddr address) override;
     VideoCore::FrameHandle PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& group,
@@ -29,19 +29,24 @@ public:
     VideoCore::FrameHandle PrepareLastFrame() override;
     void Present(const VideoCore::FrameHandle& frame, bool reuse = false,
                  bool game = true) override;
-    bool IsHDRSupported() const override {
-        return false;
-    }
+    bool IsHDRSupported() const override;
+    void SetHDROutput(bool enabled, float sdr_white_nits = 80.0f);
     void SetHDR(bool enabled) override;
     void SetGamma(float value) override;
 
 private:
     void GetBuffers();
     void RenderFrame();
-    void ResizeBuffers(uint32_t width, uint32_t height);
+    void ResizeBuffers(uint32_t width, uint32_t height, DXGI_FORMAT format);
     struct Frame;
+    std::vector<u8> ConvertPixels(const Frame& frame, bool floating_point) const;
     std::shared_ptr<Frame> last_frame;
     std::shared_ptr<std::atomic<u64>> frame_bytes{std::make_shared<std::atomic<u64>>(0)};
+    bool float_supported{};
+    bool hdr_enabled{};
+    float sdr_white_nits{80.0f};
+    std::atomic_bool hdr_display{};
+    DXGI_FORMAT format{DXGI_FORMAT_B8G8R8A8_UNORM};
     std::atomic<float> gamma{1.0f};
     std::mutex mutex;
     D3D12DeviceContext context;
@@ -55,5 +60,7 @@ private:
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> buffers;
     uint32_t width{};
     uint32_t height{};
+    uint32_t display_width{}, display_height{};
+    float composition_scale_x{1.0f}, composition_scale_y{1.0f};
 };
 } // namespace Core::Uwp

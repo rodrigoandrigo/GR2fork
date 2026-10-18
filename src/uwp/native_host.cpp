@@ -67,9 +67,12 @@ void NativeHost::InitializeGpu() {
     liverpool = std::move(gpu);
     VideoCore::SetPresentationSink(presentation);
 }
-void NativeHost::Resize(uint32_t width, uint32_t height) {
+void NativeHost::Resize(uint32_t width, uint32_t height, float scale_x, float scale_y) {
     window->ResizeEmbedded(width, height);
-    presentation->Resize(width, height);
+    presentation->Resize(width, height, scale_x, scale_y);
+}
+void NativeHost::SetHDROutput(bool enabled, float sdr_white_nits) {
+    presentation->SetHDROutput(enabled, sdr_white_nits);
 }
 void NativeHost::Render() {
     if (shadps4_get_state() != SHADPS4_RUNNING)

@@ -474,6 +474,8 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/ngs2/ngs2_error.h
                 src/core/libraries/ngs2/ngs2_impl.cpp
                 src/core/libraries/ngs2/ngs2_impl.h
+                src/core/libraries/ngs2/ngs2_runtime.h
+                src/core/libraries/ngs2/ngs2_runtime_types.h
                 src/core/libraries/ngs2/ngs2_custom.cpp
                 src/core/libraries/ngs2/ngs2_custom.h
                 src/core/libraries/ngs2/ngs2_reverb.cpp
@@ -1047,6 +1049,7 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/linker.cpp
          src/core/linker.h
          src/core/memory.cpp
+         src/core/gpu_memory_access.cpp
          src/core/memory.h
          src/core/module.cpp
          src/core/module.h
@@ -1615,11 +1618,13 @@ if(SHADPS4_UWP)
     add_library(shadps4_native_d3d12 OBJECT
         src/video_core/renderer_d3d12/resource_cache.cpp
         src/video_core/renderer_d3d12/image_cache.cpp
+        src/video_core/renderer_d3d12/tiling_runtime.cpp
         src/video_core/renderer_d3d12/msaa_transfer.cpp
         src/video_core/renderer_d3d12/command_runtime.cpp
         src/video_core/renderer_d3d12/draw_runtime.cpp
         src/video_core/renderer_d3d12/pipeline_cache.cpp
         src/video_core/renderer_d3d12/resource_bindings.cpp
+        src/video_core/renderer_d3d12/image_buffer_alias.cpp
         src/video_core/renderer_d3d12/shader_cache.cpp
         src/video_core/renderer_d3d12/d3d12_rasterizer.cpp
         src/uwp/d3d12_presenter.cpp
