@@ -8,9 +8,11 @@
 #include <stdexcept>
 #include <winrt/base.h>
 #include "d3d12_pipeline_cache.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/tessellation.h"
 #include "video_core/renderer_d3d12/primitive_conversion.h"
+#include "video_core/renderer_d3d12/cmask_address.h"
 #include "video_core/renderer_d3d12/profile.h"
 #include "video_core/renderer_d3d12/resource_bindings.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
@@ -157,23 +159,48 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     auto domain_runtime = request.domain_runtime;
     std::optional<CompiledShader> hull, domain;
     std::vector<CompiledShader*> stages;
+    std::unique_ptr<TranslatedShader> translated_hull, translated_domain;
+    std::optional<TessellationLink> tessellation_link;
     if (request.hull) {
         if (request.hull_runtime.sw_stage != Shader::SwStage::TessellationControl ||
             domain_runtime.sw_stage != Shader::SwStage::TessellationEval ||
             vertex_runtime.hw_stage != Shader::HwStage::Local)
             throw std::runtime_error("Invalid native tessellation stage configuration");
-        TessellationLink link{domain_runtime.sw.tes.tess_type,
-                              domain_runtime.sw.tes.tess_partitioning,
-                              domain_runtime.sw.tes.tess_topology,
-                              request.hull_runtime.sw.tcs.num_input_control_points, 0};
-        auto prepared_hull = shaders.Prepare(*request.hull, request.hull_runtime, next_bindings);
-        next_bindings = prepared_hull.shader.end_bindings;
+        tessellation_link.emplace(TessellationLink{
+            domain_runtime.sw.tes.tess_type, domain_runtime.sw.tes.tess_partitioning,
+            domain_runtime.sw.tes.tess_topology,
+            request.hull_runtime.sw.tcs.num_input_control_points, 0});
+        translated_hull = shaders.Translate(*request.hull, request.hull_runtime);
         Shader::TessellationDataConstantBuffer constants{};
-        prepared_hull.shader.info.ReadTessConstantBuffer(constants);
+        translated_hull->shader.info.ReadTessConstantBuffer(constants);
         vertex_runtime.hw.ls.ls_stride = constants.ls_stride;
         domain_runtime.InitFromTessConstants(constants);
-        link.output_control_points = prepared_hull.shader.runtime.sw.tcs.NumOutputControlPoints();
-        auto prepared_domain = shaders.Prepare(*request.domain, domain_runtime, next_bindings);
+        tessellation_link->output_control_points =
+            translated_hull->shader.runtime.sw.tcs.NumOutputControlPoints();
+        translated_domain = shaders.Translate(*request.domain, domain_runtime);
+    }
+    auto translated_vertex = shaders.Translate(request.vertex, vertex_runtime);
+    auto translated_geometry =
+        request.geometry ? shaders.Translate(*request.geometry, request.geometry_runtime) : nullptr;
+    auto translated_fragment = !request.fragment.code.empty()
+                                   ? shaders.Translate(request.fragment, request.fragment_runtime)
+                                   : nullptr;
+    std::vector<ShaderResourceRange> stage_resources;
+    for (const auto* translated :
+         {translated_hull.get(), translated_domain.get(), translated_vertex.get(),
+          translated_geometry.get(), translated_fragment.get()}) {
+        if (!translated)
+            continue;
+        const auto ranges = GetShaderResourceRanges(translated->shader.info);
+        stage_resources.insert(stage_resources.end(), ranges.begin(), ranges.end());
+    }
+    if (translated_hull) {
+        auto prepared_hull =
+            shaders.Prepare(std::move(translated_hull), next_bindings, stage_resources);
+        next_bindings = prepared_hull.shader.end_bindings;
+        auto prepared_domain =
+            shaders.Prepare(std::move(translated_domain), next_bindings, stage_resources);
+        const auto& link = *tessellation_link;
         hull.emplace(
             shaders.Finalize(prepared_hull, false, false, false, &link, prepared_domain.words));
         domain.emplace(shaders.Finalize(prepared_domain, !request.geometry && request.flip_y, false,
@@ -183,11 +210,17 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         stages.push_back(&*hull);
         stages.push_back(&*domain);
     }
+    const auto compile_stage =
+        [&](std::unique_ptr<TranslatedShader> translated, Shader::Backend::Bindings bindings,
+            bool flip_y, bool sample_mask, bool sample_shading, bool depth_bounds, bool flip_x) {
+            auto prepared = shaders.Prepare(std::move(translated), bindings, stage_resources);
+            return shaders.Finalize(prepared, flip_y, sample_mask, sample_shading, nullptr, {},
+                                    depth_bounds, flip_x);
+        };
     auto vertex = ProfileSample(profile, "pso_compile", 128, [&] {
-        return shaders.Compile(request.vertex, vertex_runtime, next_bindings,
-                               !request.geometry && !request.domain && request.flip_y, false, false,
-                               nullptr, false,
-                               !request.geometry && !request.domain && request.flip_x);
+        return compile_stage(std::move(translated_vertex), next_bindings,
+                             !request.geometry && !request.domain && request.flip_y, false, false,
+                             false, !request.geometry && !request.domain && request.flip_x);
     });
     std::array<DXGI_FORMAT, 8> logic_formats{};
     std::array<u32, 8> logic_masks{};
@@ -239,9 +272,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             request.line_pattern_msb, request.line_pattern_scale, request.line_viewport_dims);
     }
     if (request.geometry) {
-        geometry.emplace(shaders.Compile(*request.geometry, request.geometry_runtime, end_bindings,
-                                         request.flip_y, false, false, nullptr, false,
-                                         request.flip_x));
+        geometry.emplace(compile_stage(std::move(translated_geometry), end_bindings,
+                                        request.flip_y, false, false, false, request.flip_x));
         end_bindings = geometry->end_bindings;
         stages.push_back(&*geometry);
         const bool strmout_active = std::any_of(request.strmout.begin(), request.strmout.end(),
@@ -261,12 +293,13 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         }
     }
     if (!request.fragment.code.empty()) {
-        fragment.emplace(shaders.Compile(request.fragment, request.fragment_runtime, end_bindings,
-                                         false, request.samples > 1, request.sample_shading,
-                                         nullptr, request.depth_bounds));
+        fragment.emplace(compile_stage(std::move(translated_fragment), end_bindings, false,
+                                       request.samples > 1, request.sample_shading,
+                                       request.depth_bounds, false));
         if (std::any_of(logic_formats.begin(), logic_formats.end(),
                         [](auto format) { return format != DXGI_FORMAT_UNKNOWN; }))
-            fragment->binary = shaders.CompileLogicOp(*fragment->binary, logic_formats, logic_masks);
+            fragment->binary =
+                shaders.CompileLogicOp(*fragment->binary, logic_formats, logic_masks);
         stages.push_back(&*fragment);
     } else if (!request.colors.empty())
         throw std::runtime_error("D3D12 color rendering requires a fragment shader");
@@ -315,9 +348,35 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         access_ranges.push_back({request.depth_read_address, depth.guest_size});
         access_ranges.push_back({request.stencil_read_address, depth.stencil_size});
     }
-    const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
+    if (!request.color_clear_buffers.empty() &&
+        request.color_clear_buffers.size() != request.colors.size())
+        throw std::runtime_error("D3D12 CMASK descriptors do not match color targets");
+    for (const auto& buffer : request.color_clear_buffers)
+        if (buffer.info.fast_clear && buffer.cmask_base_address)
+            access_ranges.push_back({buffer.CmaskAddress(), (u64(buffer.cmask_slice.tile_max) + 1) *
+                                                                128 * buffer.NumSlices()});
     resources.BeginBatch();
-    images.BeginBatch();
+    BeginImages();
+    auto cpu_ranges = bindings.CpuRanges(request.border_colors);
+    for (const auto& sharp : vertex_sharps)
+        cpu_ranges.push_back({sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
+    if (request.index_address)
+        cpu_ranges.push_back({request.index_address, u64(request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
+    for (u32 i = 0; i < request.color_clear_buffers.size(); ++i) {
+        const auto& buffer = request.color_clear_buffers[i];
+        if (buffer.info.fast_clear && buffer.cmask_base_address)
+            cpu_ranges.push_back({request.colors[i].guest_address, request.colors[i].guest_size});
+    }
+    if (request.depth_image &&
+        ((request.depth_read_address && request.depth_read_address != request.depth_image->guest_address) ||
+         (request.stencil_read_address && request.stencil_read_address != request.depth_image->stencil_addr))) {
+        cpu_ranges.push_back({request.depth_image->guest_address, request.depth_image->guest_size});
+        cpu_ranges.push_back({request.depth_image->stencil_addr, request.depth_image->stencil_size});
+        cpu_ranges.push_back({request.depth_read_address, request.depth_image->guest_size});
+        cpu_ranges.push_back({request.stencil_read_address, request.depth_image->stencil_size});
+    }
+    SynchronizeImages(cpu_ranges, true);
+    bindings.PrepareImages();
 
     std::array<ImageCache::Image*, 8> colors{};
     u32 num_render_targets = 0;
@@ -367,16 +426,35 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             throw std::runtime_error("D3D12 stencil test requires stencil plane");
         }
     }
-    D3D12ResourceAllocator transient;
-    transient.Initialize(device.Device(), 64ULL * 1024 * 1024);
-    std::vector<D3D12Resource> input_resources;
+    const auto synchronize_sample_positions = [&](ImageCache::Image* image) {
+        if (!image || !image->msaa)
+            return;
+        const auto& previous = image->sample_positions;
+        const auto& next = request.sample_positions;
+        if (previous.size() == next.size() &&
+            (previous.empty() || std::memcmp(previous.data(), next.data(),
+                                             previous.size() * sizeof(D3D12_SAMPLE_POSITION)) == 0))
+            return;
+        const std::array<ResourceCache::Range, 2> ranges{{
+            {image->info.guest_address, image->info.guest_size},
+            {image->info.stencil_addr, image->info.stencil_size}}};
+        SynchronizeImages(ranges, true);
+    };
+    for (auto* color : colors)
+        synchronize_sample_positions(color);
+    synchronize_sample_positions(depth);
+    const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
+    for (u32 i = 0; i < request.color_clear_buffers.size(); ++i)
+        MaterializeColorClearImpl(request.color_clear_buffers[i], request.colors[i]);
+    u64 input_bytes{};
     const auto upload_contents = [&](std::span<const u8> contents) -> ID3D12Resource* {
         const u64 size = contents.size();
         if (!size || size > 16ULL * 1024 * 1024)
             throw std::runtime_error("D3D12 input buffer exceeds upload budget");
-        D3D12Resource resource;
-        winrt::check_hresult(transient.CreateBuffer(size, D3D12_HEAP_TYPE_UPLOAD,
-                                                    D3D12_RESOURCE_STATE_GENERIC_READ, resource));
+        if (input_bytes + ((size + 65535) & ~u64{65535}) > 64ULL * 1024 * 1024)
+            throw std::runtime_error("D3D12 draw inputs exceed upload budget");
+        auto resource = transfer_pool->Acquire(size, D3D12_HEAP_TYPE_UPLOAD);
+        input_bytes += resource.AllocationBytes();
         void* mapped;
         const D3D12_RANGE empty{0, 0};
         winrt::check_hresult(resource->Map(0, &empty, &mapped));
@@ -567,24 +645,38 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             ds << domain->binary->hlsl;
         }
     }
+    const bool first_pipeline = pipelines.lower_bound(std::vector<u8>{1}) == pipelines.end();
+    if (first_pipeline)
+        LOG_INFO(Core, "[UWP stage] first graphics pipeline creation begin");
     auto& cached =
-        GetPipeline(PipelineKey(desc, blob.Get()), blob.Get(), [&](auto* root, auto** state) {
+        GetPipeline(PipelineKey(desc, blob.Get()), blob.Get(), [&](auto* root, auto** state, D3D12_CACHED_PIPELINE_STATE cached) {
             desc.pRootSignature = root;
+            desc.CachedPSO = cached;
             const HRESULT created = ProfileSample(profile, "pso_create", 128, [&] {
                 return device.Device()->CreateGraphicsPipelineState(
                     &desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(state));
             });
             return created;
         });
+    if (first_pipeline)
+        LOG_INFO(Core, "[UWP stage] first graphics pipeline creation completed");
     auto& pipeline = cached.state;
     auto& root = cached.root;
     D3D12DescriptorArena rtv, dsv;
     rtv.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, false);
+    if (first_pipeline)
+        LOG_INFO(Core, "[UWP stage] first graphics RTV heap ready");
     dsv.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
+    if (first_pipeline)
+        LOG_INFO(Core, "[UWP stage] first graphics DSV heap ready");
     static_cast<void>(rtv.Allocate(8));
     static_cast<void>(dsv.Allocate(1));
-    winrt::check_hresult(allocator->Reset());
-    winrt::check_hresult(commands->Reset(allocator.Get(), pipeline.Get()));
+    device.CheckResult(allocator->Reset(), L"Native graphics allocator Reset");
+    if (first_pipeline)
+        LOG_INFO(Core, "[UWP stage] first graphics allocator reset completed");
+    device.CheckResult(commands->Reset(allocator.Get(), nullptr), L"Native graphics command list Reset");
+    if (first_pipeline)
+        LOG_INFO(Core, "[UWP stage] first graphics command list reset completed");
     RecordingGuard recording{failed};
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> color_handles{};
     for (u32 i = 0; i < num_render_targets; ++i) {
@@ -628,8 +720,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         if (clear_stencil && (request.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL)) {
             throw std::runtime_error("D3D12 guest stencil clear with read-only view");
         }
-        depth->written = request.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL || clear_depth;
-        depth->stencil_written =
+        depth->written |= request.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL || clear_depth;
+        depth->stencil_written |=
             (request.depth.StencilEnable && request.depth.StencilWriteMask != 0) || clear_stencil;
         depth_view = dsv.Cpu(0);
         D3D12_DEPTH_STENCIL_VIEW_DESC view{};
@@ -694,20 +786,24 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     resources.PrepareDownload(commands.Get());
     images.PrepareDownloads(commands.Get());
     winrt::check_hresult(commands->Close());
+    if (first_pipeline)
+        LOG_INFO(Core, "[UWP stage] first graphics submission begin");
     if (profile.enabled) {
         const auto wait_start = std::chrono::steady_clock::now();
-        device.Wait(device.Submit(commands.Get()));
+        device.Wait(SubmitCommands());
         const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - wait_start)
                                 .count();
         if (waited > 3000)
             std::fprintf(stderr, "WAIT_SLOW %llu us\n", static_cast<unsigned long long>(waited));
     } else {
-        device.Wait(device.Submit(commands.Get()));
+        device.Wait(SubmitCommands());
     }
+    if (first_pipeline)
+        LOG_INFO(Core, "[UWP stage] first graphics submission completed");
     resources.CommitDownloads(bool(memory_access));
     bindings.CommitGds(gds);
-    images.CommitDownloads();
+    CompleteImages(bindings.CpuRanges(0, true));
     recording.completed = true;
 }
 } // namespace D3D12

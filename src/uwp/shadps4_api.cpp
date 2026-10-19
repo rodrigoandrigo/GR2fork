@@ -353,6 +353,7 @@ int32_t shadps4_run(const wchar_t* executable) {
             throw std::runtime_error("Guest boot requires an MTA worker");
         if (!presentation && !native_presentation)
             throw std::runtime_error("Guest boot requires a host game presentation surface");
+        LOG_INFO(Core, "[UWP stage] preparing boot storage");
         const auto path =
             Core::Uwp::PrepareBootStorage(winrt::to_string(std::wstring_view{executable}));
         {
@@ -371,7 +372,9 @@ int32_t shadps4_run(const wchar_t* executable) {
             LOG_INFO(Core, "Host app memory budget unavailable: {}",
                      winrt::to_string(error.message()));
         }
+        LOG_INFO(Core, "[UWP stage] creating emulator");
         emulator = Common::Singleton<Core::Emulator>::Instance();
+        LOG_INFO(Core, "[UWP stage] loading guest executable");
         emulator->Run(std::filesystem::path{path});
         guest_threads_stopped.store(true);
         state.store(session_failed.load() ? SHADPS4_FAILED : SHADPS4_STOPPED);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "video_core/renderer_d3d12/transfer_pool.h"
+
 #include <functional>
 #include <map>
 #include <mutex>
@@ -51,18 +53,26 @@ public:
     };
     using ResolveBacking = std::function<std::vector<Range>(VAddr, u64)>;
     void SetBackingResolver(ResolveBacking resolver) {
+        std::scoped_lock lock{invalidation_mutex};
         resolve_backing = std::move(resolver);
+        ++mapping_generation;
     }
     struct View {
         Buffer* buffer;
         u64 offset;
         u64 size;
         VAddr guest_address{};
+        std::vector<Buffer::WriteTarget> segments;
     };
     void Initialize(D3D12DeviceContext& device, Read read, Write write, Resolve resolve = {},
-                    Overlaps overlaps = {});
+                    Overlaps overlaps = {}, std::shared_ptr<TransferPool> transfers = {});
+    u64 MappingGeneration() const {
+        std::scoped_lock lock{invalidation_mutex};
+        return mapping_generation;
+    }
     Identity Canonicalize(VAddr address, u64 size) const;
     bool Aliases(VAddr first, u64 first_size, VAddr second, u64 second_size) const;
+    bool HasRepeatedBacking(VAddr address, u64 size) const;
     void MarkWritten(const View& view);
     void BeginBatch();
     Buffer& GetBuffer(VAddr address, u64 size, bool physical = false, bool gathered = false);
@@ -72,6 +82,7 @@ public:
     void Barrier(Buffer& buffer, ID3D12GraphicsCommandList* commands, D3D12_RESOURCE_STATES state);
     void PrepareDownload(ID3D12GraphicsCommandList* commands);
     void CommitDownloads(bool mapping_stable = false);
+    void RetireUploads(u64 fence);
     void MapMemory(VAddr address, u64 size) override;
     void RegisterMemory(VAddr address, u64 size) override;
     void UnmapMemory(VAddr address, u64 size) override;
@@ -91,13 +102,16 @@ private:
     bool InvalidateRange(VAddr address, u64 size, bool mapping);
     D3D12DeviceContext* context{};
     D3D12ResourceAllocator allocator;
+    std::shared_ptr<TransferPool> transfer_pool;
+    u64 transfer_fence{};
     Read read;
     Write write;
     Resolve resolve;
     Overlaps overlaps;
     ResolveBacking resolve_backing;
     std::map<std::tuple<bool, VAddr, u64>, std::unique_ptr<Buffer>> buffers;
-    std::mutex invalidation_mutex;
+    mutable std::mutex invalidation_mutex;
+    u64 mapping_generation{};
     std::vector<Invalidation> invalidations;
     u64 epoch{};
     u64 age{};

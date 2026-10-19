@@ -1,5 +1,7 @@
 #pragma once
 
+#include "video_core/renderer_d3d12/transfer_pool.h"
+
 #include <map>
 #include <memory>
 #include "video_core/renderer_d3d12/msaa_transfer.h"
@@ -25,7 +27,6 @@ public:
         }
         D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
         std::vector<u8> guest, linear;
-        std::vector<u8> guest_scratch;
         std::vector<u8> stencil_guest, stencil_linear;
         std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
         bool logic_op{};
@@ -40,6 +41,10 @@ public:
         u64 age{};
         u64 batch{};
         u32 base_layer{}, native_layers{};
+        bool cpu_dirty{true};
+        bool resident{};
+        bool download_requested{};
+        bool invalidate_after_download{};
         bool written{};
         bool stencil_written{};
         bool has_stencil{};
@@ -52,21 +57,48 @@ public:
     void Initialize(D3D12DeviceContext& device, ResourceCache::Read read,
                     ResourceCache::Write write,
                     std::function<ResourceCache::Identity(VAddr, u64)> canonicalize = {},
-                    class ShaderCache* shader_cache = nullptr);
+                    class ShaderCache* shader_cache = nullptr,
+                    std::shared_ptr<TransferPool> transfer_pool = {},
+                    const ResourceCache* alias_cache = nullptr);
+    struct Watch {
+        VAddr address;
+        u64 size;
+        bool dirty;
+    };
+    struct Statistics {
+        u64 uploads{}, resident_hits{}, downloads{}, cpu_invalidations{};
+    };
+    void ConfigureResidency(bool enabled, std::function<void(VAddr, u64)> synchronize = {});
+    std::vector<Watch> Watches() const;
+    bool RequestDownloads(std::span<const ResourceCache::Range> ranges, bool all);
+    void InvalidateCpu(std::span<const ResourceCache::Range> ranges, bool all = false);
+    bool HasDirtyImages() const;
+    const Statistics& ResidencyStatistics() const {
+        return statistics;
+    }
+    Image* FindPresentation(const VideoCore::ImageInfo& info);
     void BeginBatch();
     Image& GetImage(const VideoCore::ImageInfo& info, DXGI_FORMAT format,
-                    D3D12_RESOURCE_FLAGS flags, u32 base_layer = 0, u32 layer_count = 0, bool logic_op = false, u32 logic_mask = 15);
+                    D3D12_RESOURCE_FLAGS flags, u32 base_layer = 0, u32 layer_count = 0,
+                    bool logic_op = false, u32 logic_mask = 15);
     void Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr read_address = 0,
                 VAddr stencil_read_address = 0);
     void Barrier(Image& image, ID3D12GraphicsCommandList* commands, D3D12_RESOURCE_STATES state);
     void PrepareDownloads(ID3D12GraphicsCommandList* commands);
     void CommitDownloads();
+    void RetireUploads(u64 fence);
     void Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands);
     const std::vector<u8>& MaskShader() const {
         return transfers.MaskShader();
     }
 
 private:
+    bool Overlaps(const Image& image, VAddr address, u64 size) const;
+    void Synchronize(Image& image);
+    bool persistent{};
+    Statistics statistics{};
+    std::function<void(VAddr, u64)> synchronize;
+    const ResourceCache* alias_cache{};
     void EnsureSpace(u64 required, u64 cpu_required = 0, bool inserting = false);
     void EnsureStaging(Image& image, bool download);
     void CopyRows(Image& image, void* data, bool upload);
@@ -80,6 +112,8 @@ private:
     void CommitMsaaStencilDownloads(Image& image);
     D3D12DeviceContext* device{};
     D3D12ResourceAllocator allocator;
+    std::shared_ptr<TransferPool> transfer_pool;
+    u64 transfer_fence{};
     MsaaTransfer transfers;
     std::unique_ptr<TilingRuntime> tilizer;
     ResourceCache::Read read;

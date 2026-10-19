@@ -22,6 +22,8 @@
 
 namespace VideoCore {
 class GpuMemorySink;
+struct ImageInfo;
+struct ResidentFrame;
 }
 
 namespace Libraries::Kernel {
@@ -187,6 +189,7 @@ public:
     explicit MemoryManager();
     ~MemoryManager();
 
+    std::shared_ptr<VideoCore::ResidentFrame> CapturePresentation(const VideoCore::ImageInfo& info);
     void SetRasterizer(VideoCore::GpuMemorySink* rasterizer_) {
         rasterizer = rasterizer_;
     }
@@ -294,6 +297,14 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
     std::shared_ptr<void> AcquireGpuAccess(std::span<const std::pair<VAddr, u64>> ranges);
+    struct GpuImageWatch {
+        VAddr address;
+        u64 size;
+        bool dirty;
+    };
+    void EnableGpuImageTracking(bool enabled);
+    void SetGpuImageWatches(std::span<const GpuImageWatch> ranges);
+
 
     /// A contiguous run of the never-protected physical backing view.
     struct BackingSpan {
@@ -392,6 +403,13 @@ private:
     std::condition_variable_any gpu_access_cv;
     std::thread::id gpu_access_owner;
     std::vector<GpuProtectedRange> gpu_protected_ranges;
+    struct GpuImageProtectedRange {
+        GpuProtectedRange range;
+        bool dirty;
+    };
+    void ApplyGpuImageProtection(std::span<const GpuImageProtectedRange> previous, bool release);
+    std::vector<GpuImageProtectedRange> gpu_image_ranges;
+    std::atomic<bool> gpu_image_tracking{};
     u64 gpu_access_epoch{};
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));

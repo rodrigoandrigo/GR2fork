@@ -24,6 +24,14 @@ public:
         main_file_helper_.open(main_filename, truncate);
     }
 
+    void SwitchSession(const spdlog::filename_t& filename, bool truncate,
+                       unsigned long long size_limit) {
+        std::scoped_lock lock{this->mutex_};
+        session_file_helper_.open(filename, truncate);
+        _size_limit = size_limit;
+        _current_size = truncate ? 0 : session_file_helper_.size();
+    }
+
     spdlog::details::file_helper main_file_helper_;
     spdlog::details::file_helper session_file_helper_;
 
@@ -37,8 +45,19 @@ protected:
         if (session_file_helper_.filename().empty()) {
             // always log in the main file, it shouldnt be too big
             main_file_helper_.write(formatted);
-        } else if (_current_size < _size_limit || msg.log_level == spdlog::level::critical) {
+#ifdef SHADPS4_UWP
+            main_file_helper_.flush();
+            if (msg.log_level >= spdlog::level::err)
+                main_file_helper_.sync();
+#endif
+        } else if (_size_limit == UNLIMITED_SIZE || _current_size < _size_limit ||
+                   msg.log_level == spdlog::level::critical) {
             session_file_helper_.write(formatted);
+#ifdef SHADPS4_UWP
+            session_file_helper_.flush();
+            if (msg.log_level >= spdlog::level::err)
+                session_file_helper_.sync();
+#endif
             _current_size += formatted.size();
         }
     }

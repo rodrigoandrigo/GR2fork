@@ -80,6 +80,8 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
         return BUFFER_STORE(4, false, false, inst);
 
         // Buffer atomic operations
+    case Opcode::BUFFER_ATOMIC_SUB:
+        return BUFFER_ATOMIC(AtomicOp::Sub, inst);
     case Opcode::BUFFER_ATOMIC_ADD:
         return BUFFER_ATOMIC(AtomicOp::Add, inst);
     case Opcode::BUFFER_ATOMIC_SWAP:
@@ -141,6 +143,10 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
         return IMAGE_ATOMIC(AtomicOp::Swap, inst);
     case Opcode::IMAGE_ATOMIC_CMPSWAP:
         return IMAGE_ATOMIC(AtomicOp::CmpSwap, inst);
+    case Opcode::IMAGE_ATOMIC_SUB:
+        return IMAGE_ATOMIC(AtomicOp::Sub, inst);
+    case Opcode::IMAGE_ATOMIC_FCMPSWAP:
+        return IMAGE_ATOMIC(AtomicOp::FCmpSwap, inst);
     case Opcode::IMAGE_ATOMIC_ADD:
         return IMAGE_ATOMIC(AtomicOp::Add, inst);
     case Opcode::IMAGE_ATOMIC_SMIN:
@@ -387,9 +393,12 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
             return ir.BufferAtomicCmpSwap(handle, address, vdata_val, cmp_val, buffer_info);
         }
         case AtomicOp::FCmpSwap: {
-            const IR::Value cmp_val = ir.GetVectorReg(vdata + 1);
+            const IR::Value cmp_val = ir.GetVectorReg<IR::F32>(vdata + 1);
             return ir.BufferAtomicFCmpSwap(handle, address, vdata_val, cmp_val, buffer_info);
         }
+        case AtomicOp::Sub:
+            return ir.BufferAtomicIAdd(handle, address, ir.ISub(ir.Imm32(0u), IR::U32{vdata_val}),
+                                       buffer_info);
         case AtomicOp::Add:
             return ir.BufferAtomicIAdd(handle, address, vdata_val, buffer_info);
         case AtomicOp::Smin:
@@ -407,9 +416,9 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
         case AtomicOp::Xor:
             return ir.BufferAtomicXor(handle, address, vdata_val, buffer_info);
         case AtomicOp::Inc:
-            return ir.BufferAtomicInc(handle, address, buffer_info);
+            return ir.BufferAtomicInc(handle, address, vdata_val, buffer_info);
         case AtomicOp::Dec:
-            return ir.BufferAtomicDec(handle, address, buffer_info);
+            return ir.BufferAtomicDec(handle, address, vdata_val, buffer_info);
         case AtomicOp::Fmin:
             return ir.BufferAtomicFMin(handle, address, vdata_val, buffer_info);
         case AtomicOp::Fmax:
@@ -550,7 +559,9 @@ void Translator::IMAGE_ATOMIC(AtomicOp op, const GcnInst& inst) {
     info.is_array.Assign(mimg.da);
     info.is_r128.Assign(mimg.r128);
 
-    const IR::Value value = ir.GetVectorReg(val_reg);
+    const bool is_float = op == AtomicOp::Fmin || op == AtomicOp::Fmax || op == AtomicOp::FCmpSwap;
+    const IR::Value value = is_float ? IR::Value{ir.GetVectorReg<IR::F32>(val_reg)}
+                                     : IR::Value{ir.GetVectorReg(val_reg)};
     const IR::Value tsharp_low =
         ir.CompositeConstruct(ir.GetScalarReg(tsharp_reg), ir.GetScalarReg(tsharp_reg + 1),
                               ir.GetScalarReg(tsharp_reg + 2), ir.GetScalarReg(tsharp_reg + 3));
@@ -567,11 +578,16 @@ void Translator::IMAGE_ATOMIC(AtomicOp op, const GcnInst& inst) {
     const IR::Value prev = [&] {
         switch (op) {
         case AtomicOp::Swap:
-            return ir.ImageAtomicExchange(handle, body, value, {});
+            return ir.ImageAtomicExchange(handle, body, value, info);
         case AtomicOp::CmpSwap: {
             const IR::Value cmp_val = ir.GetVectorReg(val_reg + 1);
             return ir.ImageAtomicCmpSwap(handle, body, value, cmp_val, info);
         }
+        case AtomicOp::FCmpSwap:
+            return ir.ImageAtomicFCmpSwap(handle, body, value,
+                                          ir.GetVectorReg<IR::F32>(val_reg + 1), info);
+        case AtomicOp::Sub:
+            return ir.ImageAtomicIAdd(handle, body, ir.ISub(ir.Imm32(0u), IR::U32{value}), info);
         case AtomicOp::Add:
             return ir.ImageAtomicIAdd(handle, body, value, info);
         case AtomicOp::Smin:
@@ -601,7 +617,10 @@ void Translator::IMAGE_ATOMIC(AtomicOp op, const GcnInst& inst) {
         }
     }();
     if (mimg.glc) {
-        ir.SetVectorReg(val_reg, IR::U32{prev});
+        if (is_float)
+            ir.SetVectorReg(val_reg, IR::F32{prev});
+        else
+            ir.SetVectorReg(val_reg, IR::U32{prev});
     }
 }
 

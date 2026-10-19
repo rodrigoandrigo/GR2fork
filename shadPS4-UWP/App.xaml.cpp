@@ -5,6 +5,7 @@
 
 #include "pch.h"
 #include "DirectXPage.xaml.h"
+#include "UwpDiagnostics.h"
 
 using namespace shadPS4_UWP;
 
@@ -28,6 +29,18 @@ using namespace Windows::UI::Xaml::Navigation;
 /// </summary>
 App::App()
 {
+    UwpDiagnostics::Initialize(std::wstring(ApplicationData::Current->LocalFolder->Path->Data()) + L"\\shadPS4");
+    UnhandledException += ref new UnhandledExceptionEventHandler([](Object^, UnhandledExceptionEventArgs^ e) {
+        UwpDiagnostics::Write(UwpDiagnostics::crash_file, "xaml_unhandled_hresult", static_cast<uint32_t>(e->Exception.Value));
+    });
+    try {
+        Windows::System::MemoryManager::AppMemoryUsageIncreased += ref new EventHandler<Object^>([](Object^, Object^) {
+            UwpDiagnostics::Memory("memory_usage_increased bytes/limit");
+        });
+    } catch (Platform::Exception^ error) {
+        UwpDiagnostics::Record("memory_event_unavailable hresult", static_cast<uint32_t>(error->HResult));
+    }
+    UwpDiagnostics::Memory("app_memory bytes/limit");
 	InitializeComponent();
 	Suspending += ref new SuspendingEventHandler(this, &App::OnSuspending);
 	Resuming += ref new EventHandler<Object^>(this, &App::OnResuming);
@@ -41,6 +54,7 @@ App::App()
 /// <param name="e">Detalhes sobre a solicitação e o processo de inicialização.</param>
 void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEventArgs^ e)
 {
+    UwpDiagnostics::Record("app_launched previous_execution_state", static_cast<uint32_t>(e->PreviousExecutionState));
 	DebugSettings->EnableFrameRateCounter = false;
 	if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily == "Windows.Xbox")
 	{
@@ -114,6 +128,7 @@ void App::OnSuspending(Object^ sender, SuspendingEventArgs^ e)
 	(void) sender;	// Parâmetro não usado
 	(void) e;	// Parâmetro não usado
 
+    UwpDiagnostics::Memory("app_suspending bytes/limit");
 	m_directXPage->SaveInternalState(ApplicationData::Current->LocalSettings->Values);
 }
 

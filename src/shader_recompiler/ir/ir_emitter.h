@@ -154,6 +154,10 @@ public:
                                         BufferInstInfo info);
     [[nodiscard]] Value BufferAtomicDec(const Value& handle, const Value& address,
                                         BufferInstInfo info);
+    [[nodiscard]] Value BufferAtomicInc(const Value& handle, const Value& address,
+                                        const Value& limit, BufferInstInfo info);
+    [[nodiscard]] Value BufferAtomicDec(const Value& handle, const Value& address,
+                                        const Value& limit, BufferInstInfo info);
     [[nodiscard]] Value BufferAtomicAnd(const Value& handle, const Value& address,
                                         const Value& value, BufferInstInfo info);
     [[nodiscard]] Value BufferAtomicOr(const Value& handle, const Value& address,
@@ -365,6 +369,9 @@ public:
                                        TextureInstInfo info);
     [[nodiscard]] Value ImageAtomicExchange(const Value& handle, const Value& coords,
                                             const Value& value, TextureInstInfo info);
+    [[nodiscard]] Value ImageAtomicFCmpSwap(const Value& handle, const Value& coords,
+                                            const Value& value, const Value& compare,
+                                            TextureInstInfo info);
     [[nodiscard]] Value ImageAtomicCmpSwap(const Value& handle, const Value& coords,
                                            const Value& value, const Value& cmp_value,
                                            TextureInstInfo info);

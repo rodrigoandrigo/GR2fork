@@ -1,5 +1,7 @@
 #pragma once
 
+#include "video_core/renderer_d3d12/transfer_pool.h"
+
 #include <span>
 #include <unordered_map>
 #include <wrl/client.h>
@@ -21,8 +23,11 @@ struct TilingEntry {
 };
 class TilingRuntime {
 public:
-    void Initialize(D3D12DeviceContext& device, class ShaderCache& shaders);
+    void Initialize(D3D12DeviceContext& device, class ShaderCache& shaders,
+                    std::shared_ptr<TransferPool> transfers = {});
     void BeginBatch();
+    void RetireUploads(u64 fence);
+    void ReleaseReadbacks(u64 fence);
     bool CanRecord(const VideoCore::ImageInfo& info, std::span<const TilingEntry> entries,
                    bool tile) const;
     static bool Supported(const VideoCore::ImageInfo& info, size_t entries);
@@ -57,6 +62,8 @@ private:
     D3D12DeviceContext* device{};
     class ShaderCache* shaders{};
     D3D12ResourceAllocator allocator;
+    std::shared_ptr<TransferPool> transfer_pool;
+    u64 transfer_fence{};
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
     std::unordered_map<u64, Microsoft::WRL::ComPtr<ID3D12PipelineState>> pipelines;
     struct Operation {

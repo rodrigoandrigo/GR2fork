@@ -61,6 +61,10 @@ public:
     void ScopeMarkerBegin(std::string_view, bool = false) override {}
     void ScopeMarkerEnd(bool = false) override {}
     void ScopedMarkerInsertColor(std::string_view, u32, bool = false) override {}
+    std::shared_ptr<void> AcquireCpuAccess(VAddr address, u64 size, bool write) override;
+    std::shared_ptr<void> AcquireMemoryMappingAccess() override;
+    std::shared_ptr<VideoCore::ResidentFrame> CapturePresentation(
+        const VideoCore::ImageInfo& info) override;
     void MapMemory(VAddr address, u64 size) override;
     void RegisterMemory(VAddr address, u64 size) override;
     void UnmapMemory(VAddr address, u64 size) override;
@@ -93,6 +97,7 @@ private:
     void FillBufferImpl(VAddr address, u32 size, u32 value, bool gds);
     void CopyBufferImpl(VAddr dst, VAddr src, u32 size, bool dst_gds, bool src_gds);
     bool failed{};
+    bool logged_draw{}, logged_dispatch{};
     struct IndirectDraw {
         u32 count, instances, first, first_instance;
         s32 base_vertex;

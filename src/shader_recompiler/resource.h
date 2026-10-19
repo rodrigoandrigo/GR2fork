@@ -108,6 +108,8 @@ enum class BufferType : u8 {
     SharedMemory,
     ClipPlanes,
     ImageAddressTable,
+    SamplerTable,
+    BufferAddressTable,
     Strmout,
 };
 

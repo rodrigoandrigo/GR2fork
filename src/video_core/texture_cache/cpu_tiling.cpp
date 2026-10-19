@@ -440,21 +440,25 @@ std::vector<u32> BuildAddresses(const ImageInfo& info) {
     u32 index{};
     for (u32 mip = 0; mip < info.resources.levels; ++mip) {
         const auto& layout = info.mips_layout[mip];
-        if (!layout.pitch || !layout.height || layout.size % block)
+        const u32 pitch_blocks =
+            std::max<u32>(u32(layout.pitch) >> (info.props.is_block ? 2u : 0u), 1u);
+        const u32 height_blocks =
+            std::max<u32>(u32(layout.height) >> (info.props.is_block ? 2u : 0u), 1u);
+        if (!pitch_blocks || !height_blocks || layout.size % block)
             throw std::runtime_error("Invalid image address table layout");
         const bool macro =
             AmdGpu::IsMacroTiled(info.array_mode) && !(info.micro_tiled_mips & (1u << mip));
         for (u32 texel = 0; texel < layout.size / block; ++texel) {
-            const u32 x = texel % layout.pitch, y = (texel / layout.pitch) % layout.height;
-            const u32 plane = texel / (u32(layout.pitch) * layout.height);
+            const u32 x = texel % pitch_blocks, y = (texel / pitch_blocks) % height_blocks;
+            const u32 plane = texel / (pitch_blocks * height_blocks);
             const u32 sample = plane % info.num_samples, slice = plane / info.num_samples;
-            const u64 offset = layout.offset +
-                (!info.props.is_tiled ? u64(texel) * block
-                 : macro ? address.ComputeSurfaceAddrFromCoordMacroTiled(
-                               x, y, slice, layout.pitch, layout.height, sample)
-                         : address.ComputeSurfaceAddrFromCoordMicroTiled(
-                               x, y, slice, layout.pitch, layout.height,
-                               std::min(address.MICRO_TILE_THICKNESS, 4u), sample));
+            const u64 offset =
+                layout.offset + (!info.props.is_tiled ? u64(texel) * block
+                                 : macro ? address.ComputeSurfaceAddrFromCoordMacroTiled(
+                                               x, y, slice, pitch_blocks, height_blocks, sample)
+                                         : address.ComputeSurfaceAddrFromCoordMicroTiled(
+                                               x, y, slice, pitch_blocks, height_blocks,
+                                               std::min(address.MICRO_TILE_THICKNESS, 4u), sample));
             if (offset + block > info.guest_size || index >= offsets.size())
                 throw std::runtime_error("Image address table exceeds guest allocation");
             offsets[index++] = u32(offset);
@@ -467,10 +471,11 @@ std::vector<u32> BuildAddresses(const ImageInfo& info) {
 std::vector<u32> BuildImageAddressTable(const ImageInfo& info) {
     if (info.num_bits == 96 && info.props.is_tiled)
         throw std::runtime_error("RGB96 guest images require linear tiling");
-    if (info.props.is_block || !std::has_single_bit(info.num_samples) || info.num_samples > 16 ||
-        !info.resources.levels || info.resources.levels > MAX_MIPS ||
-        info.guest_size > 16 * 1024 * 1024)
+    if (!std::has_single_bit(info.num_samples) || info.num_samples > 16 || !info.resources.levels ||
+        info.resources.levels > MAX_MIPS || info.guest_size > 16 * 1024 * 1024)
         throw std::runtime_error("Unsupported shared image address table allocation");
+    if (info.props.is_block && info.num_samples != 1)
+        throw std::runtime_error("Compressed shared image tables require a single sample");
     switch (info.num_bits) {
     case 8:
         return BuildAddresses<8>(info);

@@ -2,12 +2,28 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <winrt/base.h>
 
 namespace D3D12 {
 namespace {
+void CheckWrapMode(AmdGpu::ClampMode mode) {
+    switch (mode) {
+    case AmdGpu::ClampMode::Wrap:
+    case AmdGpu::ClampMode::Mirror:
+    case AmdGpu::ClampMode::ClampLastTexel:
+    case AmdGpu::ClampMode::MirrorOnceLastTexel:
+    case AmdGpu::ClampMode::ClampBorder:
+        return;
+    default:
+        throw std::runtime_error(
+            "Guest sampler border/mirror mode requires shader coordinate emulation");
+    }
+}
+
 D3D12_TEXTURE_ADDRESS_MODE AddressMode(AmdGpu::ClampMode mode) {
     switch (mode) {
     case AmdGpu::ClampMode::Wrap:
@@ -116,6 +132,8 @@ ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& b
                                resource.buffer_type != Shader::BufferType::ClipPlanes &&
                                resource.buffer_type != Shader::BufferType::GdsBuffer &&
                                resource.buffer_type != Shader::BufferType::ImageAddressTable &&
+                               resource.buffer_type != Shader::BufferType::BufferAddressTable &&
+                               resource.buffer_type != Shader::BufferType::SamplerTable &&
                                resource.buffer_type != Shader::BufferType::SharedMemory)
                         throw std::runtime_error(
                             "D3D12 shader special buffer requires additional execution state");
@@ -201,11 +219,106 @@ void ResourceBindings::ValidateTargetRange(VAddr address, u64 size) const {
         }
     }
 }
+std::vector<ResourceCache::Range> ResourceBindings::CpuRanges(VAddr border_colors,
+                                                              bool written_only) const {
+    std::vector<ResourceCache::Range> ranges;
+    for (u32 i = 0; i < entries.size(); ++i) {
+        const auto& entry = entries[i];
+        if (entry.binding.kind == ResourceKind::Image || !guest_ranges[i].address ||
+            !guest_ranges[i].size)
+            continue;
+        if (written_only && (entry.binding.kind != ResourceKind::Buffer ||
+                             !entry.shader->info.buffers[entry.index].is_written))
+            continue;
+        ranges.push_back(guest_ranges[i]);
+    }
+    if (!written_only)
+        for (const auto& entry : entries) {
+            if (entry.binding.kind != ResourceKind::Sampler)
+                continue;
+            const auto sharp =
+                entry.shader->info.samplers[entry.index].GetSharp(entry.shader->info);
+            if (sharp.border_color_type.Value() != AmdGpu::BorderColor::Custom)
+                continue;
+            const u64 offset = sharp.border_color_ptr.Value() * 16;
+            if (!border_colors || border_colors > UINT64_MAX - offset - 16)
+                throw std::runtime_error("Invalid guest custom sampler border table");
+            ranges.push_back({border_colors + offset, 16});
+        }
+    return ranges;
+}
+void ResourceBindings::PrepareImages() {
+    for (const auto& entry : entries) {
+        if (entry.binding.kind != ResourceKind::Image)
+            continue;
+        const auto& resource = entry.shader->info.images[entry.index];
+        const auto sharp = resource.GetSharp(entry.shader->info);
+        if (!sharp)
+            continue;
+        const auto type = sharp.GetViewType(resource.is_array);
+        const bool array =
+            type == AmdGpu::ImageType::Color1DArray || type == AmdGpu::ImageType::Color2DArray ||
+            type == AmdGpu::ImageType::Color2DMsaaArray || type == AmdGpu::ImageType::Cube;
+        const VideoCore::ImageInfo info{sharp, resource};
+        auto format = ConvertFormat(info.pixel_format);
+        const bool writable = entry.binding.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        if (resource.is_depth)
+            format = sharp.GetDataFmt() == AmdGpu::DataFormat::Format16 ? DXGI_FORMAT_R16_UNORM
+                                                                        : DXGI_FORMAT_R32_FLOAT;
+        if (writable && format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+            format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        images.GetImage(info, TypelessFormat(format),
+                        writable ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                                 : D3D12_RESOURCE_FLAG_NONE,
+                        array ? 0 : sharp.base_array, array ? 0 : 1);
+    }
+}
 void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushData& push,
                               std::span<const float, 24> clip_planes, VAddr border_colors,
                               const ResourceCache::Read& read, std::span<const u8, 65536> gds,
                               std::span<const u8> shared_memory) {
     const auto views = buffers.GetViews(guest_ranges);
+    std::map<const CompiledShader*, std::vector<u32>> address_tables;
+    for (u32 i = 0; i < entries.size(); ++i) {
+        const auto& entry = entries[i];
+        if (entry.binding.kind != ResourceKind::Buffer ||
+            entry.shader->info.buffers[entry.index].buffer_type != Shader::BufferType::Guest)
+            continue;
+        auto& table = address_tables[entry.shader];
+        if (table.empty())
+            table.resize(entry.shader->info.buffers.size() * 4);
+        const auto& view = views[i];
+        auto segments = view.segments;
+        if (segments.empty() && view.buffer)
+            segments.push_back({view.guest_address, view.offset, view.size});
+        u32 shift = 14;
+        const u32 bias = segments.empty() ? 0 : segments.front().offset & 3;
+        for (const auto& segment : segments) {
+            const u64 begin = segment.address - view.guest_address + bias;
+            const u64 end = begin + segment.size;
+            if ((segment.offset & 3) != (begin & 3))
+                throw std::runtime_error("D3D12 buffer mapping splits a physical word");
+            while (shift > 2 && ((begin != bias && (begin & ((1u << shift) - 1))) ||
+                                 (end != view.size + bias && (end & ((1u << shift) - 1)))))
+                --shift;
+        }
+        const u32 mask = (1u << shift) - 1;
+        const u32 pages = std::max<u64>(1, (view.size + bias + mask) >> shift);
+        const u32 start = table.size();
+        if (u64(start) + pages > 4ULL * 1024 * 1024)
+            throw std::runtime_error("D3D12 buffer address tables exceed allocation budget");
+        table.resize(start + pages, UINT32_MAX);
+        table[entry.index * 4] = start;
+        table[entry.index * 4 + 1] = shift;
+        table[entry.index * 4 + 2] = bias;
+        table[entry.index * 4 + 3] = view.size;
+        for (const auto& segment : segments) {
+            const u64 begin = segment.address - view.guest_address + bias;
+            const u64 end = begin + segment.size;
+            for (u64 page = begin >> shift; page <= (end - 1) >> shift; ++page)
+                table[start + page] = u32(segment.offset + (page << shift) - begin);
+        }
+    }
     for (u32 i = 0; i < entries.size(); ++i) {
         if (entries[i].binding.kind != ResourceKind::Buffer || !views[i].buffer)
             continue;
@@ -244,10 +357,16 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                                                {reinterpret_cast<const u8*>(info.flat_ud),
                                                 static_cast<size_t>(bytes)}),
                         0, bytes};
+            } else if (resource.buffer_type == Shader::BufferType::BufferAddressTable) {
+                const auto& table = address_tables.at(entry.shader);
+                const u64 identity = 0xfff9000000000000ULL + (u64(info.sw_stage) << 32);
+                view = {&buffers.GetHostBuffer(identity, {reinterpret_cast<const u8*>(table.data()),
+                                                          table.size() * sizeof(u32)}),
+                        0, table.size() * sizeof(u32)};
             } else if (resource.buffer_type == Shader::BufferType::ImageAddressTable) {
                 const auto& table = entry.shader->image_address_tables.at(entry.index);
                 const u64 identity =
-                    0xfffa000000000000ULL + (u64(info.sw_stage) << 32) + entry.index;
+                    0xfffa000000000000ULL + (u64(info.sw_stage) << 32) + (u64(entry.index) << 26);
                 view = {&buffers.GetHostBuffer(identity, {reinterpret_cast<const u8*>(table.data()),
                                                           table.size() * sizeof(u32)}),
                         0, table.size() * sizeof(u32)};
@@ -265,14 +384,63 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                 auto& scratch = buffers.GetHostBuffer(0xfffb000000000000ULL, shared_memory);
                 scratch.snapshot.clear();
                 view = {&scratch, 0, shared_memory.size()};
-            } else
+            } else if (resource.buffer_type == Shader::BufferType::SamplerTable) {
+                if (info.samplers.empty())
+                    throw std::runtime_error("Missing guest sampler table for lowered sampling");
+                std::vector<u32> words(info.samplers.size() * 8, 0);
+                for (u32 i = 0; i < info.samplers.size(); ++i) {
+                    const auto sharp = info.samplers[i].GetSharp(info);
+                    if (!sharp.Valid())
+                        throw std::runtime_error("Invalid guest sampler");
+                    CheckWrapMode(sharp.clamp_x);
+                    CheckWrapMode(sharp.clamp_y);
+                    CheckWrapMode(sharp.clamp_z);
+                    const u32 xy_linear = sharp.xy_min_filter == AmdGpu::Filter::Bilinear ? 1U : 0U;
+                    const u32 z_linear = sharp.z_filter.Value() == 1U ? 1U : 0U;
+                    u32 border = 0;
+                    switch (sharp.border_color_type.Value()) {
+                    case AmdGpu::BorderColor::TransparentBlack:
+                        break;
+                    case AmdGpu::BorderColor::OpaqueBlack:
+                        border = 0xff000000u;
+                        break;
+                    case AmdGpu::BorderColor::White:
+                        border = 0xffffffffu;
+                        break;
+                    case AmdGpu::BorderColor::Custom: {
+                        const u64 offset = sharp.border_color_ptr.Value() * 16;
+                        if (!border_colors || border_colors > UINT64_MAX - offset - 16)
+                            throw std::runtime_error("Invalid guest custom sampler border table");
+                        std::array<float, 4> color{};
+                        read(border_colors + offset,
+                             {reinterpret_cast<u8*>(color.data()), sizeof(color)});
+                        for (u32 c = 0; c < 4; ++c)
+                            border |= u32(std::clamp(std::lround(color[c] * 255.f), 0L, 255L))
+                                      << (c * 8);
+                        break;
+                    }
+                    }
+                    words[i * 8] = u32(sharp.clamp_x.Value()) | u32(sharp.clamp_y.Value()) << 3 |
+                                   u32(sharp.clamp_z.Value()) << 6 | xy_linear << 9 |
+                                   z_linear << 10 | u32(sharp.depth_compare_func.Value()) << 11 |
+                                   (sharp.trunc_coord ? 1U << 14 : 0U);
+                    words[i * 8 + 1] = border;
+                }
+                const u64 identity = 0xfff8000000000000ULL + (u64(info.sw_stage) << 32);
+                view = {&buffers.GetHostBuffer(identity, {reinterpret_cast<const u8*>(words.data()),
+                                                          words.size() * sizeof(u32)}),
+                        0, words.size() * sizeof(u32)};
+            } else if (resource.buffer_type != Shader::BufferType::Guest)
                 push.AddOffset(entry.shader->start_bindings.buffer + entry.index, view.offset & 15);
             D3D12_UNORDERED_ACCESS_VIEW_DESC descriptor{};
             descriptor.Format = DXGI_FORMAT_R32_TYPELESS;
             descriptor.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            descriptor.Buffer.FirstElement = (view.offset & ~u64{15}) / 4;
+            const bool translated = resource.buffer_type == Shader::BufferType::Guest;
+            descriptor.Buffer.FirstElement = translated ? 0 : (view.offset & ~u64{15}) / 4;
             descriptor.Buffer.NumElements =
-                view.buffer ? (view.size + (view.offset & 15) + 3) / 4 : 1;
+                view.buffer
+                    ? ((translated ? view.buffer->size : view.size + (view.offset & 15)) + 3) / 4
+                    : 1;
             descriptor.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
             device.Device()->CreateUnorderedAccessView(
                 view.buffer ? view.buffer->native.Get() : nullptr, nullptr, &descriptor,

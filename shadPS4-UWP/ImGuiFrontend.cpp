@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "UwpDiagnostics.h"
 
 #include "ImGuiFrontend.h"
 
@@ -292,7 +293,13 @@ void ImGuiFrontend::Run(std::wstring root) {
     if (ready)
       ready();
     auto last = std::chrono::steady_clock::now();
+    auto last_memory_sample = last;
     while (!stopping.load()) {
+      const auto memory_time = std::chrono::steady_clock::now();
+      if (memory_time - last_memory_sample >= std::chrono::seconds(1)) {
+        UwpDiagnostics::Memory("memory_sample bytes/limit");
+        last_memory_sample = memory_time;
+      }
       FrontendInput snapshot;
       {
         std::lock_guard<std::mutex> lock{input_mutex};

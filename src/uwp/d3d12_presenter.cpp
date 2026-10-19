@@ -12,6 +12,8 @@
 #include <chrono>
 #include <winrt/base.h>
 #include "core/memory.h"
+#include "common/logging/log.h"
+#include "uwp/resident_conversion.h"
 #include "uwp/session.h"
 #include "video_core/renderer_d3d12/profile.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
@@ -23,6 +25,8 @@ namespace Core::Uwp {
 struct D3D12Presenter::Frame final : VideoCore::PresentationFrame {
     std::vector<u8> pixels;
     D3D12Resource upload;
+    std::shared_ptr<VideoCore::ResidentFrame> resident;
+    ComPtr<ID3D12Resource> source, converted;
     D3D12::TemporalJitter::Sample jitter;
     u32 width{};
     u32 height{};
@@ -55,6 +59,9 @@ void D3D12Presenter::RegisterVideoOutSurface(const Libraries::VideoOut::BufferAt
 VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
     const Libraries::VideoOut::BufferAttributeGroup& group, VAddr address) {
     RegisterVideoOutSurface(group, address);
+    const bool first = !prepared_frame.exchange(true);
+    if (first)
+        LOG_INFO(Core, "[UWP stage] first VideoOut frame capture");
     VideoCore::ImageInfo info{group, address};
     if (group.attrib.tiling_mode == Libraries::VideoOut::TilingMode::Linear) {
         info.pitch = group.attrib.pitch_in_pixel;
@@ -64,7 +71,12 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
         throw std::runtime_error("D3D12 VideoOut surface exceeds staging budget");
     auto frame = std::make_shared<Frame>();
     const u32 pixel_bytes = info.num_bits / 8;
-    const u64 charge = u64(group.attrib.width) * group.attrib.height * (pixel_bytes + 8);
+    const auto allocation = [](u64 bytes) { return (bytes + 65535) & ~u64{65535}; };
+    const u64 source_bytes =
+        ((u64(info.pitch) * pixel_bytes + 255) & ~u64{255}) * group.attrib.height;
+    const u64 output_bytes =
+        ((u64(group.attrib.width) * 8 + 255) & ~u64{255}) * group.attrib.height;
+    const u64 charge = allocation(source_bytes) + allocation(output_bytes) + 65536;
     constexpr u64 limit = 256ULL * 1024 * 1024;
     if (charge > limit)
         throw std::runtime_error("D3D12 VideoOut frame exceeds budget");
@@ -81,6 +93,15 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
     frame->budget = frame_bytes;
     frame->width = group.attrib.width;
     frame->height = group.attrib.height;
+    frame->format = group.attrib.pixel_format;
+    frame->gamma = gamma.load();
+    frame->resident = Core::Memory::Instance()->CapturePresentation(info);
+    if (frame->resident) {
+        if (first)
+            LOG_INFO(Core, "[UWP stage] first resident VideoOut snapshot ready");
+        frame->jitter = D3D12::NativeTemporalJitter().CompleteFrame();
+        return frame;
+    }
     std::vector<u8> guest(info.guest_size), linear(info.guest_size);
     {
         auto* memory = Core::Memory::Instance();
@@ -88,8 +109,6 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
         memory->CopySparseMemory(address, guest.data(), guest.size());
     }
     VideoCore::ConvertTiling(guest, linear, info, false);
-    frame->format = group.attrib.pixel_format;
-    frame->gamma = gamma.load();
     frame->pixels.resize(u64(frame->width) * frame->height * pixel_bytes);
     for (u32 row = 0; row < frame->height; ++row) {
         const u64 source = u64(row) * info.mips_layout[0].pitch * pixel_bytes;
@@ -98,12 +117,14 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
             throw std::runtime_error("D3D12 VideoOut row exceeds guest backing");
         std::memcpy(frame->pixels.data() + u64(row) * bytes, linear.data() + source, bytes);
     }
+    if (first)
+        LOG_INFO(Core, "[UWP stage] first CPU VideoOut snapshot ready");
     frame->jitter = D3D12::NativeTemporalJitter().CompleteFrame();
     return frame;
 }
-std::vector<u8> D3D12Presenter::ConvertPixels(const Frame& frame, bool floating_point) const {
+std::array<float, 1024> D3D12Presenter::ColorComponents(const Frame& frame,
+                                                        bool floating_point) const {
     using Format = Libraries::VideoOut::PixelFormat;
-    const bool fp16 = frame.format == Format::A16R16G16B16Float;
     const bool srgb = frame.format == Format::A8R8G8B8Srgb ||
                       frame.format == Format::A8B8G8R8Srgb ||
                       frame.format == Format::A2R10G10B10Srgb;
@@ -128,20 +149,38 @@ std::vector<u8> D3D12Presenter::ConvertPixels(const Frame& frame, bool floating_
         frame.format == Format::A8R8G8B8Srgb || frame.format == Format::A8B8G8R8Srgb;
     const u32 maximum = eight_bit ? 255 : 1023;
     std::array<float, 1024> components{};
-    if (!fp16) {
-        for (u32 i = 0; i <= maximum; ++i) {
-            float value = float(i) / maximum;
-            if (pq) {
-                value = decode_pq(value);
-            } else {
-                if (srgb)
-                    value = degamma(value);
-                if (!floating_point || (!hdr_enabled && frame.gamma != 1.0f))
-                    value = floating_point ? degamma(encode(value)) : encode(value);
-            }
-            components[i] = value;
+    if (frame.format == Format::A16R16G16B16Float)
+        return components;
+    for (u32 i = 0; i <= maximum; ++i) {
+        float value = float(i) / maximum;
+        if (pq) {
+            value = decode_pq(value);
+        } else {
+            if (srgb)
+                value = degamma(value);
+            if (!floating_point || (!hdr_enabled && frame.gamma != 1.0f))
+                value = floating_point ? degamma(encode(value)) : encode(value);
         }
+        components[i] = value;
     }
+    return components;
+}
+std::vector<u8> D3D12Presenter::ConvertPixels(const Frame& frame, bool floating_point) const {
+    using Format = Libraries::VideoOut::PixelFormat;
+    const bool fp16 = frame.format == Format::A16R16G16B16Float;
+    const bool pq = frame.format == Format::A2R10G10B10Bt2020Pq ||
+                    (hdr_enabled && (frame.format == Format::A2R10G10B10 ||
+                                     frame.format == Format::A2R10G10B10Srgb));
+    const auto degamma = [](float value) {
+        return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f);
+    };
+    const auto encode = [&](float value) {
+        return value > 0.0031308f ? 1.055f * std::pow(value, 1.0f / (3.4f - frame.gamma)) - 0.055f
+                                  : 12.92f * value / frame.gamma;
+    };
+    const u32 maximum = frame.format == Format::A8R8G8B8Srgb ||
+                                frame.format == Format::A8B8G8R8Srgb ? 255 : 1023;
+    const auto components = ColorComponents(frame, floating_point);
     const u32 input_bytes = fp16 ? 8 : 4, output_bytes = floating_point ? 8 : 4;
     std::vector<u8> pixels(u64(frame.width) * frame.height * output_bytes);
     for (u64 i = 0; i < u64(frame.width) * frame.height; ++i) {
@@ -197,9 +236,7 @@ std::vector<u8> D3D12Presenter::ConvertPixels(const Frame& frame, bool floating_
             std::memcpy(output, packed.data(), sizeof(packed));
         } else {
             for (u32 c = 0; c < 4; ++c)
-                output[c] = static_cast<u8>(std::clamp(rgba[c == 0   ? 2
-                                                            : c == 2 ? 0
-                                                                     : c] *
+                output[c] = static_cast<u8>(std::clamp(rgba[c] *
                                                                255 +
                                                            0.5f,
                                                        0.0f, 255.0f));
@@ -220,7 +257,14 @@ void D3D12Presenter::Present(const VideoCore::FrameHandle& frame, bool, bool) {
         throw std::runtime_error("VideoOut frame belongs to another presentation backend");
     std::scoped_lock lock{mutex};
     last_frame = native;
+    const bool first = !presented_frame && native->width && native->height;
+    if (first)
+        LOG_INFO(Core, "[UWP stage] first native game presentation begin");
     RenderFrame();
+    if (first) {
+        presented_frame = true;
+        LOG_INFO(Core, "[UWP stage] first native game presentation completed");
+    }
 }
 bool D3D12Presenter::IsHDRSupported() const {
     return float_supported && hdr_display.load() && EmulatorSettings.IsHdrAllowed();
@@ -245,6 +289,8 @@ void D3D12Presenter::CheckEnvironment() {
     D3D12ResourceAllocator allocator;
     allocator.Initialize(device.Device(), 1024 * 1024);
     D3D12Resource upload;
+    std::shared_ptr<VideoCore::ResidentFrame> resident;
+    ComPtr<ID3D12Resource> source, converted;
     D3D12Resource buffer;
     D3D12Resource readback;
     constexpr std::array<uint32_t, 4> expected{0x10203040, 0x50607080, 0x90abcdef, 0x12345678};
@@ -343,6 +389,115 @@ void D3D12Presenter::Render() {
     std::scoped_lock lock{mutex};
     ProfileSample(presenter_profile, "presenter_render", 128, [&] { RenderFrame(); });
 }
+void D3D12Presenter::ConvertResident(Frame& frame) {
+    if (frame.converted && frame.upload_hdr == hdr_enabled &&
+        frame.upload_sdr_white == sdr_white_nits)
+        return;
+    if (!conversion_pipeline) {
+        conversion_shaders.Initialize(context.Device());
+        const auto binary =
+            conversion_shaders.CompileHlslRaw(std::string(ResidentConversion), L"cs_6_0", {});
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+        D3D12_ROOT_PARAMETER parameters[4]{};
+        parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        parameters[0].Descriptor.ShaderRegister = 0;
+        parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[1].DescriptorTable = {1, &range};
+        parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[2].Constants = {0, 0, 8};
+        parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        parameters[3].Descriptor.ShaderRegister = 1;
+        D3D12_ROOT_SIGNATURE_DESC root_description{4, parameters};
+        ComPtr<ID3DBlob> serialized, errors;
+        winrt::check_hresult(D3D12SerializeRootSignature(
+            &root_description, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors));
+        winrt::check_hresult(context.Device()->CreateRootSignature(
+            0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+            IID_PPV_ARGS(&conversion_root)));
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+        pipeline.pRootSignature = conversion_root.Get();
+        pipeline.CS = {binary->dxil.data(), binary->dxil.size()};
+        winrt::check_hresult(context.Device()->CreateComputePipelineState(
+            &pipeline, IID_PPV_ARGS(&conversion_pipeline)));
+        D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        winrt::check_hresult(
+            context.Device()->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&conversion_heap)));
+    }
+    if (!frame.source)
+        winrt::check_hresult(context.Device()->OpenSharedHandle(frame.resident->handle.get(),
+                                                                IID_PPV_ARGS(&frame.source)));
+    D3D12_RESOURCE_DESC description{};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = frame.width;
+    description.Height = frame.height;
+    description.DepthOrArraySize = description.MipLevels = 1;
+    description.Format = format;
+    description.SampleDesc.Count = 1;
+    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    frame.converted.Reset();
+    winrt::check_hresult(context.Device()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&frame.converted)));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.Format = format;
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    context.Device()->CreateUnorderedAccessView(
+        frame.converted.Get(), nullptr, &view,
+        conversion_heap->GetCPUDescriptorHandleForHeapStart());
+    using Format = Libraries::VideoOut::PixelFormat;
+    const u32 mode = frame.format == Format::A8R8G8B8Srgb          ? 0
+                     : frame.format == Format::A8B8G8R8Srgb        ? 1
+                     : frame.format == Format::A2R10G10B10         ? 2
+                     : frame.format == Format::A2R10G10B10Srgb     ? 3
+                     : frame.format == Format::A2R10G10B10Bt2020Pq ? 4
+                                                                   : 5;
+    const std::array<u32, 8> constants{frame.width,
+                                       frame.height,
+                                       frame.resident->row_pitch,
+                                       mode,
+                                       u32(format == DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                       u32(hdr_enabled),
+                                       std::bit_cast<u32>(frame.gamma),
+                                       std::bit_cast<u32>(sdr_white_nits)};
+    const auto components = ColorComponents(frame, format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+    frame.upload.Reset();
+    winrt::check_hresult(resources.CreateBuffer(sizeof(components), D3D12_HEAP_TYPE_UPLOAD,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, frame.upload));
+    void* mapped{};
+    const D3D12_RANGE empty{0, 0};
+    winrt::check_hresult(frame.upload->Map(0, &empty, &mapped));
+    std::memcpy(mapped, components.data(), sizeof(components));
+    const D3D12_RANGE contents{0, sizeof(components)};
+    frame.upload->Unmap(0, &contents);
+    commands->SetComputeRootSignature(conversion_root.Get());
+    commands->SetPipelineState(conversion_pipeline.Get());
+    auto* descriptors = conversion_heap.Get();
+    commands->SetDescriptorHeaps(1, &descriptors);
+    commands->SetComputeRootShaderResourceView(0, frame.source->GetGPUVirtualAddress());
+    commands->SetComputeRootDescriptorTable(1,
+                                            conversion_heap->GetGPUDescriptorHandleForHeapStart());
+    commands->SetComputeRoot32BitConstants(2, constants.size(), constants.data(), 0);
+    commands->SetComputeRootShaderResourceView(3, frame.upload->GetGPUVirtualAddress());
+    D3D12_RESOURCE_BARRIER source{};
+    source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    source.Transition = {frame.source.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                         D3D12_RESOURCE_STATE_COMMON,
+                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    commands->ResourceBarrier(1, &source);
+    commands->Dispatch((frame.width + 7) / 8, (frame.height + 7) / 8, 1);
+    std::swap(source.Transition.StateBefore, source.Transition.StateAfter);
+    D3D12_RESOURCE_BARRIER output{};
+    output.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    output.Transition = {frame.converted.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    const D3D12_RESOURCE_BARRIER barriers[]{source, output};
+    commands->ResourceBarrier(2, barriers);
+    frame.upload_hdr = hdr_enabled;
+    frame.upload_sdr_white = sdr_white_nits;
+}
 void D3D12Presenter::RenderFrame() {
     if (last_frame && last_frame->width && last_frame->height)
         ResizeBuffers(last_frame->width, last_frame->height,
@@ -351,10 +506,10 @@ void D3D12Presenter::RenderFrame() {
                                   Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq ||
                               hdr_enabled
                           ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                          : DXGI_FORMAT_B8G8R8A8_UNORM);
+                          : DXGI_FORMAT_R8G8B8A8_UNORM);
     else
         ResizeBuffers(display_width, display_height, hdr_enabled ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                                               : DXGI_FORMAT_B8G8R8A8_UNORM);
+                                                               : DXGI_FORMAT_R8G8B8A8_UNORM);
     const float scale = std::min(float(display_width) / width, float(display_height) / height);
     const DXGI_MATRIX_3X2_F transform{
         scale / composition_scale_x, 0, 0, scale / composition_scale_y,
@@ -366,7 +521,11 @@ void D3D12Presenter::RenderFrame() {
     const auto index = swapchain->GetCurrentBackBufferIndex();
     D3D12CommandEncoder encoder{commands.Get(), transfers};
     encoder.Track(buffers[index].Get(), D3D12_RESOURCE_STATE_PRESENT);
-    if (last_frame && !last_frame->pixels.empty()) {
+    if (last_frame && last_frame->resident) {
+        ConvertResident(*last_frame);
+        encoder.Transition(buffers[index].Get(), D3D12_RESOURCE_STATE_COPY_DEST);
+        commands->CopyResource(buffers[index].Get(), last_frame->converted.Get());
+    } else if (last_frame && !last_frame->pixels.empty()) {
         const auto description = buffers[index]->GetDesc();
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
         u64 bytes;

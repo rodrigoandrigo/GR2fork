@@ -459,6 +459,8 @@ u64 FootprintBytes(std::span<const TilingEntry> entries) {
 } // namespace
 
 bool TilingRuntime::Supported(const VideoCore::ImageInfo& info, size_t entries) {
+    if (info.pixel_format == vk::Format::eB4G4R4A4UnormPack16)
+        return false;
     if (!info.props.is_tiled || info.num_samples != 1 || info.resources.layers != 1 ||
         entries == 0 || entries > 16 || info.guest_size == 0) {
         return false;
@@ -510,6 +512,12 @@ D3D12Resource& TilingRuntime::RequestBuffer(D3D12Resource& buffer, u64 size, D3D
                                             D3D12_RESOURCE_FLAGS flags) {
     if (buffer.Get() && buffer.AllocationBytes() >= size)
         return buffer;
+    if (heap != D3D12_HEAP_TYPE_DEFAULT) {
+        transfer_pool->Retire(std::move(buffer), device->LastSignaledValue());
+        buffer = transfer_pool->Acquire(size, heap);
+        state = initial_state;
+        return buffer;
+    }
     buffer.Reset();
     winrt::check_hresult(
         allocator.CreateBuffer((size + 65535) & ~u64{65535}, heap, initial_state, flags, buffer));
@@ -528,16 +536,45 @@ void TilingRuntime::Transition(ID3D12GraphicsCommandList* commands, D3D12Resourc
     state = next;
 }
 
-void TilingRuntime::Initialize(D3D12DeviceContext& device_context, ShaderCache& cache) {
+void TilingRuntime::Initialize(D3D12DeviceContext& device_context, ShaderCache& cache,
+                               std::shared_ptr<TransferPool> pool) {
     device = &device_context;
+    transfer_pool = std::move(pool);
+    if (!transfer_pool) {
+        transfer_pool = std::make_shared<TransferPool>();
+        transfer_pool->Initialize(device_context);
+    }
     shaders = &cache;
     allocator.Initialize(device->Device(), 64ULL * 1024 * 1024);
     root = CreateRootSignature(device->Device());
 }
 
-void TilingRuntime::BeginBatch() {
+void TilingRuntime::RetireUploads(u64 fence) {
+    transfer_fence = fence;
+    for (auto& operation : operations) {
+        transfer_pool->Retire(std::move(operation->params), fence);
+        transfer_pool->Retire(std::move(operation->staging), fence);
+        transfer_pool->Retire(std::move(operation->zeros), fence);
+        operation->zeros_zeroed = 0;
+    }
+}
+void TilingRuntime::ReleaseReadbacks(u64 fence) {
+    if (!operations.empty() && device->CompletedValue() < fence)
+        throw std::runtime_error("D3D12 tiling resources released before transfer fence");
+    for (auto& operation : operations)
+        transfer_pool->Retire(std::move(operation->tile_readback), fence);
     operations.clear();
     active = nullptr;
+}
+void TilingRuntime::BeginBatch() {
+    const auto fence = device->LastSignaledValue();
+    RetireUploads(fence);
+    ReleaseReadbacks(fence);
+    if (pipelines.size() > 128) {
+        device->Wait(fence);
+        while (pipelines.size() > 128)
+            pipelines.erase(pipelines.begin());
+    }
 }
 
 bool TilingRuntime::CanRecord(const VideoCore::ImageInfo& info,
@@ -565,7 +602,7 @@ ID3D12PipelineState* TilingRuntime::Pipeline(const VideoCore::ImageInfo& info, b
     if (const auto it = pipelines.find(hash); it != pipelines.end())
         return it->second.Get();
     const auto defines = SpecDefines(specs);
-    auto binary = shaders->CompileHlslRaw(std::string(TilingShader), L"cs_6_6", defines);
+    auto binary = shaders->CompileHlslRaw(std::string(TilingShader), L"cs_6_4", defines);
     D3D12_COMPUTE_PIPELINE_STATE_DESC description{};
     description.pRootSignature = root.Get();
     description.CS.pShaderBytecode = binary->dxil.data();

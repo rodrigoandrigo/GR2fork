@@ -62,10 +62,13 @@ void NativeHost::DetachSurface() {
 void NativeHost::InitializeGpu() {
     if (liverpool)
         throw std::runtime_error("The guest GPU processor is already initialized");
+    LOG_INFO(Core, "[UWP stage] creating native GPU processor");
     auto gpu = std::make_unique<AmdGpu::Liverpool>();
+    LOG_INFO(Core, "[UWP stage] creating native D3D12 rasterizer");
     gpu->OwnRasterizer(std::make_unique<D3D12::Rasterizer>(*gpu, *Core::Memory::Instance()));
     liverpool = std::move(gpu);
     VideoCore::SetPresentationSink(presentation);
+    LOG_INFO(Core, "[UWP stage] native D3D12 GPU ready");
 }
 void NativeHost::Resize(uint32_t width, uint32_t height, float scale_x, float scale_y) {
     window->ResizeEmbedded(width, height);

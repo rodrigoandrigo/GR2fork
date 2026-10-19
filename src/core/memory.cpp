@@ -135,6 +135,9 @@ u64 MemoryManager::ClampRangeSizeSlow(VAddr virtual_addr, u64 size) {
 }
 
 void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     PrtArea& area = prt_areas[id];
     if (area.mapped) {
         rasterizer->UnmapMemory(area.start, area.end - area.start);
@@ -150,6 +153,10 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
+    const auto image_access = gpu_image_tracking.load(std::memory_order_acquire) &&
+                                      gpu_access_memory != this && rasterizer
+                                  ? rasterizer->AcquireCpuAccess(virtual_addr, size, false)
+                                  : nullptr;
     GuestCopyScope scope{this};
     auto access_lock = LockGpuAccess();
     const auto measured = getenv("GAME_PROFILE") != nullptr;
@@ -300,6 +307,10 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+    const auto image_access = gpu_image_tracking.load(std::memory_order_acquire) &&
+                                      gpu_access_memory != this && rasterizer
+                                  ? rasterizer->AcquireCpuAccess(reinterpret_cast<VAddr>(address), size, true)
+                                  : nullptr;
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     // Shared lock unless a GuestCopyScope already holds it (see GuestCopyScope).
     std::shared_lock lk{mutex, std::defer_lock};
@@ -385,6 +396,9 @@ MemoryManager::BackingWriteStats MemoryManager::DrainBackingWriteStats() {
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     std::scoped_lock lk{mutex, unmap_mutex};
     alignment = alignment > 0 ? alignment : 64_KB;
 
@@ -427,6 +441,9 @@ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, 
 
 PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u64 alignment,
                               s32 memory_type) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     std::scoped_lock lk{mutex, unmap_mutex};
     alignment = alignment > 0 ? alignment : 16_KB;
 
@@ -465,6 +482,9 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
 }
 
 s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     // Basic bounds checking
     if (phys_addr > total_direct_size || (is_checked && phys_addr + size > total_direct_size)) {
         LOG_ERROR(Kernel_Vmm, "phys_addr {:#x}, size {:#x} goes outside dmem map", phys_addr, size);
@@ -557,6 +577,9 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
 }
 
 s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32 mtype) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     std::scoped_lock lk{unmap_mutex};
     std::unique_lock lk2{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
@@ -697,6 +720,9 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
 s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
                              MemoryMapFlags flags, VMAType type, std::string_view name,
                              bool validate_dmem, PAddr phys_addr, u64 alignment) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     // Certain games perform flexible mappings on loop to determine
     // the available flexible memory size. Questionable but we need to handle this.
     if (type == VMAType::Flexible && flexible_usage + size > total_flexible_size) {
@@ -881,6 +907,9 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
 
 s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
                            MemoryMapFlags flags, s32 fd, s64 phys_addr) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     uintptr_t handle = 0;
     std::scoped_lock lk{unmap_mutex};
     // Get the file to map
@@ -1006,6 +1035,9 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 }
 
 s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     std::scoped_lock lk{unmap_mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);
@@ -1092,6 +1124,9 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
 }
 
 s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     if (size == 0) {
         return ORBIS_OK;
     }
@@ -1348,6 +1383,9 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
 }
 
 s32 MemoryManager::Protect(VAddr addr, u64 size, MemoryProt prot) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     // If size is zero, then there's nothing to protect
     if (size == 0) {
         return ORBIS_OK;
@@ -1539,6 +1577,9 @@ s32 MemoryManager::DirectQueryAvailable(PAddr search_start, PAddr search_end, u6
 }
 
 s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     std::scoped_lock lk{mutex, unmap_mutex};
 
     ASSERT_MSG(IsValidMapping(addr, size), "Attempted to access invalid address {:#x}", addr);
@@ -1589,6 +1630,9 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
 }
 
 void MemoryManager::NameVirtualRange(VAddr virtual_addr, u64 size, std::string_view name) {
+    const auto gpu_mapping = gpu_image_tracking.load(std::memory_order_acquire) && rasterizer
+                                 ? rasterizer->AcquireMemoryMappingAccess()
+                                 : nullptr;
     std::scoped_lock lk{mutex, unmap_mutex};
 
     // Sizes are aligned up to the nearest 16_KB

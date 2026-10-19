@@ -6,7 +6,7 @@
 namespace D3D12 {
 CommandRuntime::Pipeline& CommandRuntime::GetPipeline(
     std::vector<u8> key, ID3DBlob* blob,
-    const std::function<HRESULT(ID3D12RootSignature*, ID3D12PipelineState**)>& create) {
+    const std::function<HRESULT(ID3D12RootSignature*, ID3D12PipelineState**, D3D12_CACHED_PIPELINE_STATE)>& create) {
     constexpr size_t limit = 32 * 1024 * 1024;
     if (key.size() > limit)
         throw std::runtime_error("D3D12 pipeline exceeds cache budget");
@@ -20,7 +20,25 @@ CommandRuntime::Pipeline& CommandRuntime::GetPipeline(
     Pipeline created;
     winrt::check_hresult(device.Device()->CreateRootSignature(
         0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&created.root)));
-    winrt::check_hresult(create(created.root.Get(), created.state.ReleaseAndGetAddressOf()));
+    const auto cached = persistent_pipelines.Load(key);
+    HRESULT result = create(created.root.Get(), created.state.ReleaseAndGetAddressOf(),
+                            {cached.data(), cached.size()});
+    const bool reused = SUCCEEDED(result) && !cached.empty();
+    if (FAILED(result) && !cached.empty()) {
+        persistent_pipelines.Remove(key);
+        created.state.Reset();
+        result = create(created.root.Get(), created.state.ReleaseAndGetAddressOf(), {});
+    }
+    device.CheckResult(result, L"Native D3D12 pipeline creation");
+    device.CheckResult(device.Device()->GetDeviceRemovedReason(),
+                       L"Native D3D12 device after pipeline creation");
+    Microsoft::WRL::ComPtr<ID3DBlob> compiled;
+    if (persistent_pipelines.Enabled() && !reused &&
+        SUCCEEDED(created.state->GetCachedBlob(&compiled)) && compiled)
+        persistent_pipelines.Store(key, {static_cast<const u8*>(compiled->GetBufferPointer()),
+                                        compiled->GetBufferSize()});
+    device.CheckResult(device.Device()->GetDeviceRemovedReason(),
+                       L"Native D3D12 device after pipeline cache extraction");
     const size_t bytes = key.size();
     auto found = pipelines.emplace(std::move(key), std::move(created)).first;
     pipeline_bytes += bytes;

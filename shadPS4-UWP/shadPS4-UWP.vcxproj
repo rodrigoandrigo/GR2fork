@@ -114,6 +114,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ClInclude Include="ShadPS4Host.h" />
+    <ClInclude Include="UwpDiagnostics.h" />
     <ClCompile Include="ShadPS4Host.cpp" />
     <Content Include="$(CoreRuntimeDir)\shadPS4.dll">
       <Link>shadPS4.dll</Link>

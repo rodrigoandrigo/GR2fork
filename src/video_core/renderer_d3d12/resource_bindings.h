@@ -18,6 +18,9 @@ public:
                 std::span<const float, 24> clip_planes, VAddr border_colors,
                 const ResourceCache::Read& read, std::span<const u8, 65536> gds,
                 std::span<const u8> shared_memory = {});
+    void PrepareImages();
+    std::vector<ResourceCache::Range> CpuRanges(VAddr border_colors,
+                                                bool written_only = false) const;
     void CommitGds(std::span<u8, 65536> gds);
     const std::vector<D3D12_DESCRIPTOR_RANGE>& ResourceRanges() const {
         return resource_ranges;

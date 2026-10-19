@@ -191,10 +191,9 @@ void Switch(std::string_view game_filename, bool append_log) {
     UpdateLogLevels(EmulatorSettings.GetLogFilter());
     UpdateLogFlushLevel(EmulatorSettings.GetLogFlushLevel());
 
-    g_shad_file_sink->_size_limit = EmulatorSettings.GetLogSizeLimit();
-    g_shad_file_sink->session_file_helper_.open(
+    g_shad_file_sink->SwitchSession(
         (GetUserPath(Common::FS::PathType::LogDir) / game_filename).string(),
-        !(append_log || EmulatorSettings.IsLogAppend()));
+        !(append_log || EmulatorSettings.IsLogAppend()), EmulatorSettings.GetLogSizeLimit());
 }
 
 void Shutdown() {
@@ -224,7 +223,11 @@ void Flush() {
 }
 
 void UpdateSinks() {
+#ifdef SHADPS4_UWP
+    std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink};
+#else
     std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
+#endif
 
     spdlog::sinks::async_sink::config async_config{.sinks = sinks};
 #ifdef SHADPS4_UWP
@@ -241,9 +244,17 @@ void UpdateSinks() {
             EmulatorSettings.IsLogSync() ? sinks : async_sink)};
 
     for (auto& logger : ALL_LOGGERS) {
+#ifdef SHADPS4_UWP
+        logger->sinks() = {g_shad_file_sink};
+        const auto output = EmulatorSettings.IsLogSkipDuplicate()
+                                ? dup_filter
+                                : (EmulatorSettings.IsLogSync() ? sinks : async_sink);
+        logger->sinks().insert(logger->sinks().end(), output.begin(), output.end());
+#else
         logger->sinks() = EmulatorSettings.IsLogSkipDuplicate()
                               ? dup_filter
                               : (EmulatorSettings.IsLogSync() ? sinks : async_sink);
+#endif
     }
 }
 

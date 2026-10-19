@@ -147,8 +147,8 @@ OPCODE(BufferAtomicSMax64,                                  U64,            Opaq
 OPCODE(BufferAtomicUMax32,                                  U32,            Opaque,         Opaque,         U32                                             )
 OPCODE(BufferAtomicUMax64,                                  U64,            Opaque,         Opaque,         U64                                             )
 OPCODE(BufferAtomicFMax32,                                  F32,            Opaque,         Opaque,         F32                                             )
-OPCODE(BufferAtomicInc32,                                   U32,            Opaque,         Opaque,                                                         )
-OPCODE(BufferAtomicDec32,                                   U32,            Opaque,         Opaque,                                                         )
+OPCODE(BufferAtomicInc32,                                   U32,            Opaque,         Opaque,         U32                                             )
+OPCODE(BufferAtomicDec32,                                   U32,            Opaque,         Opaque,         U32                                             )
 OPCODE(BufferAtomicAnd32,                                   U32,            Opaque,         Opaque,         U32,                                            )
 OPCODE(BufferAtomicOr32,                                    U32,            Opaque,         Opaque,         U32,                                            )
 OPCODE(BufferAtomicXor32,                                   U32,            Opaque,         Opaque,         U32,                                            )
@@ -448,6 +448,7 @@ OPCODE(ImageAtomicOr32,                                     U32,            Opaq
 OPCODE(ImageAtomicXor32,                                    U32,            Opaque,         Opaque,         U32,                                            )
 OPCODE(ImageAtomicExchange32,                               U32,            Opaque,         Opaque,         U32,                                            )
 OPCODE(ImageAtomicCmpSwap32,                                U32,            Opaque,         Opaque,         U32,            U32,                            )
+OPCODE(ImageAtomicFCmpSwap32,                               F32,            Opaque,         Opaque,         F32,            F32                             )
 
 // Cube operations - optional, usable if profile.supports_native_cube_calc
 OPCODE(CubeFaceIndex,                                       F32,            F32,            F32,            F32,                                            )

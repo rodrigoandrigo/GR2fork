@@ -9,8 +9,8 @@
 
 namespace D3D12 {
 namespace {
-std::vector<ResourceCache::Buffer::WriteTarget>
-UniqueRanges(std::vector<ResourceCache::Buffer::WriteTarget> ranges) {
+std::vector<ResourceCache::Buffer::WriteTarget> UniqueRanges(
+    std::vector<ResourceCache::Buffer::WriteTarget> ranges) {
     std::ranges::sort(ranges, [](const auto& a, const auto& b) {
         return a.offset != b.offset ? a.offset < b.offset : a.size > b.size;
     });
@@ -31,8 +31,14 @@ UniqueRanges(std::vector<ResourceCache::Buffer::WriteTarget> ranges) {
 }
 } // namespace
 void ResourceCache::Initialize(D3D12DeviceContext& device, Read reader, Write writer,
-                               Resolve resolver, Overlaps overlap) {
+                               Resolve resolver, Overlaps overlap,
+                               std::shared_ptr<TransferPool> transfers) {
     context = &device;
+    transfer_pool = std::move(transfers);
+    if (!transfer_pool) {
+        transfer_pool = std::make_shared<TransferPool>();
+        transfer_pool->Initialize(device);
+    }
     read = std::move(reader);
     write = std::move(writer);
     resolve = std::move(resolver);
@@ -69,11 +75,27 @@ bool ResourceCache::Aliases(VAddr first, u64 first_size, VAddr second, u64 secon
     return a.physical == b.physical && a.address < b.address + second_size &&
            b.address < a.address + first_size;
 }
+bool ResourceCache::HasRepeatedBacking(VAddr address, u64 size) const {
+    if (!resolve_backing || !address || !size)
+        return false;
+    const auto parts = resolve_backing(address, size);
+    for (u32 i = 0; i < parts.size(); ++i)
+        for (u32 j = 0; j < i; ++j)
+            if (parts[i].address < parts[j].address + parts[j].size &&
+                parts[j].address < parts[i].address + parts[i].size)
+                return true;
+    return false;
+}
 void ResourceCache::MarkWritten(const View& view) {
     if (!view.buffer)
         return;
     view.buffer->written = true;
     if (!view.buffer->host) {
+        if (!view.segments.empty()) {
+            view.buffer->targets.insert(view.buffer->targets.end(), view.segments.begin(),
+                                        view.segments.end());
+            return;
+        }
         if (!view.guest_address || view.offset > view.buffer->size ||
             view.size > view.buffer->size - view.offset)
             throw std::runtime_error("Invalid guest writeback view");
@@ -155,7 +177,7 @@ std::vector<ResourceCache::View> ResourceCache::GetBackingViews(std::span<const 
         u64 offset{};
         for (const auto& part : resolve_backing(range.address, range.size)) {
             if (!part.size || part.size > range.size - offset ||
-                part.address > UINT64_MAX - part.size)
+                part.address > UINT64_MAX - part.size - 15)
                 throw std::runtime_error("Invalid D3D12 buffer backing segment");
             backing[i].push_back({part.address, part.size, offset});
             offset += part.size;
@@ -163,93 +185,70 @@ std::vector<ResourceCache::View> ResourceCache::GetBackingViews(std::span<const 
         if (offset != range.size)
             throw std::runtime_error("Incomplete D3D12 buffer backing");
     }
-    std::vector<std::vector<std::pair<u32, s64>>> edges(ranges.size());
-    for (u32 i = 0; i < ranges.size(); ++i) {
-        for (u32 j = 0; j < i; ++j) {
-            std::optional<s64> delta;
-            bool compatible = true;
-            for (const auto& a : backing[i]) {
-                for (const auto& b : backing[j]) {
-                    const auto begin = std::max(a.address, b.address);
-                    const auto end = std::min(a.address + a.size, b.address + b.size);
-                    if (begin >= end)
-                        continue;
-                    const s64 difference =
-                        s64(a.offset + begin - a.address) - s64(b.offset + begin - b.address);
-                    if (delta && *delta != difference)
-                        compatible = false;
-                    delta = difference;
-                }
-            }
-            if (delta && compatible) {
-                for (const auto& a : backing[i]) {
-                    for (const auto& b : backing[j]) {
-                        const s64 a_begin = a.offset;
-                        const s64 b_begin = *delta + s64(b.offset);
-                        const s64 begin = std::max(a_begin, b_begin);
-                        if (begin < std::min(a_begin + s64(a.size), b_begin + s64(b.size)) &&
-                            a.address + u64(begin - a_begin) != b.address + u64(begin - b_begin))
-                            compatible = false;
-                    }
-                }
-            }
-            if (delta && compatible) {
-                edges[i].emplace_back(j, *delta);
-                edges[j].emplace_back(i, -*delta);
-            }
-        }
-    }
     std::vector<View> views(ranges.size());
-    std::vector<std::optional<s64>> origins(ranges.size());
+    std::vector<bool> assigned(ranges.size());
     for (u32 root = 0; root < ranges.size(); ++root) {
-        if (backing[root].empty() || origins[root])
+        if (backing[root].empty() || assigned[root])
             continue;
-        origins[root] = backing[root][0].address & 3;
         std::vector<u32> group{root};
-        s64 begin = *origins[root];
-        s64 end = begin + ranges[root].size;
+        assigned[root] = true;
         for (u32 position = 0; position < group.size(); ++position) {
-            const u32 current = group[position];
-            for (const auto& [next, delta] : edges[current]) {
-                const s64 origin = *origins[current] + delta;
-                if (origins[next]) {
-                    if (*origins[next] != origin)
-                        throw std::runtime_error(
-                            "D3D12 physical aliases cannot share a linear buffer allocation");
+            for (u32 next = 0; next < ranges.size(); ++next) {
+                if (assigned[next] || backing[next].empty())
                     continue;
+                bool shared{};
+                for (const auto& a : backing[group[position]])
+                    for (const auto& b : backing[next])
+                        shared |= a.address < b.address + b.size && b.address < a.address + a.size;
+                if (shared) {
+                    assigned[next] = true;
+                    group.push_back(next);
                 }
-                origins[next] = origin;
-                group.push_back(next);
-                begin = std::min(begin, origin);
-                end = std::max(end, origin + s64(ranges[next].size));
             }
         }
-        begin &= ~s64{3};
-        const u64 bytes = (u64(end - begin) + 3) & ~u64{3};
+        std::vector<Range> physical;
+        for (const u32 index : group)
+            for (const auto& segment : backing[index])
+                physical.push_back({segment.address & ~u64{15},
+                                    ((segment.address + segment.size + 15) & ~u64{15}) -
+                                        (segment.address & ~u64{15})});
+        std::ranges::sort(physical, {}, &Range::address);
+        std::vector<Segment> allocations;
+        u64 bytes{};
+        for (const auto& range : physical) {
+            if (!allocations.empty() &&
+                range.address <= allocations.back().address + allocations.back().size) {
+                auto& last = allocations.back();
+                const u64 end = std::max(last.address + last.size, range.address + range.size);
+                bytes += end - last.address - last.size;
+                last.size = end - last.address;
+            } else {
+                allocations.push_back({range.address, range.size, bytes});
+                bytes += range.size;
+            }
+        }
         if (bytes > 16ULL * 1024 * 1024)
             throw std::runtime_error("Shared D3D12 buffer aliases exceed allocation budget");
-        for (u32 i = 0; i < group.size(); ++i) {
-            for (u32 j = 0; j < i; ++j) {
-                for (const auto& a : backing[group[i]]) {
-                    for (const auto& b : backing[group[j]]) {
-                        const s64 a_begin = *origins[group[i]] + a.offset;
-                        const s64 b_begin = *origins[group[j]] + b.offset;
-                        const s64 overlap = std::max(a_begin, b_begin);
-                        if (overlap < std::min(a_begin + s64(a.size), b_begin + s64(b.size)) &&
-                            a.address + u64(overlap - a_begin) !=
-                                b.address + u64(overlap - b_begin))
-                            throw std::runtime_error(
-                                "D3D12 physical aliases require nonlinear buffer addressing");
-                    }
-                }
-            }
-        }
         auto& buffer = GetBuffer(ranges[root].address, bytes, false, true);
-        for (const auto index : group) {
-            const auto& range = ranges[index];
-            const u64 offset = *origins[index] - begin;
-            buffer.sources.push_back({range.address, offset, range.size});
-            views[index] = {&buffer, offset, range.size, range.address};
+        for (const u32 index : group) {
+            auto& view = views[index];
+            view = {&buffer, 0, ranges[index].size, ranges[index].address};
+            for (const auto& segment : backing[index]) {
+                const auto allocation = std::ranges::find_if(allocations, [&](const auto& part) {
+                    return segment.address >= part.address &&
+                           segment.address + segment.size <= part.address + part.size;
+                });
+                const u64 offset = allocation->offset + segment.address - allocation->address;
+                const Buffer::WriteTarget source{ranges[index].address + segment.offset, offset,
+                                                 segment.size};
+                buffer.sources.push_back(source);
+                view.segments.push_back(source);
+            }
+            const u64 first = view.segments.front().offset;
+            if (std::ranges::all_of(view.segments, [&](const auto& segment) {
+                    return segment.offset == first + segment.address - view.guest_address;
+                }))
+                view.offset = first;
         }
     }
     return views;
@@ -329,10 +328,8 @@ void ResourceCache::EnsureStaging(Buffer& buffer, bool download) {
     if (resource.Get())
         return;
     const u64 size = (buffer.size + 3) & ~u64{3};
-    EnsureSpace((size + 65535) & ~u64{65535});
-    winrt::check_hresult(allocator.CreateBuffer(
-        size, download ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD,
-        download ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_GENERIC_READ, resource));
+    resource = transfer_pool->Acquire(
+        size, download ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD);
 }
 void ResourceCache::Barrier(Buffer& buffer, ID3D12GraphicsCommandList* commands,
                             D3D12_RESOURCE_STATES state) {
@@ -395,7 +392,15 @@ void ResourceCache::PrepareDownload(ID3D12GraphicsCommandList* commands) {
     for (auto& [key, buffer] : buffers)
         Barrier(*buffer, commands, D3D12_RESOURCE_STATE_COMMON);
 }
+void ResourceCache::RetireUploads(u64 fence) {
+    transfer_fence = fence;
+    for (auto& [key, buffer] : buffers)
+        transfer_pool->Retire(std::move(buffer->upload), fence);
+}
 void ResourceCache::CommitDownloads(bool mapping_stable) {
+    const u64 fence = std::max(transfer_fence, context->LastSignaledValue());
+    if (context->CompletedValue() < fence)
+        throw std::runtime_error("D3D12 buffer readback requested before transfer fence");
     for (auto& [key, buffer] : buffers) {
         if (!buffer->written)
             continue;
@@ -415,6 +420,9 @@ void ResourceCache::CommitDownloads(bool mapping_stable) {
                       {buffer->snapshot.data() + target.offset, static_cast<size_t>(target.size)});
         buffer->written = false;
     }
+    RetireUploads(fence);
+    for (auto& [key, buffer] : buffers)
+        transfer_pool->Retire(std::move(buffer->readback), fence);
 }
 bool ResourceCache::Changed(const Buffer& buffer, bool mappings_only) {
     if (buffer.host || buffer.physical)
@@ -446,6 +454,8 @@ bool ResourceCache::InvalidateRange(VAddr address, u64 size, bool mapping) {
         return false;
     std::scoped_lock lock{invalidation_mutex};
     invalidations.push_back({address, size, ++epoch, mapping});
+    if (mapping)
+        ++mapping_generation;
     if (invalidations.size() > 4096) {
         invalidation_floor = invalidations[2047].epoch;
         for (u32 i = 0; i < 2048; ++i)
@@ -455,9 +465,13 @@ bool ResourceCache::InvalidateRange(VAddr address, u64 size, bool mapping) {
     }
     return true;
 }
-void ResourceCache::MapMemory(VAddr address, u64 size) { InvalidateRange(address, size, true); }
+void ResourceCache::MapMemory(VAddr address, u64 size) {
+    InvalidateRange(address, size, true);
+}
 void ResourceCache::RegisterMemory(VAddr address, u64 size) {
     InvalidateRange(address, size, true);
 }
-void ResourceCache::UnmapMemory(VAddr address, u64 size) { InvalidateRange(address, size, true); }
+void ResourceCache::UnmapMemory(VAddr address, u64 size) {
+    InvalidateRange(address, size, true);
+}
 } // namespace D3D12

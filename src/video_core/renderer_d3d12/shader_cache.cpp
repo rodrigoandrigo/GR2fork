@@ -11,14 +11,150 @@
 #include <appmodel.h>
 #include <spirv_hlsl.hpp>
 #include <winrt/base.h>
+#include "core/emulator_settings.h"
 #include "externals/mesa-uwp/src/microsoft/spirv_to_dxil/spirv_to_dxil.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "video_core/renderer_d3d12/image_buffer_alias.h"
 #include "video_core/renderer_d3d12/logic_op_format.h"
+#include "video_core/renderer_d3d12/resource_cache.h"
 
 namespace D3D12 {
+struct ShaderVariant {
+    struct Prepared {
+        Shader::Backend::Bindings bindings;
+        std::vector<ShaderResourceRange> stage_resources;
+        u64 mapping_generation;
+        PreparedShader shader;
+    };
+    std::vector<u32> code, copy_code, dependencies;
+    Shader::RuntimeInfo input_runtime{};
+    CompiledShader translated{};
+    std::vector<Prepared> prepared;
+    size_t bytes{};
+    u64 used{};
+    bool direct_memory_access{};
+};
 namespace {
+bool SameRuntime(const Shader::RuntimeInfo& first, const Shader::RuntimeInfo& second) {
+    if (!(first == second))
+        return false;
+    if (first.hw_stage == Shader::HwStage::Compute &&
+        first.hw.cs.shared_memory_size != second.hw.cs.shared_memory_size)
+        return false;
+    if (first.hw_stage == Shader::HwStage::Geometry)
+        return first.hw.gs.in_vertex_data_size == second.hw.gs.in_vertex_data_size &&
+               first.hw.gs.out_vertex_data_size == second.hw.gs.out_vertex_data_size &&
+               first.hw.gs.mode == second.hw.gs.mode;
+    return true;
+}
+void BindUserData(Shader::Info& info, std::span<const u32> user_data) {
+    info.user_data = user_data;
+    info.RefreshFlatBuf();
+}
+void DetachUserData(Shader::Info& info) {
+    info.user_data = {};
+    info.flat_ud = nullptr;
+}
+std::vector<u32> TranslationDependencies(const Shader::Info& info) {
+    std::vector<u32> result(info.flat_ud, info.flat_ud + info.srt_info.flattened_bufsize_dw);
+    const auto append = [&](const auto& value) {
+        static_assert(sizeof(value) % sizeof(u32) == 0);
+        const size_t offset = result.size();
+        result.resize(offset + sizeof(value) / sizeof(u32));
+        std::memcpy(result.data() + offset, &value, sizeof(value));
+    };
+    if (info.has_fetch_shader) {
+        Shader::Gcn::FetchShaderData fetch;
+        if (!Shader::Gcn::ParseFetchShader(info, fetch))
+            throw std::runtime_error("Invalid cached D3D12 fetch shader");
+        const auto* code = Shader::Gcn::GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+        result.push_back(fetch.size);
+        result.insert(result.end(), code, code + fetch.size / sizeof(u32));
+        for (const auto& attribute : fetch.attributes)
+            append(attribute.GetSharp(info));
+    }
+    if (info.tess_consts_dword_offset >= 0) {
+        Shader::TessellationDataConstantBuffer constants{};
+        info.ReadTessConstantBuffer(constants);
+        append(constants);
+    }
+    return result;
+}
+size_t InfoBytes(const Shader::Info& info) {
+    return sizeof(info) + info.flattened_ud_buf.capacity() * sizeof(u32) +
+           info.buffers.size() * sizeof(Shader::BufferResource) +
+           info.images.size() * sizeof(Shader::ImageResource) +
+           info.samplers.size() * sizeof(Shader::SamplerResource) +
+           info.fmasks.size() * sizeof(Shader::FMaskResource) +
+           info.gs_copy_data.attr_map.size() * (sizeof(u32) * 8);
+}
+size_t PreparedBytes(const PreparedShader& prepared) {
+    size_t bytes = sizeof(prepared) + InfoBytes(prepared.shader.info) +
+                   prepared.words.capacity() * sizeof(u32);
+    for (const auto& [binding, table] : prepared.shader.image_address_tables)
+        bytes += sizeof(binding) + sizeof(table) + table.capacity() * sizeof(u32) + 32;
+    return bytes;
+}
+bool SameRanges(std::span<const ShaderResourceRange> first,
+                std::span<const ShaderResourceRange> second) {
+    return std::ranges::equal(first, second, [](const auto& a, const auto& b) {
+        return a.address == b.address && a.size == b.size && a.stage == b.stage &&
+               a.written == b.written;
+    });
+}
+std::vector<u8> ShaderDiskKey(std::span<const u32> key) {
+    std::vector<u8> result{0};
+    const auto* bytes = reinterpret_cast<const u8*>(key.data());
+    result.insert(result.end(), bytes, bytes + key.size_bytes());
+    return result;
+}
+std::vector<u8> EncodeBinary(const ShaderBinary& binary) {
+    const u32 sizes[]{u32(binary.dxil.size()), u32(binary.hlsl.size()), u32(binary.bindings.size())};
+    const auto* header = reinterpret_cast<const u8*>(sizes);
+    std::vector<u8> bytes(header, header + sizeof(sizes));
+    bytes.insert(bytes.end(), binary.dxil.begin(), binary.dxil.end());
+    bytes.insert(bytes.end(), binary.hlsl.begin(), binary.hlsl.end());
+    for (const auto& binding : binary.bindings) {
+        const u32 fields[]{u32(binding.kind), u32(binding.type), binding.binding, binding.space,
+                           binding.count};
+        const auto* first = reinterpret_cast<const u8*>(fields);
+        bytes.insert(bytes.end(), first, first + sizeof(fields));
+    }
+    return bytes;
+}
+bool ValidDxil(std::span<const u8> bytes) {
+    return bytes.size() >= 32 && std::memcmp(bytes.data(), "DXBC", 4) == 0;
+}
+std::shared_ptr<ShaderBinary> DecodeBinary(std::span<const u8> bytes) {
+    u32 sizes[3]{};
+    if (bytes.size() < sizeof(sizes))
+        return {};
+    std::memcpy(sizes, bytes.data(), sizeof(sizes));
+    if (sizes[2] > 1024 || u64(sizes[0]) + sizes[1] + u64(sizes[2]) * 20 + sizeof(sizes) != bytes.size())
+        return {};
+    bytes = bytes.subspan(sizeof(sizes));
+    if (!ValidDxil(bytes.first(sizes[0])))
+        return {};
+    auto binary = std::make_shared<ShaderBinary>();
+    binary->dxil.assign(bytes.begin(), bytes.begin() + sizes[0]);
+    bytes = bytes.subspan(sizes[0]);
+    binary->hlsl.assign(reinterpret_cast<const char*>(bytes.data()), sizes[1]);
+    bytes = bytes.subspan(sizes[1]);
+    for (u32 i = 0; i < sizes[2]; ++i) {
+        u32 fields[5];
+        std::memcpy(fields, bytes.data(), sizeof(fields));
+        bytes = bytes.subspan(sizeof(fields));
+        if (fields[0] > u32(ResourceKind::Constants) ||
+            fields[1] > D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER || !fields[4] || fields[4] > 1024 ||
+            fields[3] > Shader::MaxStageTypes)
+            return {};
+        binary->bindings.push_back({ResourceKind(fields[0]), D3D12_DESCRIPTOR_RANGE_TYPE(fields[1]),
+                                    fields[2], fields[3], fields[4]});
+    }
+    return binary;
+}
 struct CompilerModule {
     HMODULE handle{};
     static void Anchor() {}
@@ -252,20 +388,20 @@ void ApplyDepthBounds(std::string& source) {
     source.insert(body + 1, "\nif (" + position + ".z < shadDepthBounds.x || " + position +
                                 ".z > shadDepthBounds.y) discard;\n");
 }
-const wchar_t* Target(Shader::SwStage stage) {
+const wchar_t* Target(Shader::SwStage stage, D3D_SHADER_MODEL model) {
     switch (stage) {
     case Shader::SwStage::Vertex:
-        return L"vs_6_6";
+        return model >= D3D_SHADER_MODEL_6_6 ? L"vs_6_6" : L"vs_6_4";
     case Shader::SwStage::Fragment:
-        return L"ps_6_6";
+        return model >= D3D_SHADER_MODEL_6_6 ? L"ps_6_6" : L"ps_6_4";
     case Shader::SwStage::Compute:
-        return L"cs_6_6";
+        return model >= D3D_SHADER_MODEL_6_6 ? L"cs_6_6" : L"cs_6_4";
     case Shader::SwStage::Geometry:
-        return L"gs_6_6";
+        return model >= D3D_SHADER_MODEL_6_6 ? L"gs_6_6" : L"gs_6_4";
     case Shader::SwStage::TessellationControl:
-        return L"hs_6_6";
+        return model >= D3D_SHADER_MODEL_6_6 ? L"hs_6_6" : L"hs_6_4";
     case Shader::SwStage::TessellationEval:
-        return L"ds_6_6";
+        return model >= D3D_SHADER_MODEL_6_6 ? L"ds_6_6" : L"ds_6_4";
     default:
         throw std::runtime_error("Invalid D3D12 shader stage");
     }
@@ -289,16 +425,37 @@ spv::ExecutionModel Model(Shader::SwStage stage) {
     }
 }
 } // namespace
-void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resources) {
+void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resources,
+                             D3D_SHADER_MODEL maximum_model) {
+    variants.clear();
+    variant_bytes = 0;
+    variant_age = 0;
+    statistics = {};
+    cache.clear();
+    cache_bytes = 0;
     this->resources = resources;
-    D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
-    winrt::check_hresult(
-        device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)));
-    if (model.HighestShaderModel < D3D_SHADER_MODEL_6_6)
-        throw std::runtime_error("D3D12 guest shaders require Shader Model 6.6");
+    persistent.Initialize("shaders");
+    if (maximum_model < D3D_SHADER_MODEL_6_4 || maximum_model > D3D_SHADER_MODEL_6_6)
+        throw std::runtime_error("Invalid D3D12 shader model ceiling");
+    D3D12_FEATURE_DATA_SHADER_MODEL model{maximum_model};
+    auto status = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+    if (status == E_INVALIDARG && maximum_model > D3D_SHADER_MODEL_6_4) {
+        model.HighestShaderModel = D3D_SHADER_MODEL_6_4;
+        status = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+    }
+    winrt::check_hresult(status);
+    if (model.HighestShaderModel < D3D_SHADER_MODEL_6_4)
+        throw std::runtime_error("D3D12 guest shaders require Shader Model 6.4");
+    shader_model = model.HighestShaderModel >= D3D_SHADER_MODEL_6_6 ? D3D_SHADER_MODEL_6_6
+                                                                    : D3D_SHADER_MODEL_6_4;
+    LOG_INFO(Core, "[UWP stage] native shader model {}.{} (reported {}.{})", u32(shader_model) >> 4,
+             u32(shader_model) & 15, u32(model.HighestShaderModel) >> 4,
+             u32(model.HighestShaderModel) & 15);
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
     winrt::check_hresult(
         device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options, sizeof(options)));
+    LOG_INFO(Core, "[UWP stage] native wave capabilities: ops={} lanes={}..{}",
+             bool(options.WaveOps), options.WaveLaneCountMin, options.WaveLaneCountMax);
     if (!options.WaveOps || options.WaveLaneCountMin > 64 || options.WaveLaneCountMax < 64)
         throw std::runtime_error("D3D12 guest shaders require wave64 support");
     fixed_graphics_wave64 = options.WaveLaneCountMin == 64 && options.WaveLaneCountMax == 64;
@@ -313,6 +470,7 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     profile.supports_shader_stencil_export = true;
     profile.needs_image_load_feedback = true;
     profile.needs_subword_buffer_emulation = true;
+    profile.needs_signed_atomic32_emulation = true;
     profile.needs_buffer_offsets = true;
 }
 CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
@@ -324,18 +482,113 @@ CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::Runtime
     return Finalize(prepared, flip_y, sample_mask, sample_shading, tessellation, {}, depth_bounds,
                     flip_x);
 }
-PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
-                                    Shader::Backend::Bindings bindings) {
+std::unique_ptr<TranslatedShader> ShaderCache::Translate(Shader::ShaderParams params,
+                                                         Shader::RuntimeInfo runtime) {
     if (params.code.empty() || params.code.size() > 1024 * 1024 ||
         runtime.props.num_user_data > Shader::NUM_USER_DATA_REGS ||
         (runtime.sw_stage == Shader::SwStage::Fragment && runtime.hw.fs.num_inputs > 32))
         throw std::runtime_error("Invalid guest shader code or register bounds");
-    CompiledShader result{
-        Shader::Info{runtime.hw_stage, runtime.sw_stage, params}, runtime, bindings, bindings, {}};
-    pools.ReleaseContents();
-    auto program =
-        Shader::TranslateProgram(params.code, pools, result.info, result.runtime, profile);
-    if (LowerImageBufferAliases(result, program, resources)) {
+    const auto stage = static_cast<u32>(runtime.sw_stage);
+    if (stage >= pools.size())
+        throw std::runtime_error("Invalid D3D12 shader stage");
+    if (!EmulatorSettings.IsInlineFetchShader()) {
+        for (const auto& variant : variants) {
+            if (variant->direct_memory_access != EmulatorSettings.IsDirectMemoryAccessEnabled() ||
+                !SameRuntime(variant->input_runtime, runtime) ||
+                variant->translated.info.pgm_hash != params.hash ||
+                variant->translated.info.pgm_base != params.Base() ||
+                !std::ranges::equal(variant->code, params.code))
+                continue;
+            if (runtime.hw_stage == Shader::HwStage::Geometry &&
+                !std::ranges::equal(variant->copy_code, runtime.hw.gs.vs_copy))
+                continue;
+            auto translated = std::make_unique<TranslatedShader>(
+                TranslatedShader{variant->translated, {}, {}, {}});
+            if (runtime.hw_stage == Shader::HwStage::Geometry)
+                translated->shader.runtime.hw.gs.vs_copy = runtime.hw.gs.vs_copy;
+            BindUserData(translated->shader.info, params.user_data);
+            if (TranslationDependencies(translated->shader.info) != variant->dependencies)
+                continue;
+            translated->variant = variant;
+            translated->params = params;
+            variant->used = ++variant_age;
+            return translated;
+        }
+    }
+    return TranslateUncached(params, runtime);
+}
+std::unique_ptr<TranslatedShader> ShaderCache::TranslateUncached(Shader::ShaderParams params,
+                                                                 Shader::RuntimeInfo runtime) {
+    const auto stage = static_cast<u32>(runtime.sw_stage);
+    const auto input_runtime = runtime;
+    if (!pools[stage])
+        pools[stage] = std::make_unique<Shader::Pools>();
+    auto translated = std::make_unique<TranslatedShader>(TranslatedShader{
+        {Shader::Info{runtime.hw_stage, runtime.sw_stage, params}, runtime, {}, {}, {}}, {}});
+    auto& shader = translated->shader;
+    translated->program.emplace(
+        Shader::TranslateProgram(params.code, *pools[stage], shader.info, shader.runtime, profile));
+    shader.info.RefreshFlatBuf();
+    ++statistics.translations;
+    translated->params = params;
+    if (!EmulatorSettings.IsInlineFetchShader()) {
+        auto variant = std::make_shared<ShaderVariant>();
+        variant->code.assign(params.code.begin(), params.code.end());
+        variant->input_runtime = input_runtime;
+        variant->direct_memory_access = EmulatorSettings.IsDirectMemoryAccessEnabled();
+        if (runtime.hw_stage == Shader::HwStage::Geometry) {
+            variant->copy_code.assign(input_runtime.hw.gs.vs_copy.begin(),
+                                      input_runtime.hw.gs.vs_copy.end());
+            variant->input_runtime.hw.gs.vs_copy = variant->copy_code;
+        }
+        variant->dependencies = TranslationDependencies(shader.info);
+        variant->translated = shader;
+        if (runtime.hw_stage == Shader::HwStage::Geometry)
+            variant->translated.runtime.hw.gs.vs_copy = variant->copy_code;
+        DetachUserData(variant->translated.info);
+        variant->bytes = sizeof(ShaderVariant) +
+                         (variant->code.capacity() + variant->copy_code.capacity() +
+                          variant->dependencies.capacity()) *
+                             sizeof(u32) +
+                         InfoBytes(shader.info);
+        translated->variant = std::move(variant);
+    }
+    return translated;
+}
+PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
+                                    Shader::Backend::Bindings bindings) {
+    return Prepare(Translate(params, runtime), bindings, {});
+}
+PreparedShader ShaderCache::Prepare(std::unique_ptr<TranslatedShader> translated,
+                                    Shader::Backend::Bindings bindings,
+                                    std::span<const ShaderResourceRange> stage_resources) {
+    const u64 mapping_generation = resources ? resources->MappingGeneration() : 0;
+    auto variant = translated->variant;
+    if (!translated->program) {
+        for (const auto& prepared : variant->prepared) {
+            if (prepared.bindings != bindings ||
+                prepared.mapping_generation != mapping_generation ||
+                !SameRanges(prepared.stage_resources, stage_resources))
+                continue;
+            auto result = prepared.shader;
+            if (result.shader.runtime.hw_stage == Shader::HwStage::Geometry)
+                result.shader.runtime.hw.gs.vs_copy = translated->shader.runtime.hw.gs.vs_copy;
+            BindUserData(result.shader.info, translated->params->user_data);
+            ++statistics.variant_hits;
+            return result;
+        }
+        auto runtime = variant->input_runtime;
+        if (runtime.hw_stage == Shader::HwStage::Geometry)
+            runtime.hw.gs.vs_copy = translated->shader.runtime.hw.gs.vs_copy;
+        translated = TranslateUncached(*translated->params, runtime);
+        translated->variant = variant;
+    }
+    auto& result = translated->shader;
+    auto& program = *translated->program;
+    result.start_bindings = bindings;
+    result.end_bindings = bindings;
+    const bool image_aliases = LowerImageBufferAliases(result, program, resources, stage_resources);
+    if (LowerBufferAliases(result, program, resources) || image_aliases) {
         Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
         Shader::Optimization::DeadCodeEliminationPass(program);
         Shader::Optimization::CollectShaderInfoPass(program, profile);
@@ -347,7 +600,43 @@ PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::Runtime
     const auto words =
         Shader::Backend::SPIRV::EmitSPIRV(profile, result.runtime, program, result.end_bindings);
     result.info.RefreshFlatBuf();
-    return {std::move(result), words};
+    PreparedShader prepared{std::move(result), words};
+    if (variant && (!resources || mapping_generation == resources->MappingGeneration())) {
+        constexpr size_t budget = 64 * 1024 * 1024;
+        const size_t bytes = PreparedBytes(prepared) +
+                             stage_resources.size() * sizeof(ShaderResourceRange) +
+                             sizeof(ShaderVariant::Prepared);
+        const size_t required = bytes + variant->bytes;
+        if (required <= budget) {
+            if (const auto found = std::ranges::find(variants, variant); found != variants.end()) {
+                variant_bytes -= variant->bytes;
+                variants.erase(found);
+            }
+            while (!variants.empty() &&
+                   (variants.size() >= 512 || variant_bytes + required > budget)) {
+                const auto oldest = std::ranges::min_element(
+                    variants, {}, [](const auto& entry) { return entry->used; });
+                variant_bytes -= (*oldest)->bytes;
+                variants.erase(oldest);
+            }
+            if (std::ranges::find(variants, variant) == variants.end()) {
+                variant_bytes += variant->bytes;
+                variants.push_back(variant);
+            }
+            auto snapshot = prepared;
+            DetachUserData(snapshot.shader.info);
+            if (snapshot.shader.runtime.hw_stage == Shader::HwStage::Geometry)
+                snapshot.shader.runtime.hw.gs.vs_copy = variant->copy_code;
+            variant->prepared.push_back({bindings,
+                                         {stage_resources.begin(), stage_resources.end()},
+                                         mapping_generation,
+                                         std::move(snapshot)});
+            variant->bytes += bytes;
+            variant_bytes += bytes;
+            variant->used = ++variant_age;
+        }
+    }
+    return prepared;
 }
 CompiledShader ShaderCache::Finalize(PreparedShader& prepared, bool flip_y, bool sample_mask,
                                      bool sample_shading, const TessellationLink* tessellation,
@@ -412,6 +701,10 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
         throw std::runtime_error(
             "D3D12 graphics stages cannot force 64-lane waves (WaveSize is compute-only); "
             "guest cross-lane operations require a fixed wave64 device");
+    if (stage == Shader::SwStage::Compute && shader_model < D3D_SHADER_MODEL_6_6 &&
+        !fixed_graphics_wave64 && subgroup && !quad_only)
+        throw std::runtime_error(
+            "D3D12 Shader Model 6.4 cross-lane compute requires a fixed wave64 device");
     std::vector<u32> key{static_cast<u32>(stage),        static_cast<u32>(flip_y),
                          static_cast<u32>(sample_mask),  static_cast<u32>(sample_shading),
                          static_cast<u32>(depth_bounds), static_cast<u32>(flip_x)};
@@ -422,11 +715,20 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
                                tessellation_link->input_control_points,
                                tessellation_link->output_control_points});
     }
+    key.push_back(static_cast<u32>(shader_model));
     key.push_back(static_cast<u32>(words.size()));
     key.insert(key.end(), words.begin(), words.end());
     key.insert(key.end(), peer.begin(), peer.end());
     if (const auto found = cache.find(key); found != cache.end())
         return found->second;
+    const auto disk_key = ShaderDiskKey(key);
+    if (const auto bytes = persistent.Load(disk_key); !bytes.empty()) {
+        if (auto binary = DecodeBinary(bytes)) {
+            Remember(std::move(key), binary);
+            return binary;
+        }
+        persistent.Remove(disk_key);
+    }
     spirv_cross::CompilerHLSL cross{words.data(), words.size()};
     const auto entries = cross.get_entry_points_and_stages();
     if (entries.size() != 1 || entries.front().execution_model != Model(stage))
@@ -493,7 +795,7 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
         }
     }
     auto options = cross.get_hlsl_options();
-    options.shader_model = 66;
+    options.shader_model = shader_model >= D3D_SHADER_MODEL_6_6 ? 66 : 64;
     options.force_storage_buffer_as_uav = true;
     options.support_nonzero_base_vertex_base_instance = true;
     cross.set_hlsl_aux_buffer_binding(spirv_cross::HLSL_AUX_BINDING_BASE_VERTEX_INSTANCE, 1, 0);
@@ -523,7 +825,7 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
             throw std::runtime_error("Depth bounds require a fragment shader");
         ApplyDepthBounds(result->hlsl);
     }
-    if (stage == Shader::SwStage::Compute) {
+    if (stage == Shader::SwStage::Compute && shader_model >= D3D_SHADER_MODEL_6_6) {
         const auto entry = result->hlsl.find("[numthreads(");
         if (entry == std::string::npos)
             throw std::runtime_error("Missing guest compute workgroup declaration");
@@ -531,6 +833,11 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     }
     if (!native_spirv)
         CompileHlsl(*result, stage);
+    persistent.Store(disk_key, EncodeBinary(*result));
+    Remember(std::move(key), result);
+    return result;
+}
+void ShaderCache::Remember(std::vector<u32> key, std::shared_ptr<const ShaderBinary> result) {
     const size_t bytes_used = key.size() * sizeof(u32) + result->dxil.size() + result->hlsl.size();
     if (bytes_used > 64 * 1024 * 1024)
         throw std::runtime_error("Guest shader exceeds D3D12 compiler cache budget");
@@ -542,7 +849,6 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     }
     cache_bytes += bytes_used;
     cache.emplace(std::move(key), result);
-    return result;
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompilePointFill(const ShaderBinary& vertex,
                                                                   bool keep_front, bool front_ccw) {
@@ -1001,7 +1307,8 @@ void ShaderCache::CompileNativeSpirv(std::span<const u32> words, ShaderBinary& b
     config.fixed_point_size = true;
     config.push_constant_cbv = {0, 0};
     config.runtime_data_cbv = {0, 4};
-    config.shader_model_max = SHADER_MODEL_6_6;
+    config.shader_model_max = shader_model >= D3D_SHADER_MODEL_6_6
+                                  ? SHADER_MODEL_6_6 : SHADER_MODEL_6_4;
     config.declared_read_only_images_as_srvs = false;
     config.preserve_generic_io_location_count = 32;
     if (link) {
@@ -1063,7 +1370,9 @@ void ShaderCache::CompileNativeSpirv(std::span<const u32> words, ShaderBinary& b
                        : stage == Shader::SwStage::TessellationControl
                            ? DXIL_SPIRV_SHADER_TESS_CTRL
                            : DXIL_SPIRV_SHADER_TESS_EVAL;
-    if (!compile(remapped.data(), remapped.size(), nullptr, 0, model, "main", DXIL_VALIDATOR_1_6,
+    const auto validator_version = shader_model >= D3D_SHADER_MODEL_6_6
+                                       ? DXIL_VALIDATOR_1_6 : DXIL_VALIDATOR_1_4;
+    if (!compile(remapped.data(), remapped.size(), nullptr, 0, model, "main", validator_version,
                  &debug, &config, &logger, &output))
         throw std::runtime_error("Native SPIR-V compilation failed: " + messages);
     if (output.metadata.requires_runtime_data || output.metadata.lowered_large_points ||
@@ -1091,32 +1400,42 @@ void ShaderCache::CompileNativeSpirv(std::span<const u32> words, ShaderBinary& b
     binary.dxil.assign(first, first + blob->GetBufferSize());
 }
 void ShaderCache::CompileHlsl(ShaderBinary& result, Shader::SwStage stage) {
-    const wchar_t* arguments[]{L"-E",  L"main", L"-T",   Target(stage),
-                               L"-HV", L"2021", L"-Gis", L"-O3"};
-    const DxcBuffer source{result.hlsl.data(), result.hlsl.size(), DXC_CP_UTF8};
-    Microsoft::WRL::ComPtr<IDxcResult> compiled;
-    winrt::check_hresult(compiler->Compile(&source, arguments, std::size(arguments), nullptr,
-                                           IID_PPV_ARGS(&compiled)));
-    HRESULT status;
-    winrt::check_hresult(compiled->GetStatus(&status));
-    if (FAILED(status)) {
-        Microsoft::WRL::ComPtr<IDxcBlobUtf8> errors;
-        compiled->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
-        throw std::runtime_error(errors ? errors->GetStringPointer()
-                                        : "Guest DXIL compilation failed");
-    }
-    Microsoft::WRL::ComPtr<IDxcBlob> binary;
-    winrt::check_hresult(compiled->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&binary), nullptr));
-    const auto* bytes = static_cast<const u8*>(binary->GetBufferPointer());
-    result.dxil.assign(bytes, bytes + binary->GetBufferSize());
+    result.dxil = CompileHlslRaw(result.hlsl, Target(stage, shader_model), {})->dxil;
 }
 
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileHlslRaw(
     const std::string& hlsl, std::wstring_view target, std::span<const std::wstring> defines) {
+    std::wstring selected_target{target};
+    if (selected_target.size() == 6 && selected_target[2] == L'_' &&
+        selected_target[3] == L'6' && selected_target[4] == L'_' &&
+        selected_target[5] > (shader_model >= D3D_SHADER_MODEL_6_6 ? L'6' : L'4'))
+        selected_target[5] = shader_model >= D3D_SHADER_MODEL_6_6 ? L'6' : L'4';
+    target = selected_target;
     std::vector<const wchar_t*> arguments{L"-E",  L"main", L"-T",   target.data(),
-                                          L"-HV", L"2021", L"-Gis", L"-O3"};
+                                          L"-HV", L"2021", L"-Gis", L"-O3",
+                                          L"-validator-version",
+                                          shader_model >= D3D_SHADER_MODEL_6_6 ? L"1.6" : L"1.4"};
     for (const auto& define : defines)
         arguments.push_back(define.c_str());
+    std::vector<u8> key{1};
+    const auto append = [&](const void* data, size_t size) {
+        const u64 length = size;
+        const auto* header = reinterpret_cast<const u8*>(&length);
+        key.insert(key.end(), header, header + sizeof(length));
+        const auto* first = static_cast<const u8*>(data);
+        key.insert(key.end(), first, first + size);
+    };
+    append(hlsl.data(), hlsl.size());
+    for (const auto* argument : arguments)
+        append(argument, std::wcslen(argument) * sizeof(wchar_t));
+    if (auto bytes = persistent.Load(key); !bytes.empty()) {
+        if (ValidDxil(bytes)) {
+            auto result = std::make_shared<ShaderBinary>();
+            result->dxil = std::move(bytes);
+            return result;
+        }
+        persistent.Remove(key);
+    }
     const DxcBuffer source{hlsl.data(), hlsl.size(), DXC_CP_UTF8};
     Microsoft::WRL::ComPtr<IDxcResult> compiled;
     winrt::check_hresult(compiler->Compile(&source, arguments.data(),
@@ -1135,6 +1454,7 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileHlslRaw(
     auto result = std::make_shared<ShaderBinary>();
     const auto* bytes = static_cast<const u8*>(binary->GetBufferPointer());
     result->dxil.assign(bytes, bytes + binary->GetBufferSize());
+    persistent.Store(key, result->dxil);
     return result;
 }
 } // namespace D3D12

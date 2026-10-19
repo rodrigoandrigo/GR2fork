@@ -233,8 +233,7 @@ void PatchBufferSharp(const ResourceDiscovery& resource, Info& info, Descriptors
 }
 
 void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors& descriptors,
-                     const Profile& profile, std::span<const VAddr> written_images,
-                     std::span<const VAddr> feedback_images) {
+                     const Profile& profile, std::span<const VAddr> feedback_images) {
     IR::Inst& inst = *resource.user;
 
     // Read image sharp.
@@ -254,17 +253,12 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     auto image = image_res.GetSharp(info);
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
 
-    if (profile.needs_image_load_feedback && image &&
-        inst.GetOpcode() == IR::Opcode::ImageSampleRaw &&
-        std::ranges::find(written_images, image.Address()) != written_images.end())
-        throw std::runtime_error("Sampled image feedback requires storage sampler lowering");
-
-    image_res.is_feedback = image && (is_written || inst.GetOpcode() == IR::Opcode::ImageRead) &&
-                            std::ranges::find(feedback_images, image.Address()) !=
-                                feedback_images.end();
+    image_res.is_feedback =
+        image && (is_written || inst.GetOpcode() == IR::Opcode::ImageRead) &&
+        std::ranges::find(feedback_images, image.Address()) != feedback_images.end();
     const bool needs_mip_storage_fallback = inst_info.has_lod &&
-                                           (is_written || image_res.is_feedback) &&
-                                           !profile.supports_image_load_store_lod;
+                                            (is_written || image_res.is_feedback) &&
+                                            !profile.supports_image_load_store_lod;
 
     if (needs_mip_storage_fallback) {
         // If the mip level to IMAGE_(LOAD/STORE)_MIP is a constant, set up ImageResource
@@ -919,14 +913,22 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
             if (image_res.is_feedback && image.GetNumberFmt() == AmdGpu::NumberFormat::Srgb)
                 texel = ApplyForceDegamma(ir, texel);
             // Storage image requires shader swizzle.
-            texel = ApplySwizzle(ir, texel, image.DstSelect(),
-                                 AmdGpu::IsInteger(image.GetNumberFmt()));
+            texel =
+                ApplySwizzle(ir, texel, image.DstSelect(), AmdGpu::IsInteger(image.GetNumberFmt()));
         }
         const auto converted =
             ApplyReadNumberConversionVec4(ir, texel, image.GetNumberConversion());
         inst.ReplaceUsesWith(converted);
     } else {
-        inst.SetArg(1, coords);
+        if (has_ms && IsImageAtomicInstruction(inst)) {
+            const auto x = ir.CompositeExtract(coords, 0);
+            const auto y = ir.CompositeExtract(coords, 1);
+            inst.SetArg(1, view_type == AmdGpu::ImageType::Color2DMsaa
+                               ? ir.CompositeConstruct(x, y, ms)
+                               : ir.CompositeConstruct(x, y, ir.CompositeExtract(coords, 2), ms));
+        } else {
+            inst.SetArg(1, coords);
+        }
         if (inst.GetOpcode() == IR::Opcode::ImageWrite) {
             inst.SetArg(2, lod);
             inst.SetArg(3, ms);
@@ -983,7 +985,7 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
         if (IsBufferInstruction(inst)) {
             PatchBufferSharp(usage, info, descriptors, profile);
         } else if (IsImageInstruction(inst)) {
-            PatchImageSharp(usage, info, descriptors, profile, written_images, feedback_images);
+            PatchImageSharp(usage, info, descriptors, profile, feedback_images);
         }
     }
 

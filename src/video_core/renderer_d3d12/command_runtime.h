@@ -1,8 +1,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <optional>
+#include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/amdgpu/regs_vertex.h"
 #include "video_core/renderer_d3d12/image_cache.h"
@@ -28,6 +30,7 @@ public:
         std::vector<u32> converted_indices;
         bool rectangles{};
         std::vector<VideoCore::ImageInfo> colors;
+        std::vector<AmdGpu::ColorBuffer> color_clear_buffers;
         std::vector<u32> color_slots;
         std::vector<u32> color_base_slice;
         std::optional<VideoCore::ImageInfo> depth_image;
@@ -90,6 +93,8 @@ public:
     static u64 GsInvocations(D3D_PRIMITIVE_TOPOLOGY topology, u64 count);
     void Resolve(const VideoCore::ImageInfo& source, const VideoCore::ImageInfo& destination,
                  u32 source_layer = 0, u32 destination_layer = 0, u32 layers = 0);
+    void MaterializeColorClear(const AmdGpu::ColorBuffer& buffer, const VideoCore::ImageInfo& info);
+    std::shared_ptr<VideoCore::ResidentFrame> CapturePresentation(const VideoCore::ImageInfo& info);
     u64 Flush();
     ResourceCache& Resources() {
         return resources;
@@ -100,8 +105,25 @@ public:
     std::span<u8, 65536> Gds() {
         return gds;
     }
+    const TransferPool& Transfers() const {
+        return *transfer_pool;
+    }
+    const PersistentCache::Statistics& ShaderDiskCacheStatistics() const {
+        return shaders.PersistentStatistics();
+    }
+    const PersistentCache::Statistics& PipelineCacheStatistics() const {
+        return persistent_pipelines.GetStatistics();
+    }
     D3D12DeviceContext& Device() {
         return device;
+    }
+
+    using ImageWatches = std::function<void(std::span<const ImageCache::Watch>)>;
+    void SetImageResidency(ImageWatches callback);
+    std::shared_ptr<void> AcquireCpuAccess(VAddr address, u64 size, bool write);
+    std::shared_ptr<void> AcquireMemoryMappingAccess();
+    const ImageCache::Statistics& ImageResidencyStatistics() const {
+        return images.ResidencyStatistics();
     }
 
 private:
@@ -112,26 +134,46 @@ private:
             failed |= !completed;
         }
     };
+    void MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer,
+                                   const VideoCore::ImageInfo& info);
     bool failed{};
     struct Pipeline {
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
         Microsoft::WRL::ComPtr<ID3D12PipelineState> state;
     };
-    Pipeline& GetPipeline(
-        std::vector<u8> key, ID3DBlob* root,
-        const std::function<HRESULT(ID3D12RootSignature*, ID3D12PipelineState**)>& create);
+    Pipeline& GetPipeline(std::vector<u8> key, ID3DBlob* root,
+                          const std::function<HRESULT(ID3D12RootSignature*, ID3D12PipelineState**,
+                                                      D3D12_CACHED_PIPELINE_STATE)>& create);
     std::map<std::vector<u8>, Pipeline> pipelines;
     size_t pipeline_bytes{};
+    PersistentCache persistent_pipelines;
+    struct CpuImageAccess;
+    struct ImageMappingAccess;
+    ImageWatches image_watches;
+    std::atomic<u32> image_mapping_count{};
+    std::atomic<bool> image_mapping_ready{};
+    std::recursive_mutex image_mapping_mutex;
+    bool synchronizing_images{};
+    u64 image_mapping_generation{};
+    void BeginImages();
+    void UpdateImageWatches();
+    void SynchronizeImages(std::span<const ResourceCache::Range> ranges, bool invalidate,
+                           bool all = false);
+    void CompleteImages(std::span<const ResourceCache::Range> cpu_ranges = {});
+    u64 SubmitCommands();
     D3D12DeviceContext device;
+    std::shared_ptr<TransferPool> transfer_pool;
+    std::vector<D3D12Resource> input_resources;
     ShaderCache shaders;
     ResourceCache resources;
     ImageCache images;
     ResourceCache::Read read;
+    ResourceCache::Write write;
     AcquireMemory acquire_memory;
     std::array<u8, 65536> gds{};
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commands;
-    std::mutex mutex;
+    std::recursive_mutex mutex;
     u32 strmout_filled{};
 };
 } // namespace D3D12

@@ -97,14 +97,14 @@ float4 main(uint id : SV_VertexID) : SV_Position {
     float2 p = float2((id << 1) & 2, id & 2);
     return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);
 })",
-                     L"vs_6_6");
+                     L"vs_6_4");
     mask_shader = Compile(R"(
 cbuffer State : register(b3) { uint4 masks; };
 uint main(float4 position : SV_Position) : SV_Coverage {
     uint2 pixel = uint2(position.xy);
     return masks[(pixel.x & 1) | ((pixel.y & 1) << 1)];
 })",
-                          L"ps_6_6");
+                          L"ps_6_4");
 }
 std::vector<u8> MsaaTransfer::Compile(std::string_view source, const wchar_t* target) {
     const wchar_t* arguments[]{L"-E", L"main", L"-T", target, L"-HV", L"2021", L"-O3", L"-Gis"};
@@ -156,7 +156,7 @@ MsaaTransfer::Pipeline& MsaaTransfer::GetPipeline(DXGI_FORMAT format, u32 sample
         source += fmt::format("{} main(float4 p : SV_Position) : SV_Target0 {{ return "
                               "image.Load(int3(int2(p.xy), layer), selectedSample); }}",
                               type);
-    const auto pixel = Compile(source, L"ps_6_6");
+    const auto pixel = Compile(source, L"ps_6_4");
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
     D3D12_ROOT_PARAMETER parameters[2]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;

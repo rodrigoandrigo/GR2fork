@@ -596,11 +596,21 @@ Value IREmitter::BufferAtomicFMax(const Value& handle, const Value& address, con
 }
 
 Value IREmitter::BufferAtomicInc(const Value& handle, const Value& address, BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicInc32, Flags{info}, handle, address);
+    return BufferAtomicInc(handle, address, Imm32(0xffffffffu), info);
 }
 
 Value IREmitter::BufferAtomicDec(const Value& handle, const Value& address, BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicDec32, Flags{info}, handle, address);
+    return BufferAtomicDec(handle, address, Imm32(0xffffffffu), info);
+}
+
+Value IREmitter::BufferAtomicInc(const Value& handle, const Value& address, const Value& limit,
+                                 BufferInstInfo info) {
+    return Inst(Opcode::BufferAtomicInc32, Flags{info}, handle, address, limit);
+}
+
+Value IREmitter::BufferAtomicDec(const Value& handle, const Value& address, const Value& limit,
+                                 BufferInstInfo info) {
+    return Inst(Opcode::BufferAtomicDec32, Flags{info}, handle, address, limit);
 }
 
 Value IREmitter::BufferAtomicAnd(const Value& handle, const Value& address, const Value& value,
@@ -2093,6 +2103,11 @@ Value IREmitter::ImageAtomicXor(const Value& handle, const Value& coords, const 
 Value IREmitter::ImageAtomicExchange(const Value& handle, const Value& coords, const Value& value,
                                      TextureInstInfo info) {
     return Inst(Opcode::ImageAtomicExchange32, Flags{info}, handle, coords, value);
+}
+
+Value IREmitter::ImageAtomicFCmpSwap(const Value& handle, const Value& coords, const Value& value,
+                                     const Value& compare, TextureInstInfo info) {
+    return Inst(Opcode::ImageAtomicFCmpSwap32, Flags{info}, handle, coords, value, compare);
 }
 
 Value IREmitter::ImageAtomicCmpSwap(const Value& handle, const Value& coords, const Value& value,

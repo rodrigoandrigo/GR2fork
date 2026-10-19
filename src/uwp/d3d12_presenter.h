@@ -12,6 +12,8 @@
 #include "uwp/shadps4_api.h"
 #include "video_core/presentation_sink.h"
 #include "video_core/renderer_d3d12/profile.h"
+#include "video_core/renderer_d3d12/shader_cache.h"
+#include "video_core/resident_frame.h"
 
 namespace Core::Uwp {
 class D3D12Presenter final : public VideoCore::PresentationSink {
@@ -35,10 +37,12 @@ public:
     void SetGamma(float value) override;
 
 private:
+    struct Frame;
+    void ConvertResident(Frame& frame);
     void GetBuffers();
     void RenderFrame();
     void ResizeBuffers(uint32_t width, uint32_t height, DXGI_FORMAT format);
-    struct Frame;
+    std::array<float, 1024> ColorComponents(const Frame& frame, bool floating_point) const;
     std::vector<u8> ConvertPixels(const Frame& frame, bool floating_point) const;
     std::shared_ptr<Frame> last_frame;
     std::shared_ptr<std::atomic<u64>> frame_bytes{std::make_shared<std::atomic<u64>>(0)};
@@ -46,10 +50,16 @@ private:
     bool hdr_enabled{};
     float sdr_white_nits{80.0f};
     std::atomic_bool hdr_display{};
-    DXGI_FORMAT format{DXGI_FORMAT_B8G8R8A8_UNORM};
+    DXGI_FORMAT format{DXGI_FORMAT_R8G8B8A8_UNORM};
     std::atomic<float> gamma{1.0f};
+    std::atomic_bool prepared_frame{};
+    bool presented_frame{};
     std::mutex mutex;
     D3D12DeviceContext context;
+    D3D12::ShaderCache conversion_shaders;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> conversion_root;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> conversion_pipeline;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> conversion_heap;
     D3D12ResourceAllocator resources;
     D3D12DescriptorArena descriptors;
     D3D12TransferStats transfers;

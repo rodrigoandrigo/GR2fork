@@ -13,6 +13,44 @@
 #include "video_core/texture_cache/cpu_tiling.h"
 
 namespace D3D12 {
+ImageCache::Image* ImageCache::FindPresentation(const VideoCore::ImageInfo& info) {
+    Image* result{};
+    for (auto& [key, image] : images) {
+        const auto& source = image->info;
+        if (!image->resident || image->cpu_dirty || image->logic_op || source.props.is_depth ||
+            source.props.is_volume || source.num_samples != 1 || image->base_layer != 0 ||
+            source.size.width != info.size.width || source.size.height != info.size.height ||
+            source.num_bits != info.num_bits || source.pitch != info.pitch ||
+            source.mips_layout[0].pitch != info.mips_layout[0].pitch ||
+            ((source.micro_tiled_mips ^ info.micro_tiled_mips) & 1) ||
+            source.tile_mode != info.tile_mode || source.alt_tile != info.alt_tile ||
+            source.bank_swizzle != info.bank_swizzle)
+            continue;
+        auto first = canonicalize ? canonicalize(source.guest_address, info.guest_size)
+                                  : ResourceCache::Identity{source.guest_address, false};
+        auto second = canonicalize ? canonicalize(info.guest_address, info.guest_size)
+                                   : ResourceCache::Identity{info.guest_address, false};
+        if (first.address != second.address || first.physical != second.physical)
+            continue;
+        const auto format = image->Native()->GetDesc().Format;
+        const bool compatible = info.num_bits == 64
+                                    ? format == DXGI_FORMAT_R16G16B16A16_FLOAT
+                                    : format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                                          format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                                          format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+                                          format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                                          format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                                          format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+                                          format == DXGI_FORMAT_R10G10B10A2_UNORM ||
+                                          format == DXGI_FORMAT_R10G10B10A2_TYPELESS;
+        if (compatible &&
+            (!result ||
+             (image->written != result->written ? image->written : image->age > result->age)))
+            result = image.get();
+    }
+    return result;
+}
+
 DXGI_FORMAT ConvertFormat(vk::Format format) {
     switch (format) {
     case vk::Format::eR8Unorm:
@@ -43,6 +81,10 @@ DXGI_FORMAT ConvertFormat(vk::Format format) {
         return DXGI_FORMAT_R8G8B8A8_SNORM;
     case vk::Format::eB8G8R8A8Unorm:
         return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case vk::Format::eR5G6B5UnormPack16:
+        return DXGI_FORMAT_B5G6R5_UNORM;
+    case vk::Format::eA1R5G5B5UnormPack16:
+        return DXGI_FORMAT_B5G5R5A1_UNORM;
     case vk::Format::eB4G4R4A4UnormPack16:
         return DXGI_FORMAT_B4G4R4A4_UNORM;
     case vk::Format::eB8G8R8A8Srgb:
@@ -155,8 +197,15 @@ DXGI_FORMAT ConvertFormat(vk::Format format) {
 void ImageCache::Initialize(D3D12DeviceContext& context, ResourceCache::Read reader,
                             ResourceCache::Write writer,
                             std::function<ResourceCache::Identity(VAddr, u64)> resolver,
-                            ShaderCache* shader_cache) {
+                            ShaderCache* shader_cache, std::shared_ptr<TransferPool> pool,
+                            const ResourceCache* aliases) {
     device = &context;
+    alias_cache = aliases;
+    transfer_pool = std::move(pool);
+    if (!transfer_pool) {
+        transfer_pool = std::make_shared<TransferPool>();
+        transfer_pool->Initialize(context);
+    }
     read = std::move(reader);
     write = std::move(writer);
     canonicalize = std::move(resolver);
@@ -164,7 +213,83 @@ void ImageCache::Initialize(D3D12DeviceContext& context, ResourceCache::Read rea
     transfers.Initialize(context.Device());
     if (shader_cache) {
         tilizer = std::make_unique<TilingRuntime>();
-        tilizer->Initialize(context, *shader_cache);
+        tilizer->Initialize(context, *shader_cache, transfer_pool);
+    }
+}
+void ImageCache::ConfigureResidency(bool enabled, std::function<void(VAddr, u64)> callback) {
+    if (enabled && !persistent)
+        InvalidateCpu({}, true);
+    persistent = enabled;
+    synchronize = std::move(callback);
+}
+bool ImageCache::Overlaps(const Image& image, VAddr address, u64 size) const {
+    const auto overlap = [&](VAddr base, u64 bytes) {
+        if (!base || !bytes || !address || !size)
+            return false;
+        return alias_cache ? alias_cache->Aliases(base, bytes, address, size)
+                           : base <= UINT64_MAX - bytes && address <= UINT64_MAX - size &&
+                                 base < address + size && address < base + bytes;
+    };
+    return overlap(image.info.guest_address, image.info.guest_size) ||
+           overlap(image.info.stencil_addr, image.info.stencil_size);
+}
+void ImageCache::Synchronize(Image& image) {
+    if (!(image.written || image.stencil_written))
+        return;
+    if (!synchronize)
+        throw std::runtime_error("Dirty D3D12 image requires a synchronization callback");
+    if (image.info.guest_address)
+        synchronize(image.info.guest_address, image.info.guest_size);
+    if (image.info.stencil_addr)
+        synchronize(image.info.stencil_addr, image.info.stencil_size);
+}
+std::vector<ImageCache::Watch> ImageCache::Watches() const {
+    std::vector<Watch> result;
+    if (!persistent)
+        return result;
+    for (const auto& [key, image] : images) {
+        if (!image->resident || image->cpu_dirty)
+            continue;
+        const bool dirty = image->written || image->stencil_written;
+        if (image->has_depth)
+            result.push_back({image->info.guest_address, image->info.guest_size, dirty});
+        if (image->has_stencil)
+            result.push_back({image->info.stencil_addr, image->info.stencil_size, dirty});
+    }
+    return result;
+}
+bool ImageCache::HasDirtyImages() const {
+    return std::ranges::any_of(images, [](const auto& entry) {
+        return entry.second->written || entry.second->stencil_written;
+    });
+}
+bool ImageCache::RequestDownloads(std::span<const ResourceCache::Range> ranges, bool all) {
+    bool found{};
+    for (auto& [key, image] : images) {
+        if (!(image->written || image->stencil_written))
+            continue;
+        if (all || std::ranges::any_of(ranges, [&](const auto& range) {
+                return Overlaps(*image, range.address, range.size);
+            })) {
+            image->download_requested = true;
+            found = true;
+        }
+    }
+    return found;
+}
+void ImageCache::InvalidateCpu(std::span<const ResourceCache::Range> ranges, bool all) {
+    for (auto& [key, image] : images) {
+        if (!(all || std::ranges::any_of(ranges, [&](const auto& range) {
+                  return Overlaps(*image, range.address, range.size);
+              })))
+            continue;
+        if (image->written || image->stencil_written)
+            throw std::runtime_error("CPU invalidation requires GPU image writeback first");
+        image->cpu_dirty = true;
+        image->resident = false;
+        image->guest.clear();
+        image->stencil_guest.clear();
+        ++statistics.cpu_invalidations;
     }
 }
 void ImageCache::BeginBatch() {
@@ -292,7 +417,36 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         const auto& layout = info.mips_layout[mip];
         key.insert(key.end(), {layout.size, layout.pitch, layout.height, layout.offset});
     }
-    if (auto found = images.find(key); found != images.end()) {
+    auto found = images.find(key);
+    if (persistent) {
+        const auto priority = [](const Image& image) {
+            return (image.written || image.stencil_written) ? 2
+                   : image.resident && !image.cpu_dirty     ? 1
+                                                            : 0;
+        };
+        auto compatible = key;
+        compatible[7] = compatible[8] = 0;
+        for (auto candidate = images.begin(); candidate != images.end(); ++candidate) {
+            auto other = candidate->first;
+            other[7] = other[8] = 0;
+            const auto description = candidate->second->Native()->GetDesc();
+            if (other == compatible && (description.Flags & flags) == flags &&
+                (description.Format == format || description.Format == view_format ||
+                 format == view_format) &&
+                (found == images.end() ||
+                 priority(*candidate->second) > priority(*found->second))) {
+                found = candidate;
+            }
+        }
+    }
+    if (persistent) {
+        for (auto& [other_key, other] : images)
+            if ((found == images.end() || other.get() != found->second.get()) &&
+                (Overlaps(*other, info.guest_address, info.guest_size) ||
+                 Overlaps(*other, info.stencil_addr, info.stencil_size)))
+                Synchronize(*other);
+    }
+    if (found != images.end()) {
         found->second->batch = batch;
         found->second->age = ++age;
         found->second->info = info;
@@ -467,12 +621,14 @@ void ImageCache::EnsureSpace(u64 required, u64 cpu_required, bool inserting) {
            cpu_required > 256ULL * 1024 * 1024 - cpu_bytes) {
         auto oldest = images.end();
         for (auto it = images.begin(); it != images.end(); ++it)
-            if (it->second->batch != batch && !it->second->written &&
-                !it->second->stencil_written &&
+            if (it->second->batch != batch &&
+                (persistent || (!it->second->written && !it->second->stencil_written)) &&
                 (oldest == images.end() || it->second->age < oldest->second->age))
                 oldest = it;
         if (oldest == images.end())
             throw std::runtime_error("D3D12 image cache budget exhausted");
+        if (persistent)
+            Synchronize(*oldest->second);
         cpu_bytes -= (oldest->second->has_depth ? u64(oldest->second->info.guest_size) * 2 : 0) +
                      (oldest->second->has_stencil ? u64(oldest->second->info.stencil_size) * 2 : 0);
         native_bytes -= oldest->second->allocation_bytes;
@@ -480,23 +636,13 @@ void ImageCache::EnsureSpace(u64 required, u64 cpu_required, bool inserting) {
     }
 }
 void ImageCache::EnsureStaging(Image& image, bool download) {
+    const auto heap = download ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD;
     auto& resource = download ? image.readback : image.upload;
-    if (image.has_depth && !resource.Get()) {
-        EnsureSpace((image.staging_bytes + 65535) & ~u64{65535});
-        winrt::check_hresult(allocator.CreateBuffer(
-            image.staging_bytes, download ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD,
-            download ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_GENERIC_READ,
-            resource));
-    }
+    if (image.has_depth && !resource.Get())
+        resource = transfer_pool->Acquire(image.staging_bytes, heap);
     auto& stencil_resource = download ? image.stencil_readback : image.stencil_upload;
-    if (image.has_stencil && !stencil_resource.Get()) {
-        EnsureSpace((image.stencil_staging_bytes + 65535) & ~u64{65535});
-        winrt::check_hresult(allocator.CreateBuffer(
-            image.stencil_staging_bytes,
-            download ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD,
-            download ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_GENERIC_READ,
-            stencil_resource));
-    }
+    if (image.has_stencil && !stencil_resource.Get())
+        stencil_resource = transfer_pool->Acquire(image.stencil_staging_bytes, heap);
 }
 void ImageCache::Barrier(Image& image, ID3D12GraphicsCommandList* commands,
                          D3D12_RESOURCE_STATES state) {
@@ -554,6 +700,14 @@ void ImageCache::CopyRows(Image& image, void* data, bool upload) {
                         for (u32 x = 0; x < footprint.Footprint.Width; ++x)
                             CopyLogicOpTexel(logic_format, guest + u64(x) * logic_format.bytes,
                                              host + u64(x) * 16, upload, image.logic_mask);
+                    } else if (image.info.pixel_format == vk::Format::eB4G4R4A4UnormPack16) {
+                        for (u32 x = 0; x < footprint.Footprint.Width; ++x) {
+                            u16 value;
+                            std::memcpy(&value, (upload ? guest : host) + x * 2, 2);
+                            value = ((value & 0xf) << 12) | ((value & 0xf0) << 4) |
+                                    ((value & 0xf00) >> 4) | ((value & 0xf000) >> 12);
+                            std::memcpy((upload ? host : guest) + x * 2, &value, 2);
+                        }
                     } else {
                         std::memcpy(upload ? host : guest, upload ? guest : host,
                                     image.row_bytes[subresource]);
@@ -622,6 +776,15 @@ u32 StencilSubresource(u32 mip, u32 layer, u32 levels, u32 layers) {
 } // namespace
 void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr read_address,
                         VAddr stencil_read_address) {
+    if (persistent && image.resident && !image.cpu_dirty &&
+        (!read_address || read_address == image.info.guest_address) &&
+        (!stencil_read_address || stencil_read_address == image.info.stencil_addr)) {
+        ++statistics.resident_hits;
+        return;
+    }
+    image.resident = true;
+    image.cpu_dirty = false;
+    ++statistics.uploads;
     if (image.has_stencil) {
         if (image.msaa)
             UploadMsaaStencil(image, commands, read_address, stencil_read_address);
@@ -632,12 +795,12 @@ void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr
     bool changed{};
     bool gpu_detile{};
     ProfileSample(profile, "upload_read", 128, [&] {
-        image.guest_scratch.resize(image.info.guest_size);
-        read(read_address ? read_address : image.info.guest_address, image.guest_scratch);
-        changed = image.msaa || image.guest_scratch != image.guest;
+        std::vector<u8> guest(image.info.guest_size);
+        read(read_address ? read_address : image.info.guest_address, guest);
+        changed = image.msaa || guest != image.guest;
         if (!changed)
             return;
-        image.guest = image.guest_scratch;
+        image.guest = std::move(guest);
         const auto entries = TilingRuntime::Entries(image.info, image.footprints);
         if (!image.logic_op && tilizer && TilingRuntime::Supported(image.info, entries.size()) &&
             tilizer->CanRecord(image.info, entries, false)) {
@@ -1094,7 +1257,32 @@ void ImageCache::CommitMsaaStencilDownloads(Image& image) {
     }
 }
 void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
+    if (persistent) {
+        for (auto& [key, owner] : images) {
+            if (!(owner->written || owner->stencil_written))
+                continue;
+            for (auto& [other_key, other] : images) {
+                if (owner.get() == other.get() ||
+                    !(Overlaps(*other, owner->info.guest_address, owner->info.guest_size) ||
+                      Overlaps(*other, owner->info.stencil_addr, owner->info.stencil_size)))
+                    continue;
+                if (other->written || other->stencil_written) {
+                    owner->download_requested = true;
+                    other->download_requested = true;
+                    owner->invalidate_after_download = true;
+                    other->invalidate_after_download = true;
+                } else {
+                    other->cpu_dirty = true;
+                    other->resident = false;
+                    other->guest.clear();
+                    other->stencil_guest.clear();
+                }
+            }
+        }
+    }
     for (auto& [key, image] : images) {
+        if (persistent && !image->download_requested)
+            continue;
         if (image->has_stencil) {
             if (image->written || image->stencil_written) {
                 if (image->msaa)
@@ -1128,14 +1316,15 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
             }
             if (!image->msaa) {
                 const auto entries = TilingRuntime::Entries(image->info, image->footprints);
-                if (!image->logic_op && tilizer && TilingRuntime::Supported(image->info, entries.size()) &&
+                if (!image->logic_op && tilizer &&
+                    TilingRuntime::Supported(image->info, entries.size()) &&
                     tilizer->CanRecord(image->info, entries, true)) {
                     image->gpu_tiled = true;
-                    image->guest_scratch.resize(image->info.guest_size);
-                    read(image->info.guest_address, image->guest_scratch);
-                    image->tiled_readback = tilizer->Tile(commands, image->info, entries,
-                                                         image->Native(), image->footprints,
-                                                         image->guest_scratch);
+                    std::vector<u8> guest(image->info.guest_size);
+                    read(image->info.guest_address, guest);
+                    image->tiled_readback =
+                        tilizer->Tile(commands, image->info, entries, image->Native(),
+                                      image->footprints, guest);
                 }
             }
         }
@@ -1168,8 +1357,25 @@ void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsComman
         commands->ResolveSubresource(destination.Native(), layer, source.Native(), layer, format);
     destination.written = true;
 }
-void ImageCache::CommitDownloads() {
+void ImageCache::RetireUploads(u64 fence) {
+    transfer_fence = fence;
     for (auto& [key, image] : images) {
+        transfer_pool->Retire(std::move(image->upload), fence);
+        transfer_pool->Retire(std::move(image->stencil_upload), fence);
+    }
+    if (tilizer)
+        tilizer->RetireUploads(fence);
+}
+void ImageCache::CommitDownloads() {
+    const u64 fence = std::max(transfer_fence, device->LastSignaledValue());
+    if (device->CompletedValue() < fence)
+        throw std::runtime_error("D3D12 image readback requested before transfer fence");
+    for (auto& [key, image] : images) {
+        if (persistent && !image->download_requested)
+            continue;
+        if (image->written || image->stencil_written)
+            ++statistics.downloads;
+        image->download_requested = false;
         if (image->has_stencil) {
             if (image->msaa)
                 CommitMsaaStencilDownloads(*image);
@@ -1208,5 +1414,28 @@ void ImageCache::CommitDownloads() {
         write(image->info.guest_address, image->guest);
         image->written = false;
     }
+    for (auto& [key, image] : images) {
+        if (image->invalidate_after_download) {
+            image->invalidate_after_download = false;
+            image->resident = false;
+            image->cpu_dirty = true;
+            image->guest.clear();
+            image->stencil_guest.clear();
+        }
+    }
+    RetireUploads(fence);
+    for (auto& [key, image] : images) {
+        transfer_pool->Retire(std::move(image->readback), fence);
+        transfer_pool->Retire(std::move(image->stencil_readback), fence);
+        image->tiled_readback = nullptr;
+        if (persistent) {
+            std::vector<u8>{}.swap(image->guest);
+            std::vector<u8>{}.swap(image->linear);
+            std::vector<u8>{}.swap(image->stencil_guest);
+            std::vector<u8>{}.swap(image->stencil_linear);
+        }
+    }
+    if (tilizer)
+        tilizer->ReleaseReadbacks(fence);
 }
 } // namespace D3D12

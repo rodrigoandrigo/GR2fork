@@ -286,7 +286,7 @@ struct Image {
         if (!alt_tile_mode || dfmt == DataFormat::FormatInvalid || !IsMacroTiled(array_mode)) {
             return 0;
         }
-        const u32 bpp = NumBitsPerElement(dfmt);
+        const u32 bpp = NumBitsPerBlock(dfmt);
         const auto macro_tile_mode = CalculateMacrotileMode(tile_mode, bpp, NumSamples());
         const u32 banks = GetAltNumBanks(macro_tile_mode);
         return (((banks - 1) << 4) & base_address) >> 4;

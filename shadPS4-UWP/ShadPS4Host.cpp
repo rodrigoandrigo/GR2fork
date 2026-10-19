@@ -1,12 +1,23 @@
 #include "pch.h"
 
 #include "ShadPS4Host.h"
+#include "UwpDiagnostics.h"
+#include <cstring>
 
 #include <thread>
 #include <array>
 #include <vector>
 #include <roapi.h>
 #include <windows.ui.xaml.media.dxinterop.h>
+
+void UwpDiagnostics::Memory(const char* stage) noexcept {
+    try {
+        Record(stage, Windows::System::MemoryManager::AppMemoryUsage,
+               Windows::System::MemoryManager::AppMemoryUsageLimit);
+    } catch (...) {
+        Record("memory_query_unavailable");
+    }
+}
 
 using namespace Microsoft::WRL;
 using namespace Windows::UI::Core;
@@ -41,7 +52,10 @@ void ShadPS4Host::SetLogConsumer(std::function<void(std::string)> consumer) {
     log_consumer = std::move(consumer);
 }
 
-void ShadPS4Host::Log(void* context, uint32_t, const char* message) {
+void ShadPS4Host::Log(void* context, uint32_t level, const char* message) {
+    if (level >= 5 || std::strstr(message, "[UWP stage]"))
+        UwpDiagnostics::Record(message);
+
     if (context) {
         auto* host = static_cast<ShadPS4Host*>(context);
         std::lock_guard<std::mutex> lock{host->log_mutex};
@@ -53,17 +67,20 @@ void ShadPS4Host::Log(void* context, uint32_t, const char* message) {
 }
 
 void ShadPS4Host::ReportError(void*, const char* message) {
+    UwpDiagnostics::Record(message);
     OutputDebugStringA(message);
     OutputDebugStringA("\n");
 }
 
 void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width, uint32_t height,
                              bool frontend, bool game_surface) {
+    UwpDiagnostics::Memory("core_load_begin bytes/limit");
     module = LoadPackagedLibrary(L"shadPS4.dll", 0);
     if (!module) {
         throw ref new Platform::FailureException(ref new Platform::String(
             (L"Could not load shadPS4.dll: " + std::to_wstring(GetLastError())).c_str()));
     }
+    UwpDiagnostics::Record("core_loaded dll_base", reinterpret_cast<uintptr_t>(module));
     const auto version = Resolve<decltype(&shadps4_get_api_version)>("shadps4_get_api_version");
     if (version() != 1) {
         throw ref new Platform::FailureException(L"Unsupported shadPS4 DLL interface.");
@@ -106,9 +123,11 @@ void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width,
     config.height = height;
     config.attach_swapchain = !frontend || game_surface ? AttachSwapChain : nullptr;
     config.attach_context = this;
+    UwpDiagnostics::Memory("core_initialize_begin bytes/limit");
     if (initialize(&config)) {
         throw ref new Platform::FailureException(ref new Platform::String(Error().c_str()));
     }
+    UwpDiagnostics::Memory("core_ready bytes/limit");
     if (!frontend)
         presentation_thread = std::thread([this] { PresentationLoop(); });
 }
@@ -231,7 +250,10 @@ void ShadPS4Host::Run(std::wstring executable,
     session_thread.join();
   session_thread = std::thread([this, executable, completed] {
     const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED);
+    UwpDiagnostics::Memory("game_run_begin bytes/limit");
     const auto result = SUCCEEDED(initialized) ? run(executable.c_str()) : -1;
+    UwpDiagnostics::Record("game_run_return result", static_cast<uint32_t>(result));
+    UwpDiagnostics::Memory("game_run_end bytes/limit");
     const auto message = FAILED(initialized)
                              ? L"Não foi possível iniciar o worker MTA."
                          : result ? Error()
