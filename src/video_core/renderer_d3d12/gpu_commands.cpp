@@ -18,18 +18,18 @@ cbuffer Config : register(b0) {
 };
 uint LoadIndex(uint i) {
     if (!index_bytes) return i;
-    uint relative = i * index_bytes;
-    uint address = input_offset + (relative & ~3u);
-    uint value = Input.Load(address & ~3u);
-    if ((address & 3) != 0) {
-        value >>= (address & 3) * 8;
-        if ((relative & ~3u) + 4 <= input_count * index_bytes)
-            value |= Input.Load((address & ~3u) + 4) << (32 - (address & 3) * 8);
+    if (i >= stride) return 0;
+    uint value = 0;
+    uint mask = swap_mode == 1 ? 1 : swap_mode == 2 ? 3 : swap_mode == 3 ? 2 : 0;
+    for (uint byte = 0; byte < index_bytes; ++byte) {
+        uint relative = (i * index_bytes + byte) ^ mask;
+        bool valid = relative < indexed * index_bytes;
+        uint address = input_offset + (valid ? relative : 0);
+        uint word = Input.Load(address & ~3u);
+        uint component = valid ? (word >> ((address & 3u) * 8)) & 255u : 0;
+        value |= component << (byte * 8);
     }
-    if (swap_mode == 1) value = ((value & 0x00ff00ffu) << 8) | ((value >> 8) & 0x00ff00ffu);
-    if (swap_mode == 2) value = (value << 24) | ((value & 0xff00u) << 8) | ((value >> 8) & 0xff00u) | (value >> 24);
-    if (swap_mode == 3) value = (value << 16) | (value >> 16);
-    return index_bytes == 2 ? (value >> ((relative & 2) * 8)) & 65535u : value;
+    return value;
 }
 [numthreads(64,1,1)]
 void main(uint3 thread : SV_DispatchThreadID) {
@@ -202,9 +202,12 @@ void GpuCommands::ExecuteDispatch(ID3D12GraphicsCommandList* list, ID3D12RootSig
     list->ExecuteIndirect(dispatch.Get(), 1, arguments.Get(), 0, nullptr, 0);
 }
 void GpuCommands::RecordIndices(ID3D12GraphicsCommandList* list, const Expansion& description,
-                                const ResourceCache::View& input, u32 bytes, u32 swap) {
+                                const ResourceCache::View& input, u32 bytes, u32 swap, u32 readable_count, u32 read_count) {
     Bind(list,
-         {1, description.output_count, u32(input.offset), 0, 0, 0, 0, bytes, swap, description.mode,
+         {1, description.output_count, u32(input.offset), 0,
+          std::min(description.input_count, readable_count),
+          read_count == UINT32_MAX ? description.input_count : read_count,
+          0, bytes, swap, description.mode,
           u32(description.provoking_last), description.input_count},
          input, {});
     Transition(list, indices, index_state, D3D12_RESOURCE_STATE_INDEX_BUFFER);

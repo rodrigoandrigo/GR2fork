@@ -164,8 +164,8 @@ struct DepthRenderOverride {
 };
 
 struct Eqaa {
-    u32 max_anchor_samples : 1;
-    u32 : 3;
+    u32 max_anchor_samples : 3;
+    u32 : 1;
     u32 ps_iter_samples : 3;
     u32 : 1;
     u32 mask_export_num_samples : 3;

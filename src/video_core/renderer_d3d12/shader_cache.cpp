@@ -30,6 +30,7 @@ struct ShaderVariant {
         Shader::Backend::Bindings bindings;
         std::vector<ShaderResourceRange> stage_resources;
         u64 mapping_generation;
+        IndexFetch indices;
         PreparedShader shader;
     };
     std::vector<u32> code, copy_code, dependencies;
@@ -69,6 +70,8 @@ std::vector<u32> TranslationDependencies(const Shader::Info& info) {
         result.resize(offset + sizeof(value) / sizeof(u32));
         std::memcpy(result.data() + offset, &value, sizeof(value));
     };
+    for (const auto& sampler : info.samplers)
+        append(sampler.GetSharp(info));
     if (info.has_fetch_shader) {
         Shader::Gcn::FetchShaderData fetch;
         if (!Shader::Gcn::ParseFetchShader(info, fetch))
@@ -475,6 +478,9 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     profile.needs_image_load_feedback = true;
     profile.needs_subword_buffer_emulation = true;
     profile.needs_signed_atomic32_emulation = true;
+    profile.needs_inline_vertex_fetch = true;
+    profile.supports_image_sample_min_lod = true;
+    profile.needs_unified_buffer_types = true;
     profile.needs_buffer_offsets = true;
 }
 CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
@@ -568,13 +574,14 @@ PreparedShader ShaderCache::Prepare(Shader::ShaderParams params, Shader::Runtime
 }
 PreparedShader ShaderCache::Prepare(std::unique_ptr<TranslatedShader> translated,
                                     Shader::Backend::Bindings bindings,
-                                    std::span<const ShaderResourceRange> stage_resources) {
+                                    std::span<const ShaderResourceRange> stage_resources,
+                                    const IndexFetch& indices) {
     const u64 mapping_generation = resources ? resources->MappingGeneration() : 0;
     auto variant = translated->variant;
     if (!translated->program) {
         for (const auto& prepared : variant->prepared) {
             if (prepared.bindings != bindings ||
-                prepared.mapping_generation != mapping_generation ||
+                prepared.mapping_generation != mapping_generation || prepared.indices != indices ||
                 !SameRanges(prepared.stage_resources, stage_resources))
                 continue;
             auto result = prepared.shader;
@@ -594,8 +601,13 @@ PreparedShader ShaderCache::Prepare(std::unique_ptr<TranslatedShader> translated
     auto& program = *translated->program;
     result.start_bindings = bindings;
     result.end_bindings = bindings;
+    const bool index_fetch = LowerIndexFetch(result, program, indices);
+    if (result.info.has_inline_fetch_shader)
+        for (auto& buffer : result.info.buffers)
+            if (buffer.buffer_type == Shader::BufferType::Guest)
+                buffer.is_coherent = true;
     const bool image_aliases = LowerImageBufferAliases(result, program, resources, stage_resources);
-    if (LowerBufferAliases(result, program, resources) || image_aliases) {
+    if (LowerBufferAliases(result, program, resources) || image_aliases || index_fetch) {
         Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
         Shader::Optimization::DeadCodeEliminationPass(program);
         Shader::Optimization::CollectShaderInfoPass(program, profile);
@@ -637,6 +649,7 @@ PreparedShader ShaderCache::Prepare(std::unique_ptr<TranslatedShader> translated
             variant->prepared.push_back({bindings,
                                          {stage_resources.begin(), stage_resources.end()},
                                          mapping_generation,
+                                         indices,
                                          std::move(snapshot)});
             variant->bytes += bytes;
             variant_bytes += bytes;

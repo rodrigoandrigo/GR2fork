@@ -1162,8 +1162,13 @@ template void Translator::SetDstPk<IR::F32, false>(const InstOperand& operand,
 void Translator::EmitFetch(const GcnInst& inst) {
     const auto code_sgpr_base = inst.src[0].code;
 
-    if (EmulatorSettings.IsInlineFetchShader()) {
-        // Translate fetch shader inline using regular buffer bindings; useful for debugging.
+    if (EmulatorSettings.IsInlineFetchShader() || profile.needs_inline_vertex_fetch) {
+        if (profile.needs_inline_vertex_fetch) {
+            info.has_fetch_shader = true;
+            info.has_inline_fetch_shader = true;
+            info.fetch_shader_sgpr_base = code_sgpr_base;
+            ASSERT(ParseFetchShader(info, fetch_data));
+        }
         const auto* code = GetFetchShaderCode(info, code_sgpr_base);
         GcnCodeSlice slice(code, code + std::numeric_limits<u32>::max());
         GcnDecodeContext decoder;

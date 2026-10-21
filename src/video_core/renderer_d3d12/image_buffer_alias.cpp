@@ -347,7 +347,7 @@ IR::Value DecodeBcnTexel(IR::IREmitter& ir, AmdGpu::DataFormat data_format,
     }
 }
 
-constexpr u32 SamplerEntryWords = 8;
+constexpr u32 SamplerEntryWords = SharedSamplerWords;
 
 bool IsSampledInstruction(IR::Opcode opcode) {
     return opcode == IR::Opcode::ImageSampleImplicitLod ||
@@ -445,8 +445,7 @@ SampleAxis BuildSampleAxis(IR::IREmitter& ir, const IR::U32& mode, const IR::F32
         u = IR::F32{ir.FPAdd(u, IR::F32{ir.FPMul(offset_f, IR::F32{ir.FPRecip(dims_f)})})};
     }
     const auto s = IR::F32{ir.FPMul(WrapCoord(ir, mode, u), dims_f)};
-    const auto shift = IR::F32{ir.Select(
-        linear, ir.Imm32(0.5f), IR::F32{ir.Select(trunc, ir.Imm32(0.f), ir.Imm32(-0.5f))})};
+    const auto shift = IR::F32{ir.Select(linear, ir.Imm32(0.5f), ir.Imm32(0.f))};
     const auto f = IR::F32{ir.FPSub(s, shift)};
     const auto base_f = IR::F32{ir.FPFloor(f)};
     const auto frac_raw = IR::F32{ir.FPSub(f, base_f)};
@@ -454,13 +453,18 @@ SampleAxis BuildSampleAxis(IR::IREmitter& ir, const IR::U32& mode, const IR::F32
     const auto next = IR::U32{ir.IAdd(low, ir.Imm32(1u))};
     const auto fixed_low = SampleFixLowIndex(ir, mode, low, dims);
     const auto fixed_high = SampleFixHighIndex(ir, mode, next, dims);
-    return {IR::U32{ir.Select(linear, fixed_low, low)}, IR::U32{ir.Select(linear, fixed_high, low)},
+    const auto point = SampleFixHighIndex(ir, mode, fixed_low, dims);
+    return {IR::U32{ir.Select(linear, fixed_low, point)},
+            IR::U32{ir.Select(linear, fixed_high, point)},
             IR::F32{ir.Select(linear, frac_raw, ir.Imm32(0.f))}};
 }
 
-IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32 sampler_table) {
+IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32 sampler_table,
+                 const AmdGpu::Sampler& sampler, bool fragment_stage) {
     if (sampler_table == 0xffff)
         throw std::runtime_error("Missing lowered sampler table");
+    if (!sampler.Valid())
+        throw std::runtime_error("Invalid shared-image sampler");
     const auto opcode = inst.GetOpcode();
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto type = image.sharp.GetViewType(image.resource.is_array);
@@ -477,173 +481,364 @@ IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32
     const bool explicit_lod = opcode == IR::Opcode::ImageSampleExplicitLod ||
                               opcode == IR::Opcode::ImageSampleDrefExplicitLod;
     const bool gradient = opcode == IR::Opcode::ImageGradient;
-    if (!explicit_lod && !gradient && image.info.resources.levels != 1)
-        throw std::runtime_error("Shared image implicit sampling requires mip-less images");
-
+    const u32 axes = one_d || one_d_array ? 1u : is_3d ? 3u : 2u;
     const IR::Value coords = inst.Arg(1);
-    const IR::Value offset = explicit_lod ? inst.Arg(3) : inst.Arg(4);
+    const IR::Value offset = inst.Arg(gradient || is_dref ? 4u : 3u);
     const IR::F32 dref = is_dref ? IR::F32{inst.Arg(2)} : IR::F32{};
-
     const u32 view_base =
         image.sharp.base_level +
         (image.resource.mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex
              ? image.resource.constant_mip_index
              : 0);
-    IR::Value raw_mip{};
-    if (explicit_lod) {
-        const auto mip_level = IR::F32{ir.FPFloor(IR::F32{inst.Arg(2)})};
-        raw_mip = IR::U32{ir.ConvertFToU(32, IR::F32{ir.FPMax(mip_level, ir.Imm32(0.f))})};
-    } else if (gradient) {
-        const u32 base_width = std::max(1u, image.info.size.width >> std::min(view_base, 31u));
-        const u32 base_height = std::max(1u, image.info.size.height >> std::min(view_base, 31u));
-        const auto span = IR::F32{ir.FPMaxTri(
-            IR::F32{ir.FPMul(IR::F32{ir.FPAbs(IR::F32{inst.Arg(2)})}, ir.Imm32(float(base_width)))},
-            IR::F32{
-                ir.FPMul(IR::F32{ir.FPAbs(IR::F32{inst.Arg(3)})}, ir.Imm32(float(base_height)))},
-            ir.Imm32(1.f))};
-        auto lod = IR::F32{ir.FPLog2(span)};
-        const IR::Value lod_clamp = inst.Arg(5);
-        if (!lod_clamp.IsEmpty())
-            lod = IR::F32{ir.FPMin(lod, IR::F32{lod_clamp})};
-        const auto mip_level = IR::F32{ir.FPFloor(lod)};
-        raw_mip = IR::U32{ir.ConvertFToU(32, IR::F32{ir.FPMax(mip_level, ir.Imm32(0.f))})};
+    if (view_base >= image.info.resources.levels)
+        throw std::runtime_error("Shared image base mip exceeds storage");
+    const u32 view_levels = std::min(image.sharp.NumViewLevels(image.resource.is_array),
+                                     image.info.resources.levels - view_base);
+    if (!view_levels)
+        throw std::runtime_error("Shared image sampling has an empty mip view");
+    const auto entry = ir.Imm32((inst.Arg(0).U32() >> 16) * SamplerEntryWords);
+    const auto word = [&](u32 index) {
+        return IR::U32{ir.LoadBufferU32(1, ir.Imm32(sampler_table),
+                                        IR::U32{ir.IAdd(entry, ir.Imm32(index))}, {})};
+    };
+    const auto field = [&](u32 shift, u32 mask) {
+        return IR::U32{
+            ir.BitwiseAnd(ir.ShiftRightLogical(word(5), ir.Imm32(shift)), ir.Imm32(mask))};
+    };
+    const auto real = [&](u32 index) { return ir.BitCast<IR::F32>(word(index)); };
+    const auto params = word(0);
+    std::array<IR::F32, 4> border;
+    for (u32 c = 0; c < 4; ++c) {
+        border[c] = real(6 + c);
+        const auto number = image.sharp.GetNumberFmt();
+        if (number == AmdGpu::NumberFormat::Unorm || number == AmdGpu::NumberFormat::Srgb)
+            border[c] = IR::F32{ir.FPSaturate(border[c])};
+        else if (number == AmdGpu::NumberFormat::Snorm)
+            border[c] = IR::F32{ir.FPMin(ir.FPMax(border[c], ir.Imm32(-1.f)), ir.Imm32(1.f))};
     }
-    const auto mip_u = Mip(ir, image, raw_mip);
-
-    const u32 sampler_index = inst.Arg(0).U32() >> 16;
-    const auto entry = ir.Imm32(sampler_index * SamplerEntryWords);
-    const auto params = IR::U32{ir.LoadBufferU32(1, ir.Imm32(sampler_table), entry, {})};
-    const auto border_word = IR::U32{
-        ir.LoadBufferU32(1, ir.Imm32(sampler_table), IR::U32{ir.IAdd(entry, ir.Imm32(1u))}, {})};
-    const IR::Value border_color = ir.Unpack4x8(AmdGpu::NumberFormat::Unorm, border_word);
-    const auto wrap_x = IR::U32{ir.BitwiseAnd(params, ir.Imm32(0x7u))};
+    const auto border_color = ir.CompositeConstruct(border[0], border[1], border[2], border[3]);
+    const auto wrap_x = IR::U32{ir.BitwiseAnd(params, ir.Imm32(7u))};
     const auto wrap_y =
-        IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(params, ir.Imm32(3u)), ir.Imm32(0x7u))};
+        IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(params, ir.Imm32(3u)), ir.Imm32(7u))};
     const auto wrap_z =
-        IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(params, ir.Imm32(6u)), ir.Imm32(0x7u))};
-    const auto linear_xy = IR::U1{ir.IEqual(
-        ir.BitwiseAnd(ir.ShiftRightLogical(params, ir.Imm32(9u)), ir.Imm32(1u)), ir.Imm32(1u))};
-    const auto trunc = IR::U1{ir.IEqual(
-        ir.BitwiseAnd(ir.ShiftRightLogical(params, ir.Imm32(14u)), ir.Imm32(1u)), ir.Imm32(1u))};
+        IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(params, ir.Imm32(6u)), ir.Imm32(7u))};
+    const auto trunc =
+        IR::U1{ir.INotEqual(ir.BitwiseAnd(params, ir.Imm32(1u << 14)), ir.Imm32(0u))};
     const auto cmp_func =
-        IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(params, ir.Imm32(11u)), ir.Imm32(0x7u))};
-
-    IR::U32 slice_u{};
-    if (is_array) {
-        auto slice_f = IR::F32{ir.CompositeExtract(coords, one_d_array ? 1u : 2u)};
-        if (inst_info.is_unnormalized)
-            slice_f = IR::F32{ir.FPMul(
-                slice_f, ir.Imm32(float(image.sharp.NumViewLayers(image.resource.is_array))))};
-        slice_u = IR::U32{ir.ConvertFToS(32, IR::F32{ir.FPFloor(slice_f)})};
-    }
-
-    const auto coord_axis = [&](u32 axis) -> IR::F32 {
+        IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(params, ir.Imm32(11u)), ir.Imm32(7u))};
+    const auto mip_filter = field(4, 3);
+    const auto reduction = is_dref ? ir.Imm32(0u) : field(6, 3);
+    const auto base_coord_axis = [&](u32 axis) -> IR::F32 {
         return one_d ? IR::F32{coords} : IR::F32{ir.CompositeExtract(coords, axis)};
     };
+    std::array<IR::F32, 3> dx{ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)};
+    std::array<IR::F32, 3> dy = dx;
+    auto xx = ir.Imm32(0.f), yy = ir.Imm32(0.f), xy = ir.Imm32(0.f);
+    for (u32 axis = 0; axis < axes; ++axis) {
+        if (gradient) {
+            dx[axis] =
+                axes == 1 ? IR::F32{inst.Arg(2)} : IR::F32{ir.CompositeExtract(inst.Arg(2), axis)};
+            dy[axis] =
+                axes == 1 ? IR::F32{inst.Arg(3)} : IR::F32{ir.CompositeExtract(inst.Arg(3), axis)};
+        } else if (!explicit_lod && fragment_stage) {
+            dx[axis] = ir.FPDdx(base_coord_axis(axis));
+            dy[axis] = ir.FPDdy(base_coord_axis(axis));
+        }
+        const u32 size = axis == 0   ? image.info.size.width
+                         : axis == 1 ? image.info.size.height
+                                     : image.info.size.depth;
+        const auto scale = ir.Imm32(float(std::max(1u, size >> std::min(view_base, 31u))));
+        if (gradient && (inst_info.is_unnormalized || sampler.force_unnormalized)) {
+            dx[axis] = IR::F32{ir.FPDiv(dx[axis], scale)};
+            dy[axis] = IR::F32{ir.FPDiv(dy[axis], scale)};
+        }
+        const auto x = IR::F32{ir.FPMul(dx[axis], scale)};
+        const auto y = IR::F32{ir.FPMul(dy[axis], scale)};
+        xx = IR::F32{ir.FPAdd(xx, ir.FPMul(x, x))};
+        yy = IR::F32{ir.FPAdd(yy, ir.FPMul(y, y))};
+        xy = IR::F32{ir.FPAdd(xy, ir.FPMul(x, y))};
+    }
+    const auto isotropic = ir.FPSqrt(IR::F32{ir.FPMax(xx, yy)});
+    auto lod = explicit_lod ? IR::F32{inst.Arg(is_dref ? 3u : 2u)}
+                            : ir.FPLog2(IR::F32{ir.FPMax(isotropic, ir.Imm32(0x1p-64f))});
+    lod = IR::F32{ir.FPAdd(lod, real(4))};
+    if (!explicit_lod) {
+        if (!gradient) {
+            const auto bias = inst.Arg(is_dref ? 3u : 2u);
+            if (!bias.IsEmpty())
+                lod = IR::F32{ir.FPAdd(lod, IR::F32{bias})};
+        }
+    }
+    const auto last_lod = ir.Imm32(float(view_levels - 1));
+    const auto min_lod = IR::F32{ir.FPMin(real(2), last_lod)};
+    const auto max_lod = IR::F32{ir.FPMax(min_lod, ir.FPMin(real(3), last_lod))};
+    const auto clamp_lod = [&](IR::F32 value) {
+        value = IR::F32{ir.FPMin(ir.FPMax(value, min_lod), max_lod)};
+        value = IR::F32{ir.Select(ir.IEqual(mip_filter, ir.Imm32(0u)), min_lod, value)};
+        if (gradient && !inst.Arg(5).IsEmpty())
+            value = IR::F32{ir.FPMax(value, IR::F32{inst.Arg(5)})};
+        if (opcode == IR::Opcode::ImageSampleImplicitLod && !inst.Arg(4).IsEmpty())
+            value = IR::F32{ir.FPMax(value, IR::F32{inst.Arg(4)})};
+        value = IR::F32{ir.FPMax(value, ir.Imm32(std::max(
+            0.f, float(image.sharp.min_lod) / 256.f - float(view_base))))};
+        return IR::F32{ir.FPMin(value, last_lod)};
+    };
+    const u32 max_taps = !explicit_lod && (gradient || fragment_stage) &&
+                                 (AmdGpu::IsAnisoFilter(sampler.xy_min_filter) ||
+                                  AmdGpu::IsAnisoFilter(sampler.xy_mag_filter))
+                             ? u32(sampler.MaxAniso())
+                             : 1u;
+    auto tap_count = ir.Imm32(1u);
+    std::array<IR::F32, 3> direction{ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)};
+    if (max_taps > 1) {
+        const auto delta = IR::F32{ir.FPSub(xx, yy)};
+        const auto disc = ir.FPSqrt(
+            IR::F32{ir.FPAdd(ir.FPMul(delta, delta), ir.FPMul(ir.Imm32(4.f), ir.FPMul(xy, xy)))});
+        const auto major2 = IR::F32{ir.FPMul(ir.Imm32(0.5f), ir.FPAdd(ir.FPAdd(xx, yy), disc))};
+        const auto minor2 = IR::F32{
+            ir.FPMax(ir.FPMul(ir.Imm32(0.5f), ir.FPSub(ir.FPAdd(xx, yy), disc)), ir.Imm32(0.f))};
+        const auto major = ir.FPSqrt(major2);
+        const auto minor = IR::F32{ir.FPMaxTri(
+            ir.FPSqrt(minor2), ir.FPDiv(major, ir.Imm32(float(max_taps))), ir.Imm32(1.f))};
+        const auto selected_filter =
+            IR::U32{ir.Select(ir.FPGreaterThan(clamp_lod(lod), ir.Imm32(0.f)), field(2, 3), field(0, 3))};
+        const auto enabled = IR::U1{
+            ir.LogicalAnd(ir.INotEqual(ir.BitwiseAnd(selected_filter, ir.Imm32(2u)), ir.Imm32(0u)),
+                          ir.FPGreaterThan(major, ir.Imm32(1.f)))};
+        tap_count = IR::U32{
+            ir.Select(enabled,
+                      ir.UMin(ir.ConvertFToU(32, IR::F32{ir.FPCeil(ir.FPDiv(major, minor))}),
+                              ir.Imm32(max_taps)),
+                      ir.Imm32(1u))};
+        lod = IR::F32{ir.Select(
+            enabled,
+            ir.FPAdd(lod, ir.FPSub(ir.FPLog2(minor),
+                                   ir.FPLog2(IR::F32{ir.FPMax(isotropic, ir.Imm32(0x1p-64f))}))),
+            lod)};
+        const auto x_dominant = IR::U1{ir.FPGreaterThanEqual(xx, yy)};
+        auto vx = IR::F32{ir.Select(x_dominant, ir.FPSub(major2, yy), xy)};
+        auto vy = IR::F32{ir.Select(x_dominant, xy, ir.FPSub(major2, xx))};
+        const auto length2 = IR::F32{ir.FPAdd(ir.FPMul(vx, vx), ir.FPMul(vy, vy))};
+        const auto nonzero = IR::U1{ir.FPGreaterThan(length2, ir.Imm32(0x1p-64f))};
+        const auto inverse =
+            IR::F32{ir.FPRecipSqrt(IR::F32{ir.FPMax(length2, ir.Imm32(0x1p-64f))})};
+        vx = IR::F32{ir.Select(nonzero, ir.FPMul(vx, inverse),
+                               ir.Select(x_dominant, ir.Imm32(1.f), ir.Imm32(0.f)))};
+        vy = IR::F32{ir.Select(nonzero, ir.FPMul(vy, inverse),
+                               ir.Select(x_dominant, ir.Imm32(0.f), ir.Imm32(1.f)))};
+        for (u32 axis = 0; axis < axes; ++axis)
+            direction[axis] = IR::F32{ir.Select(
+                enabled, ir.FPAdd(ir.FPMul(dx[axis], vx), ir.FPMul(dy[axis], vy)), ir.Imm32(0.f))};
+    }
+    const auto filtered_lod = clamp_lod(lod);
+    const auto minifying = IR::U1{ir.FPGreaterThan(filtered_lod, ir.Imm32(0.f))};
+    const auto filter = IR::U32{ir.Select(minifying, field(2, 3), field(0, 3))};
+    const auto linear_xy = IR::U1{ir.INotEqual(ir.BitwiseAnd(filter, ir.Imm32(1u)), ir.Imm32(0u))};
+    const auto linear_z = IR::U1{ir.INotEqual(ir.BitwiseAnd(field(11, 3), ir.Imm32(1u)), ir.Imm32(0u))};
+    const bool point_preclamp = sampler.mip_filter == AmdGpu::MipFilter::Point && sampler.mip_point_preclamp;
+    lod = point_preclamp ? clamp_lod(IR::F32{ir.FPAdd(lod, ir.Imm32(0.5f))}) : filtered_lod;
+    const auto mip_linear = IR::U1{ir.IEqual(mip_filter, ir.Imm32(2u))};
+    const auto selected_lod = IR::F32{
+        ir.Select(mip_linear, lod, point_preclamp ? lod : IR::F32{ir.FPAdd(lod, ir.Imm32(0.5f))})};
+    const auto mip_lo = IR::U32{ir.ConvertFToU(32, IR::F32{ir.FPFloor(selected_lod)})};
+    const auto mip_hi = IR::U32{ir.UMin(ir.IAdd(mip_lo, ir.Imm32(1u)), ir.Imm32(view_levels - 1))};
+    const auto mip_frac = IR::F32{ir.Select(mip_linear, ir.FPFract(lod), ir.Imm32(0.f))};
+    IR::U32 slice_u{};
+    if (is_array) {
+        auto layer = IR::F32{ir.CompositeExtract(coords, one_d_array ? 1u : 2u)};
+        if (inst_info.is_unnormalized || sampler.force_unnormalized)
+            layer = IR::F32{ir.FPMul(
+                layer, ir.Imm32(float(image.sharp.NumViewLayers(image.resource.is_array))))};
+        const auto last_layer =
+            ir.Imm32(float(image.sharp.NumViewLayers(image.resource.is_array) - 1));
+        layer = IR::F32{ir.FPMin(ir.FPMax(layer, ir.Imm32(0.f)), last_layer)};
+        slice_u = IR::U32{ir.ConvertFToU(32, IR::F32{ir.FPFloor(ir.FPAdd(layer, ir.Imm32(0.5f)))})};
+    }
     const auto offset_axis = [&](u32 axis) -> IR::Value {
         if (offset.IsEmpty())
             return {};
-        return one_d || one_d_array ? IR::Value{offset}
-                                    : IR::Value{ir.CompositeExtract(offset, axis)};
+        return axes == 1 ? offset : IR::Value{ir.CompositeExtract(offset, axis)};
     };
-    const SampleAxis axis_x = BuildSampleAxis(ir, wrap_x, coord_axis(0), offset_axis(0),
-                                              SampleSize(ir, image, mip_u, 0), linear_xy, trunc);
-    const SampleAxis axis_y =
-        one_d ? SampleAxis{.low = ir.Imm32(0u), .high = ir.Imm32(0u), .frac = ir.Imm32(0.f)}
-              : BuildSampleAxis(ir, wrap_y, coord_axis(1), offset_axis(1),
-                                SampleSize(ir, image, mip_u, 1), linear_xy, trunc);
-    const auto make_coords = [&](IR::U32 x, IR::U32 y, IR::U32 z) -> IR::Value {
-        if (one_d)
-            return IR::Value{x};
-        if (one_d_array)
-            return ir.CompositeConstruct(x, slice_u);
-        if (is_3d)
-            return ir.CompositeConstruct(x, y, z);
-        if (is_array)
-            return ir.CompositeConstruct(x, y, slice_u);
-        return ir.CompositeConstruct(x, y);
+    const auto combine = [&](IR::F32 a, IR::F32 b, IR::F32 weight) {
+        const auto average = IR::F32{ir.FPAdd(a, ir.FPMul(b, weight))};
+        const auto reduced =
+            IR::F32{ir.Select(ir.IEqual(reduction, ir.Imm32(1u)), ir.FPMin(a, b), ir.FPMax(a, b))};
+        return IR::F32{ir.Select(ir.FPGreaterThan(weight, ir.Imm32(0.f)),
+                                 ir.Select(ir.IEqual(reduction, ir.Imm32(0u)), average, reduced),
+                                 a)};
     };
+    const auto sample_level = [&](IR::U32 raw_mip,
+                                  const std::array<IR::F32, 3>& position) -> IR::Value {
+        const auto coord_axis = [&](u32 axis) { return position[axis]; };
+        const auto mip_u = Mip(ir, image, raw_mip);
+        const SampleAxis axis_x =
+            BuildSampleAxis(ir, wrap_x, coord_axis(0), offset_axis(0),
+                            SampleSize(ir, image, mip_u, 0), linear_xy, trunc);
+        const SampleAxis axis_y =
+            axes == 1 ? SampleAxis{.low = ir.Imm32(0u), .high = ir.Imm32(0u), .frac = ir.Imm32(0.f)}
+                      : BuildSampleAxis(ir, wrap_y, coord_axis(1), offset_axis(1),
+                                        SampleSize(ir, image, mip_u, 1), linear_xy, trunc);
+        const auto make_coords = [&](IR::U32 x, IR::U32 y, IR::U32 z) -> IR::Value {
+            if (one_d)
+                return IR::Value{x};
+            if (one_d_array)
+                return ir.CompositeConstruct(x, slice_u);
+            if (is_3d)
+                return ir.CompositeConstruct(x, y, z);
+            if (is_array)
+                return ir.CompositeConstruct(x, y, slice_u);
+            return ir.CompositeConstruct(x, y);
+        };
 
-    const u32 element_shift = image.info.props.is_block ? 2u
-                                                        : (image.info.num_bits == 8    ? 0u
-                                                           : image.info.num_bits == 16 ? 1u
-                                                                                       : 2u);
-    const u32 bcn_words = image.info.num_bits == 64 ? 2u : 4u;
-    const auto fmt = Format(image);
-    const auto data_handle = ir.Imm32(image.data);
+        const u32 element_shift = image.info.props.is_block ? 2u
+                                                            : (image.info.num_bits == 8    ? 0u
+                                                               : image.info.num_bits == 16 ? 1u
+                                                                                           : 2u);
+        const u32 bcn_words = image.info.num_bits == 64 ? 2u : 4u;
+        const auto fmt = Format(image);
+        const auto data_handle = ir.Imm32(image.data);
 
-    const auto load_tap = [&](IR::U32 tx, IR::U32 ty, IR::U32 tz) -> std::pair<IR::U1, IR::Value> {
-        const auto byte_address = Address(ir, image, make_coords(tx, ty, tz), raw_mip, {});
-        const auto valid_tap =
-            IR::U1{ir.ILessThan(byte_address, ir.Imm32(image.info.guest_size), false)};
-        const auto address = IR::U32{ir.ShiftRightLogical(byte_address, ir.Imm32(element_shift))};
-        IR::Value value;
-        if (!image.info.props.is_block) {
-            value = Optimization::LoadBufferFormat(ir, data_handle, address, {}, fmt);
-        } else {
-            const auto words = ir.LoadBufferU32(bcn_words, data_handle, address, {});
-            value = DecodeBcnTexel(ir, fmt.data_format, fmt.num_format, words, tx, ty);
+        const auto load_tap = [&](IR::U32 tx, IR::U32 ty,
+                                  IR::U32 tz) -> std::pair<IR::U1, IR::Value> {
+            const auto byte_address = Address(ir, image, make_coords(tx, ty, tz), raw_mip, {});
+            const auto valid_tap =
+                IR::U1{ir.ILessThan(byte_address, ir.Imm32(image.info.guest_size), false)};
+            const auto address =
+                IR::U32{ir.ShiftRightLogical(byte_address, ir.Imm32(element_shift))};
+            IR::Value value;
+            if (!image.info.props.is_block) {
+                value = Optimization::LoadBufferFormat(ir, data_handle, address, {}, fmt);
+            } else {
+                const auto words = ir.LoadBufferU32(bcn_words, data_handle, address, {});
+                value = DecodeBcnTexel(ir, fmt.data_format, fmt.num_format, words, tx, ty);
+            }
+            if (image.sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb)
+                value = IR::ApplyForceDegamma(ir, value);
+            return {valid_tap, value};
+        };
+
+        std::array<IR::U32, 2> xs{axis_x.low, axis_x.high};
+        std::array<IR::F32, 2> wx{IR::F32{ir.FPSub(ir.Imm32(1.f), axis_x.frac)}, axis_x.frac};
+        std::array<IR::U32, 2> ys{axis_y.low, axis_y.high};
+        std::array<IR::F32, 2> wy{IR::F32{ir.FPSub(ir.Imm32(1.f), axis_y.frac)}, axis_y.frac};
+        SampleAxis axis_z{.low = ir.Imm32(0u), .high = ir.Imm32(0u), .frac = ir.Imm32(0.f)};
+        if (is_3d) {
+            const auto coord_z = coord_axis(2);
+            const auto offset_z =
+                offset.IsEmpty() ? IR::Value{} : IR::Value{ir.CompositeExtract(offset, 2)};
+            axis_z = BuildSampleAxis(ir, wrap_z, coord_z, offset_z, SampleSize(ir, image, mip_u, 2),
+                                     linear_z, trunc);
         }
-        return {valid_tap, value};
-    };
+        std::array<IR::U32, 2> zs{axis_z.low, axis_z.high};
+        std::array<IR::F32, 2> wz{IR::F32{ir.FPSub(ir.Imm32(1.f), axis_z.frac)}, axis_z.frac};
 
-    std::array<IR::U32, 2> xs{axis_x.low, axis_x.high};
-    std::array<IR::F32, 2> wx{IR::F32{ir.FPSub(ir.Imm32(1.f), axis_x.frac)}, axis_x.frac};
-    std::array<IR::U32, 2> ys{axis_y.low, axis_y.high};
-    std::array<IR::F32, 2> wy{IR::F32{ir.FPSub(ir.Imm32(1.f), axis_y.frac)}, axis_y.frac};
-    SampleAxis axis_z{.low = ir.Imm32(0u), .high = ir.Imm32(0u), .frac = ir.Imm32(0.f)};
-    if (is_3d) {
-        const auto coord_z = IR::F32{ir.CompositeExtract(coords, 2)};
-        const auto offset_z =
-            offset.IsEmpty() ? IR::Value{} : IR::Value{ir.CompositeExtract(offset, 2)};
-        axis_z = BuildSampleAxis(ir, wrap_z, coord_z, offset_z, SampleSize(ir, image, mip_u, 2),
-                                 linear_xy, trunc);
-    }
-    std::array<IR::U32, 2> zs{axis_z.low, axis_z.high};
-    std::array<IR::F32, 2> wz{IR::F32{ir.FPSub(ir.Imm32(1.f), axis_z.frac)}, axis_z.frac};
-
-    std::array<IR::F32, 4> accum{ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)};
-    IR::F32 scalar_accum{ir.Imm32(0.f)};
-    for (u32 j = 0; j < 2u; ++j) {
-        for (u32 i = 0; i < 2u; ++i) {
-            for (u32 k = 0; k < (is_3d ? 2u : 1u); ++k) {
-                const auto tap_weight = IR::F32{ir.FPMul(wx[i], IR::F32{ir.FPMul(wy[j], wz[k])})};
-                const auto [tap_valid, tap_value] = load_tap(xs[i], ys[j], zs[k]);
-                if (is_dref) {
-                    const auto depth =
-                        IR::F32{ir.Select(tap_valid, IR::F32{ir.CompositeExtract(tap_value, 0)},
-                                          IR::F32{ir.CompositeExtract(border_color, 0)})};
-                    const auto compared = IR::F32{ir.Select(
-                        SampleCompare(ir, cmp_func, dref, depth), ir.Imm32(1.f), ir.Imm32(0.f))};
-                    scalar_accum =
-                        IR::F32{ir.FPAdd(scalar_accum, IR::F32{ir.FPMul(compared, tap_weight)})};
-                } else {
-                    for (u32 comp = 0; comp < 4u; ++comp) {
-                        const auto blended = IR::F32{ir.FPMul(
-                            IR::F32{ir.Select(tap_valid,
-                                              IR::F32{ir.CompositeExtract(tap_value, comp)},
-                                              IR::F32{ir.CompositeExtract(border_color, comp)})},
-                            tap_weight)};
-                        accum[comp] = IR::F32{ir.FPAdd(accum[comp], blended)};
+        std::array<IR::F32, 4> accum{ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)};
+        IR::F32 scalar_accum{ir.Imm32(0.f)};
+        for (u32 j = 0; j < 2u; ++j) {
+            for (u32 i = 0; i < 2u; ++i) {
+                for (u32 k = 0; k < (is_3d ? 2u : 1u); ++k) {
+                    const auto tap_weight =
+                        IR::F32{ir.FPMul(wx[i], IR::F32{ir.FPMul(wy[j], wz[k])})};
+                    const auto [tap_valid, tap_value] = load_tap(xs[i], ys[j], zs[k]);
+                    if (is_dref) {
+                        const auto depth =
+                            IR::F32{ir.Select(tap_valid, IR::F32{ir.CompositeExtract(tap_value, 0)},
+                                              IR::F32{ir.CompositeExtract(border_color, 0)})};
+                        const auto compared =
+                            IR::F32{ir.Select(SampleCompare(ir, cmp_func, dref, depth),
+                                              ir.Imm32(1.f), ir.Imm32(0.f))};
+                        scalar_accum = combine(scalar_accum, compared, tap_weight);
+                    } else {
+                        for (u32 comp = 0; comp < 4u; ++comp) {
+                            const auto texel = IR::F32{
+                                ir.Select(tap_valid, IR::F32{ir.CompositeExtract(tap_value, comp)},
+                                          IR::F32{ir.CompositeExtract(border_color, comp)})};
+                            if (i == 0 && j == 0 && k == 0)
+                                accum[comp] = IR::F32{ir.Select(ir.IEqual(reduction, ir.Imm32(0u)),
+                                                                ir.Imm32(0.f), texel)};
+                            accum[comp] = combine(accum[comp], texel, tap_weight);
+                        }
                     }
                 }
             }
         }
+        const IR::Value value =
+            is_dref ? IR::Value{ir.CompositeConstruct(scalar_accum, ir.Imm32(0.f), ir.Imm32(0.f),
+                                                      ir.Imm32(0.f))}
+                    : IR::Value{ir.CompositeConstruct(accum[0], accum[1], accum[2], accum[3])};
+        return value;
+    };
+    const auto inv_taps = IR::F32{ir.FPRecip(IR::F32{ir.ConvertUToF(32, 32, tap_count)})};
+    std::array<IR::F32, 4> result{ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)};
+    for (u32 tap = 0; tap < max_taps; ++tap) {
+        std::array<IR::F32, 3> position{ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)};
+        const auto distance =
+            IR::F32{ir.FPSub(ir.FPMul(ir.Imm32(float(tap) + 0.5f), inv_taps), ir.Imm32(0.5f))};
+        for (u32 axis = 0; axis < axes; ++axis)
+            position[axis] =
+                IR::F32{ir.FPAdd(base_coord_axis(axis), ir.FPMul(direction[axis], distance))};
+        const auto low = sample_level(mip_lo, position);
+        const auto high =
+            sampler.mip_filter == AmdGpu::MipFilter::Linear ? sample_level(mip_hi, position) : low;
+        const auto weight = IR::F32{
+            ir.Select(ir.ILessThan(ir.Imm32(tap), tap_count, false), inv_taps, ir.Imm32(0.f))};
+        for (u32 c = 0; c < 4; ++c) {
+            const auto a = IR::F32{ir.CompositeExtract(low, c)};
+            const auto b = IR::F32{ir.CompositeExtract(high, c)};
+            const auto base = IR::F32{ir.Select(ir.IEqual(reduction, ir.Imm32(0u)),
+                                                ir.FPMul(a, ir.FPSub(ir.Imm32(1.f), mip_frac)), a)};
+            const auto filtered = combine(base, b, mip_frac);
+            if (tap == 0)
+                result[c] =
+                    IR::F32{ir.Select(ir.IEqual(reduction, ir.Imm32(0u)), ir.Imm32(0.f), filtered)};
+            result[c] = combine(result[c], filtered, weight);
+        }
     }
-    const IR::Value value =
-        is_dref ? IR::Value{ir.CompositeConstruct(scalar_accum, ir.Imm32(0.f), ir.Imm32(0.f),
-                                                  ir.Imm32(0.f))}
-                : IR::Value{ir.CompositeConstruct(accum[0], accum[1], accum[2], accum[3])};
-    if (!image.resource.is_written && !image.resource.is_feedback) {
-        if (image.sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb)
-            return IR::ApplyForceDegamma(ir, value);
+    const auto value = ir.CompositeConstruct(result[0], result[1], result[2], result[3]);
+    if (!image.resource.is_written && !image.resource.is_feedback)
         return IR::ApplySwizzle(ir, value, image.sharp.DstSelect(),
                                 AmdGpu::IsInteger(image.sharp.GetNumberFmt()));
-    }
     return value;
 }
+
 } // namespace
 
+bool LowerIndexFetch(CompiledShader& shader, IR::Program& program, const IndexFetch& indices) {
+    if (!indices.address)
+        return false;
+    if (shader.info.sw_stage != Shader::SwStage::Vertex ||
+        (indices.element_size != 2 && indices.element_size != 4) || !indices.size)
+        throw std::runtime_error("Invalid D3D12 programmable index fetch");
+    const auto handle = IR::Value{AddBuffer(shader.info, indices.address, indices.size, false,
+                                          Shader::BufferType::Guest)};
+    for (auto* block : program.blocks) {
+        for (auto& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::GetAttributeU32 ||
+                inst.Arg(0).Attribute() != IR::Attribute::VertexId)
+                continue;
+            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+            const auto vertex = ir.ISub(ir.GetAttributeU32(IR::Attribute::VertexId),
+                                        ir.GetAttributeU32(IR::Attribute::BaseVertex));
+            const auto base = ir.IMul(vertex, ir.Imm32(indices.element_size));
+            auto index = ir.Imm32(0u);
+            for (u32 byte = 0; byte < indices.element_size; ++byte) {
+                const auto offset = ir.BitwiseXor(ir.IAdd(base, ir.Imm32(byte)),
+                                                 ir.Imm32(indices.byte_xor));
+                const auto valid = ir.ILessThan(offset, ir.Imm32(indices.size), false);
+                const auto safe_offset = IR::U32{ir.Select(valid, offset, ir.Imm32(0u))};
+                const auto loaded = ir.UConvert(32, ir.LoadBufferU8(handle, safe_offset, {}));
+                const auto value = IR::U32{ir.Select(valid, loaded, ir.Imm32(0u))};
+                index = ir.BitwiseOr(index, ir.ShiftLeftLogical(value, ir.Imm32(byte * 8)));
+            }
+            const auto valid_index = ir.ILessThan(
+                vertex, ir.Imm32(std::min(indices.count, indices.size / indices.element_size)), false);
+            index = IR::U32{ir.Select(valid_index, index, ir.Imm32(0u))};
+            inst.ReplaceUsesWithAndRemove(
+                ir.IAdd(index, ir.GetAttributeU32(IR::Attribute::BaseVertex)));
+        }
+    }
+    return true;
+}
 std::vector<ShaderResourceRange> GetShaderResourceRanges(const Shader::Info& info) {
     std::vector<ShaderResourceRange> ranges;
     for (const auto& image : info.images) {
@@ -858,7 +1053,7 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
                 throw std::runtime_error("Shared image gather/query requires raw shader lowering");
             if (sampled) {
                 ir.DeviceMemoryBarrier();
-                inst.ReplaceUsesWithAndRemove(Sample(ir, inst, image, sampler_table));
+                inst.ReplaceUsesWithAndRemove(Sample(ir, inst, image, sampler_table, info.samplers.at(inst.Arg(0).U32() >> 16).GetSharp(info), info.sw_stage == Shader::SwStage::Fragment));
                 continue;
             }
             const auto lod = opcode == IR::Opcode::ImageRead || opcode == IR::Opcode::ImageWrite

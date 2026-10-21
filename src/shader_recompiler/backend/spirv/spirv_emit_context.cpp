@@ -338,7 +338,7 @@ void EmitContext::DefineInputs() {
         }
 
         Shader::Gcn::FetchShaderData fetch_shader;
-        if (!Gcn::ParseFetchShader(info, fetch_shader)) {
+        if (info.has_inline_fetch_shader || !Gcn::ParseFetchShader(info, fetch_shader)) {
             break;
         }
         ASSERT(fetch_shader.attributes.size() <= IR::NumParams);
@@ -890,12 +890,13 @@ void EmitContext::DefineBuffers() {
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);
         }
         if (True(desc.used_types & IR::Type::U32) ||
+            (profile.needs_unified_buffer_types && True(desc.used_types & IR::Type::F32)) ||
             (profile.needs_subword_buffer_emulation &&
              True(desc.used_types & (IR::Type::U8 | IR::Type::U16)))) {
             spv_buffer.Alias(PointerType::U32) =
                 DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
         }
-        if (True(desc.used_types & IR::Type::F32)) {
+        if (!profile.needs_unified_buffer_types && True(desc.used_types & IR::Type::F32)) {
             spv_buffer.Alias(PointerType::F32) =
                 DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, F32[1]);
         }

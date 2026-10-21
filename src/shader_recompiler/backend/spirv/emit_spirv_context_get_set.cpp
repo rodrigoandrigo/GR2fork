@@ -383,6 +383,11 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
 
 template <u32 N, PointerType alias>
 static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if constexpr (alias == PointerType::F32) {
+        if (ctx.profile.needs_unified_buffer_types)
+            return ctx.OpBitcast(ctx.F32[N],
+                                EmitLoadBufferB32xN<N, PointerType::U32>(ctx, inst, handle, address));
+    }
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
@@ -526,6 +531,13 @@ Id EmitLoadBufferFormatF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addr
 template <u32 N, PointerType alias>
 static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address,
                                  Id value) {
+    if constexpr (alias == PointerType::F32) {
+        if (ctx.profile.needs_unified_buffer_types) {
+            EmitStoreBufferB32xN<N, PointerType::U32>(ctx, inst, handle, address,
+                                                    ctx.OpBitcast(ctx.U32[N], value));
+            return;
+        }
+    }
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);

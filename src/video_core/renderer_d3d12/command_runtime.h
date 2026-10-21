@@ -53,6 +53,8 @@ public:
         std::optional<GpuCommands::Arguments> indirect;
         std::optional<GpuCommands::Expansion> expansion;
         u32 source_index_count{};
+        u32 index_capacity{UINT32_MAX};
+        u32 index_read_count{UINT32_MAX};
         bool rectangles{};
         std::vector<VideoCore::ImageInfo> colors;
         std::vector<AmdGpu::ColorBuffer> color_clear_buffers;
@@ -85,6 +87,7 @@ public:
         std::array<float, 4> blend_factor{};
         u32 count{}, instances{1}, first_vertex{}, first_instance{};
         VAddr index_address{};
+        bool index_buffer_bound{};
         VAddr border_colors{};
         DXGI_FORMAT index_format{DXGI_FORMAT_R16_UINT};
         AmdGpu::IndexSwapMode index_swap{AmdGpu::IndexSwapMode::None};
@@ -104,6 +107,7 @@ public:
         float line_pattern_scale{1.f};
         std::array<f32, AmdGpu::NUM_VIEWPORTS * 2> line_viewport_dims{};
         bool sample_shading{};
+        u32 sample_iterations{};
         bool alpha_to_coverage{};
         u32 samples{1};
         std::array<u32, 4> sample_masks{UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX};

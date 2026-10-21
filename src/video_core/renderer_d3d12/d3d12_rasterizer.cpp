@@ -314,6 +314,48 @@ u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputCo
 }
 } // namespace
 namespace {
+u32 MappedIndexCount(Core::MemoryManager& memory, VAddr address, u64 count, u32 bytes) {
+    if (!count || address >= (1ULL << 40))
+        return 0;
+    count = std::min<u64>(count, ((1ULL << 40) - address) / bytes);
+    if (count > 16 * 1024 * 1024 / bytes)
+        throw std::runtime_error("Guest index range exceeds D3D12 input budget");
+    std::vector<Core::MemoryManager::BackingSpan> spans((u64(count) * bytes + 4095) / 4096 + 1);
+    const auto mapped = [&](u32 length) {
+        return memory.ResolveBackingSpans(address, u64(length) * bytes, spans.data(),
+                                          spans.size(), false) != 0;
+    };
+    if (mapped(count))
+        return count;
+    u32 low = 0, high = count;
+    while (low < high) {
+        const u32 middle = low + (high - low + 1) / 2;
+        if (mapped(middle))
+            low = middle;
+        else
+            high = middle - 1;
+    }
+    return low;
+}
+void ReadIndexBuffer(Core::MemoryManager& memory, VAddr address, u32 capacity, u32 bytes,
+                     AmdGpu::IndexSwapMode swap, u32 prefix, std::span<u32> output,
+                     const auto& read) {
+    std::ranges::fill(output, 0);
+    if (!capacity || output.empty())
+        return;
+    const u32 unit = swap == AmdGpu::IndexSwapMode::None ? bytes :
+                     swap == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, bytes) : 4;
+    const u64 size = (u64(output.size()) * bytes + prefix + unit - 1) & ~u64(unit - 1);
+    std::vector<u8> packed(size);
+    address -= prefix;
+    const auto count = MappedIndexCount(
+        memory, address, (u64(std::min<u64>(capacity, output.size())) * bytes + prefix + unit - 1) /
+                             unit * (unit / bytes), bytes);
+    read(address, std::span<u8>{packed.data(), u64(count) * bytes});
+    SwapIndexBytes(packed, swap);
+    for (u32 i = 0; i < std::min<u64>(output.size(), capacity); ++i)
+        std::memcpy(&output[i], packed.data() + prefix + u64(i) * bytes, bytes);
+}
 std::vector<ResourceCache::Range> ResolveBacking(Core::MemoryManager& memory, VAddr address,
                                                  u64 size) {
     if (!Core::MemoryManager::tls_in_guest_copy_scope)
@@ -323,7 +365,9 @@ std::vector<ResourceCache::Range> ResolveBacking(Core::MemoryManager& memory, VA
     std::vector<Core::MemoryManager::BackingSpan> spans((size + 4095) / 4096 + 1);
     const u32 count = memory.ResolveBackingSpans(address, size, spans.data(), spans.size(), false);
     if (!count)
-        throw std::runtime_error("Guest GPU range lacks mapped physical backing");
+        throw std::runtime_error(fmt::format(
+            "Guest GPU range lacks mapped physical backing: address={:#x} size={:#x}",
+            address, size));
     std::vector<ResourceCache::Range> result;
     u64 total{};
     for (u32 i = 0; i < count; ++i) {
@@ -452,14 +496,8 @@ Rasterizer::Rasterizer(AmdGpu::Liverpool& gpu, Core::MemoryManager& manager)
                                                     : std::nullopt;
                        },
                        [this](VAddr first, u64 first_size, VAddr second, u64 second_size) {
-                           const auto a = ResolveBacking(memory, first, first_size);
-                           const auto b = ResolveBacking(memory, second, second_size);
-                           for (const auto& left : a)
-                               for (const auto& right : b)
-                                   if (left.address < right.address + right.size &&
-                                       right.address < left.address + left.size)
-                                       return true;
-                           return false;
+                           return memory.BackingRangesOverlap(first, first_size, second,
+                                                               second_size);
                        });
     D3D12_FEATURE_DATA_D3D12_OPTIONS13 options{};
     alpha_blend_factor_supported =
@@ -711,9 +749,12 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         throw std::runtime_error("Guest raster sample count exceeds D3D12 limits");
     if (draw.samples > 1) {
         const auto& values = regs.reg_array;
-        const u32 iterations = 1u << ((values[0xa201] >> 4) & 7);
+        const u32 iterations = (values[0xa293] & (1u << 16))
+                                   ? 1u << ((values[0xa201] >> 4) & 7)
+                                   : 1u;
         if (iterations > draw.samples)
             throw std::runtime_error("Guest sample shading iterations exceed guest samples");
+        draw.sample_iterations = iterations;
         draw.sample_shading = iterations > 1;
         draw.alpha_to_coverage =
             (values[0xa2dc] & 1) && !regs.depth_shader_control.alpha_to_mask_disable;
@@ -1368,7 +1409,23 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         const VAddr base = regs.index_base_address.Address();
         if (base > UINT64_MAX - u64(index_offset) * size)
             throw std::runtime_error("Guest index buffer address overflow");
+        draw.index_buffer_bound = true;
         draw.index_address = base + u64(index_offset) * size;
+        u32 capacity = indirect
+                           ? regs.max_index_size - std::min(regs.max_index_size, index_offset)
+                           : regs.max_index_size;
+        if (indirect && index_offset && capacity) {
+            const u64 end = std::min<u64>(regs.max_index_size, u64(index_offset) + draw.count);
+            const auto mapped = MappedIndexCount(memory, base, end, size);
+            capacity = std::min(capacity, mapped - std::min(mapped, index_offset));
+        }
+        const u32 logical_count = std::min(draw.count, capacity);
+        const u32 unit = regs.index_buffer_type.swap_mode == AmdGpu::IndexSwapMode::None ? size :
+                         regs.index_buffer_type.swap_mode == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, size) : 4;
+        const u64 read_count = (u64(logical_count) + unit / size - 1) / (unit / size) *
+                               (unit / size);
+        draw.index_read_count = MappedIndexCount(memory, draw.index_address, read_count, size);
+        draw.index_capacity = std::min(logical_count, draw.index_read_count);
         draw.index_format = size == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
         draw.index_swap = regs.index_buffer_type.swap_mode;
         draw.base_vertex = indirect ? indirect->base_vertex : regs.index_offset;
@@ -1518,29 +1575,36 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             draw.expansion = GpuCommands::Expansion{9, draw.count, draw.count, false};
         }
     }
+    const auto read_indices = [&](std::span<u32> output) {
+        const u32 bytes = draw.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+        const u32 unit = draw.index_swap == AmdGpu::IndexSwapMode::None ? bytes :
+                         draw.index_swap == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, bytes) : 4;
+        const u32 prefix = indirect ? (u64(index_offset) * bytes) % unit : 0;
+        ReadIndexBuffer(memory, draw.index_address, draw.index_capacity, bytes, draw.index_swap,
+                        prefix, output, [&](VAddr address, std::span<u8> data) { Read(address, data); });
+    };
+    if (!convert && !draw.expansion && indexed && indirect &&
+        (draw.index_swap == AmdGpu::IndexSwapMode::Swap32 ||
+         draw.index_swap == AmdGpu::IndexSwapMode::SwapWord) &&
+        draw.index_format == DXGI_FORMAT_R16_UINT && (index_offset & 1)) {
+        if (draw.count > 4 * 1024 * 1024)
+            throw std::runtime_error("Guest index conversion exceeds upload budget");
+        draw.converted_indices.resize(draw.count);
+        read_indices(draw.converted_indices);
+    }
     if (convert && !draw.expansion) {
         if (draw.count > 4 * 1024 * 1024)
             throw std::runtime_error("Guest index conversion exceeds upload budget");
         std::vector<u32> indices(draw.count);
         if (indexed) {
-            if (draw.index_format == DXGI_FORMAT_R32_UINT) {
-                Read(draw.index_address,
-                     {reinterpret_cast<u8*>(indices.data()), indices.size() * sizeof(u32)});
-                SwapIndexBytes({reinterpret_cast<u8*>(indices.data()), indices.size() * 4},
-                               regs.index_buffer_type.swap_mode);
-            } else {
-                std::vector<u16> packed(draw.count);
-                Read(draw.index_address,
-                     {reinterpret_cast<u8*>(packed.data()), packed.size() * sizeof(u16)});
-                SwapIndexBytes({reinterpret_cast<u8*>(packed.data()), packed.size() * 2},
-                               regs.index_buffer_type.swap_mode);
-                std::copy(packed.begin(), packed.end(), indices.begin());
-            }
+            read_indices(indices);
         } else {
             for (u32 i = 0; i < draw.count; ++i)
                 indices[i] = i;
             draw.base_vertex = draw.first_vertex;
         }
+        if (indexed)
+            std::fill(indices.begin() + draw.index_capacity, indices.end(), 0);
         const auto restart = indexed && regs.enable_primitive_restart
                                  ? std::optional<u32>{regs.primitive_restart_index}
                                  : std::nullopt;
@@ -1722,15 +1786,10 @@ void Rasterizer::DrawIndirectImpl(bool indexed, VAddr address, u32 offset, u32 s
                 total += spans[index].size;
             return total == size;
         };
-        if (capacity && capacity <= 4 * 1024 * 1024 && last + bytes <= 16 * 1024 * 1024 &&
-            mapped(first, last + bytes) && (!count_address || mapped(count_address, 4)) &&
-            (!indexed || mapped(liverpool.regs.index_base_address.Address(),
-                                u64(capacity) * (liverpool.regs.index_buffer_type.index_type ==
-                                                         AmdGpu::IndexType::Index16
-                                                     ? 2
-                                                     : 4)))) {
+        if (capacity <= 4 * 1024 * 1024 && last + bytes <= 16 * 1024 * 1024 &&
+            mapped(first, last + bytes) && (!count_address || mapped(count_address, 4))) {
             try {
-                IndirectDraw draw{capacity, 1, 0, 0, 0, vertex_sgpr, instance_sgpr};
+                IndirectDraw draw{std::max(1u, capacity), 1, 0, 0, 0, vertex_sgpr, instance_sgpr};
                 draw.gpu = GpuCommands::Arguments{first, count_address, stride, count, indexed};
                 DrawImpl(indexed, 0, draw);
                 return;

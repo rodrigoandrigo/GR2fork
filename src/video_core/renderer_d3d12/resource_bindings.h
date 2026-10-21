@@ -36,7 +36,7 @@ public:
     void Bind(ID3D12GraphicsCommandList* commands, bool graphics, u32 resource_slot,
               u32 sampler_slot);
     void ValidateInputRange(VAddr address, u64 size) const;
-    void ValidateTargetRange(VAddr address, u64 size) const;
+    void ValidateTargetRange(VAddr address, u64 size, bool written = true) const;
     std::vector<ResourceCache::Range> AccessRanges(VAddr border_colors) const;
 
 private:

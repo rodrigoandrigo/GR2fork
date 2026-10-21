@@ -307,6 +307,45 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
     return num_spans;
 }
 
+bool MemoryManager::BackingRangesOverlap(VAddr first, u64 first_size, VAddr second,
+                                         u64 second_size) {
+    if (!first_size || !second_size || first > UINT64_MAX - first_size ||
+        second > UINT64_MAX - second_size)
+        return false;
+    std::shared_lock lock{mutex, std::defer_lock};
+    if (!tls_in_guest_copy_scope)
+        lock.lock();
+    const auto visit = [&](VAddr address, u64 size, const auto& overlaps) {
+        const VAddr end = address + size;
+        auto vma = vma_map.upper_bound(address);
+        if (vma != vma_map.begin())
+            --vma;
+        for (; vma != vma_map.end() && vma->first < end; ++vma) {
+            const auto& area = vma->second;
+            if (!HasPhysicalBacking(area) || area.base + area.size <= address)
+                continue;
+            const auto begin = std::max(address, area.base) - area.base;
+            const auto limit = std::min(end, area.base + area.size) - area.base;
+            auto physical = area.phys_areas.upper_bound(begin);
+            if (physical != area.phys_areas.begin())
+                --physical;
+            for (; physical != area.phys_areas.end() && physical->first < limit; ++physical) {
+                const auto start = std::max(begin, u64{physical->first});
+                const auto stop = std::min(limit, physical->first + physical->second.size);
+                if (start < stop && overlaps(physical->second.base + start - physical->first,
+                                              stop - start))
+                    return true;
+            }
+        }
+        return false;
+    };
+    return visit(first, first_size, [&](PAddr left, u64 left_size) {
+        return visit(second, second_size, [&](PAddr right, u64 right_size) {
+            return left < right + right_size && right < left + left_size;
+        });
+    });
+}
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const auto image_access = gpu_image_tracking.load(std::memory_order_acquire) &&
                                       gpu_access_memory != this && rasterizer

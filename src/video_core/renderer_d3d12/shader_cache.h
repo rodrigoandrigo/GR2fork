@@ -65,7 +65,8 @@ public:
                                                 Shader::RuntimeInfo runtime);
     PreparedShader Prepare(std::unique_ptr<TranslatedShader> translated,
                            Shader::Backend::Bindings bindings,
-                           std::span<const ShaderResourceRange> stage_resources);
+                           std::span<const ShaderResourceRange> stage_resources,
+                           const IndexFetch& indices = {});
     PreparedShader Prepare(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                            Shader::Backend::Bindings bindings);
     CompiledShader Finalize(PreparedShader& shader, bool flip_y, bool sample_mask,

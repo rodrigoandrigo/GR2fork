@@ -261,6 +261,8 @@ Id EmitFPExp2(EmitContext& ctx, Id value);
 Id EmitFPPow(EmitContext& ctx, Id x, Id y);
 Id EmitFPLdexp(EmitContext& ctx, Id value, Id exp);
 Id EmitFPLog2(EmitContext& ctx, Id value);
+Id EmitFPDdx(EmitContext& ctx, Id value);
+Id EmitFPDdy(EmitContext& ctx, Id value);
 Id EmitFPRecip32(EmitContext& ctx, Id value);
 Id EmitFPRecip64(EmitContext& ctx, Id value);
 Id EmitFPRecipSqrt32(EmitContext& ctx, Id value);
@@ -435,7 +437,7 @@ Id EmitImageHandle(EmitContext& ctx, Id, Id);
 Id EmitImageSampleRaw(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address1, Id address2,
                       Id address3, Id address4);
 Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id bias,
-                              const IR::Value& offset);
+                              const IR::Value& offset, const IR::Value& lod_clamp);
 Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod,
                               const IR::Value& offset);
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,

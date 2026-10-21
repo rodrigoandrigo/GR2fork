@@ -121,6 +121,14 @@ Id EmitFPLog2(EmitContext& ctx, Id value) {
     return ctx.OpLog2(ctx.F32[1], value);
 }
 
+Id EmitFPDdx(EmitContext& ctx, Id value) {
+    return ctx.OpDPdx(ctx.F32[1], value);
+}
+
+Id EmitFPDdy(EmitContext& ctx, Id value) {
+    return ctx.OpDPdy(ctx.F32[1], value);
+}
+
 Id EmitFPRecip32(EmitContext& ctx, Id value) {
     return ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), value);
 }

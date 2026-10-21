@@ -135,6 +135,28 @@ void CommandRuntime::Draw(const DrawRequest& request) {
     ProfileSample(profile, "runtime_draw", 128, [&] { DrawImpl(request); });
 }
 void CommandRuntime::DrawImpl(const DrawRequest& request) {
+    const u32 sample_iterations = request.sample_iterations
+                                      ? request.sample_iterations
+                                      : request.sample_shading ? request.samples : 1u;
+    if (!std::has_single_bit(request.samples) || request.samples > 16 ||
+        !std::has_single_bit(sample_iterations) || sample_iterations > request.samples)
+        throw std::runtime_error("Invalid guest coverage/shading sample counts");
+    if (sample_iterations != 1 && sample_iterations != request.samples)
+        throw std::runtime_error(
+            "Guest partial sample shading requires grouped execution; full-rate replay changes side effects");
+    for (const auto& color : request.colors)
+        if (color.num_samples != request.samples)
+            throw std::runtime_error("Guest EQAA requires coverage-to-fragment mapping");
+    if (request.depth_image && request.depth_image->num_samples != request.samples)
+        throw std::runtime_error("Guest EQAA requires coverage-to-depth anchor mapping");
+    const u32 index_bytes = request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+    const u32 index_unit = request.index_swap == AmdGpu::IndexSwapMode::None ? index_bytes :
+                           request.index_swap == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, index_bytes) : 4;
+    const u32 index_source_count = std::min(
+        request.expansion ? request.source_index_count : request.count, request.index_capacity);
+    const u64 index_read_count = std::min<u64>(
+        (u64(index_source_count) + index_unit / index_bytes - 1) / (index_unit / index_bytes) *
+            (index_unit / index_bytes), request.index_read_count);
     std::scoped_lock lock{mutex};
     MaintainMemory();
     if (!contexts.empty()) {
@@ -179,8 +201,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             collect(request.vertex, request.vertex_runtime, true);
         if (request.geometry)
             collect(*request.geometry, request.geometry_runtime, false);
-        if (request.index_address)
-            reads.push_back({request.index_address, u64(request.expansion ? request.source_index_count : request.count) *
+        if (request.index_address || request.index_buffer_bound)
+            reads.push_back({request.index_address, u64(index_read_count) *
                 (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
         for (const auto& color : request.colors)
             writes.push_back({color.guest_address, color.guest_size});
@@ -253,6 +275,34 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         const auto ranges = GetShaderResourceRanges(translated->shader.info);
         stage_resources.insert(stage_resources.end(), ranges.begin(), ranges.end());
     }
+    IndexFetch index_fetch;
+    if (request.index_address || request.index_buffer_bound) {
+        const u32 bytes = request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+        const u64 size = u64(index_read_count) * bytes;
+        const bool feedback = std::ranges::any_of(stage_resources, [&](const auto& range) {
+            return range.written && resources.Aliases(request.index_address, size,
+                                                     range.address, range.size);
+        });
+        if (feedback) {
+            if (request.indirect)
+                throw GpuDrawFallback{};
+            if (request.expansion || !request.converted_indices.empty() ||
+                request.strip_cut != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED)
+                throw std::runtime_error(
+                    "D3D12 coherent index fetch with primitive conversion/restart is not implemented");
+            if (!size || size > 16ULL * 1024 * 1024 ||
+                (request.index_format != DXGI_FORMAT_R16_UINT &&
+                 request.index_format != DXGI_FORMAT_R32_UINT))
+                throw std::runtime_error("Invalid D3D12 coherent index range");
+            const u32 byte_xor = request.index_swap == AmdGpu::IndexSwapMode::Swap16 ? 1 :
+                                 request.index_swap == AmdGpu::IndexSwapMode::Swap32 ? 3 :
+                                 request.index_swap == AmdGpu::IndexSwapMode::SwapWord ? 2 : 0;
+            index_fetch = {request.index_address, u32(size), bytes, byte_xor,
+                           request.index_capacity};
+            stage_resources.push_back(
+                {request.index_address, size, Shader::SwStage::Vertex, false});
+        }
+    }
     if (translated_hull) {
         auto prepared_hull =
             shaders.Prepare(std::move(translated_hull), next_bindings, stage_resources);
@@ -272,7 +322,9 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     const auto compile_stage =
         [&](std::unique_ptr<TranslatedShader> translated, Shader::Backend::Bindings bindings,
             bool flip_y, bool sample_mask, bool sample_shading, bool depth_bounds, bool flip_x) {
-            auto prepared = shaders.Prepare(std::move(translated), bindings, stage_resources);
+            const auto indices = translated->shader.info.sw_stage == Shader::SwStage::Vertex
+                                     ? index_fetch : IndexFetch{};
+            auto prepared = shaders.Prepare(std::move(translated), bindings, stage_resources, indices);
             return shaders.Finalize(prepared, flip_y, sample_mask, sample_shading, nullptr, {},
                                     depth_bounds, flip_x);
         };
@@ -353,7 +405,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     }
     if (!request.fragment.code.empty()) {
         fragment.emplace(compile_stage(std::move(translated_fragment), end_bindings, false,
-                                       request.samples > 1, request.sample_shading,
+                                       request.samples > 1, sample_iterations > 1,
                                        request.depth_bounds, false));
         if (std::any_of(logic_formats.begin(), logic_formats.end(),
                         [](auto format) { return format != DXGI_FORMAT_UNKNOWN; }))
@@ -402,7 +454,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                               &sampler_descriptors,
                               coordinator != nullptr};
     Shader::Gcn::FetchShaderData fetch;
-    Shader::Gcn::ParseFetchShader(vertex.info, fetch);
+    if (!vertex.info.has_inline_fetch_shader)
+        Shader::Gcn::ParseFetchShader(vertex.info, fetch);
     std::vector<AmdGpu::Buffer> vertex_sharps;
     auto access_ranges = bindings.AccessRanges(request.border_colors);
     for (const auto& attribute : fetch.attributes) {
@@ -411,10 +464,10 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         access_ranges.push_back(
             {sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
     }
-    if (request.index_address)
+    if (request.index_address || request.index_buffer_bound)
         access_ranges.push_back(
             {request.index_address,
-             u64(request.expansion ? request.source_index_count : request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
+             u64(index_read_count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
     for (const auto& color : request.colors)
         access_ranges.push_back({color.guest_address, color.guest_size});
     if (request.depth_image) {
@@ -440,9 +493,9 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                                                     (indirect.indexed ? 20 : 16)});
         gpu_ranges.push_back({indirect.count_address, indirect.count_address ? 4u : 0u});
     }
-    if (request.expansion && request.index_address)
+    if (request.expansion && (request.index_address || request.index_buffer_bound))
         gpu_ranges.push_back(
-            {request.index_address, u64(request.source_index_count) *
+            {request.index_address, u64(index_read_count) *
                                         (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
     access_ranges.insert(access_ranges.end(), gpu_ranges.begin(), gpu_ranges.end());
     resources.BeginBatch();
@@ -450,8 +503,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     auto cpu_ranges = bindings.CpuRanges(request.border_colors);
     for (const auto& sharp : vertex_sharps)
         cpu_ranges.push_back({sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
-    if (request.index_address)
-        cpu_ranges.push_back({request.index_address, u64(request.expansion ? request.source_index_count : request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
+    if (request.index_address || request.index_buffer_bound)
+        cpu_ranges.push_back({request.index_address, u64(index_read_count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
     for (u32 i = 0; i < request.color_clear_buffers.size(); ++i) {
         const auto& buffer = request.color_clear_buffers[i];
         if (buffer.info.fast_clear && buffer.cmask_base_address)
@@ -485,10 +538,10 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         const u32 slot = request.color_slots[bound];
         if (slot >= 8 || bound >= request.color_base_slice.size())
             throw std::runtime_error("Invalid D3D12 guest color slot mapping");
-        if (info.num_samples != request.samples)
-            throw std::runtime_error(
-                "Guest raster and color sample counts require unsupported EQAA");
-        bindings.ValidateTargetRange(info.guest_address, info.guest_size);
+        bindings.ValidateTargetRange(
+            info.guest_address, info.guest_size,
+            request.blend.RenderTarget[request.blend.IndependentBlendEnable ? slot : 0]
+                    .RenderTargetWriteMask != 0);
         colors[slot] = &images.GetImage(
             info, ConvertFormat(info.pixel_format), D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             request.color_base_slice[bound], 0, logic_formats[slot] != DXGI_FORMAT_UNKNOWN,
@@ -499,24 +552,29 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         }
     }
     ImageCache::Image* depth{};
+    const bool depth_written =
+        (request.depth.DepthEnable && request.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL) ||
+        request.clear_depth;
+    const bool stencil_written =
+        (request.depth.StencilEnable && request.depth.StencilWriteMask != 0) || request.clear_stencil;
     if (request.depth_image) {
         if (request.depth_image->num_samples != request.samples)
             throw std::runtime_error("Guest raster and depth sample counts do not match");
         if (request.depth_image->guest_address) {
             bindings.ValidateTargetRange(request.depth_image->guest_address,
-                                         request.depth_image->guest_size);
+                                         request.depth_image->guest_size, depth_written);
         }
         if (request.depth_read_address) {
             bindings.ValidateTargetRange(request.depth_read_address,
-                                         request.depth_image->guest_size);
+                                         request.depth_image->guest_size, depth_written);
         }
         if (request.depth_image->stencil_addr) {
             bindings.ValidateTargetRange(request.depth_image->stencil_addr,
-                                         request.depth_image->stencil_size);
+                                         request.depth_image->stencil_size, stencil_written);
         }
         if (request.stencil_read_address) {
             bindings.ValidateTargetRange(request.stencil_read_address,
-                                         request.depth_image->stencil_size);
+                                         request.depth_image->stencil_size, stencil_written);
         }
         depth =
             &images.GetImage(*request.depth_image, ConvertFormat(request.depth_image->pixel_format),
@@ -644,7 +702,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         vertices.push_back({buffer, static_cast<UINT>(size), sharp.stride});
     }
     D3D12_INDEX_BUFFER_VIEW index_view{};
-    const bool indexed = request.expansion || request.index_address || !request.converted_indices.empty();
+    const bool indexed = request.expansion || request.index_address || request.index_buffer_bound || !request.converted_indices.empty();
     if (request.expansion) {
         index_view = {gpu_commands.Indices()->GetGPUVirtualAddress(), request.expansion->output_count * 4, DXGI_FORMAT_R32_UINT};
     } else if (!request.converted_indices.empty()) {
@@ -653,25 +711,32 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             upload_contents({reinterpret_cast<const u8*>(request.converted_indices.data()), size});
         index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(size),
                       DXGI_FORMAT_R32_UINT};
-    } else if (request.index_address) {
+    } else if ((request.index_address || request.index_buffer_bound) && !index_fetch.address) {
         if (request.index_format != DXGI_FORMAT_R16_UINT &&
             request.index_format != DXGI_FORMAT_R32_UINT)
             throw std::runtime_error("Invalid guest index format");
         const u64 size =
-            u64(request.expansion ? request.source_index_count : request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4);
-        if (!size || size > 16ULL * 1024 * 1024 || request.index_address > UINT64_MAX - size)
+            u64(index_read_count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4);
+        if (size > 16ULL * 1024 * 1024 || request.index_address > UINT64_MAX - size)
             throw std::runtime_error("Invalid D3D12 guest input buffer");
         bindings.ValidateInputRange(request.index_address, size);
-        if (request.index_swap == AmdGpu::IndexSwapMode::None) {
-            index_view = {upload_input(request.index_address, size), static_cast<UINT>(size), request.index_format};
+        if (!size) {
+            std::array<u32, 1> zero{};
+            auto* buffer = upload_contents({reinterpret_cast<const u8*>(zero.data()), sizeof(zero)});
+            index_view = {buffer->GetGPUVirtualAddress(), 0, request.index_format};
+        } else if (request.index_swap == AmdGpu::IndexSwapMode::None) {
+            index_view = {upload_input(request.index_address, size), static_cast<UINT>(std::min<u64>(size, u64(request.index_capacity) * index_bytes)),
+                          request.index_format};
         } else {
             const ResourceCache::Range range{request.index_address, size};
             SynchronizeBuffers({&range, 1}, false);
-            std::vector<u8> contents(size);
-            read(request.index_address, contents);
+            const u64 unit = request.index_swap == AmdGpu::IndexSwapMode::Swap16 ? 2 : 4;
+            std::vector<u8> contents((size + unit - 1) & ~(unit - 1));
+            read(request.index_address, {contents.data(), size});
             SwapIndexBytes(contents, request.index_swap);
             auto* buffer = upload_contents(contents);
-            index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(size), request.index_format};
+            index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(std::min<u64>(size, u64(request.index_capacity) * index_bytes)),
+                          request.index_format};
         }
     }
     std::vector<D3D12_ROOT_PARAMETER> parameters(2);
@@ -838,8 +903,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         else
             gpu_commands.RecordIndices(commands.Get(), *request.expansion,
                 gpu_views.empty() ? ResourceCache::View{} : gpu_views[0],
-                request.index_address ? (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4) : 0,
-                u32(request.index_swap));
+                (request.index_address || request.index_buffer_bound) ? (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4) : 0,
+                u32(request.index_swap), request.index_capacity, u32(index_read_count));
     }
     BeginGpuTiming();
     if (first_pipeline)
@@ -860,7 +925,6 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         ProfileSample(profile, "color_upload", 128,
                       [&] { images.Upload(*colors[i], commands.Get()); });
         images.Barrier(*colors[i], commands.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
-        colors[i]->written = true;
         color_handles[i] = rtv.Cpu(i);
         D3D12_RENDER_TARGET_VIEW_DESC view{};
         view.Format = desc.RTVFormats[i];
@@ -887,9 +951,6 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         if (clear_stencil && (request.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL)) {
             throw std::runtime_error("D3D12 guest stencil clear with read-only view");
         }
-        depth->written |= request.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL || clear_depth;
-        depth->stencil_written |=
-            (request.depth.StencilEnable && request.depth.StencilWriteMask != 0) || clear_stencil;
         depth_view = dsv.Cpu(0);
         D3D12_DEPTH_STENCIL_VIEW_DESC view{};
         view.Format = desc.DSVFormat;
@@ -943,7 +1004,9 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                                  depth ? &depth_view : nullptr);
     commands->OMSetBlendFactor(request.blend_factor.data());
     commands->OMSetStencilRef(request.stencil_ref);
-    if (indexed) {
+    if (index_fetch.address) {
+        commands->DrawInstanced(request.count, request.instances, 0, request.first_instance);
+    } else if (indexed) {
         commands->IASetIndexBuffer(&index_view);
         if (request.indirect)
             gpu_commands.Execute(commands.Get(), root.Get(), true, request.indirect->count);
@@ -957,6 +1020,15 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                                 request.first_instance);
     if (request.indirect) ++(coordinator ? coordinator : this)->async_statistics.gpu_draw_batches;
     if (request.expansion) ++(coordinator ? coordinator : this)->async_statistics.gpu_index_expansions;
+    for (u32 slot = 0; slot < colors.size(); ++slot)
+        if (colors[slot])
+            colors[slot]->written |=
+                request.blend.RenderTarget[request.blend.IndependentBlendEnable ? slot : 0]
+                    .RenderTargetWriteMask != 0;
+    if (depth) {
+        depth->written |= depth_written && depth->has_depth;
+        depth->stencil_written |= stencil_written && depth->has_stencil;
+    }
     resources.PrepareDownload(commands.Get());
     images.PrepareDownloads(commands.Get());
     EndGpuTiming();

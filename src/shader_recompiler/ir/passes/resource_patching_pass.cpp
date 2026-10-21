@@ -827,7 +827,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         if (explicit_lod) {
             return ir.ImageSampleExplicitLod(handle, coords, lod, offset, inst_info);
         }
-        return ir.ImageSampleImplicitLod(handle, coords, bias, offset, inst_info);
+        return ir.ImageSampleImplicitLod(handle, coords, bias, offset, inst_info, lod_clamp);
     }();
 
     auto converted = ApplyReadNumberConversionVec4(ir, texel, image.GetNumberConversion());

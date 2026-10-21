@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <map>
 #include <stdexcept>
 #include <winrt/base.h>
+#include "video_core/renderer_d3d12/image_buffer_alias.h"
 
 namespace D3D12 {
 namespace {
@@ -226,21 +228,29 @@ void ResourceBindings::ValidateInputRange(VAddr address, u64 size) const {
         }
     }
 }
-void ResourceBindings::ValidateTargetRange(VAddr address, u64 size) const {
+void ResourceBindings::ValidateTargetRange(VAddr address, u64 size, bool written) const {
     if (address > UINT64_MAX - size)
         throw std::runtime_error("Guest render target range overflow");
     for (u32 i = 0; i < entries.size(); ++i) {
         const auto& entry = entries[i];
-        if (Aliases(address, size, guest_ranges[i].address, guest_ranges[i].size))
-            throw std::runtime_error(
-                "D3D12 render target/buffer alias requires coherent image access");
+        if (Aliases(address, size, guest_ranges[i].address, guest_ranges[i].size)) {
+            const auto& resource = entry.shader->info.buffers[entry.index];
+            if (written || resource.is_written ||
+                resource.buffer_type == Shader::BufferType::Strmout)
+                throw std::runtime_error(
+                    "D3D12 writable attachment/buffer feedback requires ordered access");
+        }
         if (entry.binding.kind == ResourceKind::Image) {
             const auto& resource = entry.shader->info.images[entry.index];
             const auto sharp = resource.GetSharp(entry.shader->info);
             if (sharp) {
                 const VideoCore::ImageInfo info{sharp, resource};
-                if (Aliases(address, size, info.guest_address, info.guest_size))
-                    throw std::runtime_error("D3D12 attachment feedback loop is not implemented");
+                const bool overlap =
+                    Aliases(address, size, info.guest_address, info.guest_size) ||
+                    Aliases(address, size, info.stencil_addr, info.stencil_size);
+                if (overlap && (written || resource.is_written))
+                    throw std::runtime_error(
+                        "D3D12 writable attachment/image feedback requires ordered access");
             }
         }
     }
@@ -413,7 +423,7 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
             } else if (resource.buffer_type == Shader::BufferType::SamplerTable) {
                 if (info.samplers.empty())
                     throw std::runtime_error("Missing guest sampler table for lowered sampling");
-                std::vector<u32> words(info.samplers.size() * 8, 0);
+                std::vector<u32> words(info.samplers.size() * SharedSamplerWords, 0);
                 for (u32 i = 0; i < info.samplers.size(); ++i) {
                     const auto sharp = info.samplers[i].GetSharp(info);
                     if (!sharp.Valid())
@@ -424,33 +434,45 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                     const u32 xy_linear = sharp.xy_min_filter == AmdGpu::Filter::Bilinear ? 1U : 0U;
                     const u32 z_linear = sharp.z_filter.Value() == 1U ? 1U : 0U;
                     u32 border = 0;
+                    std::array<float, 4> border_float{};
                     switch (sharp.border_color_type.Value()) {
                     case AmdGpu::BorderColor::TransparentBlack:
                         break;
                     case AmdGpu::BorderColor::OpaqueBlack:
                         border = 0xff000000u;
+                        border_float[3] = 1.f;
                         break;
                     case AmdGpu::BorderColor::White:
                         border = 0xffffffffu;
+                        border_float.fill(1.f);
                         break;
                     case AmdGpu::BorderColor::Custom: {
                         const u64 offset = sharp.border_color_ptr.Value() * 16;
                         if (!border_colors || border_colors > UINT64_MAX - offset - 16)
                             throw std::runtime_error("Invalid guest custom sampler border table");
-                        std::array<float, 4> color{};
                         read(border_colors + offset,
-                             {reinterpret_cast<u8*>(color.data()), sizeof(color)});
-                        for (u32 c = 0; c < 4; ++c)
-                            border |= u32(std::clamp(std::lround(color[c] * 255.f), 0L, 255L))
-                                      << (c * 8);
+                             {reinterpret_cast<u8*>(border_float.data()), sizeof(border_float)});
                         break;
                     }
                     }
-                    words[i * 8] = u32(sharp.clamp_x.Value()) | u32(sharp.clamp_y.Value()) << 3 |
+                    const u32 entry = i * SharedSamplerWords;
+                    words[entry] = u32(sharp.clamp_x.Value()) | u32(sharp.clamp_y.Value()) << 3 |
                                    u32(sharp.clamp_z.Value()) << 6 | xy_linear << 9 |
                                    z_linear << 10 | u32(sharp.depth_compare_func.Value()) << 11 |
                                    (sharp.trunc_coord ? 1U << 14 : 0U);
-                    words[i * 8 + 1] = border;
+                    words[entry + 1] = border;
+                    words[entry + 2] = std::bit_cast<u32>(sharp.MinLod());
+                    words[entry + 3] = std::bit_cast<u32>(sharp.MaxLod());
+                    words[entry + 4] = std::bit_cast<u32>(sharp.LodBias());
+                    words[entry + 5] = u32(sharp.xy_mag_filter.Value()) |
+                                      (u32(sharp.xy_min_filter.Value()) << 2) |
+                                      (u32(sharp.mip_filter.Value()) << 4) |
+                                      (u32(sharp.filter_mode.Value()) << 6) |
+                                      (u32(sharp.max_aniso.Value()) << 8) |
+                                      (u32(sharp.z_filter.Value()) << 11);
+                    for (u32 c = 0; c < 4; ++c)
+                        words[entry + 6 + c] = std::bit_cast<u32>(border_float[c]);
+                    std::memcpy(words.data() + entry + 12, &sharp, sizeof(sharp));
                 }
                 const u64 identity = 0xfff8000000000000ULL + (u64(info.sw_stage) << 32);
                 view = {&buffers.GetHostBuffer(identity, {reinterpret_cast<const u8*>(words.data()),

@@ -238,6 +238,8 @@ public:
     [[nodiscard]] F32 FPSin(const F32& value);
     [[nodiscard]] F32 FPExp2(const F32& value);
     [[nodiscard]] F32 FPLog2(const F32& value);
+    [[nodiscard]] F32 FPDdx(const F32& value);
+    [[nodiscard]] F32 FPDdy(const F32& value);
     [[nodiscard]] F32 FPPow(const F32& x, const F32& y);
     [[nodiscard]] F32 FPLdexp(const F32& value, const U32& exp);
     [[nodiscard]] F32F64 FPRecip(const F32F64& value);
@@ -385,7 +387,7 @@ public:
 
     [[nodiscard]] Value ImageSampleImplicitLod(const Value& handle, const Value& body,
                                                const F32& bias, const Value& offset,
-                                               TextureInstInfo info);
+                                               TextureInstInfo info, const F32& lod_clamp = {});
 
     [[nodiscard]] Value ImageSampleExplicitLod(const Value& handle, const Value& body,
                                                const F32& lod, const Value& offset,

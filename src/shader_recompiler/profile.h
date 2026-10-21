@@ -34,6 +34,7 @@ struct Profile {
     bool support_fp32_signed_zero_inf_nan_preserve{};
     bool support_fp64_signed_zero_inf_nan_preserve{};
     bool supports_image_load_store_lod{};
+    bool supports_image_sample_min_lod{};
     bool supports_native_cube_calc{};
     bool supports_trinary_minmax{};
     bool supports_buffer_fp32_atomic_min_max{};
@@ -55,6 +56,8 @@ struct Profile {
     bool needs_image_load_feedback{};
     bool needs_subword_buffer_emulation{};
     bool needs_signed_atomic32_emulation{};
+    bool needs_inline_vertex_fetch{};
+    bool needs_unified_buffer_types{};
 
     bool operator==(const Profile&) const = default;
 };

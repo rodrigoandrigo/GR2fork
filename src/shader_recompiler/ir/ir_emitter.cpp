@@ -1146,6 +1146,14 @@ F32 IREmitter::FPLog2(const F32& value) {
     return Inst<F32>(Opcode::FPLog2, value);
 }
 
+F32 IREmitter::FPDdx(const F32& value) {
+    return Inst<F32>(Opcode::FPDdx, value);
+}
+
+F32 IREmitter::FPDdy(const F32& value) {
+    return Inst<F32>(Opcode::FPDdy, value);
+}
+
 F32 IREmitter::FPPow(const F32& x, const F32& y) {
     return Inst<F32>(Opcode::FPPow, x, y);
 }
@@ -2127,8 +2135,8 @@ Value IREmitter::ImageSampleRaw(const Value& image_handle, const Value& sampler_
 }
 
 Value IREmitter::ImageSampleImplicitLod(const Value& handle, const Value& coords, const F32& bias,
-                                        const Value& offset, TextureInstInfo info) {
-    return Inst(Opcode::ImageSampleImplicitLod, Flags{info}, handle, coords, bias, offset);
+                                        const Value& offset, TextureInstInfo info, const F32& lod_clamp) {
+    return Inst(Opcode::ImageSampleImplicitLod, Flags{info}, handle, coords, bias, offset, lod_clamp);
 }
 
 Value IREmitter::ImageSampleExplicitLod(const Value& handle, const Value& coords, const F32& lod,

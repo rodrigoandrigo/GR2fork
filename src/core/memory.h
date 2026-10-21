@@ -318,6 +318,8 @@ public:
     u32 ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out, u32 max_spans,
                             bool open_push_window);
 
+    bool BackingRangesOverlap(VAddr first, u64 first_size, VAddr second, u64 second_size);
+
     /// Called (if registered) before an unmap edits the address space, so the
     /// stream copy lane can drain jobs whose backing pointers would dangle.
     static void RegisterUnmapDrain(void (*drain)());

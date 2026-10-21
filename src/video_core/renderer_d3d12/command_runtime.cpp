@@ -393,11 +393,19 @@ std::shared_ptr<void> CommandRuntime::AcquireCpuAccess(VAddr address, u64 size, 
                 context->CompleteContext();
             static_cast<void>(context->AcquireCpuAccess(address, size, write));
         }
-    if (image_mapping_count.load() && image_mapping_ready.load())
+    const bool internal_access =
+        buffer_commands_open || recording_context || synchronizing_images || completing ||
+        std::ranges::any_of(contexts, [](const auto& context) {
+            return context->recording_context || context->buffer_commands_open ||
+                   context->synchronizing_images || context->completing;
+        });
+    if (image_mapping_count.load() && image_mapping_ready.load() && !internal_access)
         return AcquireMemoryMappingAccess();
     auto access = std::make_shared<CpuImageAccess>(*this);
     if (failed)
         throw std::runtime_error("CPU access to failed D3D12 image owner");
+    if (buffer_commands_open || recording_context || synchronizing_images || completing)
+        return access;
     const ResourceCache::Range range{address, size};
     SynchronizeBuffers({&range, 1}, write);
     SynchronizeImages({&range, 1}, write);
@@ -495,14 +503,21 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
     };
     std::vector<Tile> tiles;
     std::optional<CmaskAddress> address;
+    const u32 coverage_log2 = buffer.attrib.num_samples_log2;
+    if (buffer.info.compression &&
+        (!coverage_log2 || coverage_log2 > 3 ||
+         buffer.attrib.num_fragments_log2 != coverage_log2))
+        throw std::runtime_error("Unsupported D3D12 CMASK sample/fragment configuration");
+    const u32 expanded_code = buffer.info.compression ? (12u | coverage_log2) : 15u;
     for (u32 layer = buffer.BaseSlice(); layer < buffer.NumSlices(); ++layer) {
         const auto slice = std::span{metadata}.subspan(layer * slice_bytes, slice_bytes);
-        if (std::ranges::all_of(slice, [](u8 value) { return value == 0xff; }))
+        if (std::ranges::all_of(slice, [expanded_code](u8 value) {
+                return value == (expanded_code | (expanded_code << 4));
+            }))
             continue;
         if (!address) {
-            if (buffer.info.compression || buffer.info.dcc_enable || buffer.info.cmask_addr_type)
-                throw std::runtime_error(
-                    "D3D12 CMASK requires uncompressed non-TC-compatible color");
+            if (buffer.info.dcc_enable || buffer.info.cmask_addr_type)
+                throw std::runtime_error("D3D12 CMASK requires non-DCC non-TC-compatible color");
             address.emplace(buffer.Pitch(), buffer.Height(),
                             info.alt_tile ? AmdGpu::GetAltPipeConfig(buffer.GetTileMode())
                                           : AmdGpu::GetPipeConfig(buffer.GetTileMode()),
@@ -514,11 +529,13 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
             for (u32 x = 0; x < info.size.width; x += 8) {
                 const auto [byte, shift] = address->At(layer, x, y);
                 const u32 code = (metadata.at(byte) >> shift) & 15;
-                if (code != 0 && code != 15)
-                    throw std::runtime_error("Unsupported D3D12 CMASK tile code");
-                if (code == 0) {
+                const u32 clear_code = buffer.info.compression ? coverage_log2 : 0u;
+                if (code != clear_code && code != expanded_code)
+                    throw std::runtime_error("Unsupported D3D12 CMASK color/FMASK tile state");
+                if (code == clear_code) {
                     tiles.push_back({layer, x, y});
-                    metadata[byte] |= 15u << shift;
+                    metadata[byte] = (metadata[byte] & ~(15u << shift)) |
+                                     (expanded_code << shift);
                 }
             }
     }

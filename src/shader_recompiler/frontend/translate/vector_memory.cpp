@@ -173,14 +173,20 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
         return IMAGE_ATOMIC(AtomicOp::Dec, inst);
 
     case Opcode::IMAGE_SAMPLE:
+    case Opcode::IMAGE_SAMPLE_CL:
+    case Opcode::IMAGE_SAMPLE_B_CL:
     case Opcode::IMAGE_SAMPLE_D:
+    case Opcode::IMAGE_SAMPLE_D_CL:
     case Opcode::IMAGE_SAMPLE_L:
     case Opcode::IMAGE_SAMPLE_B:
     case Opcode::IMAGE_SAMPLE_LZ:
     case Opcode::IMAGE_SAMPLE_C:
     case Opcode::IMAGE_SAMPLE_C_LZ:
     case Opcode::IMAGE_SAMPLE_O:
+    case Opcode::IMAGE_SAMPLE_CL_O:
+    case Opcode::IMAGE_SAMPLE_B_CL_O:
     case Opcode::IMAGE_SAMPLE_D_O:
+    case Opcode::IMAGE_SAMPLE_D_CL_O:
     case Opcode::IMAGE_SAMPLE_L_O:
     case Opcode::IMAGE_SAMPLE_B_O:
     case Opcode::IMAGE_SAMPLE_LZ_O:
@@ -646,7 +652,8 @@ IR::Value EmitImageSample(IR::IREmitter& ir, const GcnInst& inst, const IR::Scal
         info.gather_comp.Assign(std::bit_width(mimg.dmask) - 1);
         info.is_gather.Assign(true);
     } else {
-        info.has_derivatives.Assign(flags.test(MimgModifier::Derivative));
+        info.has_derivatives.Assign(flags.test(MimgModifier::Derivative) ||
+                                    flags.test(MimgModifier::CoarseDerivative));
     }
 
     // Load all dwords of T# and S#. We will use them as the handle that will guide

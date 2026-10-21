@@ -201,3 +201,43 @@ libSceGnmDriver. Registre modelo/firmware e todos os hashes para comparar o
 hardware com o emulador. Não foi compilado nem executado: SDK ausente neste
 ambiente. Esses hashes não medem desempenho nem comprovam a ausência de
 readbacks no emulador.
+
+O caso `COMMAND_DEPENDENCIES` também lê duas vezes os mesmos 12 bytes de
+`/app0/eboot.bin` para buffers locais da pilha após submeter comandos GPU.
+`CPU_STACK_FILE_COPY bytes=12 result=PASS` exige leituras completas e idênticas;
+a conclusão dos comandos e os aliases físicos continuam sendo verificados.
+Esse acesso CPU não deve exigir que a pilha seja um recurso GPU com backing
+Direct/Flexible/Pooled. Execute a fonte em PS4 físico e no emulador e registre
+as duas saídas. Essa extensão ainda não foi compilada nem executada em PS4.
+
+`READONLY_ATTACHMENT_FEEDBACK` usa um segundo color attachment com máscara de
+escrita zero e lê seu backing como textura `R32_FLOAT` no pixel shader. O primeiro
+attachment recebe vermelho 0,5; o backing lido e seu padding devem permanecer
+inalterados. Repete com alias virtual distinto. O draw é submetido uma vez e não
+escreve no attachment compartilhado. Essa extensão ainda não foi compilada nem
+executada em PS4; não valida feedback com escrita nem depth/stencil.
+
+`COHERENT_VERTEX_FETCH` grava três posições no vertex shader e as lê pelo fetch
+shader na mesma invocação, após `s_waitcnt`. Repete a leitura por alias virtual
+para o mesmo backing físico. Espera um quadrado verde de 16×16, as três posições
+no buffer e padding preservado. `COHERENT_INDEX_FETCH` usa índices 32 bits e um
+storage buffer sobre o mesmo backing; o VS grava a quarta palavra e incrementa
+um contador na quinta. Espera o mesmo quadrado, `12345678` na quarta palavra e
+contador 3. Repete com índice em alias físico. Os índices usados não são escritos
+simultaneamente: o caso evita uma corrida sem resultado definido e observa
+coerência do backing compartilhado e ausência de replay. As duas extensões ainda
+não foram compiladas nem executadas em PS4 por ausência do SDK OpenOrbis.
+
+`BOUNDED_INDEX_FETCH` mantém `INDEX_COUNT=3` e varia `MAX_SIZE` entre 0, 1, 2 e 3
+no pacote `DRAW_INDEX_2`, usando um alias físico para os índices. Somente capacidade
+3 deve produzir o quadrado; nos demais casos os índices ausentes são zero e a
+primitiva é degenerada. O contador do VS é observado entre 1 e 3, sem presumir
+reutilização exata pelo vertex cache. Não submete memória GPU desmapeada ao PS4.
+Esta extensão ainda não foi compilada nem executada em hardware.
+
+O grupo `CMASK_MSAA` acrescenta superfícies 2×/4×/8× com FMASK em memória,
+CMASK inicialmente expandido D/E/F e um tile em clear 1/2/3. Após eliminar o
+clear, conta os texels materializados e verifica a preservação dos outros
+texels e dos estados FMASK. É uma referência para comparação em PS4, ainda
+não compilada com OpenOrbis nem executada em hardware; não valida DCC, HTILE,
+TC-compatible ou leitura de FMASK por shaders.

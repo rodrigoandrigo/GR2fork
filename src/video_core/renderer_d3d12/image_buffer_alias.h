@@ -13,8 +13,17 @@ namespace Shader::IR {
 struct Program;
 }
 namespace D3D12 {
+inline constexpr u32 SharedSamplerWords = 16;
 struct CompiledShader;
 class ResourceCache;
+struct IndexFetch {
+    VAddr address{};
+    u32 size{}, element_size{}, byte_xor{};
+    u32 count{UINT32_MAX};
+    bool operator==(const IndexFetch&) const = default;
+};
+bool LowerIndexFetch(CompiledShader& shader, Shader::IR::Program& program,
+                     const IndexFetch& indices);
 struct ShaderResourceRange {
     VAddr address;
     u64 size;

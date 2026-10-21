@@ -34,7 +34,8 @@ public:
     void RecordDispatch(ID3D12GraphicsCommandList* list, const ResourceCache::View& input);
     void ExecuteDispatch(ID3D12GraphicsCommandList* list, ID3D12RootSignature* compute);
     void RecordIndices(ID3D12GraphicsCommandList* list, const Expansion& description,
-                       const ResourceCache::View& input, u32 index_bytes, u32 swap);
+                       const ResourceCache::View& input, u32 index_bytes, u32 swap,
+                       u32 readable_count = UINT32_MAX, u32 read_count = UINT32_MAX);
     ID3D12Resource* Indices() const { return indices.Get(); }
     void Execute(ID3D12GraphicsCommandList* list, ID3D12RootSignature* graphics, bool indexed,
                  u32 count);

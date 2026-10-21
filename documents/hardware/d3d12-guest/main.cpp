@@ -132,12 +132,24 @@ bool RunCommandDependencies(uint8_t *bytes, uint8_t *alias_bytes) {
   const int rc = sceGnmSubmitCommandBuffers(1, addresses, sizes, nullptr, nullptr);
   if (rc < 0)
     return false;
+  std::array<uint8_t, 12> stack_first{}, stack_second{};
+  bool stack_copy{};
+  if (auto *file = std::fopen("/app0/eboot.bin", "rb")) {
+    const auto first_read = std::fread(stack_first.data(), 1, stack_first.size(), file);
+    std::rewind(file);
+    const auto second_read = std::fread(stack_second.data(), 1, stack_second.size(), file);
+    std::fclose(file);
+    stack_copy = first_read == stack_first.size() && second_read == stack_second.size() &&
+                 stack_first == stack_second;
+  }
   for (uint32_t wait = 0; *fence != 2; ++wait) {
     if (wait == 10000)
       std::printf("COMMAND_DEPENDENCIES TIMEOUT; retaining submitted memory\n");
     sceKernelUsleep(1000);
   }
-  bool pass = *reinterpret_cast<volatile uint32_t *>(bytes + 0x240000) == 0x11223344;
+  std::printf("CPU_STACK_FILE_COPY bytes=12 result=%s\n", stack_copy ? "PASS" : "FAIL");
+  bool pass = stack_copy &&
+              *reinterpret_cast<volatile uint32_t *>(bytes + 0x240000) == 0x11223344;
   for (uint32_t i = 0; i < 8; ++i)
     pass &= *reinterpret_cast<volatile uint32_t *>(alias_bytes + 0x1c0000 + i * 0x10000) == 0x11223344;
   std::printf("COMMAND_DEPENDENCIES independent=8 alias_copy=%08x %s\n",
@@ -807,7 +819,9 @@ bool RunImageBufferAtomics(uint8_t *bytes) {
   return pass;
 }
 
-bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 0) {
+bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 0,
+                     bool readonly_feedback = false, bool coherent_fetch = false,
+                     bool coherent_indices = false, uint32_t index_capacity = 3) {
   auto *source = reinterpret_cast<volatile uint32_t *>(bytes + 0x40000);
   auto *target = reinterpret_cast<volatile uint32_t *>(bytes + 0x60000);
   for (uint32_t i = 0; i < 64 * 32; ++i)
@@ -860,12 +874,61 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
     vertex_length = sizeof(strip_vertex);
     pixel_length = sizeof(strip_pixel);
   }
+  if (readonly_feedback) {
+    source[0] = 0x3f000000;
+    vertex_length = sizeof(vertex) - 9 * sizeof(uint32_t);
+    std::memcpy(vs, vertex + 9, vertex_length);
+    const uint32_t reader[]{
+        vop1(1, 8, 128), vop1(1, 9, 128), vop1(1, 10, 128), vop1(1, 11, 128),
+        0xf0003100, 0x00000408, 0xbf8c0000,
+        vop1(1, 5, 128), vop1(1, 6, 128), vop1(1, 7, 242),
+        0xf800180f, 0x07060504, 0xbf810000};
+    pixel_length = sizeof(reader);
+    std::memcpy(ps, reader, pixel_length);
+  }
+  if (coherent_fetch) {
+    const uint32_t writer[]{
+        0xc0840300, vop2(26, 1, 129, 0), vop2(27, 1, 130, 1), vop2(27, 2, 130, 0),
+        vop1(6, 1, 257), vop1(6, 2, 258), vop2(8, 1, 244, 1), vop2(8, 2, 244, 2),
+        vop2(3, 1, 243, 1), vop2(3, 2, 243, 2), vop1(1, 3, 128), vop1(1, 4, 242),
+        0xe0782000, 0x80020100, 0xbf8c0f70, 0xbe802104,
+        0xf80008cf, 0x0b0a0908, 0xbf810000};
+    const uint32_t green[]{vop1(1, 0, 242), vop1(1, 1, 128),
+                           0xf800180f, 0x00010001, 0xbf810000};
+    vertex_length = sizeof(writer);
+    pixel_length = sizeof(green);
+    std::memcpy(vs, writer, vertex_length);
+    std::memcpy(ps, green, pixel_length);
+  }
+  if (coherent_indices) {
+    source[0] = 0;
+    source[1] = 1;
+    source[2] = 2;
+    source[4] = 0;
+    const uint32_t writer[]{
+        0xc0840300, vop2(26, 1, 129, 0), vop2(27, 1, 130, 1), vop2(27, 2, 130, 0),
+        vop1(6, 1, 257), vop1(6, 2, 258), vop2(8, 1, 244, 1), vop2(8, 2, 244, 2),
+        vop2(3, 1, 243, 1), vop2(3, 2, 243, 2), vop1(1, 3, 128), vop1(1, 4, 242),
+        vop1(1, 5, 128), vop1(1, 6, 255), 0x12345678,
+        0xe070100c, 0x80020605, vop1(1, 6, 129), 0xe0c81010, 0x80020605,
+        0xbf8c0f70, 0xf80008cf, 0x04030201, 0xbf810000};
+    const uint32_t green[]{vop1(1, 0, 242), vop1(1, 1, 128),
+                           0xf800180f, 0x00010001, 0xbf810000};
+    vertex_length = sizeof(writer);
+    pixel_length = sizeof(green);
+    std::memcpy(vs, writer, vertex_length);
+    std::memcpy(ps, green, pixel_length);
+  }
   const ShaderBinaryInfo vs_info{{'O', 'r', 'b', 'S', 'h', 'd', 'r'}, 1,
                                  vertex_length << 8,       0,
-                                 0x7374616765767300 + variant + (blend_case >= 13 ? 0x100 : 0),        0};
+                                 0x7374616765767300 + variant + (blend_case >= 13 ? 0x100 : 0) +
+                                     (readonly_feedback ? 0x200 : 0) + (coherent_fetch ? 0x400 : 0) +
+                                     (coherent_indices ? 0x800 : 0),        0};
   const ShaderBinaryInfo ps_info{{'O', 'r', 'b', 'S', 'h', 'd', 'r'}, 1,
                                  pixel_length << 8,        0,
-                                 0x7374616765707300 + variant + (blend_case >= 13 ? 0x100 : 0),        0};
+                                 0x7374616765707300 + variant + (blend_case >= 13 ? 0x100 : 0) +
+                                     (readonly_feedback ? 0x200 : 0) + (coherent_fetch ? 0x400 : 0) +
+                                     (coherent_indices ? 0x800 : 0),        0};
   std::memcpy(vs + 0x80, &vs_info, sizeof(vs_info));
   std::memcpy(ps + 0x80, &ps_info, sizeof(ps_info));
   uint64_t image[]{
@@ -879,6 +942,28 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
   image[0] = (uintptr_t(read_alias + 0x40000) >> 8) | (uint64_t(4) << 52) |
              (uint64_t(7) << 58);
   std::memcpy(ps_user, image, sizeof(image));
+  if (coherent_fetch || coherent_indices) {
+    auto *fetch = reinterpret_cast<uint32_t *>(bytes + 0x72000);
+    const uint32_t instructions[]{0xc0860304, 0xe00c2000, 0x80030800,
+                                  0xbf8c0f70, 0xbe802000};
+    std::memcpy(fetch, instructions, sizeof(instructions));
+    auto *table = reinterpret_cast<uint32_t *>(bytes + 0x72100);
+    const uint32_t descriptor[]{uint32_t(uintptr_t(source)),
+        uint32_t(uintptr_t(source) >> 32) | (16u << 16), 3,
+        4u | (5u << 3) | (6u << 6) | (7u << 9) | (7u << 12) | (14u << 15)};
+    std::memcpy(table, descriptor, sizeof(descriptor));
+    if (coherent_indices) {
+      table[1] = uint32_t(uintptr_t(source) >> 32);
+      table[2] = 20;
+    }
+    std::memcpy(table + 4, descriptor, sizeof(descriptor));
+    const uintptr_t alias_address = uintptr_t(read_alias + 0x40000);
+    table[4] = uint32_t(alias_address);
+    table[5] = uint32_t(alias_address >> 32) | (16u << 16);
+    const uintptr_t table_address = uintptr_t(table), fetch_address = uintptr_t(fetch);
+    std::memcpy(vs_user + 2, &table_address, sizeof(table_address));
+    std::memcpy(vs_user + 4, &fetch_address, sizeof(fetch_address));
+  }
   auto *words = reinterpret_cast<uint32_t *>(bytes + 0x30000);
   const int initialized = sceGnmDrawInitDefaultHardwareState350(words, 0x1000);
   if (initialized <= 0 || initialized > 0x1000)
@@ -938,6 +1023,14 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
   context(0xa31b, 0);
   context(0xa31c, 0x8028);
   context(0xa31d, 8);
+  if (readonly_feedback) {
+    context(0xa327, uint32_t(uintptr_t(source) >> 8));
+    context(0xa328, 7);
+    context(0xa329, 31);
+    context(0xa32a, 0);
+    context(0xa32b, 0x8710);
+    context(0xa32c, 8);
+  }
   const uint32_t blend = blend_case ? blend_case - 1 : 0;
   const uint32_t source_factor = blend & 1;
   const uint32_t destination_factor = (blend >> 1) & 1;
@@ -964,7 +1057,14 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
   }
   commands.Packet(0x79, {0x242, blend_case == 11 ? 0u : blend_case >= 13 ? 6u : 4u});
   commands.Packet(0x2f, {1});
-  commands.Packet(0x2d, {blend_case >= 13 ? 4u : 3u, 2});
+  if (coherent_indices) {
+    const uintptr_t index_address = uintptr_t(read_alias + 0x40000);
+    commands.Packet(0x2a, {1});
+    commands.Packet(0x27, {index_capacity, uint32_t(index_address),
+                            uint32_t(index_address >> 32), 3, 0});
+  } else {
+    commands.Packet(0x2d, {blend_case >= 13 ? 4u : 3u, 2});
+  }
   auto *fence = reinterpret_cast<volatile uint32_t *>(bytes + 0x20100);
   *fence = 0;
   const auto completion = uintptr_t(fence);
@@ -990,9 +1090,25 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
     for (uint32_t x = 0; x < 64; ++x) {
       const bool written = blend_case != 11 && blend_case < 13 &&
                            ((y == 0 && x < 3) || (y >= 16 && x < 16));
-      pass &= source[y * 64 + x] == (written ? 0x3f000000 : 0xdeadbeef);
+      const bool half = readonly_feedback ? (x == 0 && y == 0) : written;
+      uint32_t expected_source = half ? 0x3f000000 : 0xdeadbeef;
+      if (coherent_fetch) {
+        const uint32_t positions[]{0xbf800000, 0xbf800000, 0, 0x3f800000,
+                                   0x40400000, 0xbf800000, 0, 0x3f800000,
+                                   0xbf800000, 0x40400000, 0, 0x3f800000};
+        expected_source = y == 0 && x < 12 ? positions[x] : 0xdeadbeef;
+      }
+      if (coherent_indices) {
+        const uint32_t words[]{0, 1, 2, 0x12345678, 3};
+        expected_source = y == 0 && x < 5 ? words[x] : 0xdeadbeef;
+        if (index_capacity < 3 && y == 0 && x == 4) {
+          pass &= source[4] >= 1 && source[4] <= 3;
+          expected_source = source[4];
+        }
+      }
+      pass &= source[y * 64 + x] == expected_source;
       if (y < 16) {
-        uint32_t blended = 0xff000080;
+        uint32_t blended = coherent_fetch || coherent_indices ? 0xff00ff00 : 0xff000080;
         if (blend_case && blend_case <= 8) {
           const uint32_t source_color = source_factor ? 0xff000080 : 0;
           const uint32_t destination_color = destination_factor ? 0xdeadbeef : 0;
@@ -1016,27 +1132,38 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
           if (x == y && x < 16)
             continue;
         }
-        const uint32_t expected = x < 16 ? blended : 0xdeadbeef;
+        const uint32_t expected = x < 16 && (!coherent_indices || index_capacity >= 3)
+                                      ? blended : 0xdeadbeef;
         pass &= target[y * 64 + x] == expected;
         colored += x < 16 && target[y * 64 + x] == expected;
       }
     }
-  std::printf("STAGE_SHARING_VS_PS blend_case=%u virtual_alias=%u colored=%u padding=%s %s "
+  std::printf("STAGE_SHARING_VS_PS readonly_attachment=%u blend_case=%u virtual_alias=%u colored=%u padding=%s %s "
               "submit=%08x\n",
-              blend_case, variant, colored, pass ? "PASS" : "FAIL", pass ? "PASS" : "FAIL",
+              uint32_t(readonly_feedback), blend_case, variant, colored,
+              pass ? "PASS" : "FAIL", pass ? "PASS" : "FAIL",
               uint32_t(rc));
   return pass;
 }
 bool RunMixedCmask(uint8_t *bytes, uint32_t format = 10, uint32_t number = 0,
                    uint32_t swap = 0, uint32_t word0 = 0xff000080,
                    uint32_t word1 = 0, uint32_t pixel_bytes = 4,
-                   const uint8_t *expected_pixel = nullptr) {
+                   const uint8_t *expected_pixel = nullptr,
+                   uint32_t coverage_log2 = 0) {
   auto *target = reinterpret_cast<volatile uint8_t *>(bytes + 0x140000);
   auto *metadata = bytes + 0x150000;
-  for (uint32_t i = 0; i < 64 * 16 * pixel_bytes; ++i)
+  const uint32_t samples = 1u << coverage_log2;
+  const uint32_t expanded = coverage_log2 ? 12u | coverage_log2 : 15u;
+  const uint32_t target_bytes = coverage_log2 ? 512 * 256 * 4 * samples : 64 * 16 * pixel_bytes;
+  if (coverage_log2) {
+    target = bytes + 0x200000;
+    metadata = bytes + 0x700000;
+    std::memset(bytes + 0x600000, 0, 1024 * 1024);
+  }
+  for (uint32_t i = 0; i < target_bytes; ++i)
     target[i] = 0xee;
-  std::memset(metadata, 0xff, 2048);
-  metadata[0] = 0xf0;
+  std::memset(metadata, expanded | (expanded << 4), 2048);
+  metadata[0] = (expanded << 4) | coverage_log2;
   const auto vop1 = [](uint32_t op, uint32_t dst, uint32_t src) {
     return 0x7e000000u | (dst << 17) | (op << 9) | src;
   };
@@ -1125,11 +1252,17 @@ bool RunMixedCmask(uint8_t *bytes, uint32_t format = 10, uint32_t number = 0,
   for (uint32_t i = 0; i < 6; ++i)
     context(0xa10f + i, viewport[i]);
   context(0xa318, uint32_t(uintptr_t(target) >> 8));
-  context(0xa319, 7);
-  context(0xa31a, 15);
+  context(0xa319, coverage_log2 ? 63 | (63 << 20) : 7);
+  context(0xa31a, coverage_log2 ? 2047 : 15);
   context(0xa31b, 0);
-  context(0xa31c, 0xa000 | (format << 2) | (number << 8) | (swap << 11));
-  context(0xa31d, 8);
+  context(0xa31c, 0xa000 | (format << 2) | (number << 8) | (swap << 11) |
+                       (coverage_log2 ? 1u << 14 : 0));
+  context(0xa31d, coverage_log2 ? 14 | (14 << 5) | (coverage_log2 << 12) |
+                                   (coverage_log2 << 15) : 8);
+  if (coverage_log2) {
+    context(0xa321, uint32_t(uintptr_t(bytes + 0x600000) >> 8));
+    context(0xa322, coverage_log2 == 3 ? 4095 : 1023);
+  }
   context(0xa31f, uint32_t(uintptr_t(metadata) >> 8));
   context(0xa320, 15);
   context(0xa323, word0);
@@ -1157,6 +1290,22 @@ bool RunMixedCmask(uint8_t *bytes, uint32_t format = 10, uint32_t number = 0,
       sceKernelUsleep(1000);
     }
   bool pass = rc >= 0 && !timed_out;
+  if (coverage_log2) {
+    uint32_t cleared{};
+    for (uint32_t offset = 0; offset < target_bytes; offset += 4) {
+      uint32_t value{};
+      for (uint32_t i = 0; i < 4; ++i)
+        value |= uint32_t(target[offset + i]) << (i * 8);
+      cleared += value == word0;
+      pass &= value == word0 || value == 0xeeeeeeee;
+    }
+    pass &= cleared == 64 * samples;
+    for (uint32_t offset = 0; offset < 2048; ++offset)
+      pass &= metadata[offset] == (expanded | (expanded << 4));
+    std::printf("CMASK_MSAA samples=%u expanded=%x clear_pixels=%u %s\n",
+                samples, expanded, cleared, pass ? "PASS" : "FAIL");
+    return pass;
+  }
   uint32_t cleared{};
   const uint8_t original[]{0x80, 0, 0, 0xff};
   if (!expected_pixel)
@@ -1364,11 +1513,34 @@ int main() {
   const bool image_buffer_r16 = RunImageBufferWrites(bytes, 2);
   const bool image_buffer_alt = RunImageBufferWrites(bytes, 4, true);
   const bool image_buffer_alt_bank = RunImageBufferWrites(bytes, 4, true, 1);
-  const bool cmask_mixed = RunMixedCmask(bytes);
+  bool cmask_mixed = RunMixedCmask(bytes);
+  for (uint32_t coverage_log2 : {1u, 2u, 3u})
+    cmask_mixed &= RunMixedCmask(bytes, 10, 0, 0, 0xff000080, 0, 4, nullptr,
+                               coverage_log2);
   const bool typed_clears = RunTypedClears(bytes);
   const bool command_dependencies = RunCommandDependencies(bytes, alias_bytes);
+  const bool coherent_fetch = RunStageSharing(bytes, bytes, 0, false, true);
+  const bool coherent_fetch_alias = RunStageSharing(bytes, alias_bytes, 0, false, true);
+  std::printf("COHERENT_VERTEX_FETCH direct=%s alias=%s\n",
+              coherent_fetch ? "PASS" : "FAIL", coherent_fetch_alias ? "PASS" : "FAIL");
+  const bool coherent_indices = RunStageSharing(bytes, bytes, 0, false, false, true);
+  const bool coherent_indices_alias = RunStageSharing(bytes, alias_bytes, 0, false, false, true);
+  std::printf("COHERENT_INDEX_FETCH direct=%s alias=%s\n",
+              coherent_indices ? "PASS" : "FAIL", coherent_indices_alias ? "PASS" : "FAIL");
+  bool bounded_indices = true;
+  for (uint32_t capacity = 0; capacity < 4; ++capacity) {
+    const bool bounded = RunStageSharing(bytes, alias_bytes, 0, false, false, true, capacity);
+    std::printf("BOUNDED_INDEX_FETCH capacity=%u draw_count=3 %s\n", capacity,
+                bounded ? "PASS" : "FAIL");
+    bounded_indices &= bounded;
+  }
   const bool stage_sharing = RunStageSharing(bytes, bytes);
   const bool stage_sharing_alias = RunStageSharing(bytes, alias_bytes);
+  const bool readonly_attachment = RunStageSharing(bytes, bytes, 0, true);
+  const bool readonly_attachment_alias = RunStageSharing(bytes, alias_bytes, 0, true);
+  std::printf("READONLY_ATTACHMENT_FEEDBACK direct=%s alias=%s\n",
+              readonly_attachment ? "PASS" : "FAIL",
+              readonly_attachment_alias ? "PASS" : "FAIL");
   bool minmax_blend = true;
   for (uint32_t blend_case = 1; blend_case <= 14; ++blend_case)
     minmax_blend &= RunStageSharing(bytes, bytes, blend_case);
@@ -1412,7 +1584,10 @@ int main() {
                  image_buffer_writes && image_buffer_r8 && image_buffer_r16 &&
                  image_buffer_alt && image_buffer_alt_bank && image_residency &&
                  image_residency_alias && cmask_mixed && typed_clears &&
-                 stage_sharing && stage_sharing_alias && command_dependencies && minmax_blend && !timed_out && rc >= 0
+                 stage_sharing && stage_sharing_alias && coherent_fetch && coherent_fetch_alias &&
+                 coherent_indices && coherent_indices_alias && bounded_indices &&
+                 readonly_attachment &&
+                 readonly_attachment_alias && command_dependencies && minmax_blend && !timed_out && rc >= 0
              ? 0
              : 6;
 }

@@ -56,6 +56,7 @@ struct InfoPersistent {
 
     u8 mrt_mask{};
     bool has_fetch_shader{};
+    bool has_inline_fetch_shader{};
     bool has_bitwise_xor{};
     bool uses_dma{};
 

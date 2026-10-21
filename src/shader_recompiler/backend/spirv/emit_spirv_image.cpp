@@ -152,7 +152,7 @@ Id EmitImageSampleRaw(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address1,
 }
 
 Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id bias,
-                              const IR::Value& offset) {
+                              const IR::Value& offset, const IR::Value& lod_clamp) {
     RequireSampledReadOnly(ctx, handle);
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
@@ -163,6 +163,12 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Bias, bias);
     operands.AddOffset(ctx, texture.view_type, offset);
+    if (!lod_clamp.IsEmpty()) {
+        if (!ctx.profile.supports_image_sample_min_lod)
+            throw std::runtime_error("Image sample LOD clamp is unsupported by this profile");
+        ctx.AddCapability(spv::Capability::MinLod);
+        operands.Add(spv::ImageOperandsMask::MinLod, ctx.Def(lod_clamp));
+    }
     const Id sample = ctx.OpImageSampleImplicitLod(result_type, sampled_image, fixed_coords,
                                                    operands.mask, operands.operands);
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
@@ -314,6 +320,12 @@ Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id
     ImageOperands operands;
     operands.AddDerivatives(ctx, texture.view_type, derivatives_dx, derivatives_dy);
     operands.AddOffset(ctx, texture.view_type, offset);
+    if (!lod_clamp.IsEmpty()) {
+        if (!ctx.profile.supports_image_sample_min_lod)
+            throw std::runtime_error("Image gradient LOD clamp is unsupported by this profile");
+        ctx.AddCapability(spv::Capability::MinLod);
+        operands.Add(spv::ImageOperandsMask::MinLod, ctx.Def(lod_clamp));
+    }
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, fixed_coords,
                                                    operands.mask, operands.operands);
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
