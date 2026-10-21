@@ -160,6 +160,7 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     GuestCopyScope scope{this};
     auto access_lock = LockGpuAccess();
     const auto measured = getenv("GAME_PROFILE") != nullptr;
+    const auto requested_size = size;
     const auto start = std::chrono::steady_clock::now();
     const auto& backing_pages = impl.BackingPages();
     while (size) {
@@ -181,7 +182,7 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
                                  .count();
         if (elapsed > 5000)
             std::fprintf(stderr, "SPARSE_SLOW %llu bytes %llu us\n",
-                         static_cast<unsigned long long>(size),
+                         static_cast<unsigned long long>(requested_size),
                          static_cast<unsigned long long>(elapsed));
     }
 }

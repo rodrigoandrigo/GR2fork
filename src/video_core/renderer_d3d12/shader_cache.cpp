@@ -19,8 +19,12 @@
 #include "video_core/renderer_d3d12/image_buffer_alias.h"
 #include "video_core/renderer_d3d12/logic_op_format.h"
 #include "video_core/renderer_d3d12/resource_cache.h"
+#include "video_core/renderer_d3d12/profile.h"
 
 namespace D3D12 {
+namespace {
+Profile shader_profile;
+}
 struct ShaderVariant {
     struct Prepared {
         Shader::Backend::Bindings bindings;
@@ -511,6 +515,8 @@ std::unique_ptr<TranslatedShader> ShaderCache::Translate(Shader::ShaderParams pa
                 continue;
             translated->variant = variant;
             translated->params = params;
+            if (shader_profile.enabled)
+                shader_profile.Record("gcn_variant_hit", 128, 0);
             variant->used = ++variant_age;
             return translated;
         }
@@ -519,6 +525,7 @@ std::unique_ptr<TranslatedShader> ShaderCache::Translate(Shader::ShaderParams pa
 }
 std::unique_ptr<TranslatedShader> ShaderCache::TranslateUncached(Shader::ShaderParams params,
                                                                  Shader::RuntimeInfo runtime) {
+    ProfileScope timing{shader_profile, "gcn_translate", 16};
     const auto stage = static_cast<u32>(runtime.sw_stage);
     const auto input_runtime = runtime;
     if (!pools[stage])
@@ -719,16 +726,22 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     key.push_back(static_cast<u32>(words.size()));
     key.insert(key.end(), words.begin(), words.end());
     key.insert(key.end(), peer.begin(), peer.end());
-    if (const auto found = cache.find(key); found != cache.end())
+    if (const auto found = cache.find(key); found != cache.end()) {
+        if (shader_profile.enabled)
+            shader_profile.Record("spirv_ram_hit", 128, 0);
         return found->second;
+    }
     const auto disk_key = ShaderDiskKey(key);
     if (const auto bytes = persistent.Load(disk_key); !bytes.empty()) {
         if (auto binary = DecodeBinary(bytes)) {
+            if (shader_profile.enabled)
+                shader_profile.Record("spirv_disk_hit", 32, 0);
             Remember(std::move(key), binary);
             return binary;
         }
         persistent.Remove(disk_key);
     }
+    ProfileScope timing{shader_profile, "spirv_compile_miss", 16};
     spirv_cross::CompilerHLSL cross{words.data(), words.size()};
     const auto entries = cross.get_entry_points_and_stages();
     if (entries.size() != 1 || entries.front().execution_model != Model(stage))
@@ -836,6 +849,22 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     persistent.Store(disk_key, EncodeBinary(*result));
     Remember(std::move(key), result);
     return result;
+}
+void ShaderCache::TrimMemory(u64 target) {
+    for (auto& pool : pools)
+        pool.reset();
+    while (MemoryBytes() > target && !variants.empty()) {
+        const auto oldest = std::ranges::min_element(
+            variants, {}, [](const auto& variant) { return variant->used; });
+        variant_bytes -= (*oldest)->bytes;
+        variants.erase(oldest);
+    }
+    while (MemoryBytes() > target && !cache.empty()) {
+        const auto& oldest = *cache.begin();
+        cache_bytes -= oldest.first.size() * sizeof(u32) + oldest.second->dxil.size() +
+                       oldest.second->hlsl.size();
+        cache.erase(cache.begin());
+    }
 }
 void ShaderCache::Remember(std::vector<u32> key, std::shared_ptr<const ShaderBinary> result) {
     const size_t bytes_used = key.size() * sizeof(u32) + result->dxil.size() + result->hlsl.size();
@@ -1438,9 +1467,11 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileHlslRaw(
     }
     const DxcBuffer source{hlsl.data(), hlsl.size(), DXC_CP_UTF8};
     Microsoft::WRL::ComPtr<IDxcResult> compiled;
-    winrt::check_hresult(compiler->Compile(&source, arguments.data(),
-                                           static_cast<u32>(arguments.size()), nullptr,
-                                           IID_PPV_ARGS(&compiled)));
+    ProfileSample(shader_profile, "dxc_compile", 16, [&] {
+        winrt::check_hresult(compiler->Compile(&source, arguments.data(),
+                                             static_cast<u32>(arguments.size()), nullptr,
+                                             IID_PPV_ARGS(&compiled)));
+    });
     HRESULT status;
     winrt::check_hresult(compiled->GetStatus(&status));
     if (FAILED(status)) {

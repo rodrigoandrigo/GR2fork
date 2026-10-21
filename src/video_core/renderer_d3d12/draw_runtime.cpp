@@ -136,6 +136,65 @@ void CommandRuntime::Draw(const DrawRequest& request) {
 }
 void CommandRuntime::DrawImpl(const DrawRequest& request) {
     std::scoped_lock lock{mutex};
+    MaintainMemory();
+    if (!contexts.empty()) {
+        std::vector<ResourceCache::Range> writes, reads;
+        if (request.indirect) {
+            const auto& indirect = *request.indirect;
+            reads.push_back({indirect.address, u64(indirect.count - 1) * indirect.stride + (indirect.indexed ? 20 : 16)});
+            reads.push_back({indirect.count_address, indirect.count_address ? 4u : 0u});
+        }
+        const auto collect = [&](const Shader::ShaderParams& params,
+                                 const Shader::RuntimeInfo& state, bool vertex) {
+            if (params.code.empty())
+                return;
+            const auto translated = shaders.Translate(params, state);
+            const auto& info = translated->shader.info;
+            for (const auto& image : info.images) {
+                const VideoCore::ImageInfo image_info{image.GetSharp(info), image};
+                reads.push_back({image_info.guest_address, image_info.guest_size});
+            }
+            for (const auto& buffer : info.buffers) {
+                if (buffer.buffer_type != Shader::BufferType::Guest)
+                    continue;
+                const auto sharp = buffer.GetSharp(info);
+                const ResourceCache::Range range{
+                    sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)};
+                reads.push_back(range);
+                if (buffer.is_written)
+                    writes.push_back(range);
+            }
+            if (vertex) {
+                Shader::Gcn::FetchShaderData fetch;
+                Shader::Gcn::ParseFetchShader(info, fetch);
+                for (const auto& attribute : fetch.attributes) {
+                    const auto sharp = attribute.GetSharp(info);
+                    reads.push_back({sharp.base_address,
+                                     u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
+                }
+            }
+        };
+        collect(request.fragment, request.fragment_runtime, false);
+        if (!request.hull)
+            collect(request.vertex, request.vertex_runtime, true);
+        if (request.geometry)
+            collect(*request.geometry, request.geometry_runtime, false);
+        if (request.index_address)
+            reads.push_back({request.index_address, u64(request.expansion ? request.source_index_count : request.count) *
+                (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
+        for (const auto& color : request.colors)
+            writes.push_back({color.guest_address, color.guest_size});
+        if (request.depth_image) {
+            const auto& depth = *request.depth_image;
+            writes.push_back({depth.guest_address, depth.guest_size});
+            writes.push_back({depth.stencil_addr, depth.stencil_size});
+        }
+        auto& context = NextContext(writes, reads);
+        struct Scope { bool& active; ~Scope() { active = false; } } scope{context.recording_context};
+        context.recording_context = true;
+        context.DrawImpl(request);
+        return;
+    }
     strmout_filled = 0;
     if (failed)
         throw std::runtime_error(
@@ -324,7 +383,24 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             throw std::runtime_error(
                 "Guest depth-result color write gating requires side-effect-free shaders");
     }
-    ResourceBindings bindings{device, resources, images, stages, request.strmout};
+    PrepareContext(stages);
+    if (request.indirect &&
+        (request.geometry || request.hull || request.rectangles || request.clear_depth ||
+         request.clear_stencil || std::ranges::any_of(stages, [](const auto* stage) {
+             return std::ranges::any_of(stage->info.buffers,
+                                        [](const auto& buffer) { return buffer.is_written; }) ||
+                    std::ranges::any_of(stage->info.images,
+                                        [](const auto& image) { return image.is_written; });
+         })))
+        throw GpuDrawFallback{};
+    ResourceBindings bindings{device,
+                              resources,
+                              images,
+                              stages,
+                              request.strmout,
+                              &resource_descriptors,
+                              &sampler_descriptors,
+                              coordinator != nullptr};
     Shader::Gcn::FetchShaderData fetch;
     Shader::Gcn::ParseFetchShader(vertex.info, fetch);
     std::vector<AmdGpu::Buffer> vertex_sharps;
@@ -338,7 +414,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     if (request.index_address)
         access_ranges.push_back(
             {request.index_address,
-             u64(request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
+             u64(request.expansion ? request.source_index_count : request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
     for (const auto& color : request.colors)
         access_ranges.push_back({color.guest_address, color.guest_size});
     if (request.depth_image) {
@@ -355,13 +431,27 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         if (buffer.info.fast_clear && buffer.cmask_base_address)
             access_ranges.push_back({buffer.CmaskAddress(), (u64(buffer.cmask_slice.tile_max) + 1) *
                                                                 128 * buffer.NumSlices()});
+    std::vector<ResourceCache::Range> gpu_ranges;
+    if (request.indirect) {
+        const auto& indirect = *request.indirect;
+        if (!indirect.count || indirect.count > 4096)
+            throw std::runtime_error("Invalid D3D12 GPU indirect draw count");
+        gpu_ranges.push_back({indirect.address, u64(indirect.count - 1) * indirect.stride +
+                                                    (indirect.indexed ? 20 : 16)});
+        gpu_ranges.push_back({indirect.count_address, indirect.count_address ? 4u : 0u});
+    }
+    if (request.expansion && request.index_address)
+        gpu_ranges.push_back(
+            {request.index_address, u64(request.source_index_count) *
+                                        (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
+    access_ranges.insert(access_ranges.end(), gpu_ranges.begin(), gpu_ranges.end());
     resources.BeginBatch();
     BeginImages();
     auto cpu_ranges = bindings.CpuRanges(request.border_colors);
     for (const auto& sharp : vertex_sharps)
         cpu_ranges.push_back({sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
     if (request.index_address)
-        cpu_ranges.push_back({request.index_address, u64(request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
+        cpu_ranges.push_back({request.index_address, u64(request.expansion ? request.source_index_count : request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
     for (u32 i = 0; i < request.color_clear_buffers.size(); ++i) {
         const auto& buffer = request.color_clear_buffers[i];
         if (buffer.info.fast_clear && buffer.cmask_base_address)
@@ -376,6 +466,15 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         cpu_ranges.push_back({request.stencil_read_address, request.depth_image->stencil_size});
     }
     SynchronizeImages(cpu_ranges, true);
+    SynchronizeImages(gpu_ranges, true);
+    auto image_ranges = bindings.ImageRanges();
+    for (const auto& color : request.colors)
+        image_ranges.push_back({color.guest_address, color.guest_size});
+    if (request.depth_image) {
+        image_ranges.push_back({request.depth_image->guest_address, request.depth_image->guest_size});
+        image_ranges.push_back({request.depth_image->stencil_addr, request.depth_image->stencil_size});
+    }
+    SynchronizeBuffers(image_ranges, true);
     bindings.PrepareImages();
 
     std::array<ImageCache::Image*, 8> colors{};
@@ -446,6 +545,20 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
     for (u32 i = 0; i < request.color_clear_buffers.size(); ++i)
         MaterializeColorClearImpl(request.color_clear_buffers[i], request.colors[i]);
+    resources.PrepareViews(bindings.GuestRanges());
+    std::vector<ResourceCache::View> gpu_views;
+    if (request.indirect || request.expansion) {
+        resources.PrepareViews(gpu_ranges);
+        gpu_views = resources.GetViews(gpu_ranges);
+        for (const auto& view : gpu_views)
+            if (view.buffer && std::ranges::any_of(view.segments, [&](const auto& segment) {
+                    return segment.offset != view.offset + segment.address - view.guest_address;
+                }))
+                throw GpuDrawFallback{};
+        gpu_commands.Initialize(device, shaders);
+        gpu_commands.Prepare(request.indirect ? request.indirect->count : 0,
+                             request.expansion ? request.expansion->output_count : 0);
+    }
     u64 input_bytes{};
     const auto upload_contents = [&](std::span<const u8> contents) -> ID3D12Resource* {
         const u64 size = contents.size();
@@ -465,13 +578,35 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         input_resources.push_back(std::move(resource));
         return output;
     };
-    const auto upload_input = [&](VAddr address, u64 size) -> ID3D12Resource* {
+    inputs.BeginBatch();
+    struct InputUpload {
+        ResourceCache::View view;
+        bool copy;
+    };
+    std::vector<InputUpload> pending_inputs;
+    const auto upload_input = [&](VAddr address, u64 size) -> D3D12_GPU_VIRTUAL_ADDRESS {
         if (!size || size > 16ULL * 1024 * 1024 || address > UINT64_MAX - size)
             throw std::runtime_error("Invalid D3D12 guest input buffer");
         bindings.ValidateInputRange(address, size);
-        std::vector<u8> contents(size);
-        read(address, contents);
-        return upload_contents(contents);
+        const ResourceCache::Range range{address, size};
+        auto view = inputs.GetViews({&range, 1}).front();
+        if (!view.buffer || std::ranges::any_of(view.segments, [&](const auto& part) {
+                return part.offset != view.offset + part.address - address;
+            })) {
+            SynchronizeBuffers({&range, 1}, false);
+            std::vector<u8> contents(size);
+            read(address, contents);
+            return upload_contents(contents)->GetGPUVirtualAddress();
+        }
+        const bool copy = resources.CopyResident(address, size, *view.buffer, view.offset, nullptr);
+        if (!copy)
+            SynchronizeBuffers({&range, 1}, false);
+        const auto allocation = (size + 65535) & ~u64{65535};
+        if (input_bytes + allocation > 64ULL * 1024 * 1024)
+            throw std::runtime_error("D3D12 draw inputs exceed upload budget");
+        input_bytes += allocation;
+        pending_inputs.push_back({view, copy});
+        return view.buffer->native->GetGPUVirtualAddress() + view.offset;
     };
     if (fetch.attributes.size() > D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT)
         throw std::runtime_error("Guest fetch shader exceeds D3D12 input slots");
@@ -481,7 +616,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         const auto& attribute = fetch.attributes[index];
         const auto sharp = vertex_sharps[index];
         const u64 size = u64(sharp.num_records) * std::max<u32>(1, sharp.stride);
-        auto* buffer = upload_input(sharp.base_address, size);
+        const auto buffer = upload_input(sharp.base_address, size);
         u32 step{};
         switch (attribute.GetStepRate()) {
         case Shader::Gcn::VertexAttribute::None:
@@ -506,11 +641,13 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                             step ? D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
                                  : D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
                             step});
-        vertices.push_back({buffer->GetGPUVirtualAddress(), static_cast<UINT>(size), sharp.stride});
+        vertices.push_back({buffer, static_cast<UINT>(size), sharp.stride});
     }
     D3D12_INDEX_BUFFER_VIEW index_view{};
-    const bool indexed = request.index_address || !request.converted_indices.empty();
-    if (!request.converted_indices.empty()) {
+    const bool indexed = request.expansion || request.index_address || !request.converted_indices.empty();
+    if (request.expansion) {
+        index_view = {gpu_commands.Indices()->GetGPUVirtualAddress(), request.expansion->output_count * 4, DXGI_FORMAT_R32_UINT};
+    } else if (!request.converted_indices.empty()) {
         const auto size = request.converted_indices.size() * sizeof(u32);
         auto* buffer =
             upload_contents({reinterpret_cast<const u8*>(request.converted_indices.data()), size});
@@ -521,16 +658,21 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             request.index_format != DXGI_FORMAT_R32_UINT)
             throw std::runtime_error("Invalid guest index format");
         const u64 size =
-            u64(request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4);
+            u64(request.expansion ? request.source_index_count : request.count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4);
         if (!size || size > 16ULL * 1024 * 1024 || request.index_address > UINT64_MAX - size)
             throw std::runtime_error("Invalid D3D12 guest input buffer");
         bindings.ValidateInputRange(request.index_address, size);
-        std::vector<u8> contents(size);
-        read(request.index_address, contents);
-        SwapIndexBytes(contents, request.index_swap);
-        auto* buffer = upload_contents(contents);
-        index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(size),
-                      request.index_format};
+        if (request.index_swap == AmdGpu::IndexSwapMode::None) {
+            index_view = {upload_input(request.index_address, size), static_cast<UINT>(size), request.index_format};
+        } else {
+            const ResourceCache::Range range{request.index_address, size};
+            SynchronizeBuffers({&range, 1}, false);
+            std::vector<u8> contents(size);
+            read(request.index_address, contents);
+            SwapIndexBytes(contents, request.index_swap);
+            auto* buffer = upload_contents(contents);
+            index_view = {buffer->GetGPUVirtualAddress(), static_cast<UINT>(size), request.index_format};
+        }
     }
     std::vector<D3D12_ROOT_PARAMETER> parameters(2);
     parameters[0].ParameterType = parameters[1].ParameterType =
@@ -662,19 +804,44 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         LOG_INFO(Core, "[UWP stage] first graphics pipeline creation completed");
     auto& pipeline = cached.state;
     auto& root = cached.root;
-    D3D12DescriptorArena rtv, dsv;
-    rtv.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, false);
-    if (first_pipeline)
-        LOG_INFO(Core, "[UWP stage] first graphics RTV heap ready");
-    dsv.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
-    if (first_pipeline)
-        LOG_INFO(Core, "[UWP stage] first graphics DSV heap ready");
-    static_cast<void>(rtv.Allocate(8));
-    static_cast<void>(dsv.Allocate(1));
+    auto& rtv = color_descriptors;
+    auto& dsv = depth_descriptors;
     device.CheckResult(allocator->Reset(), L"Native graphics allocator Reset");
     if (first_pipeline)
         LOG_INFO(Core, "[UWP stage] first graphics allocator reset completed");
     device.CheckResult(commands->Reset(allocator.Get(), nullptr), L"Native graphics command list Reset");
+    buffer_commands_open = true;
+    struct BufferScope {
+        bool& open;
+        ~BufferScope() { open = false; }
+    } buffer_scope{buffer_commands_open};
+    for (const auto& input : pending_inputs) {
+        auto& buffer = *input.view.buffer;
+        if (!buffer.resident || !buffer.dirty.empty()) {
+            if (input.copy && resources.CopyResident(input.view.guest_address, input.view.size,
+                                                     buffer, input.view.offset, commands.Get())) {
+                buffer.resident = true;
+                buffer.dirty.clear();
+                buffer.snapshot.clear();
+            } else {
+                inputs.Upload(buffer, commands.Get());
+            }
+        }
+        inputs.Barrier(buffer, commands.Get(), D3D12_RESOURCE_STATE_GENERIC_READ);
+    }
+    if (request.indirect || request.expansion) {
+        for (const auto& view : gpu_views)
+            if (view.buffer)
+                resources.Upload(*view.buffer, commands.Get());
+        if (request.indirect)
+            gpu_commands.RecordArguments(commands.Get(), *request.indirect, gpu_views[0], gpu_views[1]);
+        else
+            gpu_commands.RecordIndices(commands.Get(), *request.expansion,
+                gpu_views.empty() ? ResourceCache::View{} : gpu_views[0],
+                request.index_address ? (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4) : 0,
+                u32(request.index_swap));
+    }
+    BeginGpuTiming();
     if (first_pipeline)
         LOG_INFO(Core, "[UWP stage] first graphics command list reset completed");
     RecordingGuard recording{failed};
@@ -778,32 +945,25 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     commands->OMSetStencilRef(request.stencil_ref);
     if (indexed) {
         commands->IASetIndexBuffer(&index_view);
-        commands->DrawIndexedInstanced(request.count, request.instances, 0, request.base_vertex,
-                                       request.first_instance);
-    } else
+        if (request.indirect)
+            gpu_commands.Execute(commands.Get(), root.Get(), true, request.indirect->count);
+        else
+            commands->DrawIndexedInstanced(request.count, request.instances, 0, request.base_vertex,
+                                           request.first_instance);
+    } else if (request.indirect)
+        gpu_commands.Execute(commands.Get(), root.Get(), false, request.indirect->count);
+    else
         commands->DrawInstanced(request.count, request.instances, request.first_vertex,
                                 request.first_instance);
+    if (request.indirect) ++(coordinator ? coordinator : this)->async_statistics.gpu_draw_batches;
+    if (request.expansion) ++(coordinator ? coordinator : this)->async_statistics.gpu_index_expansions;
     resources.PrepareDownload(commands.Get());
     images.PrepareDownloads(commands.Get());
+    EndGpuTiming();
     winrt::check_hresult(commands->Close());
     if (first_pipeline)
         LOG_INFO(Core, "[UWP stage] first graphics submission begin");
-    if (profile.enabled) {
-        const auto wait_start = std::chrono::steady_clock::now();
-        device.Wait(SubmitCommands());
-        const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now() - wait_start)
-                                .count();
-        if (waited > 3000)
-            std::fprintf(stderr, "WAIT_SLOW %llu us\n", static_cast<unsigned long long>(waited));
-    } else {
-        device.Wait(SubmitCommands());
-    }
-    if (first_pipeline)
-        LOG_INFO(Core, "[UWP stage] first graphics submission completed");
-    resources.CommitDownloads(bool(memory_access));
-    bindings.CommitGds(gds);
-    CompleteImages(bindings.CpuRanges(0, true));
+    FinishRecording(memory_access, bindings.GdsBuffer(), bindings.CpuRanges(0, true));
     recording.completed = true;
 }
 } // namespace D3D12

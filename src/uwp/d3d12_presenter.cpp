@@ -24,7 +24,7 @@ using Microsoft::WRL::ComPtr;
 namespace Core::Uwp {
 struct D3D12Presenter::Frame final : VideoCore::PresentationFrame {
     std::vector<u8> pixels;
-    D3D12Resource upload;
+    D3D12Resource upload, spatial_input;
     std::shared_ptr<VideoCore::ResidentFrame> resident;
     ComPtr<ID3D12Resource> source, converted;
     D3D12::TemporalJitter::Sample jitter;
@@ -95,13 +95,18 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
     frame->height = group.attrib.height;
     frame->format = group.attrib.pixel_format;
     frame->gamma = gamma.load();
+    D3D12::ProfileScope prepare_timing{presenter_profile, "presenter_prepare"};
     frame->resident = Core::Memory::Instance()->CapturePresentation(info);
     if (frame->resident) {
+        if (presenter_profile.enabled)
+            presenter_profile.Record("presenter_resident_bytes", 128, 0, frame->resident->bytes);
         if (first)
             LOG_INFO(Core, "[UWP stage] first resident VideoOut snapshot ready");
         frame->jitter = D3D12::NativeTemporalJitter().CompleteFrame();
         return frame;
     }
+    if (presenter_profile.enabled)
+        presenter_profile.Record("presenter_cpu_bytes", 128, 0, info.guest_size);
     std::vector<u8> guest(info.guest_size), linear(info.guest_size);
     {
         auto* memory = Core::Memory::Instance();
@@ -248,14 +253,16 @@ VideoCore::FrameHandle D3D12Presenter::PrepareBlankFrame(bool) {
     return std::make_shared<Frame>();
 }
 VideoCore::FrameHandle D3D12Presenter::PrepareLastFrame() {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
+                              [&] { return std::unique_lock{mutex}; });
     return last_frame;
 }
 void D3D12Presenter::Present(const VideoCore::FrameHandle& frame, bool, bool) {
     const auto native = std::dynamic_pointer_cast<Frame>(frame);
     if (!native)
         throw std::runtime_error("VideoOut frame belongs to another presentation backend");
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
+                              [&] { return std::unique_lock{mutex}; });
     last_frame = native;
     const bool first = !presented_frame && native->width && native->height;
     if (first)
@@ -270,12 +277,14 @@ bool D3D12Presenter::IsHDRSupported() const {
     return float_supported && hdr_display.load() && EmulatorSettings.IsHdrAllowed();
 }
 void D3D12Presenter::SetHDROutput(bool enabled, float white_nits) {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
+                              [&] { return std::unique_lock{mutex}; });
     hdr_display.store(enabled);
     sdr_white_nits = enabled && std::isfinite(white_nits) && white_nits > 0 ? white_nits : 80.0f;
 }
 void D3D12Presenter::SetHDR(bool enabled) {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
+                              [&] { return std::unique_lock{mutex}; });
     hdr_enabled = enabled;
 }
 void D3D12Presenter::SetGamma(float value) {
@@ -386,10 +395,12 @@ void D3D12Presenter::GetBuffers() {
 }
 
 void D3D12Presenter::Render() {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
+                              [&] { return std::unique_lock{mutex}; });
     ProfileSample(presenter_profile, "presenter_render", 128, [&] { RenderFrame(); });
 }
 void D3D12Presenter::ConvertResident(Frame& frame) {
+    D3D12::ProfileScope timing{presenter_profile, "presenter_convert"};
     if (frame.converted && frame.upload_hdr == hdr_enabled &&
         frame.upload_sdr_white == sdr_white_nits)
         return;
@@ -499,17 +510,34 @@ void D3D12Presenter::ConvertResident(Frame& frame) {
     frame.upload_sdr_white = sdr_white_nits;
 }
 void D3D12Presenter::RenderFrame() {
-    if (last_frame && last_frame->width && last_frame->height)
-        ResizeBuffers(last_frame->width, last_frame->height,
-                      last_frame->format == Libraries::VideoOut::PixelFormat::A16R16G16B16Float ||
-                              last_frame->format ==
-                                  Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq ||
-                              hdr_enabled
-                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                          : DXGI_FORMAT_R8G8B8A8_UNORM);
-    else
-        ResizeBuffers(display_width, display_height, hdr_enabled ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                                               : DXGI_FORMAT_R8G8B8A8_UNORM);
+    presenter_profile.Frame("present_interval");
+    D3D12::ProfileScope timing{presenter_profile, "present_frame"};
+    const bool has_frame_size = last_frame && last_frame->width && last_frame->height;
+    u32 output_width = has_frame_size ? last_frame->width : display_width;
+    u32 output_height = has_frame_size ? last_frame->height : display_height;
+    const bool floating_point = hdr_enabled ||
+        (last_frame &&
+         (last_frame->format == Libraries::VideoOut::PixelFormat::A16R16G16B16Float ||
+          last_frame->format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq));
+    bool upscale{};
+    if (last_frame && output_width && output_height && !floating_point &&
+        EmulatorSettings.IsFsrEnabled()) {
+        const float ratio = std::min(float(display_width) / output_width,
+                                     float(display_height) / output_height);
+        if (ratio > 1.f) {
+            const u32 target_width = std::max(output_width, u32(std::lround(output_width * ratio)));
+            const u32 target_height = std::max(output_height, u32(std::lround(output_height * ratio)));
+            if (D3D12::FsrPass::Supports(target_width, target_height)) {
+                output_width = target_width;
+                output_height = target_height;
+                upscale = true;
+            }
+        }
+    }
+    if (!upscale)
+        fsr.ResetImages();
+    ResizeBuffers(output_width, output_height, floating_point ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                              : DXGI_FORMAT_R8G8B8A8_UNORM);
     const float scale = std::min(float(display_width) / width, float(display_height) / height);
     const DXGI_MATRIX_3X2_F transform{
         scale / composition_scale_x, 0, 0, scale / composition_scale_y,
@@ -521,12 +549,51 @@ void D3D12Presenter::RenderFrame() {
     const auto index = swapchain->GetCurrentBackBufferIndex();
     D3D12CommandEncoder encoder{commands.Get(), transfers};
     encoder.Track(buffers[index].Get(), D3D12_RESOURCE_STATE_PRESENT);
+    ID3D12Resource* upscale_source{};
     if (last_frame && last_frame->resident) {
-        ConvertResident(*last_frame);
+        bool direct = !upscale && !floating_point && !hdr_enabled &&
+                      last_frame->format == Libraries::VideoOut::PixelFormat::A8B8G8R8Srgb &&
+                      last_frame->gamma == 1.0f;
+        if (direct) {
+            const auto components = ColorComponents(*last_frame, false);
+            for (u32 component = 0; component < 256; ++component)
+                direct &= u32(std::clamp(components[component] * 255 + 0.5f, 0.0f, 255.0f)) ==
+                          component;
+        }
         encoder.Transition(buffers[index].Get(), D3D12_RESOURCE_STATE_COPY_DEST);
-        commands->CopyResource(buffers[index].Get(), last_frame->converted.Get());
+        if (direct) {
+            if (!last_frame->source)
+                winrt::check_hresult(context.Device()->OpenSharedHandle(
+                    last_frame->resident->handle.get(), IID_PPV_ARGS(&last_frame->source)));
+            encoder.Track(last_frame->source.Get(), D3D12_RESOURCE_STATE_COMMON);
+            encoder.Transition(last_frame->source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+            source.pResource = last_frame->source.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            source.PlacedFootprint.Footprint = {format, last_frame->width, last_frame->height, 1,
+                                                last_frame->resident->row_pitch};
+            destination.pResource = buffers[index].Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+            encoder.Transition(last_frame->source.Get(), D3D12_RESOURCE_STATE_COMMON);
+            if (presenter_profile.enabled)
+                presenter_profile.Record("presenter_direct_bytes", 128, 0,
+                                         u64(width) * height * 4);
+        } else {
+            ConvertResident(*last_frame);
+            if (upscale)
+                upscale_source = last_frame->converted.Get();
+            else {
+                if (presenter_profile.enabled)
+                    presenter_profile.Record("presenter_copy_bytes", 128, 0,
+                                             u64(width) * height * (floating_point ? 8 : 4));
+                commands->CopyResource(buffers[index].Get(), last_frame->converted.Get());
+            }
+        }
     } else if (last_frame && !last_frame->pixels.empty()) {
-        const auto description = buffers[index]->GetDesc();
+        auto description = buffers[index]->GetDesc();
+        description.Width = last_frame->width;
+        description.Height = last_frame->height;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
         u64 bytes;
         context.Device()->GetCopyableFootprints(&description, 0, 1, 0, &footprint, nullptr, nullptr,
@@ -546,10 +613,10 @@ void D3D12Presenter::RenderFrame() {
             void* mapped;
             const D3D12_RANGE empty{0, 0};
             winrt::check_hresult(last_frame->upload->Map(0, &empty, &mapped));
-            for (u32 row = 0; row < height; ++row)
+            for (u32 row = 0; row < last_frame->height; ++row)
                 std::memcpy(static_cast<u8*>(mapped) + row * footprint.Footprint.RowPitch,
-                            pixels.data() + u64(row) * width * pixel_bytes,
-                            u64(width) * pixel_bytes);
+                            pixels.data() + u64(row) * last_frame->width * pixel_bytes,
+                            u64(last_frame->width) * pixel_bytes);
             const D3D12_RANGE contents{0, static_cast<SIZE_T>(bytes)};
             last_frame->upload->Unmap(0, &contents);
         }
@@ -558,23 +625,43 @@ void D3D12Presenter::RenderFrame() {
         source.pResource = last_frame->upload.Get();
         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint = footprint;
-        destination.pResource = buffers[index].Get();
+        if (upscale) {
+            if (!last_frame->spatial_input.Get())
+                winrt::check_hresult(resources.CreateTexture2D(
+                    description, D3D12_RESOURCE_STATE_COPY_SOURCE, last_frame->spatial_input));
+            encoder.Track(last_frame->spatial_input.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+            encoder.Transition(last_frame->spatial_input.Get(), D3D12_RESOURCE_STATE_COPY_DEST);
+        }
+        destination.pResource = upscale ? last_frame->spatial_input.Get() : buffers[index].Get();
         destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        if (upscale) {
+            encoder.Transition(last_frame->spatial_input.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+            upscale_source = last_frame->spatial_input.Get();
+        }
     } else {
         encoder.Transition(buffers[index].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
         encoder.ClearColor(buffers[index].Get(), descriptors.Cpu(index),
                            {0.025f, 0.035f, 0.05f, 1.0f});
     }
+    if (upscale_source) {
+        auto* filtered = fsr.Record(context.Device(), commands.Get(), upscale_source, width, height,
+                                   EmulatorSettings.IsRcasEnabled(),
+                                   EmulatorSettings.GetRcasAttenuation() / 1000.f);
+        commands->CopyResource(buffers[index].Get(), filtered);
+    }
     encoder.Transition(buffers[index].Get(), D3D12_RESOURCE_STATE_PRESENT);
     winrt::check_hresult(commands->Close());
     const auto ticket = context.Submit(commands.Get());
-    winrt::check_hresult(swapchain->Present(1, 0));
-    context.Wait(ticket);
+    ProfileSample(presenter_profile, "swapchain_present", 128,
+                  [&] { winrt::check_hresult(swapchain->Present(1, 0)); });
+    ProfileSample(presenter_profile, "presenter_fence_wait", 128,
+                  [&] { context.Wait(ticket); });
 }
 
 void D3D12Presenter::Resize(uint32_t new_width, uint32_t new_height, float scale_x, float scale_y) {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
+                              [&] { return std::unique_lock{mutex}; });
     if (!new_width || !new_height || !std::isfinite(scale_x) || !std::isfinite(scale_y) ||
         scale_x <= 0 || scale_y <= 0)
         return;
@@ -587,8 +674,37 @@ void D3D12Presenter::Resize(uint32_t new_width, uint32_t new_height, float scale
     composition_scale_y = scale_y;
     RenderFrame();
 }
+D3D12Presenter::~D3D12Presenter() {
+    try {
+        Drain();
+    } catch (...) {
+    }
+}
+u64 D3D12Presenter::MemoryBytes() const {
+    auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
+                              [&] { return std::unique_lock{mutex}; });
+    u64 bytes = resources.Stats().live_bytes + fsr.MemoryBytes() +
+                conversion_shaders.MemoryBytes() + frame_bytes->load();
+    for (const auto& buffer : buffers)
+        if (buffer) {
+            const auto description = buffer->GetDesc();
+            bytes += context.Device()->GetResourceAllocationInfo(0, 1, &description).SizeInBytes;
+        }
+    return bytes;
+}
+void D3D12Presenter::TrimMemory() {
+    auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
+                              [&] { return std::unique_lock{mutex}; });
+    if (!context.DirectQueue())
+        return;
+    context.WaitForGpu();
+    fsr.TrimMemory();
+    conversion_shaders.TrimMemory(0);
+    static_cast<void>(context.TryTrim());
+}
 void D3D12Presenter::Drain() {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
+                              [&] { return std::unique_lock{mutex}; });
     if (context.DirectQueue())
         context.WaitForGpu();
 }

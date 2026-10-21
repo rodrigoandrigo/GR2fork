@@ -1,12 +1,12 @@
-# D3D12 nativo: jitter temporal e staging sob demanda
+# API de jitter temporal do D3D12 nativo
 
-## Escopo
+Esta referência descreve o contrato de configuração e leitura de jitter. O
+estado do renderer, a alocação de recursos e as pendências ficam em
+[D3D12-RENDERER.md](D3D12-RENDERER.md).
 
-O renderer nativo agora e compilado e ligado a DLL pelo target
-shadps4_native_d3d12. O frontend usa Vulkan -> Dozen -> D3D12 por padrao e oferece D3D12 nativo
-experimental nas configuracoes, para o proximo inicio. Esta mudanca nao implementa
-os dispatches FSR/XeSS, vetores de movimento, separacao do HUD ou reconstrucao.
-O jitter permanece desativado ate um consumidor temporal configurar seu alvo.
+Jitter permanece desativado até que um consumidor temporal configure seu alvo.
+O FSR1 espacial existente não usa esse mecanismo. A API não implementa
+reconstrução temporal, motion vectors ou separação de HUD.
 
 ## Jitter
 
@@ -57,30 +57,3 @@ para que uma fila de apresentacao nao associe o jitter de outro frame a ele.
 Nao ativar jitter em producao sem o passe de reconstrucao temporal: jitter
 isolado desloca a amostragem, mas nao produz antialiasing temporal por si so.
 
-## Alocacao
-
-ResourceCache e ImageCache deixam de criar upload e readback para todo recurso
-na entrada do cache. Upload e criado na primeira transferencia efetiva, depois
-da comparacao com o snapshot; readback so e criado para recursos escritos.
-Os recursos de staging sao mantidos para reutilizacao enquanto a entrada existe.
-
-O budget de cada cache (256 MiB) inclui staging contabilizado pelo allocator e
-os bytes reais dos recursos DEFAULT retornados por GetResourceAllocationInfo.
-As verificacoes evitam subtracao sem sinal quando o budget ja esta excedido.
-A criacao de staging tambem aplica o budget. Entradas LRU anteriores, sem
-writeback pendente e fora do lote corrente, podem ser removidas. BeginBatch
-aguarda a GPU antes dessa reutilizacao; entradas referenciadas pelo lote em
-gravacao continuam protegidas. O limite de snapshots de imagens permanece.
-Nao ha promessa de substituir o limite de 5 GiB do processo nem de eliminar
-OOM quando o conjunto de trabalho ativo excede o budget.
-
-## Evidencia
-
-Build/native-temporal-memory-final.log: sequencia, fases, reset, alvo, pixels
-rasterizados lidos da GPU, staging de buffers sob demanda e remocao LRU.
-Build/native-temporal-full.log: mesma verificacao incluindo upload/readback
-real de ImageCache com dados preservados. Sao diagnosticos nativos PC em Build,
-sem novos testes de emulacao adicionados ao repositorio.
-Build/native-temporal-package-signed.log: compilacao e assinatura do pacote.
-O boot PC pelo Dozen valida regressao desse caminho, nao gameplay no backend
-nativo nem funcionamento de FSR/XeSS no Xbox.

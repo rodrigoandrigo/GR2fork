@@ -13,15 +13,20 @@ public:
     };
     ResourceBindings(D3D12DeviceContext& device, ResourceCache& buffers, ImageCache& images,
                      std::span<CompiledShader*> shaders,
-                     std::span<const StreamOutSlot> strmout_slots = {});
+                     std::span<const StreamOutSlot> strmout_slots = {},
+                     D3D12DescriptorArena* resource_heap = nullptr,
+                     D3D12DescriptorArena* sampler_heap = nullptr, bool fence_safe = false);
     void Upload(ID3D12GraphicsCommandList* commands, Shader::PushData& push,
                 std::span<const float, 24> clip_planes, VAddr border_colors,
                 const ResourceCache::Read& read, std::span<const u8, 65536> gds,
                 std::span<const u8> shared_memory = {});
     void PrepareImages();
+    std::span<const ResourceCache::Range> GuestRanges() const { return guest_ranges; }
+    std::vector<ResourceCache::Range> ImageRanges() const;
     std::vector<ResourceCache::Range> CpuRanges(VAddr border_colors,
                                                 bool written_only = false) const;
     void CommitGds(std::span<u8, 65536> gds);
+    ResourceCache::Buffer* GdsBuffer() const { return gds_buffer; }
     const std::vector<D3D12_DESCRIPTOR_RANGE>& ResourceRanges() const {
         return resource_ranges;
     }
@@ -47,7 +52,9 @@ private:
     std::vector<Entry> entries;
     std::vector<ResourceCache::Range> guest_ranges;
     std::vector<D3D12_DESCRIPTOR_RANGE> resource_ranges, sampler_ranges;
-    D3D12DescriptorArena resources, samplers;
+    D3D12DescriptorArena owned_resources, owned_samplers;
+    D3D12DescriptorArena& resources;
+    D3D12DescriptorArena& samplers;
     ResourceCache::Buffer* gds_buffer{};
 };
 } // namespace D3D12

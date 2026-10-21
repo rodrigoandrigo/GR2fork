@@ -73,8 +73,14 @@ DXGI_FORMAT TypelessFormat(DXGI_FORMAT format) {
 } // namespace
 ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& buffer_cache,
                                    ImageCache& image_cache, std::span<CompiledShader*> shaders,
-                                   std::span<const StreamOutSlot> strmout_slots)
-    : device{context}, buffers{buffer_cache}, images{image_cache} {
+                                   std::span<const StreamOutSlot> strmout_slots,
+                                   D3D12DescriptorArena* resource_heap,
+                                   D3D12DescriptorArena* sampler_heap, bool fence_safe)
+    : device{context}, buffers{buffer_cache}, images{image_cache},
+      resources{resource_heap ? *resource_heap : owned_resources},
+      samplers{sampler_heap ? *sampler_heap : owned_samplers} {
+    if (!fence_safe && (resource_heap || sampler_heap))
+        device.Wait(device.LastSignaledValue());
     u32 resource_count{}, sampler_count{}, strmout_used{};
     for (auto* shader : shaders) {
         for (const auto& binding : shader->binary->bindings) {
@@ -144,12 +150,18 @@ ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& b
     }
     if (resource_count > 512 || sampler_count > 128)
         throw std::runtime_error("Guest shader descriptor budget exceeded");
-    resources.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                         std::max(1u, resource_count), true);
-    samplers.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                        std::max(1u, sampler_count), true);
-    static_cast<void>(resources.Allocate(std::max(1u, resource_count)));
-    static_cast<void>(samplers.Allocate(std::max(1u, sampler_count)));
+    if (!resource_heap) {
+        resources.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                             std::max(1u, resource_count), true);
+        static_cast<void>(resources.Allocate(std::max(1u, resource_count)));
+    }
+    if (!sampler_heap) {
+        samplers.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                            std::max(1u, sampler_count), true);
+        static_cast<void>(samplers.Allocate(std::max(1u, sampler_count)));
+    }
+    static_cast<void>(resources.Cpu(std::max(1u, resource_count) - 1));
+    static_cast<void>(samplers.Cpu(std::max(1u, sampler_count) - 1));
 }
 bool ResourceBindings::Aliases(VAddr first, u64 first_size, VAddr second, u64 second_size) const {
     return buffers.Aliases(first, first_size, second, second_size);
@@ -177,6 +189,20 @@ std::vector<ResourceCache::Range> ResourceBindings::AccessRanges(VAddr border_co
         }
     }
     return ranges;
+}
+std::vector<ResourceCache::Range> ResourceBindings::ImageRanges() const {
+    std::vector<ResourceCache::Range> result;
+    for (const auto& entry : entries)
+        if (entry.binding.kind == ResourceKind::Image) {
+            const auto& resource = entry.shader->info.images[entry.index];
+            const auto sharp = resource.GetSharp(entry.shader->info);
+            if (sharp) {
+                const VideoCore::ImageInfo info{sharp, resource};
+                result.push_back({info.guest_address, info.guest_size});
+                result.push_back({info.stencil_addr, info.stencil_size});
+            }
+        }
+    return result;
 }
 void ResourceBindings::ValidateInputRange(VAddr address, u64 size) const {
     if (address > UINT64_MAX - size)

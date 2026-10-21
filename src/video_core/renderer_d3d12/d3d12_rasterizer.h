@@ -57,7 +57,12 @@ public:
     void CpSync() override;
     u64 Flush() override;
     void Finish() override;
-    void OnSubmit() override {}
+    void SetBackground(bool background);
+    void SetExternalMemory(std::function<u64()> usage, std::function<void()> trim) {
+        runtime.SetExternalMemory(std::move(usage), std::move(trim));
+    }
+    void OnSubmit() override { runtime.SubmitReady(); }
+    void EndPacketRun() override { runtime.SubmitReady(); }
     void ScopeMarkerBegin(std::string_view, bool = false) override {}
     void ScopeMarkerEnd(bool = false) override {}
     void ScopedMarkerInsertColor(std::string_view, u32, bool = false) override {}
@@ -98,15 +103,17 @@ private:
     void CopyBufferImpl(VAddr dst, VAddr src, u32 size, bool dst_gds, bool src_gds);
     bool failed{};
     bool logged_draw{}, logged_dispatch{};
+    bool alpha_blend_factor_supported{};
     struct IndirectDraw {
         u32 count, instances, first, first_instance;
         s32 base_vertex;
         u16 vertex_sgpr, instance_sgpr;
+        std::optional<GpuCommands::Arguments> gpu;
     };
-    void DrawImpl(bool indexed, u32 index_offset, std::optional<IndirectDraw> indirect);
+    void DrawImpl(bool indexed, u32 index_offset, std::optional<IndirectDraw> indirect, bool gpu_conversion = true);
     void Read(VAddr address, std::span<u8> data);
     void Write(VAddr address, std::span<const u8> data);
-    void Dispatch(std::array<u32, 3> groups);
+    void Dispatch(std::array<u32, 3> groups, VAddr indirect_address = 0);
     AmdGpu::Liverpool& liverpool;
     Core::MemoryManager& memory;
     CommandRuntime runtime;

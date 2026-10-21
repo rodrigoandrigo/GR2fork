@@ -14,6 +14,7 @@
 #include <winrt/Windows.System.Profile.h>
 #endif
 #include "common/path_util.h"
+#include "video_core/renderer_d3d12/profile.h"
 
 namespace D3D12 {
 namespace {
@@ -22,6 +23,7 @@ constexpr u64 EntryLimit = 64 * 1024 * 1024;
 constexpr u64 DiskLimit = 256 * 1024 * 1024;
 constexpr size_t EntryCount = 2048;
 std::mutex disk_mutex;
+Profile disk_profile;
 std::atomic<u64> temporary_id{};
 void Append(std::vector<u8>& data, const void* source, size_t size) {
     if (!size)
@@ -152,10 +154,12 @@ std::filesystem::path PersistentCache::Path(std::span<const u8> key) const {
     return directory / (Digest(key) + ".bin");
 }
 std::vector<u8> PersistentCache::Load(std::span<const u8> key) {
+    ProfileScope timing{disk_profile, "disk_load", 32};
     ++statistics.misses;
     if (directory.empty() || key.size() > EntryLimit)
         return {};
-    std::scoped_lock lock{disk_mutex};
+    auto lock = ProfileSample(disk_profile, "disk_lock", 128,
+                              [&] { return std::unique_lock{disk_mutex}; });
     try {
         const auto full_key = Key(key);
         const auto path = Path(full_key);
@@ -189,9 +193,11 @@ std::vector<u8> PersistentCache::Load(std::span<const u8> key) {
     }
 }
 void PersistentCache::Store(std::span<const u8> key, std::span<const u8> data) {
+    ProfileScope timing{disk_profile, "disk_store", 32, data.size()};
     if (directory.empty() || data.empty() || key.size() > EntryLimit || data.size() > EntryLimit)
         return;
-    std::scoped_lock lock{disk_mutex};
+    auto lock = ProfileSample(disk_profile, "disk_lock", 128,
+                              [&] { return std::unique_lock{disk_mutex}; });
     std::filesystem::path temporary;
     try {
         auto bytes = Key(key);
@@ -225,7 +231,8 @@ void PersistentCache::Store(std::span<const u8> key, std::span<const u8> data) {
 void PersistentCache::Remove(std::span<const u8> key) {
     if (directory.empty())
         return;
-    std::scoped_lock lock{disk_mutex};
+    auto lock = ProfileSample(disk_profile, "disk_lock", 128,
+                              [&] { return std::unique_lock{disk_mutex}; });
     std::error_code error;
     std::filesystem::remove(Path(Key(key)), error);
     ++statistics.rejected;

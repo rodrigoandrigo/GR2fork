@@ -16,6 +16,7 @@
 namespace D3D12 {
 class ResourceCache final : public VideoCore::GpuMemorySink {
 public:
+    void SetAsyncRecording(bool enabled) { async_recording = enabled; }
     using Read = std::function<void(VAddr, std::span<u8>)>;
     using Write = std::function<void(VAddr, std::span<const u8>)>;
     using Resolve = std::function<std::optional<VAddr>(VAddr, u64)>;
@@ -37,6 +38,8 @@ public:
         u64 allocation_bytes{};
         u64 batch{};
         bool written{};
+        bool resident{}, download_requested{};
+        std::vector<std::pair<u64, u64>> dirty;
         bool host{};
         bool physical{};
         struct WriteTarget {
@@ -45,6 +48,7 @@ public:
         };
         std::vector<WriteTarget> targets;
         std::vector<WriteTarget> sources;
+        std::vector<std::pair<VAddr, u64>> backing_layout;
         std::vector<u8> host_data;
     };
     struct Range {
@@ -74,10 +78,32 @@ public:
     bool Aliases(VAddr first, u64 first_size, VAddr second, u64 second_size) const;
     bool HasRepeatedBacking(VAddr address, u64 size) const;
     void MarkWritten(const View& view);
+    u64 MemoryBytes() const;
+    void TrimMemory(u64 target, bool writeback);
     void BeginBatch();
     Buffer& GetBuffer(VAddr address, u64 size, bool physical = false, bool gathered = false);
     Buffer& GetHostBuffer(VAddr identity, std::span<const u8> data);
     std::vector<View> GetViews(std::span<const Range> ranges);
+    struct UploadStatistics {
+        u64 bytes{}, full{}, partial{};
+        u64 hits{}, cpu_bytes{}, downloads{}, download_bytes{};
+    };
+    const UploadStatistics& GetUploadStatistics() const {
+        return upload_statistics;
+    }
+    struct Watch {
+        VAddr address;
+        u64 size;
+        bool dirty;
+    };
+    void ConfigureResidency(bool enabled, std::function<void(VAddr, u64)> synchronize = {});
+    std::vector<Watch> Watches() const;
+    bool RequestDownloads(std::span<const Range> ranges, bool all = false);
+    void InvalidateCpu(std::span<const Range> ranges, bool all = false);
+    bool CopyResident(VAddr address, u64 size, Buffer& destination, u64 offset,
+                      ID3D12GraphicsCommandList* commands);
+    void InvalidateMappings();
+    void PrepareViews(std::span<const Range> ranges);
     void Upload(Buffer& buffer, ID3D12GraphicsCommandList* commands);
     void Barrier(Buffer& buffer, ID3D12GraphicsCommandList* commands, D3D12_RESOURCE_STATES state);
     void PrepareDownload(ID3D12GraphicsCommandList* commands);
@@ -89,6 +115,9 @@ public:
     bool InvalidateMemory(VAddr address, u64 size, bool assume_locks = false) override;
 
 private:
+    bool async_recording{}, persistent{};
+    std::function<void(VAddr, u64)> synchronize;
+    bool BufferOverlaps(const Buffer& buffer, VAddr address, u64 size) const;
     struct Invalidation {
         VAddr address;
         u64 size;
@@ -104,6 +133,7 @@ private:
     D3D12ResourceAllocator allocator;
     std::shared_ptr<TransferPool> transfer_pool;
     u64 transfer_fence{};
+    UploadStatistics upload_statistics{};
     Read read;
     Write write;
     Resolve resolve;
@@ -116,7 +146,7 @@ private:
     u64 epoch{};
     u64 age{};
     u64 batch{};
-    u64 native_bytes{};
+    u64 native_bytes{}, backing_identity{};
     u64 invalidation_floor{};
     u64 mapping_floor{};
 };

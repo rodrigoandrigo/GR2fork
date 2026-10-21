@@ -35,20 +35,25 @@ Program ReadProgramImpl(Core::MemoryManager& memory, const auto& regs) {
     const VAddr address = regs.template Address<VAddr>();
     if (!address)
         throw std::runtime_error("Guest shader program address is null");
-    std::vector<u32> header(0x4000 + sizeof(AmdGpu::BinaryInfo) / 4);
+    std::array<u32, 2> prefix{};
     ProfileSample(profile, "prog_header", 384, [&] {
-        memory.CopySparseMemory(address, reinterpret_cast<u8*>(header.data()), header.size() * 4);
+        memory.CopySparseMemory(address, reinterpret_cast<u8*>(prefix.data()), sizeof(prefix));
     });
     AmdGpu::BinaryInfo info{};
     bool found{};
-    if (header[0] == 0xbeeb03ff) {
-        const u64 offset = (u64(header[1]) + 1) * 8;
+    if (prefix[0] == 0xbeeb03ff) {
+        const u64 offset = (u64(prefix[1]) + 1) * 8;
         if (offset > 16 * 1024 * 1024 || address > UINT64_MAX - offset)
             throw std::runtime_error("Guest shader header offset exceeds compiler budget");
         memory.CopySparseMemory(address + offset, reinterpret_cast<u8*>(&info), sizeof(info));
         found = info.Valid();
     }
-    if (!found)
+    if (!found) {
+        std::vector<u32> header(0x4000 + sizeof(AmdGpu::BinaryInfo) / 4);
+        ProfileSample(profile, "prog_header_scan", 384, [&] {
+            memory.CopySparseMemory(address, reinterpret_cast<u8*>(header.data()),
+                                    header.size() * sizeof(u32));
+        });
         for (u32 index = 0; index < 0x4000; ++index) {
             std::memcpy(&info, header.data() + index, sizeof(info));
             if (info.Valid()) {
@@ -56,6 +61,7 @@ Program ReadProgramImpl(Core::MemoryManager& memory, const auto& regs) {
                 break;
             }
         }
+    }
     if (!found || !info.length || info.length % 4 || info.length > 4 * 1024 * 1024)
         throw std::runtime_error("Guest shader binary metadata is invalid");
     Program result{regs.user_data, std::vector<u32>(info.length / 4), info.shader_hash, address};
@@ -139,6 +145,20 @@ D3D12_BLEND_OP BlendOperation(AmdGpu::BlendControl::BlendFunc function) {
     default:
         throw std::runtime_error("Invalid guest blend operation");
     }
+}
+void NormalizeMinMaxBlend(D3D12_BLEND_OP& operation, D3D12_BLEND& source,
+                          D3D12_BLEND& destination, AmdGpu::NumberFormat format) {
+    if (format != AmdGpu::NumberFormat::Unorm && format != AmdGpu::NumberFormat::Srgb)
+        return;
+    if (operation != D3D12_BLEND_OP_MIN && operation != D3D12_BLEND_OP_MAX)
+        return;
+    if ((source != D3D12_BLEND_ZERO && source != D3D12_BLEND_ONE) ||
+        (destination != D3D12_BLEND_ZERO && destination != D3D12_BLEND_ONE) ||
+        (source != D3D12_BLEND_ZERO && destination != D3D12_BLEND_ZERO))
+        return;
+    if (operation == D3D12_BLEND_OP_MIN)
+        source = destination = D3D12_BLEND_ZERO;
+    operation = D3D12_BLEND_OP_ADD;
 }
 D3D12_BLEND AlphaBlendFactor(AmdGpu::BlendControl::BlendFactor factor) {
     switch (BlendFactor(factor)) {
@@ -441,6 +461,11 @@ Rasterizer::Rasterizer(AmdGpu::Liverpool& gpu, Core::MemoryManager& manager)
                                        return true;
                            return false;
                        });
+    D3D12_FEATURE_DATA_D3D12_OPTIONS13 options{};
+    alpha_blend_factor_supported =
+        SUCCEEDED(runtime.Device().Device()->CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS13, &options, sizeof(options))) &&
+        options.AlphaBlendFactorSupported;
     runtime.SetMemoryAccess([this](std::span<const ResourceCache::Range> ranges) {
         std::vector<std::pair<VAddr, u64>> access;
         access.reserve(ranges.size());
@@ -451,13 +476,32 @@ Rasterizer::Rasterizer(AmdGpu::Liverpool& gpu, Core::MemoryManager& manager)
     runtime.Resources().SetBackingResolver(
         [this](VAddr address, u64 size) { return ResolveBacking(memory, address, size); });
     memory.SetRasterizer(this);
-    memory.EnableGpuImageTracking(true);
-    runtime.SetImageResidency([this](std::span<const ImageCache::Watch> watches) {
-        std::vector<Core::MemoryManager::GpuImageWatch> ranges;
-        for (const auto& watch : watches)
-            ranges.push_back({watch.address, watch.size, watch.dirty});
-        memory.SetGpuImageWatches(ranges);
-    });
+    try {
+        memory.EnableGpuImageTracking(true);
+        runtime.SetImageResidency([this](std::span<const ImageCache::Watch> watches) {
+            std::vector<Core::MemoryManager::GpuImageWatch> ranges;
+            for (const auto& watch : watches)
+                ranges.push_back({watch.address, watch.size, watch.dirty});
+            memory.SetGpuImageWatches(ranges);
+        });
+        runtime.EnableAsync(
+            [this](VAddr address, u64 size) { return ResolveBacking(memory, address, size); },
+            [this](std::span<const ResourceCache::Range> ranges) {
+                std::vector<std::pair<VAddr, u64>> access;
+                access.reserve(ranges.size());
+                for (const auto& range : ranges)
+                    access.emplace_back(range.address, range.size);
+                return memory.AcquireAsyncGpuAccess(access);
+            });
+    } catch (...) {
+        memory.EnableGpuImageTracking(false);
+        memory.SetRasterizer(nullptr);
+        throw;
+    }
+}
+void Rasterizer::SetBackground(bool background) {
+    Core::MemoryManager::GuestCopyScope scope{&memory};
+    runtime.SetBackground(background);
 }
 Rasterizer::~Rasterizer() {
     try {
@@ -483,7 +527,7 @@ void Rasterizer::Write(VAddr address, std::span<const u8> data) {
         !memory.TryWriteBacking(reinterpret_cast<void*>(address), data.data(), data.size()))
         throw std::runtime_error("D3D12 guest writeback targets unmapped memory");
 }
-void Rasterizer::Dispatch(std::array<u32, 3> groups) {
+void Rasterizer::Dispatch(std::array<u32, 3> groups, VAddr indirect_address) {
     if (!logged_dispatch) {
         logged_dispatch = true;
         LOG_INFO(Core, "[UWP stage] first native dispatch");
@@ -504,7 +548,7 @@ void Rasterizer::Dispatch(std::array<u32, 3> groups) {
     info.hw.cs.tgid_enable = {cs.IsTgidEnabled(0), cs.IsTgidEnabled(1), cs.IsTgidEnabled(2)};
     info.hw.cs.start_offsets = {cs.start_x, cs.start_y, cs.start_z};
     info.hw.cs.shared_memory_size = cs.SharedMemSize();
-    runtime.Dispatch(program.Params(), info, groups, liverpool.regs.ta_bc_base.Address());
+    runtime.Dispatch(program.Params(), info, groups, liverpool.regs.ta_bc_base.Address(), indirect_address);
 }
 void Rasterizer::DispatchDirect() {
     Execute([&] {
@@ -519,23 +563,40 @@ void Rasterizer::DispatchIndirectImpl(VAddr address, u32 offset, u32 size) {
     if (size < 12 || address > UINT64_MAX - offset)
         throw std::runtime_error("Invalid guest indirect dispatch range");
     Core::MemoryManager::GuestCopyScope scope{&memory};
+    if (address + offset && !((address + offset) & 3)) {
+        try {
+            Dispatch({1, 1, 1}, address + offset);
+            return;
+        } catch (const GpuDrawFallback&) {
+        }
+    }
     std::array<u32, 3> groups;
     Read(address + offset, {reinterpret_cast<u8*>(groups.data()), sizeof(groups)});
     Dispatch(groups);
 }
 void Rasterizer::Draw(bool indexed, u32 index_offset) {
-    Execute(
-        [&] { ProfileSample(profile, "draw", 128, [&] { DrawImpl(indexed, index_offset, {}); }); });
+    Execute([&] {
+        ProfileSample(profile, "draw", 128, [&] {
+            try {
+                DrawImpl(indexed, index_offset, {});
+            } catch (const GpuDrawFallback&) {
+                DrawImpl(indexed, index_offset, {}, false);
+            }
+        });
+    });
 }
-void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<IndirectDraw> indirect) {
+void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<IndirectDraw> indirect,
+                          bool gpu_conversion) {
     if (!logged_draw) {
         logged_draw = true;
         LOG_INFO(Core, "[UWP stage] first native draw");
     }
     Core::MemoryManager::GuestCopyScope scope{&memory};
     const auto& regs = liverpool.regs;
-    if (regs.num_interp > 32)
-        throw std::runtime_error("Guest fragment interpolation count exceeds register bounds");
+    if (indirect && indirect->gpu &&
+        regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal &&
+        regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable)
+        throw GpuDrawFallback{};
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
         for (u32 i = 0; i < 2; ++i)
             if (regs.color_buffers[i])
@@ -557,9 +618,15 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                     VideoCore::ImageInfo{regs.color_buffers[i], liverpool.last_cb_extent[i]});
         return;
     }
+    if (regs.primitive_type == AmdGpu::PrimitiveType::None)
+        return;
+    if (regs.num_interp > 32)
+        throw std::runtime_error("Guest fragment interpolation count exceeds register bounds");
     const bool stencil_test_enable =
         regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid();
-    const bool depth_bounds = regs.depth_control.depth_bounds_enable &&
+    const bool depth_bounds = regs.depth_buffer.DepthValid() &&
+                              (regs.depth_control.depth_enable || stencil_test_enable) &&
+                              regs.depth_control.depth_bounds_enable &&
                               !(regs.depth_bounds_min <= 0.f && regs.depth_bounds_max >= 1.f);
     if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal &&
         regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable)
@@ -824,7 +891,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             target.LogicOpEnable = TRUE;
             target.LogicOp = LogicOp(regs.color_control.rop3);
         } else {
-            target.BlendEnable = blend.enable;
+            target.BlendEnable = blend.enable && !color.info.blend_bypass;
             target.LogicOpEnable = FALSE;
             target.LogicOp = D3D12_LOGIC_OP_NOOP;
             target.SrcBlend = BlendFactor(blend.color_src_factor);
@@ -836,11 +903,42 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                 blend.separate_alpha_blend ? blend.alpha_dst_factor : blend.color_dst_factor);
             target.BlendOpAlpha =
                 BlendOperation(blend.separate_alpha_blend ? blend.alpha_func : blend.color_func);
+            NormalizeMinMaxBlend(target.BlendOp, target.SrcBlend, target.DestBlend,
+                                 color.GetNumberFmt());
+            NormalizeMinMaxBlend(target.BlendOpAlpha, target.SrcBlendAlpha, target.DestBlendAlpha,
+                                 color.GetNumberFmt());
         }
         target.RenderTargetWriteMask =
             color_writes_suppressed ? 0u : regs.color_target_mask.GetMask(i);
     }
     draw.blend_factor = regs.blend_constants;
+    bool constant_color_rgb{}, constant_alpha_rgb{};
+    for (auto& target : draw.blend.RenderTarget) {
+        const auto normalize_alpha = [](D3D12_BLEND& factor) {
+            if (factor == D3D12_BLEND_ALPHA_FACTOR)
+                factor = D3D12_BLEND_BLEND_FACTOR;
+            else if (factor == D3D12_BLEND_INV_ALPHA_FACTOR)
+                factor = D3D12_BLEND_INV_BLEND_FACTOR;
+        };
+        normalize_alpha(target.SrcBlendAlpha);
+        normalize_alpha(target.DestBlendAlpha);
+        for (auto* factor : {&target.SrcBlend, &target.DestBlend}) {
+            if (target.BlendEnable && (target.RenderTargetWriteMask & 7)) {
+                constant_color_rgb |= *factor == D3D12_BLEND_BLEND_FACTOR ||
+                                      *factor == D3D12_BLEND_INV_BLEND_FACTOR;
+                constant_alpha_rgb |= *factor == D3D12_BLEND_ALPHA_FACTOR ||
+                                      *factor == D3D12_BLEND_INV_ALPHA_FACTOR;
+            }
+            if (!alpha_blend_factor_supported)
+                normalize_alpha(*factor);
+        }
+    }
+    if (!alpha_blend_factor_supported && constant_alpha_rgb) {
+        if (constant_color_rgb)
+            throw std::runtime_error(
+                "D3D12 device cannot combine constant color and constant alpha RGB blending");
+        draw.blend_factor.fill(regs.blend_constants[3]);
+    }
     draw.border_colors = regs.ta_bc_base.Address();
     const auto& polygon = regs.polygon_control;
     if (polygon.cull_front && polygon.cull_back)
@@ -1334,7 +1432,93 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                          (indexed && regs.enable_primitive_restart &&
                           regs.primitive_type != AmdGpu::PrimitiveType::AdjLineStrip &&
                           regs.primitive_type != AmdGpu::PrimitiveType::AdjTriangleStrip);
-    if (convert) {
+    if (indirect && indirect->gpu) {
+        if (convert || has_geometry || tessellation || strmout_buffer_mask || face_passes ||
+            depth_gated || point_face || line_expand ||
+            (indexed && draw.index_swap != AmdGpu::IndexSwapMode::None) ||
+            regs.enable_primitive_restart || draw.rectangles || draw.clear_depth ||
+            draw.clear_stencil ||
+            std::ranges::any_of(draw.color_clear_buffers, [](const auto& color) {
+                return color.info.fast_clear && color.cmask_base_address;
+            }))
+            throw GpuDrawFallback{};
+        draw.indirect = indirect->gpu;
+    }
+    if (convert && gpu_conversion && !indirect && !regs.enable_primitive_restart && !has_geometry &&
+        !tessellation && !face_passes && !depth_gated && !point_face && !point_cpu && !contour &&
+        !wire_expand_conv && !line_expand && !strmout_buffer_mask) {
+        u32 mode{}, output{};
+        using P = AmdGpu::PrimitiveType;
+        switch (regs.primitive_type) {
+        case P::LineLoop:
+            mode = 1;
+            output = draw.count > 1 ? draw.count * 2 : 0;
+            break;
+        case P::TriangleFan:
+        case P::Polygon:
+            mode = 2;
+            output = draw.count > 2 ? (draw.count - 2) * 3 : 0;
+            break;
+        case P::QuadList:
+            mode = 3;
+            output = (draw.count / 4) * 6;
+            break;
+        case P::QuadStrip:
+            mode = 4;
+            output = draw.count > 3 ? ((draw.count - 2) / 2) * 6 : 0;
+            break;
+        case P::TriangleStrip:
+            mode = 5;
+            output = draw.count > 2 ? (draw.count - 2) * 3 : 0;
+            break;
+        case P::TriangleList:
+            mode = 6;
+            output = (draw.count / 3) * 3;
+            break;
+        case P::LineStrip:
+            mode = 7;
+            output = draw.count > 1 ? (draw.count - 1) * 2 : 0;
+            break;
+        case P::LineList:
+            mode = 8;
+            output = (draw.count / 2) * 2;
+            break;
+        default:
+            break;
+        }
+        if (mode && draw.count <= 4 * 1024 * 1024 && output <= 4 * 1024 * 1024 &&
+            (!indexed ||
+             (draw.index_address % (draw.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4) == 0 &&
+              (draw.index_swap == AmdGpu::IndexSwapMode::None ||
+               (u64(draw.count) * (draw.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)) %
+                       (draw.index_swap == AmdGpu::IndexSwapMode::Swap16 ? 2 : 4) ==
+                   0)))) {
+            draw.source_index_count = draw.count;
+            draw.expansion = GpuCommands::Expansion{mode, draw.count, output, remap_provoking};
+            if (!indexed)
+                draw.base_vertex = draw.first_vertex;
+            draw.count = output;
+            draw.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+            draw.topology = mode == 1 || mode == 7 || mode == 8
+                                ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
+                                : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+            draw.topology_type = mode == 1 || mode == 7 || mode == 8
+                                     ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                     : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        }
+    }
+    if (!convert && gpu_conversion && !indirect && indexed &&
+        draw.index_swap != AmdGpu::IndexSwapMode::None && !has_geometry && !tessellation &&
+        !face_passes && !depth_gated && !line_expand && !strmout_buffer_mask &&
+        !regs.enable_primitive_restart && draw.count <= 4 * 1024 * 1024) {
+        const u32 bytes = draw.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+        const u32 unit = draw.index_swap == AmdGpu::IndexSwapMode::Swap16 ? 2 : 4;
+        if (draw.index_address % bytes == 0 && (u64(draw.count) * bytes) % unit == 0) {
+            draw.source_index_count = draw.count;
+            draw.expansion = GpuCommands::Expansion{9, draw.count, draw.count, false};
+        }
+    }
+    if (convert && !draw.expansion) {
         if (draw.count > 4 * 1024 * 1024)
             throw std::runtime_error("Guest index conversion exceeds upload budget");
         std::vector<u32> indices(draw.count);
@@ -1368,7 +1552,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                     "D3D12 expanded primitives preceding geometry require lowering");
             draw.converted_indices = ConvertPolygonEdges(regs.primitive_type, indices, restart);
         } else {
-            draw.converted_indices = ConvertPrimitiveIndices(regs.primitive_type, indices, restart);
+            draw.converted_indices = ConvertPrimitiveIndices(regs.primitive_type, indices, restart, remap_provoking);
         }
         draw.count = draw.converted_indices.size();
         draw.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
@@ -1521,30 +1705,67 @@ void Rasterizer::DrawIndirectImpl(bool indexed, VAddr address, u32 offset, u32 s
     if (count > 4096 || (count > 1 && (stride < bytes || stride % 4)) ||
         address > UINT64_MAX - offset)
         throw std::runtime_error("Invalid guest indirect draw range");
+    if (count && !(address + offset & 3) && !(count_address & 3)) {
+        const auto first = address + offset;
+        const u64 last = u64(count - 1) * stride;
+        if (first > UINT64_MAX - last || first + last > UINT64_MAX - bytes)
+            throw std::runtime_error("Guest indirect draw address overflow");
+        const auto capacity = indexed ? liverpool.regs.max_index_size : 1u;
+        const auto mapped = [&](VAddr base, u64 size) {
+            if (!base || base > UINT64_MAX - size)
+                return false;
+            std::vector<Core::MemoryManager::BackingSpan> spans((size + 4095) / 4096 + 1);
+            const auto length =
+                memory.ResolveBackingSpans(base, size, spans.data(), spans.size(), false);
+            u64 total{};
+            for (u32 index = 0; index < length; ++index)
+                total += spans[index].size;
+            return total == size;
+        };
+        if (capacity && capacity <= 4 * 1024 * 1024 && last + bytes <= 16 * 1024 * 1024 &&
+            mapped(first, last + bytes) && (!count_address || mapped(count_address, 4)) &&
+            (!indexed || mapped(liverpool.regs.index_base_address.Address(),
+                                u64(capacity) * (liverpool.regs.index_buffer_type.index_type ==
+                                                         AmdGpu::IndexType::Index16
+                                                     ? 2
+                                                     : 4)))) {
+            try {
+                IndirectDraw draw{capacity, 1, 0, 0, 0, vertex_sgpr, instance_sgpr};
+                draw.gpu = GpuCommands::Arguments{first, count_address, stride, count, indexed};
+                DrawImpl(indexed, 0, draw);
+                return;
+            } catch (const GpuDrawFallback&) {
+            }
+        }
+    }
     if (count_address) {
         u32 actual;
         Read(count_address, {reinterpret_cast<u8*>(&actual), sizeof(actual)});
         count = std::min(count, actual);
     }
+    if (!count)
+        return;
     const VAddr first = address + offset;
-    for (u32 draw = 0; draw < count; ++draw) {
-        const u64 delta = u64(draw) * stride;
-        if (first > UINT64_MAX - delta)
-            throw std::runtime_error("Guest indirect draw address overflow");
-        std::array<u32, 5> args{};
-        Read(first + delta, {reinterpret_cast<u8*>(args.data()), bytes});
+    const u64 last = u64(count - 1) * stride;
+    if (first > UINT64_MAX - last || first + last > UINT64_MAX - (bytes - 1))
+        throw std::runtime_error("Guest indirect draw address overflow");
+    std::vector<std::array<u32, 5>> arguments(count);
+    for (u32 draw = 0; draw < count; ++draw)
+        Read(first + u64(draw) * stride, {reinterpret_cast<u8*>(arguments[draw].data()), bytes});
+    for (const auto& args : arguments) {
         DrawImpl(indexed, 0,
                  IndirectDraw{args[0], args[1], args[2], indexed ? args[4] : args[3],
                               indexed ? std::bit_cast<s32>(args[3]) : 0, vertex_sgpr,
-                              instance_sgpr});
+                              instance_sgpr},
+                 false);
     }
 }
 void Rasterizer::FillBuffer(VAddr address, u32 size, u32 value, bool use_gds) {
     Execute([&] { FillBufferImpl(address, size, value, use_gds); });
 }
 void Rasterizer::FillBufferImpl(VAddr address, u32 size, u32 value, bool use_gds) {
-    const auto gds = runtime.Gds();
     Core::MemoryManager::GuestCopyScope scope{&memory};
+    const auto gds = runtime.Gds();
     if (!size)
         return;
     if (size % 4 || size > 16 * 1024 * 1024)
@@ -1561,8 +1782,8 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 size, bool dst_gds, bool s
     Execute([&] { CopyBufferImpl(dst, src, size, dst_gds, src_gds); });
 }
 void Rasterizer::CopyBufferImpl(VAddr dst, VAddr src, u32 size, bool dst_gds, bool src_gds) {
-    const auto gds = runtime.Gds();
     Core::MemoryManager::GuestCopyScope scope{&memory};
+    const auto gds = runtime.Gds();
     if (size > 16 * 1024 * 1024 || (src_gds && (src > gds.size() || size > gds.size() - src)) ||
         (dst_gds && (dst > gds.size() || size > gds.size() - dst)))
         throw std::runtime_error("Guest copy range exceeds backing budget");
@@ -1577,9 +1798,10 @@ void Rasterizer::CopyBufferImpl(VAddr dst, VAddr src, u32 size, bool dst_gds, bo
         Write(dst, data);
 }
 u32 Rasterizer::ReadDataFromGds(u32 offset) {
-    const auto gds = runtime.Gds();
     u32 value{};
     Execute([&] {
+        Core::MemoryManager::GuestCopyScope scope{&memory};
+        const auto gds = runtime.Gds();
         if (offset > gds.size() - 4)
             throw std::runtime_error("Guest GDS read range overflow");
         std::memcpy(&value, gds.data() + offset, 4);

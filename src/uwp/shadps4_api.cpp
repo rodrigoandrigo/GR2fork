@@ -323,11 +323,16 @@ int32_t shadps4_set_host_state(int32_t active, int32_t input_captured) {
     try {
         Core::Uwp::CaptureGamepadInput(!active || input_captured);
         Core::Uwp::SuspendAudio(!active);
+        std::scoped_lock lock{presentation_mutex};
+        if (native_presentation)
+            native_presentation->SetActive(active != 0);
         return 0;
     } catch (const winrt::hresult_error& exception) {
-        return Fail("XAudio2 HRESULT " +
+        return Fail("Host state HRESULT " +
                     std::to_string(static_cast<uint32_t>(exception.code().value)) + ": " +
                     winrt::to_string(exception.message()));
+    } catch (const std::exception& exception) {
+        return Fail(exception.what());
     }
 }
 

@@ -292,8 +292,44 @@ void ImageCache::InvalidateCpu(std::span<const ResourceCache::Range> ranges, boo
         ++statistics.cpu_invalidations;
     }
 }
+u64 ImageCache::MemoryBytes() const {
+    u64 bytes = native_bytes + transfers.MemoryBytes();
+    if (tilizer)
+        bytes += tilizer->MemoryBytes();
+    for (const auto& [key, image] : images)
+        bytes += image->guest.capacity() + image->linear.capacity() +
+                 image->stencil_guest.capacity() + image->stencil_linear.capacity();
+    return bytes;
+}
+void ImageCache::TrimMemory(u64 target, bool writeback) {
+    while (MemoryBytes() > target && !images.empty()) {
+        auto oldest = images.end();
+        for (auto it = images.begin(); it != images.end(); ++it)
+            if ((!(it->second->written || it->second->stencil_written) ||
+                 (writeback && persistent && synchronize)) &&
+                (oldest == images.end() || it->second->age < oldest->second->age))
+                oldest = it;
+        if (oldest == images.end())
+            break;
+        if (oldest->second->written || oldest->second->stencil_written) {
+            Synchronize(*oldest->second);
+            if (oldest->second->written || oldest->second->stencil_written)
+                break;
+        }
+        cpu_bytes -= (oldest->second->has_depth ? u64(oldest->second->info.guest_size) * 2 : 0) +
+                     (oldest->second->has_stencil ? u64(oldest->second->info.stencil_size) * 2 : 0);
+        native_bytes -= oldest->second->allocation_bytes;
+        images.erase(oldest);
+    }
+    if (MemoryBytes() > target) {
+        transfers.TrimMemory();
+        if (tilizer)
+            tilizer->TrimMemory();
+    }
+}
 void ImageCache::BeginBatch() {
-    device->WaitForGpu();
+    if (!async_recording)
+        device->WaitForGpu();
     if (tilizer)
         tilizer->BeginBatch();
     ++batch;
@@ -617,7 +653,7 @@ void ImageCache::EnsureSpace(u64 required, u64 cpu_required, bool inserting) {
                native_bytes > stats.budget_bytes - stats.live_bytes ||
                required > stats.budget_bytes - stats.live_bytes - native_bytes;
     };
-    while ((inserting && images.size() >= 64) || exceeds_budget() ||
+    while ((inserting && images.size() >= image_limit) || exceeds_budget() ||
            cpu_required > 256ULL * 1024 * 1024 - cpu_bytes) {
         auto oldest = images.end();
         for (auto it = images.begin(); it != images.end(); ++it)
@@ -665,6 +701,7 @@ void ImageCache::Barrier(Image& image, ID3D12GraphicsCommandList* commands,
     image.state = state;
 }
 void ImageCache::CopyRows(Image& image, void* data, bool upload) {
+    auto& linear = !image.info.props.is_tiled && !image.has_stencil ? image.guest : image.linear;
     const auto logic_format =
         image.logic_op ? GetLogicOpFormat(ConvertFormat(image.info.pixel_format)) : LogicOpFormat{};
     u64 mip_offset{};
@@ -690,9 +727,9 @@ void ImageCache::CopyRows(Image& image, void* data, bool upload) {
                         (image.base_layer * image.info.num_samples + layer + slice) * pitch *
                             height +
                         row * pitch;
-                    if (guest_offset + guest_row_bytes > image.linear.size())
+                    if (guest_offset + guest_row_bytes > linear.size())
                         throw std::runtime_error("D3D12 image row exceeds guest backing");
-                    auto* guest = image.linear.data() + guest_offset;
+                    auto* guest = linear.data() + guest_offset;
                     auto* host =
                         static_cast<u8*>(data) + footprint.Offset +
                         (slice * image.rows[subresource] + row) * footprint.Footprint.RowPitch;
@@ -794,21 +831,32 @@ void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr
     }
     bool changed{};
     bool gpu_detile{};
+    const auto entries = TilingRuntime::Entries(image.info, image.footprints, image.base_layer);
+    const bool gpu_supported = tilizer &&
+                               (image.info.props.is_tiled || image.logic_op || image.msaa ||
+                                image.info.pixel_format == vk::Format::eB4G4R4A4UnormPack16) &&
+                               TilingRuntime::Supported(image.info, entries.size()) &&
+                               tilizer->CanRecord(image.info, entries, false);
     ProfileSample(profile, "upload_read", 128, [&] {
+        if (persistent && gpu_supported) {
+            changed = gpu_detile = true;
+            std::vector<u8>{}.swap(image.guest);
+            return;
+        }
         std::vector<u8> guest(image.info.guest_size);
         read(read_address ? read_address : image.info.guest_address, guest);
         changed = image.msaa || guest != image.guest;
         if (!changed)
             return;
         image.guest = std::move(guest);
-        const auto entries = TilingRuntime::Entries(image.info, image.footprints);
-        if (!image.logic_op && tilizer && TilingRuntime::Supported(image.info, entries.size()) &&
-            tilizer->CanRecord(image.info, entries, false)) {
+        if (gpu_supported) {
             gpu_detile = true;
             return;
         }
-        image.linear.resize(image.guest.size());
-        VideoCore::ConvertTiling(image.guest, image.linear, image.info, false);
+        if (image.info.props.is_tiled) {
+            image.linear.resize(image.guest.size());
+            VideoCore::ConvertTiling(image.guest, image.linear, image.info, false);
+        }
         EnsureStaging(image, false);
         void* mapped;
         const D3D12_RANGE empty{0, 0};
@@ -821,10 +869,29 @@ void ImageCache::Upload(Image& image, ID3D12GraphicsCommandList* commands, VAddr
     }
     if (gpu_detile) {
         ProfileSample(profile, "upload_copy", 128, [&] {
-            Barrier(image, commands, D3D12_RESOURCE_STATE_COPY_DEST);
-            const auto entries = TilingRuntime::Entries(image.info, image.footprints);
-            tilizer->Detile(commands, image.info, entries, image.guest, image.Native(),
-                            image.footprints);
+            if (image.msaa)
+                MsaaTransfer::Barrier(*image.msaa, commands, D3D12_RESOURCE_STATE_COPY_DEST);
+            else
+                Barrier(image, commands, D3D12_RESOURCE_STATE_COPY_DEST);
+            const TilingRuntime::Reader reader =
+                persistent
+                    ? TilingRuntime::Reader{[this, &image, read_address](std::span<u8> bytes) {
+                          read(read_address ? read_address : image.info.guest_address, bytes);
+                      }}
+                    : TilingRuntime::Reader{};
+            tilizer->Detile(commands, image.info, entries, image.guest,
+                            image.msaa ? image.msaa->planes.Get() : image.Native(),
+                            image.footprints, image.logic_op, image.logic_mask, reader);
+            if (image.msaa) {
+                SetSamplePositions(commands, image.info.num_samples, image.sample_positions);
+                Barrier(image, commands,
+                        image.info.props.is_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE
+                                                  : D3D12_RESOURCE_STATE_RENDER_TARGET);
+                transfers.Record(commands, image.Native(), *image.msaa,
+                                 image.logic_op ? DXGI_FORMAT_R32G32B32A32_UINT
+                                                : ConvertFormat(image.info.pixel_format),
+                                 image.info.props.is_depth, true);
+            }
         });
         return;
     }
@@ -1293,7 +1360,6 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
                 }
             }
         } else if (image->written) {
-            EnsureStaging(*image, true);
             if (image->msaa) {
                 Barrier(*image, commands, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 SetSamplePositions(commands, 1, {});
@@ -1304,27 +1370,33 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
                 MsaaTransfer::Barrier(*image->msaa, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
             } else
                 Barrier(*image, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            for (u32 subresource = 0; subresource < image->footprints.size(); ++subresource) {
-                D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
-                source.pResource = image->msaa ? image->msaa->planes.Get() : image->Native();
-                source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                source.SubresourceIndex = subresource;
-                destination.pResource = image->readback.Get();
-                destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                destination.PlacedFootprint = image->footprints[subresource];
-                commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-            }
-            if (!image->msaa) {
-                const auto entries = TilingRuntime::Entries(image->info, image->footprints);
-                if (!image->logic_op && tilizer &&
-                    TilingRuntime::Supported(image->info, entries.size()) &&
-                    tilizer->CanRecord(image->info, entries, true)) {
-                    image->gpu_tiled = true;
-                    std::vector<u8> guest(image->info.guest_size);
-                    read(image->info.guest_address, guest);
-                    image->tiled_readback =
-                        tilizer->Tile(commands, image->info, entries, image->Native(),
-                                      image->footprints, guest);
+            const auto entries =
+                TilingRuntime::Entries(image->info, image->footprints, image->base_layer);
+            if (tilizer &&
+                (image->info.props.is_tiled || image->logic_op || image->msaa ||
+                 image->info.pixel_format == vk::Format::eB4G4R4A4UnormPack16) &&
+                TilingRuntime::Supported(image->info, entries.size()) &&
+                tilizer->CanRecord(image->info, entries, true)) {
+                image->gpu_tiled = true;
+                const TilingRuntime::Reader reader =
+                    [this, address = image->info.guest_address](std::span<u8> bytes) {
+                        read(address, bytes);
+                    };
+                image->tiled_readback = tilizer->Tile(
+                    commands, image->info, entries,
+                    image->msaa ? image->msaa->planes.Get() : image->Native(), image->footprints,
+                    {}, image->logic_op, image->logic_mask, reader);
+            } else {
+                EnsureStaging(*image, true);
+                for (u32 subresource = 0; subresource < image->footprints.size(); ++subresource) {
+                    D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+                    source.pResource = image->msaa ? image->msaa->planes.Get() : image->Native();
+                    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    source.SubresourceIndex = subresource;
+                    destination.pResource = image->readback.Get();
+                    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    destination.PlacedFootprint = image->footprints[subresource];
+                    commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
                 }
             }
         }
@@ -1367,7 +1439,7 @@ void ImageCache::RetireUploads(u64 fence) {
         tilizer->RetireUploads(fence);
 }
 void ImageCache::CommitDownloads() {
-    const u64 fence = std::max(transfer_fence, device->LastSignaledValue());
+    const u64 fence = transfer_fence ? transfer_fence : device->LastSignaledValue();
     if (device->CompletedValue() < fence)
         throw std::runtime_error("D3D12 image readback requested before transfer fence");
     for (auto& [key, image] : images) {
@@ -1386,7 +1458,8 @@ void ImageCache::CommitDownloads() {
         if (!image->written)
             continue;
         void* mapped;
-        const auto entries = TilingRuntime::Entries(image->info, image->footprints);
+        const auto entries =
+            TilingRuntime::Entries(image->info, image->footprints, image->base_layer);
         const bool tiled =
             image->gpu_tiled && TilingRuntime::Supported(image->info, entries.size());
         if (tiled) {
@@ -1394,16 +1467,28 @@ void ImageCache::CommitDownloads() {
         } else {
             winrt::check_hresult(image->readback->Map(0, nullptr, &mapped));
         }
-        if (tiled) {
+        if (tiled && persistent) {
+            try {
+                write(image->info.guest_address,
+                      {static_cast<const u8*>(mapped), image->info.guest_size});
+            } catch (...) {
+                const D3D12_RANGE empty{0, 0};
+                image->tiled_readback->Unmap(0, &empty);
+                throw;
+            }
+        } else if (tiled) {
             image->guest.resize(image->info.guest_size);
             std::memcpy(image->guest.data(), mapped, image->guest.size());
         } else {
             image->guest.resize(image->info.guest_size);
             read(image->info.guest_address, image->guest);
-            image->linear.resize(image->guest.size());
-            VideoCore::ConvertTiling(image->guest, image->linear, image->info, false);
+            if (image->info.props.is_tiled) {
+                image->linear.resize(image->guest.size());
+                VideoCore::ConvertTiling(image->guest, image->linear, image->info, false);
+            }
             CopyRows(*image, mapped, false);
-            VideoCore::ConvertTiling(image->linear, image->guest, image->info, true);
+            if (image->info.props.is_tiled)
+                VideoCore::ConvertTiling(image->linear, image->guest, image->info, true);
         }
         image->gpu_tiled = false;
         const D3D12_RANGE empty{0, 0};
@@ -1411,7 +1496,8 @@ void ImageCache::CommitDownloads() {
             image->tiled_readback->Unmap(0, &empty);
         else
             image->readback->Unmap(0, &empty);
-        write(image->info.guest_address, image->guest);
+        if (!tiled || !persistent)
+            write(image->info.guest_address, image->guest);
         image->written = false;
     }
     for (auto& [key, image] : images) {

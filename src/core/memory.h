@@ -297,6 +297,7 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
     std::shared_ptr<void> AcquireGpuAccess(std::span<const std::pair<VAddr, u64>> ranges);
+    std::shared_ptr<void> AcquireAsyncGpuAccess(std::span<const std::pair<VAddr, u64>> ranges);
     struct GpuImageWatch {
         VAddr address;
         u64 size;
@@ -387,11 +388,18 @@ public:
 
 private:
     struct GpuAccessLease;
+    struct AsyncGpuAccessLease;
     struct GpuProtectedRange {
         VAddr address;
         u64 size;
         MemoryPermission permissions;
     };
+    std::vector<GpuProtectedRange> ResolveGpuProtectedRanges(
+        std::span<const std::pair<VAddr, u64>> ranges);
+    void ReleaseAsyncGpuAccess(u64 id);
+    void UpdateAsyncGpuProtection();
+    std::map<u64, std::vector<GpuProtectedRange>> async_gpu_ranges;
+    u64 async_gpu_id{};
     std::shared_lock<Common::SharedFirstMutex> LockGpuAccess();
     void ReleaseGpuAccess();
     bool HandleGpuAccessFault(void* context, VAddr address);

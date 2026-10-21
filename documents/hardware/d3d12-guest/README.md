@@ -79,6 +79,75 @@ habilitado no PARAM.SFO e confirme `sceKernelIsNeoMode()`. Fora de Neo, essas
 variantes imprimem `SKIP`; isso não conta como validação. Não há submissão de
 RGB96 tiled: a referência AddrLib restringe esse formato a layout linear.
 
+As duas variantes `IMAGE_LOAD_FEEDBACK virtual_alias=1` usam o segundo
+mapeamento virtual do mesmo direct memory como descritor de leitura, enquanto
+o descritor de escrita continua no primeiro mapeamento. Ambas devem imprimir
+`PASS`, com `writer=12345678` e `reader=12345678` ou `reader=00000001` na
+variante de swizzle constante. O shader grava pelo primeiro endereço, lê pelo
+segundo e grava o valor observado no texel seguinte do primeiro. Os quatro
+casos de feedback usam endereços separados para código e metadados. A extensão
+com aliases virtuais distintos aguarda compilação com o SDK e execução em PS4.
+
+O grupo `IMAGE_BUFFER_ATOMIC` submete 47 casos em ambas as ordens (94
+submissões): operação
+pela imagem seguida de `BUFFER_ATOMIC_ADD(0)`, ou operação pelo buffer seguida
+de `IMAGE_ATOMIC_ADD(0)`. Confere o valor anterior com GLC, a observação do
+resultado pela outra view, a palavra final e a preservação do vizinho. Inclui
+SUB, INC/DEC nos limites, FMIN/FMAX e FCMPSWAP com sinais, zeros, infinidades,
+NaNs e subnormais, além de exchange, compare-swap inteiro e operações lógicas.
+Cada submissão usa código e metadados em um endereço próprio para não depender
+da reutilização do cache de instruções. Registre também os casos divergentes,
+especialmente o tratamento de NaN e denormais, para comparação com a ISA.
+Esta extensão não foi compilada: o SDK OpenOrbis não está disponível neste
+ambiente. A execução e a comparação em PS4 continuam pendentes.
+
+O grupo `STAGE_SHARING_VS_PS` submete dois draws com um triângulo cobrindo
+16x16 pixels. O vertex shader grava `0.5f` em três texels `R32_FLOAT`; o pixel
+shader lê o primeiro texel, grava o resultado em uma região separada da mesma
+superfície e exporta vermelho para um render target RGBA8. A variante
+`virtual_alias=1` usa o segundo endereço virtual no pixel shader. Os casos
+esperam `colored=256 padding=PASS PASS`, 259 texels com bits `3f000000` no
+backing compartilhado e preservação de todos os demais texels/padding. O target
+usa pitch de 64 pixels e exige `ff000080` na área 16x16. O EOP estabelece a
+fence de leitura de volta. Registre os resultados e eventuais timeouts; esse
+novo grupo também aguarda compilação com o SDK OpenOrbis e execução em PS4.
+
+O grupo `NONLINEAR_PHYSICAL_ALIAS` mapeia duas páginas virtuais de 64 KiB em
+ordem física invertida ou repete a mesma página física nas duas posições. Uma
+escrita pelo descritor segmentado é seguida de incremento atômico pelo alias
+linear e nova leitura pelo descritor segmentado. As variantes `repeated=0/1`
+esperam `old=7 observed=8 physical=8 padding=PASS PASS`, preservando todos os
+outros bytes das duas páginas físicas. Os mapeamentos são removidos após a
+fence. O grupo ainda aguarda compilação com o SDK OpenOrbis e execução em PS4.
+
+O grupo `IMAGE_RESIDENCY_CPU_GPU` executa duas submissões sobre a mesma imagem.
+A primeira escreve na GPU e confere o resultado pela CPU. Em seguida a CPU grava
+`87654321` no texel inicial e `aabbccdd` no padding do pitch; a segunda submissão
+lê o texel e o grava no próximo texel. São exercitados o endereço original e um
+alias virtual. O resultado esperado é
+`IMAGE_RESIDENCY_CPU_GPU phases=2 virtual_alias=0/1 padding=PASS PASS`.
+Cada fase aguarda seu EOP antes da inspeção CPU. O grupo ainda aguarda
+compilação com o SDK OpenOrbis e execução em PS4.
+
+O grupo `CMASK_MIXED` configura uma superfície RGBA8 linear com pitch 64,
+extensão desenhada 16x16, CMASK de 2 KiB e primeiro nibble zero; os demais
+nibbles ficam F. Um draw com `CB_COLOR_CONTROL.MODE=EliminateFastClear` deve
+materializar `ff000080` somente no tile 8x8 inicial. O resultado esperado é
+`clear_pixels=64 metadata=ff padding=PASS PASS`, preservando os demais pixels
+e os outros bytes de CMASK. Os shaders e a metadata têm endereços próprios,
+e o backing só é verificado depois do EOP. O caso aguarda compilação com o
+SDK OpenOrbis e execução em PS4; registre modelo, firmware e saída completa.
+
+O grupo `TYPED_CLEARS` repete a eliminação de fast clear com 12 variantes:
+R8/R16/RG16/RGBA8 SINT, FP16 com infinidades e payloads NaN, FP32 com zero
+negativo, RGBA32 UINT, swizzle RGBA8 e packed 565/1555/4444. Cada linha
+`CMASK_MIXED format=... number=... swap=...` deve informar
+`clear_pixels=64 metadata=ff padding=PASS PASS`; o resumo esperado é
+`TYPED_CLEARS cases=12 PASS`. A comparação confere os bytes armazenados,
+incluindo os bits de NaN e zero negativo. Este grupo ainda não foi compilado
+por falta do SDK OpenOrbis nem executado em PS4; os resultados em hardware
+continuam pendentes.
+
 Em seguida registra o segundo alias como superfície VideoOut linear e mostra
 por 300 flips um gradiente vermelho horizontal, verde vertical e quadriculado
 azul de 32 pixels. Registre `CPU_ALIAS`, `GPU_ALIAS`, a fence,
@@ -86,5 +155,49 @@ azul de 32 pixels. Registre `CPU_ALIAS`, `GPU_ALIAS`, a fence,
 para comparação. Sucesso da API e hash CPU não confirmam a imagem apresentada.
 
 Este caso não cobre todos os 56 offsets do push buffer, tiling, GDS/LDS,
-draws, MSAA, compressão, estágios avançados ou jogos. Essas comparações em
+MSAA, compressão, geometry/tessellation ou jogos. Essas comparações em
 hardware continuam necessárias antes de aceitar o renderer como completo.
+
+Os casos `STAGE_SHARING_VS_PS blend_case=1..8` exercitam MIN/MAX em
+RGBA8 UNORM com todas as combinações de fatores ZERO/ONE. Cada canal é
+comparado com MIN/MAX dos operandos multiplicados pelos fatores; o padding
+deve permanecer intacto. Esses casos registram a hipótese adotada pelo
+renderer de referência e precisam ser comparados com um PS4 físico. A fonte
+OpenOrbis foi ampliada, mas o SDK não está instalado para compilá-la aqui.
+
+Os casos 9 e 10 usam fator de alpha constante de 0,5, respectivamente com
+blend ativo e com `CB_COLOR_INFO.BLEND_BYPASS`. O caso 11 usa primitiva NONE
+e exige preservação da imagem e ausência das escritas de VS/PS. O caso 12
+habilita depth bounds fora do Z desenhado, sem depth/stencil attachment ativo,
+e espera o mesmo resultado do draw normal. Registre também os valores obtidos
+quando divergirem das hipóteses da referência.
+
+Os casos 13/14 desenham um quad como TRIANGLE_STRIP com atributo flat
+proporcional ao vertex ID (0, 0,25, 0,5 e 0,75), alternando o primeiro/último
+provoking vertex. Esperam níveis 0/64 e 128/191 nos dois triângulos. Os pixels
+sobre a diagonal são excluídos da comparação para não impor uma regra de
+cobertura para a aresta compartilhada; os demais pixels e o padding são
+verificados. Essas expectativas também aguardam comparação no PS4 físico.
+
+`COMMAND_DEPENDENCIES` submete oito dispatches independentes e uma cópia por
+alias físico após `ACQUIRE_MEM`, com uma fence final. Todos os destinos devem
+conter `11223344`, incluindo `alias_copy`. Compara dependências e preservação
+da memória submetida; não mede paralelismo da implementação D3D12. Este caso
+ainda não foi compilado nem executado por ausência do SDK OpenOrbis.
+
+`PERSISTENT_BUFFER_CPU_ALIAS` continua o caso de dependências: após a fence,
+a CPU altera a palavra vizinha pelo segundo alias e outro dispatch a lê.
+Espera-se `neighbor=aabbccdd original=11223344`. Compare esses valores no
+PS4 físico; o caso não mede readbacks ou uploads internos do emulador.
+Esta extensão ainda não foi compilada nem executada por ausência do SDK.
+
+`indirect.cpp` é um homebrew separado para o P03. Ele compara hashes de draws
+diretos com `DRAW_INDIRECT_COUNT_MULTI` e `DRAW_INDEX_INDIRECT_COUNT_MULTI`,
+com strides de 24/28 bytes, contagem 0/1/2 e SGPRs de base/instância usados na
+posição dos vértices. Compara triangle list/fan/strip e quad list/strip, incluindo
+o padding do alvo. As linhas `INDIRECT_SGPRS` devem apresentar hashes iguais.
+Use-o como `main.cpp` em outro projeto OpenOrbis e ligue libkernel e
+libSceGnmDriver. Registre modelo/firmware e todos os hashes para comparar o
+hardware com o emulador. Não foi compilado nem executado: SDK ausente neste
+ambiente. Esses hashes não medem desempenho nem comprovam a ausência de
+readbacks no emulador.

@@ -80,6 +80,14 @@ D3D12Resource TransferPool::Acquire(u64 size, D3D12_HEAP_TYPE heap) {
         device->Wait(oldest->fence);
     }
 }
+void TransferPool::TrimMemory(u64 target) {
+    const auto completed = device->CompletedValue();
+    for (size_t index = 0; index < entries.size() && allocator.Stats().live_bytes > target;)
+        if (entries[index].fence <= completed)
+            Evict(index);
+        else
+            ++index;
+}
 void TransferPool::Retire(D3D12Resource&& resource, u64 fence) {
     if (!resource.Get())
         return;

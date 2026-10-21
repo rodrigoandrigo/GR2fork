@@ -8,18 +8,21 @@
 #include <winrt/base.h>
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_d3d12/shader_cache.h"
+#include "video_core/renderer_d3d12/logic_op_format.h"
+#include "video_core/renderer_d3d12/image_cache.h"
 
 namespace D3D12 {
 namespace {
 
 constexpr std::string_view TilingShader = R"(
 struct TilingInfo {
-    uint bank_swizzle;
-    uint micro_tiled_mips;
-    uint num_entries;
-    uint pad;
-    uint4 entries_a[16];
-    uint4 entries_b[16];
+    uint bank_swizzle, micro_tiled_mips, mip, pitch;
+    uint height, tiled_offset, linear_offset, row_pitch;
+    uint width, visible_height, depth, slice;
+    uint sample_index, depth_pitch, num_texels, linear_tiling;
+    uint4 bits;
+    uint4 offsets;
+    uint logic_mask;
 };
 
 ByteAddressBuffer source_data : register(t0);
@@ -265,80 +268,103 @@ uint ComputeSurfaceAddrFromCoordMacroTiled(uint x, uint y, uint slice, uint pitc
 }
 #endif
 
-uint LinearAddress(uint entry, uint x, uint y) {
-    return info.entries_b[entry].x + y * info.entries_b[entry].y + x * BYTES_PER_PIXEL;
+uint LoadBits(uint address, uint bits) {
+    uint shift = (address & 3u) * 8u;
+    uint value = source_data.Load(address & ~3u) >> shift;
+    if (shift != 0u && bits > 32u - shift)
+        value |= source_data.Load((address & ~3u) + 4u) << (32u - shift);
+    return bits == 32u ? value : value & ((1u << bits) - 1u);
 }
-
-void Transfer(uint src_address, uint dst_address) {
-#if BITS_PER_PIXEL < 32
-    const uint src_word = src_address & ~3u;
-    const uint src_shift = (src_address & 3u) * 8u;
-    const uint value = (source_data.Load(src_word) >> src_shift) &
-                       ((1u << BITS_PER_PIXEL) - 1u);
-    const uint dst_word = dst_address & ~3u;
-    const uint dst_shift = (dst_address & 3u) * 8u;
-    const uint mask = ((1u << BITS_PER_PIXEL) - 1u) << dst_shift;
-    dest_data.InterlockedAnd(dst_word, ~mask);
-    dest_data.InterlockedOr(dst_word, value << dst_shift);
-#elif BITS_PER_PIXEL == 32
-    dest_data.Store(dst_address, source_data.Load(src_address));
-#elif BITS_PER_PIXEL == 64
-    dest_data.Store(dst_address, source_data.Load(src_address));
-    dest_data.Store(dst_address + 4u, source_data.Load(src_address + 4u));
-#elif BITS_PER_PIXEL == 96
-    dest_data.Store(dst_address, source_data.Load(src_address));
-    dest_data.Store(dst_address + 4u, source_data.Load(src_address + 4u));
-    dest_data.Store(dst_address + 8u, source_data.Load(src_address + 8u));
-#else
-    dest_data.Store(dst_address, source_data.Load(src_address));
-    dest_data.Store(dst_address + 4u, source_data.Load(src_address + 4u));
-    dest_data.Store(dst_address + 8u, source_data.Load(src_address + 8u));
-    dest_data.Store(dst_address + 12u, source_data.Load(src_address + 12u));
-#endif
-}
-
-[numthreads(64, 1, 1)]
-void main(uint dispatch : SV_DispatchThreadID) {
-    if (dispatch >= info.pad) {
-        return;
-    }
-    uint texel = dispatch;
-    uint entry = 0;
-    while (entry + 1u < info.num_entries && texel >= info.entries_b[entry].z) {
-        texel -= info.entries_b[entry].z;
-        ++entry;
-    }
-    const uint mip = info.entries_a[entry].x;
-    const uint pitch = info.entries_a[entry].y;
-    const uint height = info.entries_a[entry].z;
-    const uint x = texel % pitch;
-    const uint y = (texel / pitch) % height;
-    const uint extent = info.entries_b[entry].w;
-    if (x >= (extent & 0xffffu) || y >= (extent >> 16u)) {
-        return;
-    }
-
-#if IS_MACRO_TILED
-    uint tiled_offset = info.entries_a[entry].w;
-    if ((info.micro_tiled_mips & (1u << mip)) != 0) {
-        tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, 0u, pitch, height,
-                                                              min(MICRO_TILE_THICKNESS, 4u), 0u);
+void StoreBits(uint address, uint bits, uint value) {
+    uint shift = (address & 3u) * 8u;
+    if (bits == 32u && shift == 0u) {
+        dest_data.Store(address, value);
     } else {
-        tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(x, y, 0u, pitch, height, 0u);
+        uint mask = (bits == 32u ? 0xffffffffu : (1u << bits) - 1u) << shift;
+        dest_data.InterlockedAnd(address & ~3u, ~mask);
+        dest_data.InterlockedOr(address & ~3u, (value << shift) & mask);
+        if (shift != 0u && bits > 32u - shift) {
+            uint remaining = bits - (32u - shift);
+            mask = (1u << remaining) - 1u;
+            dest_data.InterlockedAnd((address & ~3u) + 4u, ~mask);
+            dest_data.InterlockedOr((address & ~3u) + 4u, (value >> (32u - shift)) & mask);
+        }
+    }
+}
+void Transfer(uint tiled_address, uint linear_address) {
+#if LOGIC_OP
+    uint component = 0u;
+#if !IS_TILER
+    dest_data.Store4(linear_address, 0u);
+#endif
+    for (uint c = 0u; c < 4u; ++c) {
+        uint bits = info.bits[c];
+        if ((info.logic_mask & (1u << c)) == 0u || bits == 0u)
+            continue;
+        uint address = tiled_address + info.offsets[c] / 8u;
+        uint shift = info.offsets[c] % 8u;
+        uint mask = bits == 32u ? 0xffffffffu : (1u << bits) - 1u;
+#if IS_TILER
+        uint value = source_data.Load(linear_address + component * 4u) & mask;
+        uint word = address & ~3u;
+        uint bit_shift = (address & 3u) * 8u + shift;
+        dest_data.InterlockedAnd(word, ~(mask << bit_shift));
+        dest_data.InterlockedOr(word, value << bit_shift);
+#else
+        uint value = (LoadBits(address, bits + shift) >> shift) & mask;
+        dest_data.Store(linear_address + component * 4u, value);
+#endif
+        ++component;
     }
 #else
-    const uint tiled_offset = info.entries_a[entry].w +
-                              ComputeSurfaceAddrFromCoordMicroTiled(x, y, 0u, pitch, height,
-                                                                    MICRO_TILE_THICKNESS, 0u);
-#endif
-    const uint linear_offset = LinearAddress(entry, x, y);
-
-#if IS_TILER != 0
-    Transfer(linear_offset, tiled_offset);
+#if IS_TILER
+    uint source = linear_address, destination = tiled_address;
 #else
-    Transfer(tiled_offset, linear_offset);
+    uint source = tiled_address, destination = linear_address;
+#endif
+#if SWAP_4444
+    uint value = LoadBits(source, 16u);
+    value = ((value & 0xfu) << 12u) | ((value & 0xf0u) << 4u) |
+            ((value & 0xf00u) >> 4u) | ((value & 0xf000u) >> 12u);
+    StoreBits(destination, 16u, value);
+#elif BITS_PER_PIXEL < 32
+    StoreBits(destination, BITS_PER_PIXEL, LoadBits(source, BITS_PER_PIXEL));
+#else
+    for (uint offset = 0u; offset < BYTES_PER_PIXEL; offset += 4u)
+        dest_data.Store(destination + offset, source_data.Load(source + offset));
+#endif
 #endif
 }
+[numthreads(64, 1, 1)]
+void main(uint3 dispatch : SV_DispatchThreadID) {
+    uint texel = dispatch.x + dispatch.y * (65535u * 64u);
+    if (texel >= info.num_texels)
+        return;
+    uint x = texel % info.width;
+    uint y = (texel / info.width) % info.visible_height;
+    uint z = texel / (info.width * info.visible_height);
+    uint slice = info.slice + z;
+    uint tiled_offset = info.tiled_offset;
+    if (info.linear_tiling != 0u) {
+        tiled_offset += ((slice * NUM_SAMPLES + info.sample_index) * info.pitch * info.height +
+                         y * info.pitch + x) * BYTES_PER_PIXEL;
+    } else {
+#if IS_MACRO_TILED
+        if ((info.micro_tiled_mips & (1u << info.mip)) == 0u)
+            tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(
+                x, y, slice, info.pitch, info.height, info.sample_index);
+        else
+#endif
+            tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(
+                x, y, slice, info.pitch, info.height, min(MICRO_TILE_THICKNESS, 4u),
+                info.sample_index);
+    }
+    uint native_bytes = LOGIC_OP ? 16u : BYTES_PER_PIXEL;
+    uint linear_offset = info.linear_offset + z * info.depth_pitch + y * info.row_pitch +
+                         x * native_bytes;
+    Transfer(tiled_offset, linear_offset);
+}
+
 )";
 
 Microsoft::WRL::ComPtr<ID3D12RootSignature> CreateRootSignature(ID3D12Device* device) {
@@ -349,8 +375,8 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> CreateRootSignature(ID3D12Device* de
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     parameters[1].Descriptor.ShaderRegister = 0;
     parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    parameters[2].Descriptor.ShaderRegister = 0;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[2].Constants = {0, 0, 25};
     parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC description{
         3, parameters, 0, nullptr,
@@ -368,20 +394,20 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> CreateRootSignature(ID3D12Device* de
     return root;
 }
 
-std::array<std::wstring, 14> SpecDefines(std::span<const u32, 14> specs) {
-    static constexpr std::array<const wchar_t*, 14> names{
-        L"BITS_PER_PIXEL",    L"NUM_SAMPLES",   L"MICRO_TILE_MODE", L"MICRO_TILE_THICKNESS",
-        L"IS_TILER",          L"ARRAY_MODE",    L"PIPE_CONFIG",     L"BANK_WIDTH",
-        L"BANK_HEIGHT",       L"NUM_BANKS",     L"NUM_BANK_BITS",   L"TILE_SPLIT_BYTES",
-        L"MACRO_TILE_ASPECT", L"IS_MACRO_TILED"};
-    std::array<std::wstring, 14> defines{};
+std::array<std::wstring, 16> SpecDefines(std::span<const u32, 16> specs) {
+    static constexpr std::array<const wchar_t*, 16> names{
+        L"BITS_PER_PIXEL",    L"NUM_SAMPLES",    L"MICRO_TILE_MODE", L"MICRO_TILE_THICKNESS",
+        L"IS_TILER",          L"ARRAY_MODE",     L"PIPE_CONFIG",     L"BANK_WIDTH",
+        L"BANK_HEIGHT",       L"NUM_BANKS",      L"NUM_BANK_BITS",   L"TILE_SPLIT_BYTES",
+        L"MACRO_TILE_ASPECT", L"IS_MACRO_TILED", L"LOGIC_OP",        L"SWAP_4444"};
+    std::array<std::wstring, 16> defines{};
     for (size_t index = 0; index < names.size(); ++index) {
         defines[index] = std::wstring{L"-D"} + names[index] + L"=" + std::to_wstring(specs[index]);
     }
     return defines;
 }
 
-u64 KeyHash(std::span<const u32, 14> specs) {
+u64 KeyHash(std::span<const u32, 16> specs) {
     u64 hash = 1469598103934665603ull;
     for (const u32 value : specs) {
         hash ^= value;
@@ -400,11 +426,11 @@ u32 EntryHeight(const VideoCore::ImageInfo& info, u32 mip) {
     return info.props.is_block ? std::max<u32>((layout.height + 3) / 4, 1u) : layout.height;
 }
 
-std::array<u32, 14> SpecValues(const VideoCore::ImageInfo& info, bool is_tiler) {
+std::array<u32, 16> SpecValues(const VideoCore::ImageInfo& info, bool is_tiler, bool logic_op) {
     const auto micro_tile_mode = AmdGpu::GetMicroTileMode(info.tile_mode);
     const bool macro = AmdGpu::IsMacroTiled(info.array_mode);
     const u32 thickness = AmdGpu::GetMicroTileThickness(info.array_mode);
-    std::array<u32, 14> specs{info.num_bits,
+    std::array<u32, 16> specs{info.num_bits,
                               info.num_samples,
                               u32(micro_tile_mode),
                               thickness,
@@ -417,7 +443,9 @@ std::array<u32, 14> SpecValues(const VideoCore::ImageInfo& info, bool is_tiler) 
                               1u,
                               1u,
                               1u,
-                              u32(macro)};
+                              u32(macro),
+                              u32(logic_op),
+                              u32(info.pixel_format == vk::Format::eB4G4R4A4UnormPack16)};
     if (macro) {
         const auto macro_tile_mode =
             AmdGpu::CalculateMacrotileMode(info.tile_mode, info.num_bits, info.num_samples);
@@ -438,20 +466,20 @@ std::array<u32, 14> SpecValues(const VideoCore::ImageInfo& info, bool is_tiler) 
 }
 
 struct TilingInfoCB {
-    u32 bank_swizzle;
-    u32 micro_tiled_mips;
-    u32 num_entries;
-    u32 pad;
-    alignas(16) u32 entries_a[16][4];
-    alignas(16) u32 entries_b[16][4];
+    u32 bank_swizzle, micro_tiled_mips, mip, pitch;
+    u32 height, tiled_offset, linear_offset, row_pitch;
+    u32 width, visible_height, depth, slice;
+    u32 sample_index, depth_pitch, num_texels, linear_tiling;
+    std::array<u32, 4> bits{}, offsets{};
+    u32 logic_mask;
 };
-static_assert(sizeof(TilingInfoCB) == 528);
+static_assert(sizeof(TilingInfoCB) == 100);
 
 u64 FootprintBytes(std::span<const TilingEntry> entries) {
     u64 bytes = 0;
     for (const auto& entry : entries) {
         bytes =
-            std::max<u64>(bytes, u64(entry.linear_offset) + u64(entry.row_pitch) * entry.height);
+            std::max<u64>(bytes, u64(entry.linear_offset) + u64(entry.depth_pitch) * entry.depth);
     }
     return bytes;
 }
@@ -459,17 +487,18 @@ u64 FootprintBytes(std::span<const TilingEntry> entries) {
 } // namespace
 
 bool TilingRuntime::Supported(const VideoCore::ImageInfo& info, size_t entries) {
-    if (info.pixel_format == vk::Format::eB4G4R4A4UnormPack16)
+    if (!info.resources.levels || info.resources.levels > 16 || !info.resources.layers ||
+        !std::has_single_bit(info.num_samples) || info.num_samples > 16 ||
+        (info.props.is_block && info.num_samples != 1) ||
+        (info.num_bits == 96 && info.props.is_tiled) || !entries || entries > 32768 ||
+        entries % info.resources.levels || !info.guest_size || info.guest_size > 64 * 1024 * 1024)
         return false;
-    if (!info.props.is_tiled || info.num_samples != 1 || info.resources.layers != 1 ||
-        entries == 0 || entries > 16 || info.guest_size == 0) {
-        return false;
-    }
     switch (info.num_bits) {
     case 8:
     case 16:
     case 32:
     case 64:
+    case 96:
     case 128:
         break;
     default:
@@ -477,30 +506,42 @@ bool TilingRuntime::Supported(const VideoCore::ImageInfo& info, size_t entries) 
     }
     for (u32 mip = 0; mip < info.resources.levels; ++mip) {
         const auto& layout = info.mips_layout[mip];
-        const u32 texels = u32(layout.size / (info.num_bits / 8));
-        if (u64(EntryPitch(info, mip)) * EntryHeight(info, mip) != texels) {
+        const u64 plane = u64(EntryPitch(info, mip)) * EntryHeight(info, mip) * (info.num_bits / 8);
+        if (!plane || !layout.size || layout.offset > info.guest_size ||
+            layout.size > info.guest_size - layout.offset)
             return false;
-        }
     }
     return true;
 }
-
 std::vector<TilingEntry>
 TilingRuntime::Entries(const VideoCore::ImageInfo& info,
-                       std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints) {
+                       std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints,
+                       u32 base_layer) {
     std::vector<TilingEntry> entries;
-    for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+    if (!info.resources.levels || !info.num_samples)
+        return entries;
+    entries.reserve(footprints.size());
+    for (u32 subresource = 0; subresource < footprints.size(); ++subresource) {
+        const u32 mip = subresource % info.resources.levels;
         const auto& layout = info.mips_layout[mip];
+        const auto& footprint = footprints[subresource];
         TilingEntry entry{};
         entry.mip = mip;
         entry.pitch = EntryPitch(info, mip);
         entry.height = EntryHeight(info, mip);
-        entry.texels = u32(layout.size / (info.num_bits / 8));
         entry.tiled_offset = u32(layout.offset);
-        entry.linear_offset = u32(footprints[mip].Offset);
-        entry.row_pitch = u32(footprints[mip].Footprint.RowPitch);
-        entry.width = footprints[mip].Footprint.Width;
-        entry.visible_height = footprints[mip].Footprint.Height;
+        entry.linear_offset = u32(footprint.Offset);
+        entry.row_pitch = footprint.Footprint.RowPitch;
+        entry.width =
+            info.props.is_block ? (footprint.Footprint.Width + 3) / 4 : footprint.Footprint.Width;
+        entry.visible_height =
+            info.props.is_block ? (footprint.Footprint.Height + 3) / 4 : footprint.Footprint.Height;
+        entry.depth = footprint.Footprint.Depth;
+        entry.depth_pitch = entry.row_pitch * entry.visible_height;
+        const u32 plane = subresource / info.resources.levels;
+        entry.slice = base_layer + plane / info.num_samples;
+        entry.sample = plane % info.num_samples;
+        entry.texels = entry.width * entry.visible_height * entry.depth;
         entries.push_back(entry);
     }
     return entries;
@@ -552,10 +593,7 @@ void TilingRuntime::Initialize(D3D12DeviceContext& device_context, ShaderCache& 
 void TilingRuntime::RetireUploads(u64 fence) {
     transfer_fence = fence;
     for (auto& operation : operations) {
-        transfer_pool->Retire(std::move(operation->params), fence);
         transfer_pool->Retire(std::move(operation->staging), fence);
-        transfer_pool->Retire(std::move(operation->zeros), fence);
-        operation->zeros_zeroed = 0;
     }
 }
 void TilingRuntime::ReleaseReadbacks(u64 fence) {
@@ -565,6 +603,11 @@ void TilingRuntime::ReleaseReadbacks(u64 fence) {
         transfer_pool->Retire(std::move(operation->tile_readback), fence);
     operations.clear();
     active = nullptr;
+}
+void TilingRuntime::TrimMemory() {
+    RetireUploads(transfer_fence);
+    ReleaseReadbacks(transfer_fence);
+    pipelines.clear();
 }
 void TilingRuntime::BeginBatch() {
     const auto fence = device->LastSignaledValue();
@@ -579,25 +622,46 @@ void TilingRuntime::BeginBatch() {
 
 bool TilingRuntime::CanRecord(const VideoCore::ImageInfo& info,
                               std::span<const TilingEntry> entries, bool tile) const {
+    if (!Supported(info, entries.size()))
+        return false;
+    for (const auto& entry : entries) {
+        if (entry.mip >= info.resources.levels || !entry.pitch || !entry.height ||
+            u64(entry.width) * entry.visible_height * entry.depth != entry.texels ||
+            u64(entry.row_pitch) * entry.visible_height > entry.depth_pitch)
+            return false;
+        const auto& layout = info.mips_layout[entry.mip];
+        if (!entry.texels || !entry.width || !entry.visible_height || !entry.depth ||
+            entry.width > entry.pitch || entry.visible_height > entry.height ||
+            entry.sample >= info.num_samples)
+            return false;
+        const u64 plane_bytes = u64(entry.pitch) * entry.height * (info.num_bits / 8);
+        if (info.props.is_tiled) {
+            if ((u64(entry.slice) + entry.depth) * info.num_samples > layout.size / plane_bytes)
+                return false;
+        } else {
+            const u64 end =
+                ((u64(entry.slice) + entry.depth - 1) * info.num_samples + entry.sample) *
+                    plane_bytes +
+                (u64(entry.visible_height - 1) * entry.pitch + entry.width) * (info.num_bits / 8);
+            if (end > layout.size)
+                return false;
+        }
+    }
     const auto aligned = [](u64 size) { return (size + 65535) & ~u64{65535}; };
-    const u64 bytes = aligned(info.guest_size);
-    const u64 scratch = aligned(std::max(FootprintBytes(entries), u64(info.guest_size)));
-    const u64 required = 65536 + bytes + scratch * 2 + ((tile || info.num_bits < 32) ? bytes : 0);
+    const u64 required = aligned(FootprintBytes(entries)) + (tile ? aligned(info.guest_size) : 0);
     const auto stats = allocator.Stats();
     return stats.live_bytes <= stats.budget_bytes &&
            required <= stats.budget_bytes - stats.live_bytes;
 }
-
 void TilingRuntime::BeginOperation() {
     auto operation = std::make_unique<Operation>();
     active = operation.get();
     operations.push_back(std::move(operation));
-    RequestBuffer(active->params, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
-                  active->heap_state);
 }
 
-ID3D12PipelineState* TilingRuntime::Pipeline(const VideoCore::ImageInfo& info, bool is_tiler) {
-    const auto specs = SpecValues(info, is_tiler);
+ID3D12PipelineState* TilingRuntime::Pipeline(const VideoCore::ImageInfo& info, bool is_tiler,
+                                             bool logic_op) {
+    const auto specs = SpecValues(info, is_tiler, logic_op);
     const u64 hash = KeyHash(specs);
     if (const auto it = pipelines.find(hash); it != pipelines.end())
         return it->second.Get();
@@ -616,78 +680,65 @@ ID3D12PipelineState* TilingRuntime::Pipeline(const VideoCore::ImageInfo& info, b
 }
 
 void TilingRuntime::Dispatch(ID3D12GraphicsCommandList* commands, const VideoCore::ImageInfo& info,
-                             std::span<const TilingEntry> entries, u32 texels, bool is_tiler,
-                             u64 zero_size) {
-    Transition(commands, active->input, active->input_state,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    if (zero_size) {
-        Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COPY_DEST);
-        commands->CopyBufferRegion(active->output.Get(), 0, active->zeros.Get(), 0, zero_size);
-        Transition(commands, active->output, active->output_state,
-                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    } else {
-        Transition(commands, active->output, active->output_state,
-                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    }
-    void* mapped;
-    constexpr D3D12_RANGE empty{0, 0};
-    winrt::check_hresult(active->params->Map(0, &empty, &mapped));
-    TilingInfoCB translation{};
-    translation.bank_swizzle = u32(info.bank_swizzle);
-    translation.micro_tiled_mips = info.micro_tiled_mips;
-    translation.num_entries = u32(entries.size());
-    u32 total_texels = 0;
-    for (const auto& entry : entries)
-        total_texels += entry.texels;
-    translation.pad = total_texels;
-    for (u32 index = 0; index < entries.size(); ++index) {
-        const auto& entry = entries[index];
-        u32* a = translation.entries_a[index];
-        u32* b = translation.entries_b[index];
-        a[0] = entry.mip;
-        a[1] = entry.pitch;
-        a[2] = entry.height;
-        a[3] = entry.tiled_offset;
-        b[0] = entry.linear_offset;
-        b[1] = entry.row_pitch;
-        b[2] = entry.texels;
-        b[3] = entry.width | (entry.visible_height << 16);
-    }
-    std::memcpy(mapped, &translation, sizeof(translation));
-    active->params->Unmap(0, nullptr);
+                             std::span<const TilingEntry> entries, bool is_tiler, bool logic_op,
+                             u32 logic_mask) {
+    if (is_tiler)
+        Transition(commands, active->input, active->input_state,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(commands, active->output, active->output_state,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     commands->SetComputeRootSignature(root.Get());
-    commands->SetPipelineState(Pipeline(info, is_tiler));
-    commands->SetComputeRootShaderResourceView(0, active->input->GetGPUVirtualAddress());
+    commands->SetPipelineState(Pipeline(info, is_tiler, logic_op));
+    commands->SetComputeRootShaderResourceView(
+        0, (is_tiler ? active->input.Get() : active->staging.Get())->GetGPUVirtualAddress());
     commands->SetComputeRootUnorderedAccessView(1, active->output->GetGPUVirtualAddress());
-    commands->SetComputeRootConstantBufferView(2, active->params->GetGPUVirtualAddress());
-    commands->Dispatch((texels + 63) / 64, 1, 1);
+    const auto format =
+        logic_op ? GetLogicOpFormat(ConvertFormat(info.pixel_format)) : LogicOpFormat{};
+    for (const auto& entry : entries) {
+        TilingInfoCB translation{u32(info.bank_swizzle),
+                                 info.micro_tiled_mips,
+                                 entry.mip,
+                                 entry.pitch,
+                                 entry.height,
+                                 entry.tiled_offset,
+                                 entry.linear_offset,
+                                 entry.row_pitch,
+                                 entry.width,
+                                 entry.visible_height,
+                                 entry.depth,
+                                 entry.slice,
+                                 entry.sample,
+                                 entry.depth_pitch,
+                                 entry.texels,
+                                 u32(!info.props.is_tiled),
+                                 format.bits,
+                                 format.offsets,
+                                 logic_mask};
+        commands->SetComputeRoot32BitConstants(2, 25, &translation, 0);
+        const u32 groups = (entry.texels + 63) / 64;
+        commands->Dispatch(std::min(groups, 65535u), (groups + 65534) / 65535, 1);
+    }
 }
-
-void TilingRuntime::CopyFromGuest(ID3D12GraphicsCommandList* commands, std::span<const u8> bytes) {
-    RequestBuffer(active->staging, bytes.size_bytes(), D3D12_HEAP_TYPE_UPLOAD,
-                  D3D12_RESOURCE_STATE_GENERIC_READ, active->heap_state);
-    RequestBuffer(active->input, bytes.size_bytes(), D3D12_HEAP_TYPE_DEFAULT,
-                  D3D12_RESOURCE_STATE_COMMON, active->input_state,
-                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+void TilingRuntime::CopyFromGuest(ID3D12GraphicsCommandList*, std::span<const u8> bytes,
+                                  const Reader& reader, u64 size) {
+    if (!reader)
+        size = bytes.size_bytes();
+    RequestBuffer(active->staging, size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+                  active->heap_state);
     void* mapped;
     constexpr D3D12_RANGE empty{0, 0};
     winrt::check_hresult(active->staging->Map(0, &empty, &mapped));
-    std::memcpy(mapped, bytes.data(), bytes.size_bytes());
-    active->staging->Unmap(0, &empty);
-    Transition(commands, active->input, active->input_state, D3D12_RESOURCE_STATE_COPY_DEST);
-    commands->CopyBufferRegion(active->input.Get(), 0, active->staging.Get(), 0,
-                               bytes.size_bytes());
-}
-
-void TilingRuntime::EnsureZeroed() {
-    if (!active->zeros.Get() || active->zeros_zeroed == active->zeros.AllocationBytes())
-        return;
-    void* mapped;
-    constexpr D3D12_RANGE empty{0, 0};
-    winrt::check_hresult(active->zeros->Map(0, &empty, &mapped));
-    std::memset(mapped, 0, active->zeros.AllocationBytes());
-    active->zeros->Unmap(0, nullptr);
-    active->zeros_zeroed = active->zeros.AllocationBytes();
+    try {
+        if (reader)
+            reader({static_cast<u8*>(mapped), size_t(size)});
+        else
+            std::memcpy(mapped, bytes.data(), bytes.size_bytes());
+    } catch (...) {
+        active->staging->Unmap(0, &empty);
+        throw;
+    }
+    const D3D12_RANGE written{0, size_t(size)};
+    active->staging->Unmap(0, &written);
 }
 
 void TilingRuntime::OutputToImage(ID3D12GraphicsCommandList* commands,
@@ -714,58 +765,34 @@ void TilingRuntime::OutputToBuffer(ID3D12GraphicsCommandList* commands, u64 byte
 void TilingRuntime::Detile(ID3D12GraphicsCommandList* commands, const VideoCore::ImageInfo& info,
                            std::span<const TilingEntry> entries, std::span<const u8> tiled_bytes,
                            ID3D12Resource* image,
-                           std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints) {
+                           std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints,
+                           bool logic_op, u32 logic_mask, const Reader& reader) {
+    if (entries.size() != footprints.size() || (!reader && tiled_bytes.size() != info.guest_size))
+        throw std::runtime_error("Invalid D3D12 detile backing or footprints");
     BeginOperation();
-    u32 texels = 0;
-    for (const auto& entry : entries)
-        texels += entry.texels;
-    RequestBuffer(active->input, std::max(FootprintBytes(entries), u64(info.guest_size)),
-                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->input_state,
+    CopyFromGuest(commands, tiled_bytes, reader, info.guest_size);
+    RequestBuffer(active->output, FootprintBytes(entries), D3D12_HEAP_TYPE_DEFAULT,
+                  D3D12_RESOURCE_STATE_COMMON, active->output_state,
                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    CopyFromGuest(commands, tiled_bytes);
-    RequestBuffer(active->output, std::max(FootprintBytes(entries), u64(info.guest_size)),
-                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->output_state,
-                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    RequestBuffer(active->input, std::max(FootprintBytes(entries), u64(info.guest_size)),
-                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->input_state);
-    if (info.num_bits < 32) {
-        RequestBuffer(active->zeros, info.guest_size, D3D12_HEAP_TYPE_UPLOAD,
-                      D3D12_RESOURCE_STATE_GENERIC_READ, active->heap_state);
-        EnsureZeroed();
-    }
-    Dispatch(commands, info, entries, texels, false, info.num_bits < 32 ? info.guest_size : 0);
+    Dispatch(commands, info, entries, false, logic_op, logic_mask);
     OutputToImage(commands, entries, image, footprints);
-    Transition(commands, active->input, active->input_state, D3D12_RESOURCE_STATE_COMMON);
-    Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COMMON);
 }
-
 ID3D12Resource* TilingRuntime::Tile(ID3D12GraphicsCommandList* commands,
                                     const VideoCore::ImageInfo& info,
                                     std::span<const TilingEntry> entries, ID3D12Resource* image,
                                     std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints,
-                                    std::span<const u8> guest) {
-    if (guest.size() != info.guest_size)
-        throw std::runtime_error("Invalid D3D12 tiled image backing snapshot");
+                                    std::span<const u8> guest, bool logic_op, u32 logic_mask,
+                                    const Reader& reader) {
+    if ((!reader && guest.size() != info.guest_size) || entries.size() != footprints.size())
+        throw std::runtime_error("Invalid D3D12 tiled image backing or footprints");
     BeginOperation();
-    u32 texels = 0;
-    for (const auto& entry : entries)
-        texels += entry.texels;
-    RequestBuffer(active->input, std::max(FootprintBytes(entries), u64(info.guest_size)),
-                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->input_state,
+    RequestBuffer(active->input, FootprintBytes(entries), D3D12_HEAP_TYPE_DEFAULT,
+                  D3D12_RESOURCE_STATE_COPY_DEST, active->input_state);
+    RequestBuffer(active->output, info.guest_size, D3D12_HEAP_TYPE_DEFAULT,
+                  D3D12_RESOURCE_STATE_COPY_DEST, active->output_state,
                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    RequestBuffer(active->output, std::max(FootprintBytes(entries), u64(info.guest_size)),
-                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, active->output_state,
-                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    RequestBuffer(active->staging, guest.size(), D3D12_HEAP_TYPE_UPLOAD,
-                  D3D12_RESOURCE_STATE_GENERIC_READ, active->heap_state);
-    void* mapped;
-    const D3D12_RANGE empty{0, 0};
-    winrt::check_hresult(active->staging->Map(0, &empty, &mapped));
-    std::memcpy(mapped, guest.data(), guest.size());
-    active->staging->Unmap(0, nullptr);
-    Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COPY_DEST);
-    commands->CopyBufferRegion(active->output.Get(), 0, active->staging.Get(), 0, guest.size());
-    Transition(commands, active->input, active->input_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    CopyFromGuest(commands, guest, reader, info.guest_size);
+    commands->CopyBufferRegion(active->output.Get(), 0, active->staging.Get(), 0, info.guest_size);
     for (u32 subresource = 0; subresource < entries.size(); ++subresource) {
         D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
         source.pResource = image;
@@ -776,12 +803,10 @@ ID3D12Resource* TilingRuntime::Tile(ID3D12GraphicsCommandList* commands,
         destination.PlacedFootprint = footprints[subresource];
         commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
     }
-    Dispatch(commands, info, entries, texels, true, 0);
+    Dispatch(commands, info, entries, true, logic_op, logic_mask);
     RequestBuffer(active->tile_readback, info.guest_size, D3D12_HEAP_TYPE_READBACK,
                   D3D12_RESOURCE_STATE_COPY_DEST, active->heap_state);
     OutputToBuffer(commands, info.guest_size);
-    Transition(commands, active->input, active->input_state, D3D12_RESOURCE_STATE_COMMON);
-    Transition(commands, active->output, active->output_state, D3D12_RESOURCE_STATE_COMMON);
     return active->tile_readback.Get();
 }
 } // namespace D3D12

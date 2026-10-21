@@ -12,6 +12,10 @@
 namespace D3D12 {
 class ImageCache {
 public:
+    void SetAsyncRecording(bool enabled, u32 limit = 64) {
+        async_recording = enabled;
+        image_limit = limit;
+    }
     struct Image {
         VideoCore::ImageInfo info;
         D3D12Resource upload, readback;
@@ -77,6 +81,8 @@ public:
         return statistics;
     }
     Image* FindPresentation(const VideoCore::ImageInfo& info);
+    u64 MemoryBytes() const;
+    void TrimMemory(u64 target, bool writeback);
     void BeginBatch();
     Image& GetImage(const VideoCore::ImageInfo& info, DXGI_FORMAT format,
                     D3D12_RESOURCE_FLAGS flags, u32 base_layer = 0, u32 layer_count = 0,
@@ -93,6 +99,8 @@ public:
     }
 
 private:
+    bool async_recording{};
+    u32 image_limit{64};
     bool Overlaps(const Image& image, VAddr address, u64 size) const;
     void Synchronize(Image& image);
     bool persistent{};

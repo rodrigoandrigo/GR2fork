@@ -31,7 +31,8 @@ inline void SwapIndexBytes(std::span<u8> bytes, AmdGpu::IndexSwapMode swap) {
 }
 inline std::vector<u32> ConvertPrimitiveIndices(AmdGpu::PrimitiveType primitive,
                                                 std::span<const u32> input,
-                                                std::optional<u32> restart = {}) {
+                                                std::optional<u32> restart = {},
+                                                bool provoking_last = false) {
     std::vector<u32> output;
     const auto emit = [&](std::initializer_list<u32> vertices) {
         if (output.size() + vertices.size() > 4 * 1024 * 1024)
@@ -63,8 +64,10 @@ inline std::vector<u32> ConvertPrimitiveIndices(AmdGpu::PrimitiveType primitive,
             break;
         case P::TriangleStrip:
             for (size_t i = 2; i < indices.size(); ++i) {
-                if (i & 1)
+                if ((i & 1) && provoking_last)
                     emit({indices[i - 1], indices[i - 2], indices[i]});
+                else if (i & 1)
+                    emit({indices[i - 2], indices[i], indices[i - 1]});
                 else
                     emit({indices[i - 2], indices[i - 1], indices[i]});
             }

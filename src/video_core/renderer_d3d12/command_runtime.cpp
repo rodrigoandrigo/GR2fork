@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <winrt/base.h>
 #include "common/logging/log.h"
@@ -11,11 +13,95 @@
 #include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/texture_cache/cpu_tiling.h"
+#include "video_core/renderer_d3d12/profile.h"
 
 namespace D3D12 {
+namespace {
+Profile runtime_profile;
+}
+CommandRuntime::~CommandRuntime() {
+    try {
+        DrainContexts();
+        if (device.DirectQueue())
+            device.WaitForGpu();
+        ReadGpuTiming();
+        if (gpu_timing.submissions)
+            std::fprintf(stderr, "NATIVE_GPU final_average_us=%.3f submissions=%llu\n",
+                         double(gpu_timing.ticks) * 1000000.0 / double(gpu_timing.frequency) /
+                             double(gpu_timing.submissions),
+                         static_cast<unsigned long long>(gpu_timing.submissions));
+    } catch (...) {
+        device.DrainAfterFailure();
+    }
+    contexts.clear();
+}
+const CommandRuntime::GpuTimingStatistics& CommandRuntime::GpuTimings() {
+    auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
+                              [&] { return std::unique_lock{mutex}; });
+    ReadGpuTiming();
+    if (!contexts.empty()) {
+        gpu_timing = {};
+        for (auto& context : contexts) {
+            const auto& timing = context->GpuTimings();
+            gpu_timing.submissions += timing.submissions;
+            gpu_timing.ticks += timing.ticks;
+            gpu_timing.frequency = timing.frequency;
+        }
+    }
+    return gpu_timing;
+}
+void CommandRuntime::ReadGpuTiming() {
+    if (!timestamp_fence || device.CompletedValue() < timestamp_fence)
+        return;
+    void* data{};
+    const D3D12_RANGE range{0, 2 * sizeof(u64)};
+    winrt::check_hresult(timestamp_readback->Map(0, &range, &data));
+    std::array<u64, 2> ticks{};
+    std::memcpy(ticks.data(), data, sizeof(ticks));
+    const D3D12_RANGE empty{0, 0};
+    timestamp_readback->Unmap(0, &empty);
+    gpu_timing.ticks += ticks[1] - ticks[0];
+    ++gpu_timing.submissions;
+    timestamp_fence = 0;
+    if (gpu_timing.submissions % 128 == 0)
+        std::fprintf(stderr, "NATIVE_GPU average_us=%.3f submissions=%llu\n",
+                     double(gpu_timing.ticks) * 1000000.0 / double(gpu_timing.frequency) /
+                         double(gpu_timing.submissions),
+                     static_cast<unsigned long long>(gpu_timing.submissions));
+}
+void CommandRuntime::BeginGpuTiming() {
+    ReadGpuTiming();
+    timestamp_recording = timestamp_heap && !timestamp_fence;
+    timestamp_recorded = false;
+    if (timestamp_recording)
+        commands->EndQuery(timestamp_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+}
+void CommandRuntime::EndGpuTiming() {
+    if (!timestamp_recording)
+        return;
+    commands->EndQuery(timestamp_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    commands->ResolveQueryData(timestamp_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
+                               timestamp_readback.Get(), 0);
+    timestamp_recording = false;
+    timestamp_recorded = true;
+}
+
 std::shared_ptr<VideoCore::ResidentFrame> CommandRuntime::CapturePresentation(
     const VideoCore::ImageInfo& info) {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
+                              [&] { return std::unique_lock{mutex}; });
+    ProfileScope capture{runtime_profile, "capture_resident"};
+    MaintainMemory();
+    if (!contexts.empty()) {
+        const ResourceCache::Range requested{info.guest_address, info.guest_size};
+        DrainContexts({&requested, 1}, false);
+        for (auto& context : contexts)
+            if (context->images.FindPresentation(info)) {
+                context->CompleteContext();
+                return context->CapturePresentation(info);
+            }
+        return {};
+    }
     if (failed || image_mapping_count.load())
         return {};
     BeginImages();
@@ -50,6 +136,7 @@ std::shared_ptr<VideoCore::ResidentFrame> CommandRuntime::CapturePresentation(
     frame->row_pitch = footprint.Footprint.RowPitch;
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
+    BeginGpuTiming();
     RecordingGuard recording{failed};
     const auto previous = image->state;
     images.Barrier(*image, commands.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -59,6 +146,8 @@ std::shared_ptr<VideoCore::ResidentFrame> CommandRuntime::CapturePresentation(
     destination.pResource = snapshot.Get();
     destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     destination.PlacedFootprint = footprint;
+    if (runtime_profile.enabled)
+        runtime_profile.Record("capture_copy_bytes", 128, 0, bytes);
     commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
     images.Barrier(*image, commands.Get(), previous);
     D3D12_RESOURCE_BARRIER barrier{};
@@ -66,23 +155,34 @@ std::shared_ptr<VideoCore::ResidentFrame> CommandRuntime::CapturePresentation(
     barrier.Transition = {snapshot.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON};
     commands->ResourceBarrier(1, &barrier);
+    EndGpuTiming();
     winrt::check_hresult(commands->Close());
-    device.Wait(SubmitCommands());
+    ProfileSample(runtime_profile, "runtime_submit_wait", 128,
+                  [&] { device.Wait(SubmitCommands()); });
     recording.completed = true;
     return frame;
 }
 u64 CommandRuntime::Flush() {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
+                              [&] { return std::unique_lock{mutex}; });
     if (failed)
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
+    DrainContexts();
+    for (auto& context : contexts)
+        if (!context->failed)
+            context->Flush();
+    SynchronizeBuffers({}, false, true);
     SynchronizeImages({}, false, true);
     device.WaitForGpu();
     return device.LastSignaledValue();
 }
 void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write write,
                                 ResourceCache::Resolve resolve, ResourceCache::Overlaps overlaps) {
-    device.Initialize();
+    if (!device.Device())
+        device.Initialize();
+    if (!coordinator)
+        memory_budget.Initialize(device.Device());
     transfer_pool = std::make_shared<TransferPool>();
     transfer_pool->Initialize(device);
     persistent_pipelines.Initialize("pipelines", device.Device());
@@ -93,11 +193,45 @@ void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write w
     this->read = read;
     this->write = write;
     resources.Initialize(device, read, write, std::move(resolve), std::move(overlaps), transfer_pool);
+    inputs.Initialize(device, read, write, {},
+        [this](VAddr a, u64 an, VAddr b, u64 bn) { return resources.Aliases(a, an, b, bn); }, transfer_pool);
     images.Initialize(
         device, std::move(read), std::move(write),
         [this](VAddr address, u64 size) { return resources.Canonicalize(address, size); },
         &shaders, transfer_pool, &resources);
+    resource_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                    512, true);
+    sampler_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 128, true);
+    color_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, false);
+    depth_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
+    static_cast<void>(resource_descriptors.Allocate(512));
+    static_cast<void>(sampler_descriptors.Allocate(128));
+    static_cast<void>(color_descriptors.Allocate(8));
+    static_cast<void>(depth_descriptors.Allocate(1));
+    if (std::getenv("GAME_PROFILE") &&
+        SUCCEEDED(device.DirectQueue()->GetTimestampFrequency(&gpu_timing.frequency)) &&
+        gpu_timing.frequency) {
+        D3D12_QUERY_HEAP_DESC query{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0};
+        D3D12_RESOURCE_DESC readback{};
+        readback.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readback.Width = 2 * sizeof(u64);
+        readback.Height = readback.DepthOrArraySize = readback.MipLevels = 1;
+        readback.SampleDesc.Count = 1;
+        readback.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        if (FAILED(device.Device()->CreateQueryHeap(&query, IID_PPV_ARGS(&timestamp_heap))) ||
+            FAILED(device.Device()->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &readback, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&timestamp_readback)))) {
+            timestamp_heap.Reset();
+            timestamp_readback.Reset();
+            gpu_timing.frequency = 0;
+            LOG_WARNING(Core, "Native D3D12 GPU timestamps unavailable");
+        }
+    }
     device.CreateDirectCommands(allocator, commands);
+    EndGpuTiming();
     winrt::check_hresult(commands->Close());
 }
 struct CommandRuntime::CpuImageAccess {
@@ -126,16 +260,75 @@ struct CommandRuntime::ImageMappingAccess {
     }
 };
 void CommandRuntime::SetImageResidency(ImageWatches callback) {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
+                              [&] { return std::unique_lock{mutex}; });
+    DrainContexts();
+    for (auto& context : contexts)
+        context->SetImageResidency(callback ? ImageWatches{[this](auto) { UpdateImageWatches(); }}
+                                            : ImageWatches{});
     if (image_watches)
         SynchronizeImages({}, true, true);
+    SynchronizeBuffers({}, true, true);
+    inputs.ConfigureResidency(bool(callback) && coordinator);
+    resources.ConfigureResidency(bool(callback) && coordinator, [this](VAddr address, u64 size) {
+        const ResourceCache::Range range{address, size};
+        SynchronizeBuffers({&range, 1}, true);
+    });
     image_watches = std::move(callback);
     BeginImages();
     UpdateImageWatches();
 }
+std::vector<ImageCache::Watch> CommandRuntime::ResourceWatches() const {
+    auto watches = images.Watches();
+    for (const auto& watch : inputs.Watches())
+        watches.push_back({watch.address, watch.size, false});
+    for (const auto& watch : resources.Watches())
+        watches.push_back({watch.address, watch.size, watch.dirty});
+    return watches;
+}
+void CommandRuntime::SynchronizeBuffers(std::span<const ResourceCache::Range> ranges,
+                                        bool invalidate, bool all) {
+    if (resources.RequestDownloads(ranges, all)) {
+        if (buffer_commands_open)
+            throw std::runtime_error("D3D12 buffer ownership must be resolved before recording");
+        struct Scope {
+            bool& value;
+            ~Scope() { value = false; }
+        } scope{synchronizing_images};
+        synchronizing_images = true;
+        std::vector<ResourceCache::Range> access;
+        for (const auto& watch : resources.Watches())
+            if (watch.dirty)
+                access.push_back({watch.address, watch.size});
+        const auto lease = acquire_memory ? acquire_memory(access) : nullptr;
+        winrt::check_hresult(allocator->Reset());
+        winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
+        RecordingGuard recording{failed};
+        resources.PrepareDownload(commands.Get());
+        winrt::check_hresult(commands->Close());
+        ProfileSample(runtime_profile, "runtime_submit_wait", 128,
+                  [&] { device.Wait(SubmitCommands()); });
+        resources.CommitDownloads(bool(lease));
+        recording.completed = true;
+    }
+    if (invalidate) {
+        resources.InvalidateCpu(ranges, all);
+        inputs.InvalidateCpu(ranges, all);
+    }
+    UpdateImageWatches();
+}
 void CommandRuntime::UpdateImageWatches() {
+    if (!contexts.empty() && image_watches) {
+        auto watches = ResourceWatches();
+        for (auto& context : contexts) {
+            auto next = context->ResourceWatches();
+            watches.insert(watches.end(), next.begin(), next.end());
+        }
+        image_watches(watches);
+        return;
+    }
     if (image_watches)
-        image_watches(images.Watches());
+        image_watches(ResourceWatches());
 }
 void CommandRuntime::BeginImages() {
     const bool enabled = bool(image_watches) && image_mapping_count.load() == 0;
@@ -173,10 +366,13 @@ void CommandRuntime::SynchronizeImages(std::span<const ResourceCache::Range> ran
         const auto memory_access = acquire_memory ? acquire_memory(access) : nullptr;
         winrt::check_hresult(allocator->Reset());
         winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
+        BeginGpuTiming();
         RecordingGuard recording{failed};
         images.PrepareDownloads(commands.Get());
+        EndGpuTiming();
         winrt::check_hresult(commands->Close());
-        device.Wait(SubmitCommands());
+        ProfileSample(runtime_profile, "runtime_submit_wait", 128,
+                  [&] { device.Wait(SubmitCommands()); });
         images.CommitDownloads();
         recording.completed = true;
     }
@@ -185,26 +381,63 @@ void CommandRuntime::SynchronizeImages(std::span<const ResourceCache::Range> ran
     UpdateImageWatches();
 }
 std::shared_ptr<void> CommandRuntime::AcquireCpuAccess(VAddr address, u64 size, bool write) {
+    std::unique_lock parent_lock{mutex};
+    const ResourceCache::Range requested{address, size};
+    DrainContexts({&requested, 1}, false);
+    for (auto& context : contexts)
+        if (!context->completing && !context->recording_context && !context->synchronizing_images) {
+            const auto watches = context->ResourceWatches();
+            if (context->completion && std::ranges::any_of(watches, [&](const auto& watch) {
+                    return watch.dirty && resources.Aliases(address, size, watch.address, watch.size);
+                }))
+                context->CompleteContext();
+            static_cast<void>(context->AcquireCpuAccess(address, size, write));
+        }
     if (image_mapping_count.load() && image_mapping_ready.load())
         return AcquireMemoryMappingAccess();
     auto access = std::make_shared<CpuImageAccess>(*this);
     if (failed)
         throw std::runtime_error("CPU access to failed D3D12 image owner");
     const ResourceCache::Range range{address, size};
+    SynchronizeBuffers({&range, 1}, write);
     SynchronizeImages({&range, 1}, write);
     return access;
 }
 std::shared_ptr<void> CommandRuntime::AcquireMemoryMappingAccess() {
+    auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
+                              [&] { return std::unique_lock{mutex}; });
+    DrainContexts();
+    for (auto& context : contexts) {
+        context->SynchronizeBuffers({}, true, true);
+        context->resources.InvalidateMappings();
+        context->inputs.InvalidateMappings();
+        context->SynchronizeImages({}, true, true);
+    }
+    SynchronizeBuffers({}, true, true);
+    resources.InvalidateMappings();
+    inputs.InvalidateMappings();
     return std::make_shared<ImageMappingAccess>(*this);
 }
 void CommandRuntime::CompleteImages(std::span<const ResourceCache::Range> cpu_ranges) {
     images.CommitDownloads();
     images.InvalidateCpu(cpu_ranges);
+    inputs.InvalidateCpu(cpu_ranges);
+    for (const auto& watch : images.Watches())
+        if (watch.dirty) {
+            const ResourceCache::Range range{watch.address, watch.size};
+            inputs.InvalidateCpu({&range, 1});
+        }
     UpdateImageWatches();
 }
-u64 CommandRuntime::SubmitCommands() {
-    const auto fence = device.Submit(commands.Get());
+u64 CommandRuntime::SubmitCommands(u64 fence) {
+    if (!fence)
+        fence = device.Submit(commands.Get());
+    if (timestamp_recorded) {
+        timestamp_fence = fence;
+        timestamp_recorded = false;
+    }
     resources.RetireUploads(fence);
+    inputs.RetireUploads(fence);
     images.RetireUploads(fence);
     for (auto& input : input_resources)
         transfer_pool->Retire(std::move(input), fence);
@@ -215,7 +448,20 @@ void CommandRuntime::MaterializeColorClear(const AmdGpu::ColorBuffer& buffer,
                                            const VideoCore::ImageInfo& info) {
     if (!buffer.info.fast_clear || !buffer.cmask_base_address)
         return;
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
+                              [&] { return std::unique_lock{mutex}; });
+    MaintainMemory();
+    if (!contexts.empty()) {
+        const std::array<ResourceCache::Range, 2> ranges{{
+            {info.guest_address, info.guest_size},
+            {buffer.CmaskAddress(), CmaskBytes(buffer)}}};
+        auto& context = NextContext(ranges);
+        struct Scope { bool& active; ~Scope() { active = false; } } scope{context.recording_context};
+        context.recording_context = true;
+        context.MaterializeColorClear(buffer, info);
+        return;
+    }
+    DrainContexts();
     if (failed)
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
@@ -322,8 +568,39 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
     commit(buffer.CmaskAddress(), original_metadata, metadata);
 }
 void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
-                              std::array<u32, 3> groups, VAddr border_colors) {
-    std::scoped_lock lock{mutex};
+                              std::array<u32, 3> groups, VAddr border_colors, VAddr indirect_address) {
+    auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
+                              [&] { return std::unique_lock{mutex}; });
+    MaintainMemory();
+    if (!contexts.empty()) {
+        const auto shader = shaders.Compile(params, runtime);
+        std::vector<ResourceCache::Range> writes, reads;
+        if (indirect_address) reads.push_back({indirect_address, 12});
+        for (const auto& image : shader.info.images) {
+            const VideoCore::ImageInfo info{image.GetSharp(shader.info), image};
+            reads.push_back({info.guest_address, info.guest_size});
+        }
+        for (const auto& buffer : shader.info.buffers) {
+            if (buffer.buffer_type != Shader::BufferType::Guest)
+                continue;
+            const auto sharp = buffer.GetSharp(shader.info);
+            reads.push_back({sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
+            if (!buffer.is_written)
+                continue;
+            writes.push_back({sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
+        }
+        for (const auto& image : shader.info.images) {
+            if (!image.is_written)
+                continue;
+            const VideoCore::ImageInfo info{image.GetSharp(shader.info), image};
+            writes.push_back({info.guest_address, info.guest_size});
+        }
+        auto& context = NextContext(writes, reads);
+        struct Scope { bool& active; ~Scope() { active = false; } } scope{context.recording_context};
+        context.recording_context = true;
+        context.Dispatch(params, runtime, groups, border_colors, indirect_address);
+        return;
+    }
     if (failed)
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
@@ -340,8 +617,14 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
             throw std::runtime_error("Guest dispatch exceeds D3D12 workgroup limits");
     }
     auto shader = shaders.Compile(params, runtime);
+    if (indirect_address && std::ranges::any_of(shader.info.buffers, [](const auto& buffer) {
+            return buffer.buffer_type == Shader::BufferType::SharedMemory;
+        }))
+        throw GpuDrawFallback{};
     std::array<CompiledShader*, 1> stages{&shader};
-    ResourceBindings bindings{device, resources, images, stages};
+    PrepareContext(stages);
+    ResourceBindings bindings{device, resources, images, stages, {},
+                              &resource_descriptors, &sampler_descriptors, coordinator != nullptr};
     std::vector<D3D12_ROOT_PARAMETER> parameters(2);
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants = {0, 0, 20};
@@ -384,12 +667,35 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     BeginImages();
     const auto cpu_ranges = bindings.CpuRanges(border_colors);
     SynchronizeImages(cpu_ranges, true);
+    SynchronizeBuffers(bindings.ImageRanges(), true);
     bindings.PrepareImages();
-    const auto access_ranges = bindings.AccessRanges(border_colors);
+    auto access_ranges = bindings.AccessRanges(border_colors);
+    if (indirect_address) access_ranges.push_back({indirect_address, 12});
     const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
+    resources.PrepareViews(bindings.GuestRanges());
+    ResourceCache::View indirect_view{};
+    if (indirect_address) {
+        const ResourceCache::Range range{indirect_address, 12};
+        SynchronizeImages({&range, 1}, true);
+        resources.PrepareViews({&range, 1});
+        indirect_view = resources.GetViews({&range, 1}).front();
+        if (!indirect_view.buffer || std::ranges::any_of(indirect_view.segments, [&](const auto& part) {
+                return part.offset != indirect_view.offset + part.address - indirect_address;
+            }))
+            throw GpuDrawFallback{};
+        gpu_commands.Initialize(device, shaders);
+        gpu_commands.Prepare(1, 0);
+    }
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
+    buffer_commands_open = true;
+    struct BufferScope { bool& open; ~BufferScope() { open = false; } } buffer_scope{buffer_commands_open};
+    BeginGpuTiming();
     RecordingGuard recording{failed};
+    if (indirect_address) {
+        resources.Upload(*indirect_view.buffer, commands.Get());
+        gpu_commands.RecordDispatch(commands.Get(), indirect_view);
+    }
     Shader::PushData push{};
     const std::array<float, 24> planes{};
     std::vector<u8> shared_memory;
@@ -411,20 +717,34 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     commands->SetComputeRoot32BitConstants(0, constants.size(), constants.data(), 0);
     commands->SetComputeRoot32BitConstants(1, groups.size(), groups.data(), 0);
     bindings.Bind(commands.Get(), false, resource_slot, sampler_slot);
-    commands->Dispatch(groups[0], groups[1], groups[2]);
+    if (indirect_address) {
+        gpu_commands.ExecuteDispatch(commands.Get(), root.Get());
+        ++(coordinator ? coordinator : this)->async_statistics.gpu_dispatches;
+    }
+    else commands->Dispatch(groups[0], groups[1], groups[2]);
     resources.PrepareDownload(commands.Get());
     images.PrepareDownloads(commands.Get());
+    EndGpuTiming();
     winrt::check_hresult(commands->Close());
-    device.Wait(SubmitCommands());
-    resources.CommitDownloads(bool(memory_access));
-    bindings.CommitGds(gds);
-    CompleteImages(bindings.CpuRanges(0, true));
+    FinishRecording(memory_access, bindings.GdsBuffer(), bindings.CpuRanges(0, true));
     recording.completed = true;
 }
 void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
                              const VideoCore::ImageInfo& destination, u32 source_layer,
                              u32 destination_layer, u32 layers) {
-    std::scoped_lock lock{mutex};
+    auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
+                              [&] { return std::unique_lock{mutex}; });
+    MaintainMemory();
+    if (!contexts.empty()) {
+        const ResourceCache::Range target{destination.guest_address, destination.guest_size};
+        const ResourceCache::Range input{source.guest_address, source.guest_size};
+        auto& context = NextContext({&target, 1}, {&input, 1});
+        struct Scope { bool& active; ~Scope() { active = false; } } scope{context.recording_context};
+        context.recording_context = true;
+        context.Resolve(source, destination, source_layer, destination_layer, layers);
+        return;
+    }
+    DrainContexts();
     if (failed)
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
@@ -441,11 +761,14 @@ void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
     const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
+    BeginGpuTiming();
     RecordingGuard recording{failed};
     images.Resolve(input, output, commands.Get());
     images.PrepareDownloads(commands.Get());
+    EndGpuTiming();
     winrt::check_hresult(commands->Close());
-    device.Wait(SubmitCommands());
+    ProfileSample(runtime_profile, "runtime_submit_wait", 128,
+                  [&] { device.Wait(SubmitCommands()); });
     CompleteImages();
     recording.completed = true;
 }

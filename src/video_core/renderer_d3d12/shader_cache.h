@@ -97,6 +97,8 @@ public:
     std::shared_ptr<const ShaderBinary> CompileHlslRaw(const std::string& hlsl,
                                                        std::wstring_view target,
                                                        std::span<const std::wstring> defines);
+    u64 MemoryBytes() const { return cache_bytes + variant_bytes; }
+    void TrimMemory(u64 target);
     struct Statistics {
         u64 translations{}, variant_hits{};
     };

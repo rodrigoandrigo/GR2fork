@@ -8,6 +8,8 @@
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/amdgpu/regs_vertex.h"
 #include "video_core/renderer_d3d12/image_cache.h"
+#include "video_core/renderer_d3d12/memory_budget.h"
+#include "video_core/renderer_d3d12/gpu_commands.h"
 #include "video_core/renderer_d3d12/resource_bindings.h"
 #include "video_core/renderer_d3d12/resource_cache.h"
 #include "video_core/renderer_d3d12/shader_cache.h"
@@ -15,8 +17,28 @@
 namespace D3D12 {
 class CommandRuntime {
 public:
+    CommandRuntime() = default;
+    ~CommandRuntime();
     using AcquireMemory =
         std::function<std::shared_ptr<void>(std::span<const ResourceCache::Range>)>;
+    void EnableAsync(ResourceCache::ResolveBacking backing, AcquireMemory acquire);
+    void SubmitReady();
+    void MaintainMemory(bool force = false);
+    void SetBackground(bool background);
+    void SetExternalMemory(std::function<u64()> usage, std::function<void()> trim) {
+        std::scoped_lock lock{mutex};
+        external_memory = std::move(usage);
+        trim_external_memory = std::move(trim);
+    }
+    u64 MemoryBytes() const;
+    const MemoryBudget::Statistics& MemoryStatistics() const { return memory_budget.Stats(); }
+    ResourceCache::UploadStatistics BufferStatistics(bool input = false) const;
+    struct AsyncStatistics {
+        u64 commands{}, batches{}, hazard_waits{}, capacity_waits{};
+        u64 gpu_draw_batches{}, gpu_dispatches{}, gpu_index_expansions{};
+        u32 peak_in_flight{};
+    };
+    const AsyncStatistics& AsyncStats() const { return async_statistics; }
     void SetMemoryAccess(AcquireMemory acquire) {
         acquire_memory = std::move(acquire);
     }
@@ -28,6 +50,9 @@ public:
         std::optional<Shader::ShaderParams> hull, domain;
         Shader::RuntimeInfo hull_runtime{}, domain_runtime{};
         std::vector<u32> converted_indices;
+        std::optional<GpuCommands::Arguments> indirect;
+        std::optional<GpuCommands::Expansion> expansion;
+        u32 source_index_count{};
         bool rectangles{};
         std::vector<VideoCore::ImageInfo> colors;
         std::vector<AmdGpu::ColorBuffer> color_clear_buffers;
@@ -87,7 +112,7 @@ public:
     void Initialize(ResourceCache::Read read, ResourceCache::Write write,
                     ResourceCache::Resolve resolve = {}, ResourceCache::Overlaps overlaps = {});
     void Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
-                  std::array<u32, 3> groups, VAddr border_colors = 0);
+                  std::array<u32, 3> groups, VAddr border_colors = 0, VAddr indirect_address = 0);
     void Draw(const DrawRequest& request);
     void DrawImpl(const DrawRequest& request);
     static u64 GsInvocations(D3D_PRIMITIVE_TOPOLOGY topology, u64 count);
@@ -100,11 +125,9 @@ public:
         return resources;
     }
     u32 StrmoutFilledSize() const {
-        return strmout_filled;
+        return last_context ? last_context->strmout_filled : strmout_filled;
     }
-    std::span<u8, 65536> Gds() {
-        return gds;
-    }
+    std::span<u8, 65536> Gds();
     const TransferPool& Transfers() const {
         return *transfer_pool;
     }
@@ -122,8 +145,20 @@ public:
     void SetImageResidency(ImageWatches callback);
     std::shared_ptr<void> AcquireCpuAccess(VAddr address, u64 size, bool write);
     std::shared_ptr<void> AcquireMemoryMappingAccess();
+    struct GpuTimingStatistics {
+        u64 submissions{}, ticks{}, frequency{};
+    };
+    const GpuTimingStatistics& GpuTimings();
     const ImageCache::Statistics& ImageResidencyStatistics() const {
-        return images.ResidencyStatistics();
+        residency_statistics = images.ResidencyStatistics();
+        for (const auto& context : contexts) {
+            const auto& next = context->images.ResidencyStatistics();
+            residency_statistics.uploads += next.uploads;
+            residency_statistics.resident_hits += next.resident_hits;
+            residency_statistics.downloads += next.downloads;
+            residency_statistics.cpu_invalidations += next.cpu_invalidations;
+        }
+        return residency_statistics;
     }
 
 private:
@@ -136,7 +171,12 @@ private:
     };
     void MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer,
                                    const VideoCore::ImageInfo& info);
-    bool failed{};
+    bool failed{}, trimming_memory{};
+    MemoryBudget memory_budget;
+    std::function<u64()> external_memory;
+    std::function<void()> trim_external_memory;
+    u64 LocalMemoryBytes() const;
+    void TrimLocalMemory(u64 target, bool writeback);
     struct Pipeline {
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
         Microsoft::WRL::ComPtr<ID3D12PipelineState> state;
@@ -156,16 +196,50 @@ private:
     bool synchronizing_images{};
     u64 image_mapping_generation{};
     void BeginImages();
+    void SynchronizeBuffers(std::span<const ResourceCache::Range> ranges, bool invalidate, bool all = false);
+    std::vector<ImageCache::Watch> ResourceWatches() const;
+    bool buffer_commands_open{};
     void UpdateImageWatches();
     void SynchronizeImages(std::span<const ResourceCache::Range> ranges, bool invalidate,
                            bool all = false);
     void CompleteImages(std::span<const ResourceCache::Range> cpu_ranges = {});
-    u64 SubmitCommands();
-    D3D12DeviceContext device;
+    u64 SubmitCommands(u64 fence = 0);
+    explicit CommandRuntime(D3D12DeviceContext& shared) : device{shared} {}
+    CommandRuntime& NextContext(std::span<const ResourceCache::Range> writes = {},
+                                std::span<const ResourceCache::Range> reads = {});
+    void DrainContexts(std::span<const ResourceCache::Range> ranges = {}, bool all = true);
+    void CompleteContext();
+    void PrepareContext(std::span<CompiledShader*> stages);
+    void FinishRecording(std::shared_ptr<void> lease, ResourceCache::Buffer* gds_buffer,
+                         std::vector<ResourceCache::Range> cpu_ranges);
+    CommandRuntime* coordinator{};
+    CommandRuntime* last_context{};
+    std::vector<std::unique_ptr<CommandRuntime>> contexts;
+    std::vector<ResourceCache::Range> pending_ranges, write_ranges;
+    std::function<void()> completion;
+    std::shared_ptr<void> pending_lease;
+    bool ready{}, completing{}, recording_context{};
+    u64 pending_fence{}, context_order{}, next_order{};
+    AsyncStatistics async_statistics{};
+    mutable ImageCache::Statistics residency_statistics{};
+    void BeginGpuTiming();
+    void EndGpuTiming();
+    void ReadGpuTiming();
+    GpuTimingStatistics gpu_timing{};
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamp_heap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> timestamp_readback;
+    u64 timestamp_fence{};
+    bool timestamp_recording{}, timestamp_recorded{};
+    D3D12DeviceContext owned_device;
+    D3D12DeviceContext& device{owned_device};
     std::shared_ptr<TransferPool> transfer_pool;
     std::vector<D3D12Resource> input_resources;
+    D3D12DescriptorArena resource_descriptors, sampler_descriptors;
+    D3D12DescriptorArena color_descriptors, depth_descriptors;
     ShaderCache shaders;
     ResourceCache resources;
+    ResourceCache inputs;
+    GpuCommands gpu_commands;
     ImageCache images;
     ResourceCache::Read read;
     ResourceCache::Write write;

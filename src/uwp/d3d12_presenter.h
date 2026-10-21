@@ -12,16 +12,20 @@
 #include "uwp/shadps4_api.h"
 #include "video_core/presentation_sink.h"
 #include "video_core/renderer_d3d12/profile.h"
+#include "video_core/renderer_d3d12/fsr_pass.h"
 #include "video_core/renderer_d3d12/shader_cache.h"
 #include "video_core/resident_frame.h"
 
 namespace Core::Uwp {
 class D3D12Presenter final : public VideoCore::PresentationSink {
 public:
+    ~D3D12Presenter() override;
     static void CheckEnvironment();
     void Initialize(const ShadPS4Config& config);
     void Render();
     void Drain();
+    void TrimMemory();
+    u64 MemoryBytes() const;
     void Resize(uint32_t width, uint32_t height, float scale_x = 1.0f, float scale_y = 1.0f);
     void RegisterVideoOutSurface(const Libraries::VideoOut::BufferAttributeGroup& group,
                                  VAddr address) override;
@@ -54,9 +58,10 @@ private:
     std::atomic<float> gamma{1.0f};
     std::atomic_bool prepared_frame{};
     bool presented_frame{};
-    std::mutex mutex;
+    mutable std::mutex mutex;
     D3D12DeviceContext context;
     D3D12::ShaderCache conversion_shaders;
+    D3D12::FsrPass fsr;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> conversion_root;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> conversion_pipeline;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> conversion_heap;
@@ -66,7 +71,7 @@ private:
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> commands_allocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commands;
-    D3D12::Profile presenter_profile;
+    mutable D3D12::Profile presenter_profile;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> buffers;
     uint32_t width{};
     uint32_t height{};

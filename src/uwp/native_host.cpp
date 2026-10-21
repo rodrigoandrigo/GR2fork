@@ -65,7 +65,24 @@ void NativeHost::InitializeGpu() {
     LOG_INFO(Core, "[UWP stage] creating native GPU processor");
     auto gpu = std::make_unique<AmdGpu::Liverpool>();
     LOG_INFO(Core, "[UWP stage] creating native D3D12 rasterizer");
-    gpu->OwnRasterizer(std::make_unique<D3D12::Rasterizer>(*gpu, *Core::Memory::Instance()));
+    auto renderer = std::make_unique<D3D12::Rasterizer>(*gpu, *Core::Memory::Instance());
+    {
+        std::scoped_lock lock{renderer_mutex};
+        const std::weak_ptr<D3D12Presenter> presenter = presentation;
+        renderer->SetExternalMemory(
+            [presenter] {
+                const auto value = presenter.lock();
+                return value ? value->MemoryBytes() : 0;
+            },
+            [presenter] {
+                if (const auto value = presenter.lock())
+                    value->TrimMemory();
+            });
+        renderer->SetBackground(!active);
+        auto* pointer = renderer.get();
+        gpu->OwnRasterizer(std::move(renderer));
+        rasterizer = pointer;
+    }
     liverpool = std::move(gpu);
     VideoCore::SetPresentationSink(presentation);
     LOG_INFO(Core, "[UWP stage] native D3D12 GPU ready");
@@ -76,6 +93,15 @@ void NativeHost::Resize(uint32_t width, uint32_t height, float scale_x, float sc
 }
 void NativeHost::SetHDROutput(bool enabled, float sdr_white_nits) {
     presentation->SetHDROutput(enabled, sdr_white_nits);
+}
+void NativeHost::SetActive(bool value) {
+    std::scoped_lock lock{renderer_mutex};
+    const bool changed = active != value;
+    active = value;
+    if (rasterizer)
+        rasterizer->SetBackground(!active);
+    if (changed && !active)
+        presentation->TrimMemory();
 }
 void NativeHost::Render() {
     if (shadps4_get_state() != SHADPS4_RUNNING)

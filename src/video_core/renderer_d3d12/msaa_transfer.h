@@ -34,6 +34,10 @@ public:
         D3D12DescriptorArena stencil_descriptors;
     };
     void Initialize(ID3D12Device* device);
+    u64 MemoryBytes() const {
+        return pipelines.size() * 65536 + vertex.capacity() + mask_shader.capacity();
+    }
+    void TrimMemory() { pipelines.clear(); }
     const std::vector<u8>& MaskShader() const {
         return mask_shader;
     }

@@ -1619,10 +1619,16 @@ if(SHADPS4_UWP)
         src/video_core/renderer_d3d12/resource_cache.cpp
         src/video_core/renderer_d3d12/image_cache.cpp
         src/video_core/renderer_d3d12/tiling_runtime.cpp
+        src/video_core/renderer_d3d12/fsr_pass.cpp
         src/video_core/renderer_d3d12/msaa_transfer.cpp
+        src/video_core/renderer_d3d12/command_scheduler.cpp
+        src/video_core/renderer_d3d12/memory_budget.cpp
+        src/video_core/renderer_d3d12/gpu_commands.cpp
         src/video_core/renderer_d3d12/command_runtime.cpp
         src/video_core/renderer_d3d12/draw_runtime.cpp
         src/video_core/renderer_d3d12/pipeline_cache.cpp
+        src/video_core/renderer_d3d12/persistent_cache.cpp
+        src/video_core/renderer_d3d12/transfer_pool.cpp
         src/video_core/renderer_d3d12/resource_bindings.cpp
         src/video_core/renderer_d3d12/image_buffer_alias.cpp
         src/video_core/renderer_d3d12/shader_cache.cpp
@@ -1635,6 +1641,7 @@ if(SHADPS4_UWP)
         "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp/d3d12_resource_allocator.cpp"
         "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp/d3d12_command_encoder.cpp"
         "${SHADPS4_D3D12_SOURCE_DIR}/platform/xbox_uwp/d3d12_pipeline_cache.cpp")
+    add_dependencies(shadps4_native_d3d12 host_shaders)
     get_target_property(native_dependencies shadps4 LINK_LIBRARIES)
     target_link_libraries(shadps4_native_d3d12 PRIVATE ${native_dependencies})
     target_include_directories(shadps4_native_d3d12 PRIVATE

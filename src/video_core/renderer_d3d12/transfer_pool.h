@@ -16,6 +16,7 @@ public:
     void Initialize(D3D12DeviceContext& device, u64 budget = 256ULL * 1024 * 1024);
     D3D12Resource Acquire(u64 size, D3D12_HEAP_TYPE heap);
     void Retire(D3D12Resource&& resource, u64 fence);
+    void TrimMemory(u64 target);
     const Statistics& GetStatistics() const {
         return statistics;
     }

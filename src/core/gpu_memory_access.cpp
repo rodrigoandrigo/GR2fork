@@ -51,6 +51,22 @@ MemoryManager::AcquireGpuAccess(std::span<const std::pair<VAddr, u64>> ranges) {
         throw std::runtime_error("Nested guest GPU memory ownership is not supported");
     auto lease = std::make_shared<GpuAccessLease>(*this);
     std::unique_lock lock{gpu_access_mutex};
+    if (!async_gpu_ranges.empty())
+        throw std::runtime_error("Cannot mix synchronous and asynchronous GPU ownership");
+    auto protected_ranges = ResolveGpuProtectedRanges(ranges);
+    gpu_protected_ranges = std::move(protected_ranges);
+    gpu_access_owner = std::this_thread::get_id();
+    gpu_access_memory = this;
+    gpu_fault_memory.store(this, std::memory_order_release);
+    ++gpu_access_epoch;
+    lease->memory = this;
+    for (const auto& range : gpu_protected_ranges)
+        impl.Protect(range.address, range.size, MemoryPermission::None);
+    return lease;
+}
+
+std::vector<MemoryManager::GpuProtectedRange> MemoryManager::ResolveGpuProtectedRanges(
+    std::span<const std::pair<VAddr, u64>> ranges) {
     std::vector<std::pair<PAddr, u64>> physical;
     for (const auto& [address, size] : ranges) {
         if (!address || !size)
@@ -106,15 +122,65 @@ MemoryManager::AcquireGpuAccess(std::span<const std::pair<VAddr, u64>> ranges) {
         }
     }
     std::ranges::sort(protected_ranges, {}, &GpuProtectedRange::address);
-    gpu_protected_ranges = std::move(protected_ranges);
+    return protected_ranges;
+}
+struct MemoryManager::AsyncGpuAccessLease {
+    MemoryManager* memory{};
+    u64 id{};
+    ~AsyncGpuAccessLease() {
+        if (memory)
+            memory->ReleaseAsyncGpuAccess(id);
+    }
+};
+std::shared_ptr<void> MemoryManager::AcquireAsyncGpuAccess(
+    std::span<const std::pair<VAddr, u64>> ranges) {
+    GuestCopyScope scope{this};
+    std::unique_lock lock{gpu_access_mutex};
+    if (gpu_access_memory)
+        throw std::runtime_error("Cannot mix synchronous and asynchronous GPU ownership");
+    auto protected_ranges = ResolveGpuProtectedRanges(ranges);
+    auto lease = std::make_shared<AsyncGpuAccessLease>();
+    const auto id = ++async_gpu_id;
+    async_gpu_ranges.emplace(id, std::move(protected_ranges));
+    UpdateAsyncGpuProtection();
     gpu_access_owner = std::this_thread::get_id();
-    gpu_access_memory = this;
     gpu_fault_memory.store(this, std::memory_order_release);
-    ++gpu_access_epoch;
+    lease->id = id;
     lease->memory = this;
+    return lease;
+}
+void MemoryManager::UpdateAsyncGpuProtection() {
+    std::vector<GpuImageProtectedRange> previous;
+    for (const auto& range : gpu_protected_ranges)
+        previous.push_back({range, false});
+    gpu_protected_ranges.clear();
+    for (const auto& [id, ranges] : async_gpu_ranges)
+        gpu_protected_ranges.insert(gpu_protected_ranges.end(), ranges.begin(), ranges.end());
+    std::ranges::sort(gpu_protected_ranges, {}, &GpuProtectedRange::address);
+    std::vector<GpuProtectedRange> merged;
+    for (const auto& range : gpu_protected_ranges) {
+        if (!merged.empty() && range.address <= merged.back().address + merged.back().size &&
+            range.permissions == merged.back().permissions) {
+            auto& last = merged.back();
+            last.size = std::max(last.address + last.size, range.address + range.size) - last.address;
+        } else {
+            merged.push_back(range);
+        }
+    }
+    gpu_protected_ranges = std::move(merged);
     for (const auto& range : gpu_protected_ranges)
         impl.Protect(range.address, range.size, MemoryPermission::None);
-    return lease;
+    ApplyGpuImageProtection(previous, false);
+    ++gpu_access_epoch;
+}
+void MemoryManager::ReleaseAsyncGpuAccess(u64 id) {
+    std::unique_lock lock{gpu_access_mutex};
+    async_gpu_ranges.erase(id);
+    UpdateAsyncGpuProtection();
+    if (async_gpu_ranges.empty())
+        gpu_access_owner = {};
+    lock.unlock();
+    gpu_access_cv.notify_all();
 }
 
 void MemoryManager::EnableGpuImageTracking(bool enabled) {
@@ -238,7 +304,8 @@ void MemoryManager::DetachGpuAccess() {
 
 bool MemoryManager::HandleGpuAccessFault(void* context, VAddr address) {
     std::unique_lock lock{gpu_access_mutex};
-    if (!gpu_access_epoch || gpu_access_owner == std::this_thread::get_id())
+    if (!gpu_access_epoch || (async_gpu_ranges.empty() &&
+                              gpu_access_owner == std::this_thread::get_id()))
         return false;
     const auto owned = [&] {
         const auto it = std::ranges::upper_bound(gpu_protected_ranges, address, {},
@@ -248,6 +315,13 @@ bool MemoryManager::HandleGpuAccessFault(void* context, VAddr address) {
         const auto& range = *std::prev(it);
         return address - range.address < range.size;
     };
+    if (owned() && !async_gpu_ranges.empty() && rasterizer) {
+        const bool write = Common::IsWriteError(context);
+        lock.unlock();
+        const auto access = rasterizer->AcquireCpuAccess(Common::AlignDown(address, u64{4096}),
+                                                        4096, write);
+        return bool(access);
+    }
     bool waited{};
     while (owned()) {
         waited = true;

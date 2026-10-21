@@ -1,0 +1,233 @@
+#include "video_core/renderer_d3d12/gpu_commands.h"
+
+#include <algorithm>
+#include <stdexcept>
+#include <winrt/base.h>
+
+namespace D3D12 {
+namespace {
+constexpr char Source[] = R"(
+RWByteAddressBuffer Input : register(u0);
+RWByteAddressBuffer Count : register(u1);
+RWByteAddressBuffer Arguments : register(u2);
+RWByteAddressBuffer Indices : register(u3);
+cbuffer Config : register(b0) {
+    uint mode, number, input_offset, count_offset;
+    uint stride, indexed, has_count, index_bytes;
+    uint swap_mode, primitive, provoking, input_count;
+};
+uint LoadIndex(uint i) {
+    if (!index_bytes) return i;
+    uint relative = i * index_bytes;
+    uint address = input_offset + (relative & ~3u);
+    uint value = Input.Load(address & ~3u);
+    if ((address & 3) != 0) {
+        value >>= (address & 3) * 8;
+        if ((relative & ~3u) + 4 <= input_count * index_bytes)
+            value |= Input.Load((address & ~3u) + 4) << (32 - (address & 3) * 8);
+    }
+    if (swap_mode == 1) value = ((value & 0x00ff00ffu) << 8) | ((value >> 8) & 0x00ff00ffu);
+    if (swap_mode == 2) value = (value << 24) | ((value & 0xff00u) << 8) | ((value >> 8) & 0xff00u) | (value >> 24);
+    if (swap_mode == 3) value = (value << 16) | (value >> 16);
+    return index_bytes == 2 ? (value >> ((relative & 2) * 8)) & 65535u : value;
+}
+[numthreads(64,1,1)]
+void main(uint3 thread : SV_DispatchThreadID) {
+    uint i = thread.x + thread.y * (65535u * 64u);
+    if (i >= number) return;
+    if (mode == 2) {
+        uint3 groups = Input.Load3(input_offset);
+        if (any(groups > 65535u)) groups = uint3(0,0,0);
+        Arguments.Store3(0, groups);
+        Arguments.Store3(12, groups);
+        return;
+    }
+    if (mode == 0) {
+        uint output = i * (indexed != 0 ? 28 : 24);
+        bool active = !has_count || i < Count.Load(count_offset);
+        uint4 value = active ? Input.Load4(input_offset + i * stride) : uint4(0,0,0,0);
+        uint instance = indexed != 0 && active ? Input.Load(input_offset + i * stride + 16) : value.w;
+        Arguments.Store2(output, uint2(indexed != 0 ? value.w : value.z, instance));
+        Arguments.Store4(output + 8, value);
+        if (indexed != 0) Arguments.Store(output + 24, instance);
+        return;
+    }
+    uint group = i / 3, lane = i % 3, source = i;
+    if (primitive == 1) source = (i & 1) == 0 ? i / 2 : (i / 2 + 1) % input_count;
+    if (primitive == 2) source = lane == 0 ? 0 : group + lane;
+    if (primitive == 3) {
+        uint vertex = i % 6;
+        source = (i / 6) * 4 + (vertex < 3 ? vertex : (vertex == 3 ? 0 : vertex - 2));
+    }
+    if (primitive == 4) {
+        uint vertex = i % 6;
+        source = (i / 6) * 2 + (vertex == 0 || vertex == 3 ? 0 : vertex == 1 ? 1 : vertex == 5 ? 2 : 3);
+    }
+    if (primitive == 5) {
+        source = group + lane;
+        if ((group & 1) != 0) {
+            if (provoking != 0) source = group + (lane == 0 ? 1 : lane == 1 ? 0 : 2);
+            else source = group + (lane == 0 ? 0 : lane == 1 ? 2 : 1);
+        }
+    }
+    if (primitive == 7) source = i / 2 + (i & 1);
+    if (provoking != 0) {
+        if (primitive == 1 || primitive == 7 || primitive == 8) {
+            uint other = i ^ 1u;
+            source = primitive == 8 ? other : primitive == 7 ? other / 2 + (other & 1) :
+                (other & 1) == 0 ? other / 2 : (other / 2 + 1) % input_count;
+        } else {
+            uint rotated = (lane + 2) % 3;
+            if (primitive == 2) source = rotated == 0 ? 0 : group + rotated;
+            if (primitive == 3) {
+                uint vertex = (i / 3 % 2) * 3 + rotated;
+                source = (i / 6) * 4 + (vertex < 3 ? vertex : vertex == 3 ? 0 : vertex - 2);
+            }
+            if (primitive == 4) {
+                uint vertex = (i / 3 % 2) * 3 + rotated;
+                source = (i / 6) * 2 + (vertex == 0 || vertex == 3 ? 0 : vertex == 1 ? 1 : vertex == 5 ? 2 : 3);
+            }
+            if (primitive == 5) {
+                source = group + ((group & 1) != 0 ? rotated == 0 ? 1 : rotated == 1 ? 0 : 2 : rotated);
+            }
+            if (primitive == 6) source = group * 3 + rotated;
+        }
+    }
+    Indices.Store(i * 4, LoadIndex(source));
+}
+)";
+}
+void GpuCommands::Initialize(D3D12DeviceContext& context, ShaderCache& shaders) {
+    if (device)
+        return;
+    device = &context;
+    allocator.Initialize(context.Device(), 32ULL * 1024 * 1024);
+    D3D12_ROOT_PARAMETER parameters[5]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 0, 12};
+    for (u32 index = 1; index < 5; ++index) {
+        parameters[index].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        parameters[index].Descriptor = {index - 1, 0};
+    }
+    D3D12_ROOT_SIGNATURE_DESC description{5, parameters};
+    Microsoft::WRL::ComPtr<ID3DBlob> blob, errors;
+    winrt::check_hresult(
+        D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors));
+    winrt::check_hresult(context.Device()->CreateRootSignature(
+        0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)));
+    const auto shader = shaders.CompileHlslRaw(Source, L"cs_6_4", {});
+    D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
+    compute.pRootSignature = root.Get();
+    compute.CS = {shader->dxil.data(), shader->dxil.size()};
+    winrt::check_hresult(
+        context.Device()->CreateComputePipelineState(&compute, IID_PPV_ARGS(&pipeline)));
+}
+void GpuCommands::Transition(ID3D12GraphicsCommandList* list, D3D12Resource& resource,
+                             D3D12_RESOURCE_STATES& state, D3D12_RESOURCE_STATES next) {
+    if (state == next)
+        return;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {resource.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state, next};
+    list->ResourceBarrier(1, &barrier);
+    state = next;
+}
+void GpuCommands::Prepare(u32 commands, u32 elements) {
+    if (commands > 4096 || elements > 4 * 1024 * 1024)
+        throw std::runtime_error("D3D12 GPU command expansion exceeds budget");
+    const auto resize = [&](D3D12Resource& resource, u64& capacity, u64 size,
+                            D3D12_RESOURCE_STATES& state) {
+        size = std::max<u64>(size, 16);
+        if (size <= capacity)
+            return;
+        resource.Reset();
+        capacity = 0;
+        winrt::check_hresult(allocator.CreateBuffer(
+            size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, resource));
+        capacity = size;
+        state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    };
+    resize(arguments, argument_capacity, u64(commands) * 28, argument_state);
+    resize(indices, index_capacity, u64(elements) * 4, index_state);
+}
+void GpuCommands::Bind(ID3D12GraphicsCommandList* list, const std::array<u32, 12>& constants,
+                       const ResourceCache::View& input, const ResourceCache::View& count) {
+    Transition(list, arguments, argument_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Transition(list, indices, index_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->SetComputeRootSignature(root.Get());
+    list->SetPipelineState(pipeline.Get());
+    list->SetComputeRoot32BitConstants(0, constants.size(), constants.data(), 0);
+    list->SetComputeRootUnorderedAccessView(1, input.buffer
+                                                   ? input.buffer->native->GetGPUVirtualAddress()
+                                                   : arguments->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(2, count.buffer
+                                                   ? count.buffer->native->GetGPUVirtualAddress()
+                                                   : arguments->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(3, arguments->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(4, indices->GetGPUVirtualAddress());
+    const auto groups = (constants[1] + 63) / 64;
+    list->Dispatch(std::min(groups, 65535u), (groups + 65534) / 65535, 1);
+}
+void GpuCommands::RecordArguments(ID3D12GraphicsCommandList* list, const Arguments& description,
+                                  const ResourceCache::View& input,
+                                  const ResourceCache::View& count) {
+    Bind(list,
+         {0, description.count, u32(input.offset), u32(count.offset), description.stride,
+          u32(description.indexed), u32(bool(description.count_address)), 0, 0, 0, 0, 0},
+         input, count);
+    Transition(list, arguments, argument_state, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+}
+void GpuCommands::RecordDispatch(ID3D12GraphicsCommandList* list,
+                                 const ResourceCache::View& input) {
+    Bind(list, {2, 1, u32(input.offset), 0, 0, 0, 0, 0, 0, 0, 0, 0}, input, {});
+    Transition(list, arguments, argument_state, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+}
+void GpuCommands::ExecuteDispatch(ID3D12GraphicsCommandList* list, ID3D12RootSignature* compute) {
+    if (signature_root.Get() != compute) {
+        draw.Reset();
+        indexed_draw.Reset();
+        dispatch.Reset();
+        signature_root = compute;
+    }
+    if (!dispatch) {
+        D3D12_INDIRECT_ARGUMENT_DESC parameters[2]{};
+        parameters[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        parameters[0].Constant = {1, 0, 3};
+        parameters[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        D3D12_COMMAND_SIGNATURE_DESC description{24, 2, parameters};
+        winrt::check_hresult(device->Device()->CreateCommandSignature(&description, compute,
+                                                                      IID_PPV_ARGS(&dispatch)));
+    }
+    list->ExecuteIndirect(dispatch.Get(), 1, arguments.Get(), 0, nullptr, 0);
+}
+void GpuCommands::RecordIndices(ID3D12GraphicsCommandList* list, const Expansion& description,
+                                const ResourceCache::View& input, u32 bytes, u32 swap) {
+    Bind(list,
+         {1, description.output_count, u32(input.offset), 0, 0, 0, 0, bytes, swap, description.mode,
+          u32(description.provoking_last), description.input_count},
+         input, {});
+    Transition(list, indices, index_state, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+}
+void GpuCommands::Execute(ID3D12GraphicsCommandList* list, ID3D12RootSignature* graphics,
+                          bool indexed, u32 count) {
+    if (signature_root.Get() != graphics) {
+        draw.Reset();
+        indexed_draw.Reset();
+        dispatch.Reset();
+        signature_root = graphics;
+    }
+    auto& signature = indexed ? indexed_draw : draw;
+    if (!signature) {
+        D3D12_INDIRECT_ARGUMENT_DESC parameters[2]{};
+        parameters[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        parameters[0].Constant = {1, 0, 2};
+        parameters[1].Type =
+            indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        D3D12_COMMAND_SIGNATURE_DESC description{indexed ? 28u : 24u, 2, parameters};
+        winrt::check_hresult(device->Device()->CreateCommandSignature(&description, graphics,
+                                                                      IID_PPV_ARGS(&signature)));
+    }
+    list->ExecuteIndirect(signature.Get(), count, arguments.Get(), 0, nullptr, 0);
+}
+} // namespace D3D12
