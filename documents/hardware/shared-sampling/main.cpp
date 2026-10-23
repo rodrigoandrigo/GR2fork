@@ -44,6 +44,45 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
       texture[i + 1] = uint8_t(mip * 40);
       texture[i + 3] = 255;
     }
+  if (kind >= 5 && kind <= 7) {
+    const uint32_t modes[]{0,  1, 2, 6,  10, 14, 18, 22, 26,
+                           30, 3, 7, 11, 15, 19, 23, 27, 31};
+    uint32_t seed = 0x12345678 + variant;
+    for (uint32_t byte = 0; byte < 16384; byte += 16) {
+      uint32_t block[4];
+      for (auto &word : block) {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        word = seed;
+      }
+      if (kind == 5)
+        block[0] = variant == 8 ? block[0] & ~255u
+                                : (block[0] & ~((1u << (variant + 1)) - 1)) |
+                                      (1u << variant);
+      else {
+        const auto mode = modes[variant];
+        block[0] = (block[0] & ~(mode < 2 ? 3u : 31u)) | mode;
+      }
+      std::memcpy(texture + byte, block, 16);
+    }
+  }
+  if (kind == 8)
+    for (uint32_t face = 0; face < 6; ++face)
+      for (uint32_t pixel = 0; pixel < 256; ++pixel) {
+        texture[face * 1024 + pixel * 4] = uint8_t(face * 40);
+        texture[face * 1024 + pixel * 4 + 3] = 255;
+      }
+  if (kind >= 9)
+    for (uint32_t y = 0; y < 16; ++y)
+      for (uint32_t x = 0; x < 16; ++x) {
+        texture[(y * 16 + x) * 4] = uint8_t(x * 11);
+        texture[(y * 16 + x) * 4 + 1] = uint8_t(y * 13);
+        texture[(y * 16 + x) * 4 + 2] = uint8_t(x * 3 + y * 5);
+        texture[(y * 16 + x) * 4 + 3] = 255;
+      }
+  const float custom_border[]{-0.125f, 1.75f, 0.12345679f, 0.75f};
+  std::memcpy(bytes + 0x100000, custom_border, sizeof(custom_border));
   const auto vop1 = [](uint32_t op, uint32_t dst, uint32_t src) {
     return 0x7e000000u | (dst << 17) | (op << 9) | src;
   };
@@ -115,7 +154,32 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
       scalar(11, 2.f);
     }
   }
-  pixel.insert(pixel.end(), {0xf0000f00 | (opcode << 18),
+  if (kind == 3 || kind == 4) {
+    opcode = kind == 3 ? 64 : 96;
+    scalar(0, 0.5f);
+    scalar(1, 0.5f);
+    scalar(6, 0);
+    scalar(7, 1);
+  }
+  if (kind >= 5 && kind <= 7) {
+    pixel.insert(pixel.end(), {vop2(8, 0, 255, 0), bits(1.f / 16.f),
+                               vop2(8, 1, 255, 1), bits(1.f / 16.f)});
+    scalar(2, 0);
+  }
+  if (kind == 8) {
+    scalar(0, 1.5f);
+    scalar(1, 1.5f);
+    scalar(2, float(variant));
+    scalar(3, 0);
+  }
+  if (kind >= 9) {
+    for (uint32_t axis = 0; axis < 2; ++axis)
+      pixel.insert(pixel.end(), {vop2(8, axis, 255, axis), bits(0.25f),
+                                 vop2(3, axis, 255, axis), bits(-2.f)});
+    scalar(2, 0);
+  }
+  const uint32_t mask = kind == 3 ? 1u << variant : kind == 4 ? 3u : 15u;
+  pixel.insert(pixel.end(), {0xf0000000 | (mask << 8) | (opcode << 18),
                              0x00400000 | (output << 8) | address, 0xf800180f,
                              (output + 3) << 24 | (output + 2) << 16 |
                                  (output + 1) << 8 | output,
@@ -146,6 +210,18 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
                         (uint64_t(7) << 41) | (uint64_t(3) << 48) |
                         (uint64_t(9) << 52) | (uint64_t(9) << 60),
                     uint64_t(15) << 13, 0};
+  if (kind >= 5) {
+    image[1] &= ~(uint64_t(15) << 48);
+    if (kind <= 7) {
+      image[0] &= ~(uint64_t(63) << 52);
+      image[0] |= uint64_t(kind == 5 ? 41 : 40) << 52;
+      if (kind == 7)
+        image[0] |= uint64_t(1) << 58;
+    } else if (kind == 8) {
+      image[1] = (image[1] & ~(uint64_t(15) << 60)) | (uint64_t(11) << 60);
+      image[2] |= uint64_t(5) << 45;
+    }
+  }
   std::memcpy(ps_user, image, sizeof(image));
   const uint64_t mag = variant == 7 ? 0 : 1;
   const uint64_t min = variant >= 9 && variant <= 12 ? 3 : variant == 8 ? 0 : 1;
@@ -160,6 +236,16 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
   if (variant == 4) {
     sampler[0] &= ~((uint64_t(0xfff) << 32) | (uint64_t(0xfff) << 44));
     sampler[0] |= (uint64_t(256) << 32) | (uint64_t(384) << 44);
+  }
+  if (kind >= 5) {
+    sampler[0] = 2 | (uint64_t(2) << 3) | (uint64_t(0xfff) << 44);
+    sampler[1] = uint64_t(1) << 26;
+  }
+  if (kind >= 9) {
+    const uint64_t mode = variant / 2;
+    sampler[0] = mode | (mode << 3) | (uint64_t(0xfff) << 44);
+    sampler[1] = (uint64_t(variant & 1) << 20) | (uint64_t(variant & 1) << 22) |
+                 (uint64_t(kind == 10 ? 3 : 1) << 62);
   }
   std::memcpy(ps_user + 8, sampler, sizeof(sampler));
   ps_user[12] = uint32_t(uintptr_t(texture));
@@ -190,6 +276,8 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
       shader(0x2c4c + i, vs_user[i]);
     shader(0x2c0c + i, ps_user[i]);
   }
+  context(0xa020, uint32_t(uintptr_t(bytes + 0x100000) >> 8));
+  context(0xa021, uint32_t(uintptr_t(bytes + 0x100000) >> 40));
   context(0xa2d5, 0);
   context(0xa290, 0);
   context(0xa1b1, 0);
@@ -244,53 +332,61 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
   uint32_t sizes[]{uint32_t((commands.current - commands.begin) * 4)};
   const int rc =
       sceGnmSubmitCommandBuffers(1, addresses, sizes, nullptr, nullptr);
-  bool timed_out{};
-  if (rc >= 0)
+  if (rc >= 0) {
     for (uint32_t wait = 0; *fence != 2; ++wait) {
-      if (wait == 10000) {
-        timed_out = true;
-        hash = 2166136261;
-        for (uint32_t y = 0; y < 16; ++y)
-          for (uint32_t x = 0; x < 16; ++x)
-            for (uint32_t c = 0; c < 4; ++c)
-              hash = (hash ^ target[(y * 64 + x) * 4 + c]) * 16777619;
-        std::printf("SAMPLING kind=%u variant=%u shared=%u "
-                    "rgba=%02x%02x%02x%02x hash=%08x submit=%08x\n",
-                    kind, variant, shared, target[0], target[1], target[2],
-                    target[3], hash, uint32_t(rc));
-        return rc >= 0 && !timed_out;
-      }
-    } // namespace
-  int main() {
-    off_t physical{};
-    int rc =
-        sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(),
-                                      AllocationSize, 0x10000, 3, &physical);
-    if (rc < 0)
-      return 1;
-    void *memory{};
-    rc = sceKernelMapDirectMemory(&memory, AllocationSize, 0x33, 0, physical,
-                                  0x10000);
-    if (rc < 0) {
-      sceKernelReleaseDirectMemory(physical, AllocationSize);
-      return 1;
+      if (wait == 10000)
+        return false;
+      sceKernelUsleep(1000);
     }
-    auto *bytes = static_cast<uint8_t *>(memory);
-    std::memset(bytes, 0, AllocationSize);
-    bool pass = true;
-    for (uint32_t kind : {0u, 1u, 2u})
-      for (uint32_t variant = 0; variant < 17; ++variant) {
-        if ((variant == 13 && kind != 1) ||
-            ((variant == 14 || variant == 15) && kind != 2) ||
-            (variant == 16 && kind != 1))
-          continue;
-        uint32_t normal{}, shared{};
-        pass &= Measure(bytes, kind, variant, false, normal);
-        pass &= Measure(bytes, kind, variant, true, shared);
-        pass &= normal == shared;
-      }
-    std::printf("SAMPLING_RESULT %s\n", pass ? "PASS" : "FAIL");
-    sceKernelMunmap(memory, AllocationSize);
-    sceKernelReleaseDirectMemory(physical, AllocationSize);
-    return pass ? 0 : 1;
   }
+  hash = 2166136261;
+  for (uint32_t y = 0; y < 16; ++y)
+    for (uint32_t x = 0; x < 16; ++x)
+      for (uint32_t c = 0; c < 4; ++c)
+        hash = (hash ^ target[(y * 64 + x) * 4 + c]) * 16777619;
+  std::printf("SAMPLING kind=%u variant=%u shared=%u rgba=%02x%02x%02x%02x "
+              "hash=%08x submit=%08x\n",
+              kind, variant, shared, target[0], target[1], target[2], target[3],
+              hash, uint32_t(rc));
+  return rc >= 0;
+}
+} // namespace
+int main() {
+  off_t physical{};
+  int rc = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(),
+                                         AllocationSize, 0x10000, 3, &physical);
+  if (rc < 0)
+    return 1;
+  void *memory{};
+  rc = sceKernelMapDirectMemory(&memory, AllocationSize, 0x33, 0, physical,
+                                0x10000);
+  if (rc < 0) {
+    sceKernelReleaseDirectMemory(physical, AllocationSize);
+    return 1;
+  }
+  auto *bytes = static_cast<uint8_t *>(memory);
+  std::memset(bytes, 0, AllocationSize);
+  bool pass = true;
+  for (uint32_t kind : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u})
+    for (uint32_t variant = 0; variant < (kind == 5                ? 9u
+                                          : kind == 6 || kind == 7 ? 18u
+                                          : kind == 8              ? 6u
+                                          : kind >= 9              ? 16u
+                                                                   : 17u);
+         ++variant) {
+      if (((kind == 3 || kind == 4) && variant >= 4) ||
+          (kind < 3 && ((variant == 13 && kind != 1) ||
+                        ((variant == 14 || variant == 15) && kind != 2) ||
+                        (variant == 16 && kind != 1))))
+        continue;
+      uint32_t normal{}, shared{};
+      if (!Measure(bytes, kind, variant, false, normal) ||
+          !Measure(bytes, kind, variant, true, shared))
+        return 1;
+      pass &= normal == shared;
+    }
+  std::printf("SAMPLING_RESULT %s\n", pass ? "PASS" : "FAIL");
+  sceKernelMunmap(memory, AllocationSize);
+  sceKernelReleaseDirectMemory(physical, AllocationSize);
+  return pass ? 0 : 1;
+}

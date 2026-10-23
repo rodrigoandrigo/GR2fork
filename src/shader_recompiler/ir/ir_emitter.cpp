@@ -2135,8 +2135,10 @@ Value IREmitter::ImageSampleRaw(const Value& image_handle, const Value& sampler_
 }
 
 Value IREmitter::ImageSampleImplicitLod(const Value& handle, const Value& coords, const F32& bias,
-                                        const Value& offset, TextureInstInfo info, const F32& lod_clamp) {
-    return Inst(Opcode::ImageSampleImplicitLod, Flags{info}, handle, coords, bias, offset, lod_clamp);
+                                        const Value& offset, TextureInstInfo info,
+                                        const F32& lod_clamp) {
+    return Inst(Opcode::ImageSampleImplicitLod, Flags{info}, handle, coords, bias, offset,
+                lod_clamp);
 }
 
 Value IREmitter::ImageSampleExplicitLod(const Value& handle, const Value& coords, const F32& lod,
@@ -2158,13 +2160,14 @@ Value IREmitter::ImageSampleDrefExplicitLod(const Value& handle, const Value& co
 }
 
 Value IREmitter::ImageGather(const Value& handle, const Value& coords, const Value& offset,
-                             TextureInstInfo info) {
-    return Inst(Opcode::ImageGather, Flags{info}, handle, coords, offset);
+                             TextureInstInfo info, const F32& lod, const F32& lod_clamp) {
+    return Inst(Opcode::ImageGather, Flags{info}, handle, coords, offset, lod, lod_clamp);
 }
 
 Value IREmitter::ImageGatherDref(const Value& handle, const Value& coords, const Value& offset,
-                                 const F32& dref, TextureInstInfo info) {
-    return Inst(Opcode::ImageGatherDref, Flags{info}, handle, coords, offset, dref);
+                                 const F32& dref, TextureInstInfo info, const F32& lod,
+                                 const F32& lod_clamp) {
+    return Inst(Opcode::ImageGatherDref, Flags{info}, handle, coords, offset, dref, lod, lod_clamp);
 }
 
 Value IREmitter::ImageQueryDimension(const Value& handle, const IR::U32& lod,
@@ -2172,8 +2175,9 @@ Value IREmitter::ImageQueryDimension(const Value& handle, const IR::U32& lod,
     return Inst(Opcode::ImageQueryDimensions, Flags{info}, handle, lod, skip_mips);
 }
 
-Value IREmitter::ImageQueryLod(const Value& handle, const Value& coords, TextureInstInfo info) {
-    return Inst(Opcode::ImageQueryLod, Flags{info}, handle, coords);
+Value IREmitter::ImageQueryLod(const Value& handle, const Value& coords, const Value& sampler,
+                               TextureInstInfo info) {
+    return Inst(Opcode::ImageQueryLod, Flags{info}, handle, coords, sampler);
 }
 
 Value IREmitter::ImageGradient(const Value& handle, const Value& coords,

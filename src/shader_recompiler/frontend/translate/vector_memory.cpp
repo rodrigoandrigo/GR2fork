@@ -206,6 +206,20 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
     case Opcode::IMAGE_GATHER4_C_LZ:
     case Opcode::IMAGE_GATHER4_LZ_O:
     case Opcode::IMAGE_GATHER4_C_LZ_O:
+    case Opcode::IMAGE_GATHER4_CL:
+    case Opcode::IMAGE_GATHER4_B:
+    case Opcode::IMAGE_GATHER4_B_CL:
+    case Opcode::IMAGE_GATHER4_C_CL:
+    case Opcode::IMAGE_GATHER4_C_B:
+    case Opcode::IMAGE_GATHER4_C_B_CL:
+    case Opcode::IMAGE_GATHER4_CL_O:
+    case Opcode::IMAGE_GATHER4_L_O:
+    case Opcode::IMAGE_GATHER4_B_O:
+    case Opcode::IMAGE_GATHER4_B_CL_O:
+    case Opcode::IMAGE_GATHER4_C_CL_O:
+    case Opcode::IMAGE_GATHER4_C_L_O:
+    case Opcode::IMAGE_GATHER4_C_B_O:
+    case Opcode::IMAGE_GATHER4_C_B_CL_O:
         return IMAGE_GATHER(inst);
 
         // Image misc operations
@@ -782,7 +796,12 @@ void Translator::IMAGE_GET_LOD(const GcnInst& inst) {
     const IR::Value body = ir.CompositeConstruct(
         ir.GetVectorReg<IR::F32>(addr_reg), ir.GetVectorReg<IR::F32>(addr_reg + 1),
         ir.GetVectorReg<IR::F32>(addr_reg + 2), ir.GetVectorReg<IR::F32>(addr_reg + 3));
-    const IR::Value lod = ir.ImageQueryLod(ir.ImageHandle(tsharp_low, tsharp_high), body, info);
+    const IR::ScalarReg sampler_reg{inst.src[3].code * 4};
+    const auto sampler =
+        ir.CompositeConstruct(ir.GetScalarReg(sampler_reg), ir.GetScalarReg(sampler_reg + 1),
+                              ir.GetScalarReg(sampler_reg + 2), ir.GetScalarReg(sampler_reg + 3));
+    const IR::Value lod =
+        ir.ImageQueryLod(ir.ImageHandle(tsharp_low, tsharp_high), body, sampler, info);
     if (mimg.dmask & 1) {
         ir.SetVectorReg(dst_reg++, IR::F32{ir.CompositeExtract(lod, 0)});
     }

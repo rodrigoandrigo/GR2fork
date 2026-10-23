@@ -1,19 +1,20 @@
 #include "video_core/renderer_d3d12/command_runtime.h"
+#include "video_core/renderer_d3d12/image_buffer_alias.h"
 
 #include <algorithm>
-#include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <winrt/base.h>
 #include "common/logging/log.h"
 #include "video_core/renderer_d3d12/cmask_address.h"
 #include "video_core/renderer_d3d12/color_clear.h"
+#include "video_core/renderer_d3d12/profile.h"
 #include "video_core/renderer_d3d12/resource_bindings.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/texture_cache/cpu_tiling.h"
-#include "video_core/renderer_d3d12/profile.h"
 
 namespace D3D12 {
 namespace {
@@ -192,15 +193,18 @@ void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write w
     shaders.Initialize(device.Device(), &resources);
     this->read = read;
     this->write = write;
-    resources.Initialize(device, read, write, std::move(resolve), std::move(overlaps), transfer_pool);
-    inputs.Initialize(device, read, write, {},
-        [this](VAddr a, u64 an, VAddr b, u64 bn) { return resources.Aliases(a, an, b, bn); }, transfer_pool);
+    resources.Initialize(device, read, write, std::move(resolve), std::move(overlaps),
+                         transfer_pool);
+    inputs.Initialize(
+        device, read, write, {},
+        [this](VAddr a, u64 an, VAddr b, u64 bn) { return resources.Aliases(a, an, b, bn); },
+        transfer_pool);
     images.Initialize(
         device, std::move(read), std::move(write),
-        [this](VAddr address, u64 size) { return resources.Canonicalize(address, size); },
-        &shaders, transfer_pool, &resources);
-    resource_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                                    512, true);
+        [this](VAddr address, u64 size) { return resources.Canonicalize(address, size); }, &shaders,
+        transfer_pool, &resources);
+    resource_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 512,
+                                    true);
     sampler_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 128, true);
     color_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, false);
     depth_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
@@ -221,9 +225,9 @@ void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write w
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_READBACK;
         if (FAILED(device.Device()->CreateQueryHeap(&query, IID_PPV_ARGS(&timestamp_heap))) ||
-            FAILED(device.Device()->CreateCommittedResource(
-                &heap, D3D12_HEAP_FLAG_NONE, &readback, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                IID_PPV_ARGS(&timestamp_readback)))) {
+            FAILED(device.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &readback,
+                                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                            IID_PPV_ARGS(&timestamp_readback)))) {
             timestamp_heap.Reset();
             timestamp_readback.Reset();
             gpu_timing.frequency = 0;
@@ -293,7 +297,9 @@ void CommandRuntime::SynchronizeBuffers(std::span<const ResourceCache::Range> ra
             throw std::runtime_error("D3D12 buffer ownership must be resolved before recording");
         struct Scope {
             bool& value;
-            ~Scope() { value = false; }
+            ~Scope() {
+                value = false;
+            }
         } scope{synchronizing_images};
         synchronizing_images = true;
         std::vector<ResourceCache::Range> access;
@@ -307,7 +313,7 @@ void CommandRuntime::SynchronizeBuffers(std::span<const ResourceCache::Range> ra
         resources.PrepareDownload(commands.Get());
         winrt::check_hresult(commands->Close());
         ProfileSample(runtime_profile, "runtime_submit_wait", 128,
-                  [&] { device.Wait(SubmitCommands()); });
+                      [&] { device.Wait(SubmitCommands()); });
         resources.CommitDownloads(bool(lease));
         recording.completed = true;
     }
@@ -372,7 +378,7 @@ void CommandRuntime::SynchronizeImages(std::span<const ResourceCache::Range> ran
         EndGpuTiming();
         winrt::check_hresult(commands->Close());
         ProfileSample(runtime_profile, "runtime_submit_wait", 128,
-                  [&] { device.Wait(SubmitCommands()); });
+                      [&] { device.Wait(SubmitCommands()); });
         images.CommitDownloads();
         recording.completed = true;
     }
@@ -388,7 +394,8 @@ std::shared_ptr<void> CommandRuntime::AcquireCpuAccess(VAddr address, u64 size, 
         if (!context->completing && !context->recording_context && !context->synchronizing_images) {
             const auto watches = context->ResourceWatches();
             if (context->completion && std::ranges::any_of(watches, [&](const auto& watch) {
-                    return watch.dirty && resources.Aliases(address, size, watch.address, watch.size);
+                    return watch.dirty &&
+                           resources.Aliases(address, size, watch.address, watch.size);
                 }))
                 context->CompleteContext();
             static_cast<void>(context->AcquireCpuAccess(address, size, write));
@@ -460,11 +467,15 @@ void CommandRuntime::MaterializeColorClear(const AmdGpu::ColorBuffer& buffer,
                               [&] { return std::unique_lock{mutex}; });
     MaintainMemory();
     if (!contexts.empty()) {
-        const std::array<ResourceCache::Range, 2> ranges{{
-            {info.guest_address, info.guest_size},
-            {buffer.CmaskAddress(), CmaskBytes(buffer)}}};
+        const std::array<ResourceCache::Range, 2> ranges{
+            {{info.guest_address, info.guest_size}, {buffer.CmaskAddress(), CmaskBytes(buffer)}}};
         auto& context = NextContext(ranges);
-        struct Scope { bool& active; ~Scope() { active = false; } } scope{context.recording_context};
+        struct Scope {
+            bool& active;
+            ~Scope() {
+                active = false;
+            }
+        } scope{context.recording_context};
         context.recording_context = true;
         context.MaterializeColorClear(buffer, info);
         return;
@@ -505,8 +516,7 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
     std::optional<CmaskAddress> address;
     const u32 coverage_log2 = buffer.attrib.num_samples_log2;
     if (buffer.info.compression &&
-        (!coverage_log2 || coverage_log2 > 3 ||
-         buffer.attrib.num_fragments_log2 != coverage_log2))
+        (!coverage_log2 || coverage_log2 > 3 || buffer.attrib.num_fragments_log2 != coverage_log2))
         throw std::runtime_error("Unsupported D3D12 CMASK sample/fragment configuration");
     const u32 expanded_code = buffer.info.compression ? (12u | coverage_log2) : 15u;
     for (u32 layer = buffer.BaseSlice(); layer < buffer.NumSlices(); ++layer) {
@@ -534,8 +544,7 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
                     throw std::runtime_error("Unsupported D3D12 CMASK color/FMASK tile state");
                 if (code == clear_code) {
                     tiles.push_back({layer, x, y});
-                    metadata[byte] = (metadata[byte] & ~(15u << shift)) |
-                                     (expanded_code << shift);
+                    metadata[byte] = (metadata[byte] & ~(15u << shift)) | (expanded_code << shift);
                 }
             }
     }
@@ -585,35 +594,44 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
     commit(buffer.CmaskAddress(), original_metadata, metadata);
 }
 void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
-                              std::array<u32, 3> groups, VAddr border_colors, VAddr indirect_address) {
+                              std::array<u32, 3> groups, VAddr border_colors,
+                              VAddr indirect_address) {
     auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
                               [&] { return std::unique_lock{mutex}; });
     MaintainMemory();
     if (!contexts.empty()) {
         const auto shader = shaders.Compile(params, runtime);
         std::vector<ResourceCache::Range> writes, reads;
-        if (indirect_address) reads.push_back({indirect_address, 12});
+        if (indirect_address)
+            reads.push_back({indirect_address, 12});
         for (const auto& image : shader.info.images) {
-            const VideoCore::ImageInfo info{image.GetSharp(shader.info), image};
+            const auto info = ShaderImageLayout(image.GetSharp(shader.info), image);
             reads.push_back({info.guest_address, info.guest_size});
         }
         for (const auto& buffer : shader.info.buffers) {
             if (buffer.buffer_type != Shader::BufferType::Guest)
                 continue;
             const auto sharp = buffer.GetSharp(shader.info);
-            reads.push_back({sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
+            reads.push_back(
+                {sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
             if (!buffer.is_written)
                 continue;
-            writes.push_back({sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
+            writes.push_back(
+                {sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
         }
         for (const auto& image : shader.info.images) {
             if (!image.is_written)
                 continue;
-            const VideoCore::ImageInfo info{image.GetSharp(shader.info), image};
+            const auto info = ShaderImageLayout(image.GetSharp(shader.info), image);
             writes.push_back({info.guest_address, info.guest_size});
         }
         auto& context = NextContext(writes, reads);
-        struct Scope { bool& active; ~Scope() { active = false; } } scope{context.recording_context};
+        struct Scope {
+            bool& active;
+            ~Scope() {
+                active = false;
+            }
+        } scope{context.recording_context};
         context.recording_context = true;
         context.Dispatch(params, runtime, groups, border_colors, indirect_address);
         return;
@@ -640,8 +658,14 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
         throw GpuDrawFallback{};
     std::array<CompiledShader*, 1> stages{&shader};
     PrepareContext(stages);
-    ResourceBindings bindings{device, resources, images, stages, {},
-                              &resource_descriptors, &sampler_descriptors, coordinator != nullptr};
+    ResourceBindings bindings{device,
+                              resources,
+                              images,
+                              stages,
+                              {},
+                              &resource_descriptors,
+                              &sampler_descriptors,
+                              coordinator != nullptr};
     std::vector<D3D12_ROOT_PARAMETER> parameters(2);
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants = {0, 0, 20};
@@ -669,8 +693,9 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     pipeline_key.insert(pipeline_key.end(), shader.binary->dxil.begin(), shader.binary->dxil.end());
     const auto* root_bytes = static_cast<const u8*>(root_blob->GetBufferPointer());
     pipeline_key.insert(pipeline_key.end(), root_bytes, root_bytes + root_blob->GetBufferSize());
-    auto& cached =
-        GetPipeline(std::move(pipeline_key), root_blob.Get(), [&](auto* root, auto** state, D3D12_CACHED_PIPELINE_STATE cached) {
+    auto& cached = GetPipeline(
+        std::move(pipeline_key), root_blob.Get(),
+        [&](auto* root, auto** state, D3D12_CACHED_PIPELINE_STATE cached) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC description{};
             description.pRootSignature = root;
             description.CachedPSO = cached;
@@ -687,7 +712,8 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     SynchronizeBuffers(bindings.ImageRanges(), true);
     bindings.PrepareImages();
     auto access_ranges = bindings.AccessRanges(border_colors);
-    if (indirect_address) access_ranges.push_back({indirect_address, 12});
+    if (indirect_address)
+        access_ranges.push_back({indirect_address, 12});
     const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
     resources.PrepareViews(bindings.GuestRanges());
     ResourceCache::View indirect_view{};
@@ -696,7 +722,8 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
         SynchronizeImages({&range, 1}, true);
         resources.PrepareViews({&range, 1});
         indirect_view = resources.GetViews({&range, 1}).front();
-        if (!indirect_view.buffer || std::ranges::any_of(indirect_view.segments, [&](const auto& part) {
+        if (!indirect_view.buffer ||
+            std::ranges::any_of(indirect_view.segments, [&](const auto& part) {
                 return part.offset != indirect_view.offset + part.address - indirect_address;
             }))
             throw GpuDrawFallback{};
@@ -706,7 +733,12 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
     buffer_commands_open = true;
-    struct BufferScope { bool& open; ~BufferScope() { open = false; } } buffer_scope{buffer_commands_open};
+    struct BufferScope {
+        bool& open;
+        ~BufferScope() {
+            open = false;
+        }
+    } buffer_scope{buffer_commands_open};
     BeginGpuTiming();
     RecordingGuard recording{failed};
     if (indirect_address) {
@@ -737,8 +769,8 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     if (indirect_address) {
         gpu_commands.ExecuteDispatch(commands.Get(), root.Get());
         ++(coordinator ? coordinator : this)->async_statistics.gpu_dispatches;
-    }
-    else commands->Dispatch(groups[0], groups[1], groups[2]);
+    } else
+        commands->Dispatch(groups[0], groups[1], groups[2]);
     resources.PrepareDownload(commands.Get());
     images.PrepareDownloads(commands.Get());
     EndGpuTiming();
@@ -756,7 +788,12 @@ void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
         const ResourceCache::Range target{destination.guest_address, destination.guest_size};
         const ResourceCache::Range input{source.guest_address, source.guest_size};
         auto& context = NextContext({&target, 1}, {&input, 1});
-        struct Scope { bool& active; ~Scope() { active = false; } } scope{context.recording_context};
+        struct Scope {
+            bool& active;
+            ~Scope() {
+                active = false;
+            }
+        } scope{context.recording_context};
         context.recording_context = true;
         context.Resolve(source, destination, source_layer, destination_layer, layers);
         return;
@@ -766,9 +803,9 @@ void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
     BeginImages();
-    const std::array<ResourceCache::Range, 2> access_ranges{{
-        {source.guest_address, source.guest_size},
-        {destination.guest_address, destination.guest_size}}};
+    const std::array<ResourceCache::Range, 2> access_ranges{
+        {{source.guest_address, source.guest_size},
+         {destination.guest_address, destination.guest_size}}};
 
     auto& input = images.GetImage(source, ConvertFormat(source.pixel_format),
                                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, source_layer, layers);

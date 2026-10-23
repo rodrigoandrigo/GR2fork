@@ -6,14 +6,23 @@
 
 namespace Shader {
 struct Info;
+struct ImageResource;
 enum class SwStage : u32;
 } // namespace Shader
 
 namespace Shader::IR {
 struct Program;
 }
+namespace AmdGpu {
+struct Image;
+}
+namespace VideoCore {
+struct ImageInfo;
+}
 namespace D3D12 {
 inline constexpr u32 SharedSamplerWords = 16;
+VideoCore::ImageInfo ShaderImageLayout(const AmdGpu::Image& sharp,
+                                       const Shader::ImageResource& resource);
 struct CompiledShader;
 class ResourceCache;
 struct IndexFetch {

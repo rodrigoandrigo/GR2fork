@@ -56,6 +56,13 @@ struct PreparedShader {
 };
 class ShaderCache {
 public:
+    struct StageOutput {
+        std::string semantic;
+        u32 index, components;
+        bool integer, signed_integer;
+    };
+    std::vector<StageOutput> StageOutputs(const ShaderBinary& binary);
+    std::string OutputInterface(const ShaderBinary& binary);
     void Initialize(ID3D12Device* device, const ResourceCache* resources = nullptr,
                     D3D_SHADER_MODEL maximum_model = D3D_SHADER_MODEL_6_6);
     D3D_SHADER_MODEL ShaderModel() const {
@@ -88,17 +95,22 @@ public:
                                                        const std::array<u32, 8>& masks);
     std::shared_ptr<const ShaderBinary> CompileRectangle(
         const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment);
-    std::shared_ptr<const ShaderBinary> CompilePointFill(const ShaderBinary& vertex,
-                                                         bool keep_front, bool front_ccw);
+    std::shared_ptr<const ShaderBinary> CompilePointFill(
+        const ShaderBinary& vertex, bool keep_front, bool front_ccw, bool cull = true,
+        const Shader::HwFragmentRuntimeInfo* fragment = nullptr);
     std::shared_ptr<const ShaderBinary> CompileLineExpand(
         const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool keep_front,
         bool front_ccw, D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type, bool adjacency, float width_px,
         u16 pattern, u16 repeat, bool pattern_msb_first, float pattern_scale,
-        const std::array<f32, 32>& viewport_dims);
+        const std::array<f32, 32>& viewport_dims, bool cull = true, bool batches = false);
     std::shared_ptr<const ShaderBinary> CompileHlslRaw(const std::string& hlsl,
                                                        std::wstring_view target,
                                                        std::span<const std::wstring> defines);
-    u64 MemoryBytes() const { return cache_bytes + variant_bytes; }
+    std::shared_ptr<const ShaderBinary> CompileHelperHlsl(const std::string& hlsl,
+                                                          Shader::SwStage stage);
+    u64 MemoryBytes() const {
+        return cache_bytes + variant_bytes;
+    }
     void TrimMemory(u64 target);
     struct Statistics {
         u64 translations{}, variant_hits{};

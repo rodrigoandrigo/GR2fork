@@ -5,8 +5,8 @@
 
 #include "d3d12_device_context.h"
 #include "d3d12_resource_allocator.h"
-#include "video_core/renderer_d3d12/shader_cache.h"
 #include "video_core/renderer_d3d12/resource_cache.h"
+#include "video_core/renderer_d3d12/shader_cache.h"
 
 namespace D3D12 {
 class GpuDrawFallback final : public std::exception {};
@@ -23,10 +23,16 @@ public:
     };
     void Initialize(D3D12DeviceContext& device, ShaderCache& shaders);
     void Prepare(u32 commands, u32 indices);
-    u64 MemoryBytes() const { return allocator.Stats().live_bytes; }
+    u64 MemoryBytes() const {
+        return allocator.Stats().live_bytes;
+    }
     void TrimMemory() {
         arguments.Reset();
         indices.Reset();
+        geometry_vertices.Reset();
+        geometry_counter.Reset();
+        geometry_arguments.Reset();
+        geometry_capacity = geometry_argument_capacity = 0;
         argument_capacity = index_capacity = 0;
     }
     void RecordArguments(ID3D12GraphicsCommandList* list, const Arguments& description,
@@ -36,7 +42,17 @@ public:
     void RecordIndices(ID3D12GraphicsCommandList* list, const Expansion& description,
                        const ResourceCache::View& input, u32 index_bytes, u32 swap,
                        u32 readable_count = UINT32_MAX, u32 read_count = UINT32_MAX);
-    ID3D12Resource* Indices() const { return indices.Get(); }
+    void PrepareGeometry(u64 bytes, u32 batches);
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW BeginGeometry(ID3D12GraphicsCommandList* list);
+    void EndGeometry(ID3D12GraphicsCommandList* list, u32 stride, u32 batches);
+    void ExecuteGeometry(ID3D12GraphicsCommandList* list, ID3D12RootSignature* graphics, u32 slot,
+                         u32 batches);
+    ID3D12Resource* GeometryVertices() const {
+        return geometry_vertices.Get();
+    }
+    ID3D12Resource* Indices() const {
+        return indices.Get();
+    }
     void Execute(ID3D12GraphicsCommandList* list, ID3D12RootSignature* graphics, bool indexed,
                  u32 count);
 
@@ -51,7 +67,13 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> signature_root;
     Microsoft::WRL::ComPtr<ID3D12CommandSignature> draw, indexed_draw, dispatch;
-    D3D12Resource arguments, indices;
+    D3D12Resource arguments, indices, geometry_vertices, geometry_counter, geometry_arguments;
+    u64 geometry_capacity{}, geometry_argument_capacity{};
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> geometry_signature_root;
+    D3D12_RESOURCE_STATES geometry_state{D3D12_RESOURCE_STATE_COMMON};
+    D3D12_RESOURCE_STATES geometry_counter_state{D3D12_RESOURCE_STATE_COMMON};
+    D3D12_RESOURCE_STATES geometry_argument_state{D3D12_RESOURCE_STATE_COMMON};
+    Microsoft::WRL::ComPtr<ID3D12CommandSignature> geometry_draw;
     u64 argument_capacity{}, index_capacity{};
     D3D12_RESOURCE_STATES argument_state{D3D12_RESOURCE_STATE_COMMON};
     D3D12_RESOURCE_STATES index_state{D3D12_RESOURCE_STATE_COMMON};

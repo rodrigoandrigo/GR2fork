@@ -7,6 +7,3 @@ desligado e máscaras de cobertura. O PS incrementa um contador por invocação.
 O log `EQAA` registra os valores medidos; não impõe uma associação presumida
 entre samples e fragments. Não valida os valores de cor, depth/stencil,
 resolve, posições de interpolação nem o conteúdo comprimido de FMASK.
-
-Registre modelo do PS4, firmware e saída completa. O SDK OpenOrbis não está
-instalado neste ambiente: esta fonte não foi compilada nem executada em PS4.

@@ -405,11 +405,13 @@ public:
                                             const U1& skip_mips, TextureInstInfo info);
 
     [[nodiscard]] Value ImageQueryLod(const Value& handle, const Value& coords,
-                                      TextureInstInfo info);
+                                      const Value& sampler, TextureInstInfo info);
     [[nodiscard]] Value ImageGather(const Value& handle, const Value& coords, const Value& offset,
-                                    TextureInstInfo info);
+                                    TextureInstInfo info, const F32& lod = {},
+                                    const F32& lod_clamp = {});
     [[nodiscard]] Value ImageGatherDref(const Value& handle, const Value& coords,
-                                        const Value& offset, const F32& dref, TextureInstInfo info);
+                                        const Value& offset, const F32& dref, TextureInstInfo info,
+                                        const F32& lod = {}, const F32& lod_clamp = {});
     [[nodiscard]] Value ImageGradient(const Value& handle, const Value& coords,
                                       const Value& derivatives_dx, const Value& derivatives_dy,
                                       const Value& offset, const F32& lod_clamp,

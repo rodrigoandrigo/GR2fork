@@ -55,11 +55,11 @@ explicitados neste documento; não significa cobertura de todos os jogos.
 | Estágios | VS/PS/CS, GS off-chip, LS/HS/ES/DS, invocações de GS, copy shader, interfaces e root signatures por reflexão. | [shaders](../src/video_core/renderer_d3d12/shader_cache.cpp), [draw](../src/video_core/renderer_d3d12/draw_runtime.cpp) |
 | Buffers | Residência GPU com dirty tracking por páginas, readback sob demanda, inputs persistentes, views raw/typed, snapshots, uploads parciais, agrupamento físico, backing segmentado/não linear e segmentos repetidos por tabelas de endereços. | [cache](../src/video_core/renderer_d3d12/resource_cache.cpp), [bindings](../src/video_core/renderer_d3d12/resource_bindings.cpp) |
 | Imagens | 1D por lowering, 2D/3D, arrays/cube nas views nativas, mips/layers, formatos normalizados/inteiros/float, packed e BC; tiling CPU/GPU. | [imagens](../src/video_core/renderer_d3d12/image_cache.cpp), [tiling](../src/video_core/renderer_d3d12/tiling_runtime.cpp) |
-| Aliases e feedback shader | `IMAGE_LOAD`/`STORE`, dimensões, amostragem parcial e storage compartilhado para aliases imagem/imagem/buffer, inclusive endereços virtuais distintos e entre estágios. | [lowering](../src/video_core/renderer_d3d12/image_buffer_alias.cpp), [preparação](../src/video_core/renderer_d3d12/shader_cache.cpp) |
+| Aliases e feedback shader | `IMAGE_LOAD`/`STORE`, gather/query, amostragem planar/volume/cube com cadeia de mips, BC1–BC7 e storage compartilhado para aliases imagem/imagem/buffer, inclusive endereços virtuais distintos e entre estágios. | [lowering](../src/video_core/renderer_d3d12/image_buffer_alias.cpp), [preparação](../src/video_core/renderer_d3d12/shader_cache.cpp) |
 | Escritas subword | Texels/componentes de 8/16 bits usam extração e compare-and-swap de 32 bits para preservar os vizinhos nas escritas compartilhadas. | [lowering](../src/video_core/renderer_d3d12/image_buffer_alias.cpp) |
 | Atômicos em aliases | Add, min/max signed/unsigned, and/or/xor, exchange, compare-swap inteiro/float, inc/dec e min/max float para componente de 32 bits. Não devem voltar à lista genérica de “atômicos restantes” já resolvidos. | `Atomic` em [image_buffer_alias.cpp](../src/video_core/renderer_d3d12/image_buffer_alias.cpp) |
 | Coerência | Leases CPU/GPU, resolução física, callbacks de memória, map/unmap/protect e invalidação; imagens podem continuar residentes/dirty entre comandos e sincronizar por intervalo quando a CPU ou outro uso exige. | [runtime](../src/video_core/renderer_d3d12/command_runtime.cpp), [memória](../src/core/memory.cpp) |
-| Metadata e clear | CMASK misto por tile 8×8 para códigos 0/F, clear tipado, swizzle/quantização e preservação de tiles/padding; modos alternate/Neo e bank swizzle nos layouts suportados. | [clear](../src/video_core/renderer_d3d12/color_clear.h), [CMASK](../src/video_core/renderer_d3d12/cmask_address.h) |
+| Metadata e clear | CMASK misto por tile 8×8 para códigos 0/F e estados MSAA com FMASK descomprimido (1→D, 2→E, 3→F), clear tipado, swizzle/quantização e preservação de tiles/padding; modos alternate/Neo e bank swizzle nos layouts suportados. | [clear](../src/video_core/renderer_d3d12/color_clear.h), [CMASK](../src/video_core/renderer_d3d12/cmask_address.h) |
 | Rasterização | Culling, winding, máscaras, depth clip/bias, até 16 viewports/scissors, flips X/Y, clip/cull distances, conversões de primitivas, provoking vertex first/last; expansões de point/line e passes por face com restrições. | [rasterizer](../src/video_core/renderer_d3d12/d3d12_rasterizer.cpp), [primitivas](../src/video_core/renderer_d3d12/primitive_conversion.h) |
 | Cor/depth/stencil | MRTs com gaps/subviews, blend/dual source, MIN/MAX ZERO/ONE, blend bypass, alpha constante com consulta de capacidade, testes/clears de depth/stencil, depth bounds e gate de cor por depth com restrições. | [draw](../src/video_core/renderer_d3d12/draw_runtime.cpp), [rasterizer](../src/video_core/renderer_d3d12/d3d12_rasterizer.cpp) |
 | Logic ops | 16 ROPs; alvos não inteiros são expandidos para componentes inteiros temporários e recompostos, com máscaras, padding e transferência MSAA. | [formatos](../src/video_core/renderer_d3d12/logic_op_format.h), [imagens](../src/video_core/renderer_d3d12/image_cache.cpp) |
@@ -86,7 +86,7 @@ explicitados neste documento; não significa cobertura de todos os jogos.
 | Bindings | Quatro heaps persistentes por contexto: 512 recursos, 128 samplers, 8 RTVs e 1 DSV. Limites adicionais de buffers/constantes do recompilador também se aplicam. |
 | Transferências | Por contexto: pool de 256 MiB; tiler com allocator temporário de 64 MiB e fallback CPU quando não suportado ou sem orçamento. |
 | VideoOut | Contabilidade de frames de 256 MiB; allocator do apresentador de 512 MiB; FSR com allocator separado de 128 MiB e saída até 8192 por eixo, sujeita ao orçamento. A retenção desses pools participa da meta agregada de P04; os caps locais continuam como limites de segurança. |
-| Indiretos/índices GPU | Até 4096 draws por lote, janela de argumentos até 16 MiB; índices expandidos até 4 milhões; scratch GPU de 32 MiB por contexto, reutilizado após sua fence. Stride e overflow validados; índices indiretos exigem a janela de `max_index_size` mapeada. |
+| Indiretos/índices GPU | Até 4096 draws por lote, janela de argumentos até 16 MiB; índices expandidos até 4 milhões; scratch GPU de 32 MiB por contexto, reutilizado após sua fence. Stride e overflow validados; a view de índices usa o prefixo mapeado de `max_index_size`, incluindo capacidade zero. |
 | LDS/GDS | Spill LDS até 16 MiB por dispatch, separado por workgroup; GDS de 64 KiB. |
 | Shader Model | Guest requer SM6.4; SM6.6 é usado quando reportado, sem ser requisito universal. Compute de onda variável só pode forçar wave64 com SM6.6; em SM6.4, operações cross-lane exigem dispositivo fixo wave64. |
 | Waves gráficas | Operações quad são aceitas; demais operações subgroup/cross-lane exigem `WaveLaneCountMin == WaveLaneCountMax == 64`. Não existe `[WaveSize]` gráfico neste caminho. |
@@ -153,14 +153,14 @@ O lote gráfico GPU exige estágios sem escrita storage, sem GS/tessellation,
 stream-out, clear ou múltiplos passes. Essas restrições preservam ordenação e
 barreiras entre draws; os demais casos mantêm captura prévia e execução CPU.
 Dispatch com spill LDS dimensionado pelo número de grupos mantém o fallback CPU.
-Janelas não mapeadas integralmente ou views físicas não contíguas também usam
+Janelas de argumentos não mapeadas integralmente ou views físicas não contíguas usam
 fallback, sem ampliar artificialmente o intervalo guest válido.
 
 A expansão paralela cobre line loop/strip, triangle fan/strip/list, polygon,
 quad list/strip, provoking vertex e byte swap nos casos elegíveis sem restart.
 Índices 16/32 bits e sequências não indexadas são aceitos. Restart, contornos,
 point fill, conversões antes de GS/tessellation e passes especiais continuam no
-caminho CPU. Nenhuma dessas mudanças conclui o contrato de bounds guest de F03.
+caminho CPU.
 
 Isso não equivale a dizer que toda imagem é baixada a cada draw. Com tracking
 ativo, a imagem mantém ownership/dirty na GPU e sincroniza sob demanda em acesso
@@ -171,7 +171,7 @@ embora ainda copie e espere a GPU. Não há scanout direto da textura mutável.
 
 Esses mecanismos não comprovam equivalência de todas as políticas de cache e
 barreiras guest. Os casos residuais de coerência estão na lista abaixo; as
-fontes de comparação em hardware estão na seção de evidências.
+fontes de referência estão na seção de evidências.
 
 ### Coordenação de memória (P04)
 
@@ -240,6 +240,61 @@ caminhos CPU anteriores. A representação nativa expandida de logic ops continu
 com 16 bytes por texel; P05 reduz sua formatação/cópias, sem alterar essa precisão.
 Não há suporte novo para renderizar/comprimir BC por shader nem para RGB96 tiled.
 
+O limite guest `max_index_size` delimita a view de índices sem reduzir a contagem
+do draw. Leituras além da capacidade ou do prefixo com backing mapeado retornam
+índice zero, também em indiretos, conversões CPU/GPU e fetch programável. A última
+unidade de byte swap só é lida até o backing disponível; seu padding não amplia
+a capacidade lógica. Buffer nulo mantém o draw indexado. Nos indiretos, o primeiro
+índice limita a capacidade restante também no fallback CPU. O contrato dos pacotes
+está descrito no [guia AMD](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-references/si_programming_guide_v2.pdf).
+A validação PC está em `Build/f03-index-validation.log`.
+
+O storage compartilhado (F07) inclui gather por componente/PCF com offset,
+LOD/bias/clamp e mips, query LOD limitado/sem clamp com sampler rastreado e cube
+por face/array. [BC6/BC7](../src/video_core/renderer_d3d12/bptc.h) decodifica todos
+os modos na GPU, incluindo BC6 signed/unsigned e modos reservados; escritas de
+blocos por buffer alias são observadas no mesmo shader. O caminho raw também
+lê/escreve 565/1555/4444 UNORM/SNORM/UINT/SINT e lê RGB9E5, pares GB_GR/BG_RG,
+8_24/24_8 UNORM/SNORM/UINT/SINT e X24_8_32 FLOAT/UINT. Componentes inteiros em
+point/gather preservam os bits sem interpolação float. Combinações fora dessas
+representações continuam rejeitadas explicitamente.
+
+A [ISA GCN, tabela 8.17](https://gpuopen.com/wp-content/uploads/2016/08/AMD_GCN3_Instruction_Set_Architecture_rev1.1.pdf)
+não permite `IMAGE_STORE` tipado em BC, RGB9E5, pares ou depth packed. A escrita
+válida sobre esses backings usa views raw/buffer, preservando os bytes; não há
+recompressão automática de texels. Precisão e controles secundários de amostragem
+continuam em F06 e metadata comprimida de depth em F04.
+
+O sampler manual (F08) cobre os oito modos de endereçamento, incluindo
+`ClampHalfBorder`, `MirrorOnceHalfBorder` e `MirrorOnceBorder`. Mirror-once
+reflete uma vez e mantém clamp/borda; point respeita a direção nos limites exatos
+entre texels. Os modos sem equivalente nativo, custom border e amostragem inteira
+usam lowering raw mesmo sem aliases, preservando SM 6.4. Custom border mantém os
+quatro words: FLOAT sem quantização, UINT/SINT como bits inteiros e UNORM/SNORM
+com clamp antes da filtragem. O caminho point evita operações float desnecessárias,
+preservando inclusive zero negativo, infinito, NaN e subnormal em FLOAT32.
+
+GS on-chip (F09) usa o contrato lógico de rings coerentes convertido em atributos
+ES→GS→copy, sem exigir backing físico dos rings guest. Os modos de backing
+válidos deixam de bloquear o draw; o valor reservado 2 continua rejeitado.
+Point fill e linhas largas/stipple com GS e tessellation capturam a saída do
+último estágio na GPU e aplicam a expansão em um draw indireto. O contador de
+[stream output D3D12](https://learn.microsoft.com/en-us/windows/win32/direct3d12/stream-output-counters)
+interno fornece a contagem real da expansão, incluindo strips, cuts e emissão vazia; o guest GS/HS/DS
+executa uma vez, com barreira UAV antes do PS. As interfaces vêm da reflexão
+DXIL, os helpers usam cache em RAM/disco e atributos flat conservam o primeiro
+vértice da primitiva. O quad de linha usa ordem de strip sem sobreposição interna;
+stipple é dividido em comandos para respeitar o teto de componentes por
+invocação, mantendo a janela de até 4096 bits do helper.
+
+Entrada `RectList` com guest GS não aciona a expansão de retângulo: a topologia
+é a emitida pelo GS. Os buffers transitórios pertencem ao contexto em voo e entram
+no orçamento e trim por fence; PSOs e root signatures ficam retidos por lease
+até a fence, inclusive após eviction do cache. A reserva conservadora da captura tem teto de 32 MiB por contexto;
+se a amplificação máxima ultrapassar esse limite, o draw é rejeitado antes da
+gravação. Stream-out guest completo continua em F10 e fidelidade das expansões,
+provoking-last e cobertura/interpolação continuam em F15. [Homebrew OpenOrbis](hardware/geometry-expansion/README.md).
+
 ## Trabalho pendente para jogos
 
 ### Correção funcional e fidelidade
@@ -250,16 +305,12 @@ jogo depende de cada item.
 
 | ID | O que falta para cobertura completa | Evidência no código |
 | --- | --- | --- |
-| F01 | Feedback de attachments: render target/depth-stencil usado simultaneamente como textura/buffer em shader, preservando ordem e efeitos laterais sem replay incorreto. | `ValidateTargetRange` em [resource_bindings.cpp](../src/video_core/renderer_d3d12/resource_bindings.cpp) rejeita sobreposição. |
-| F02 | Fetch coerente de vértices/índices quando o mesmo backing é escrito por shaders; incluir fetch shaders/views que ainda dependem de snapshots CPU. | `ValidateInputRange` rejeita aliases de entrada com storage escrito. |
-| F03 | Aplicar o contrato guest de capacidade do index buffer, índices fora do intervalo e ranges parcialmente mapeados em todos os draws diretos/indiretos. | Liverpool preenche `max_index_size`, mas o renderer nativo monta a view pelo `request.count`; não consome esse limite. |
-| F04 | CMASK além de 0/F, metadata comprimida/TC-compatible, DCC e HTILE com semântica real; FMASK com remapeamento/compressão guest em vez de valores constantes. | `MaterializeColorClearImpl` rejeita códigos/outros modos; [resource_patching_pass.cpp](../src/shader_recompiler/ir/passes/resource_patching_pass.cpp) substitui leituras FMASK por constantes e não aceita storage FMASK. |
-| F05 | EQAA verdadeiro, em que samples e fragments diferem, e equivalência da frequência parcial de shading por sample. | [draw_runtime.cpp](../src/video_core/renderer_d3d12/draw_runtime.cpp) rejeita EQAA; o caminho parcial atual pode executar PS por sample, alterando o número de efeitos laterais. |
-| F06 | Completar amostragem de storage compartilhado: LOD implícito com cadeia de mips, filtragem entre mips, anisotropia, seleção min/mag/LOD/reduction fiel e cálculo geral de gradientes. | `Sample` em [image_buffer_alias.cpp](../src/video_core/renderer_d3d12/image_buffer_alias.cpp) exige um nível no caso implícito; LOD explícito/gradiente escolhe mip por floor; a tabela não carrega todos os parâmetros do sampler nativo. |
-| F07 | Gather/query ainda sem lowering, cube sampling no storage compartilhado, BC6/BC7 nesse lowering, escrita comprimida e demais formatos/depth não expressos pelo caminho raw. | O lowering aceita formas 1D/2D/3D/arrays, BC1–BC5 normalizado single-sample e leitura de blocos; rejeita outros casos. Não confundir com BC1–BC7/cube nas views nativas. |
-| F08 | Modos de borda/mirror sem equivalente direto e precisão completa de custom border no sampler manual. | `CheckWrapMode`/`AddressMode` rejeitam modos que exigem coordenadas em shader; a borda custom do sampler raw é quantizada para RGBA8. Sampler nativo tem caminho separado. |
-| F09 | GS on-chip e integração dos caminhos de expansão com guest GS/tessellation nos casos atualmente incompatíveis. | [d3d12_rasterizer.cpp](../src/video_core/renderer_d3d12/d3d12_rasterizer.cpp) rejeita on-chip, point fill com GS/tessellation e wide/stippled lines com guest GS. |
-| F10 | Stream-out completo: draws sem GS, múltiplos streams/rast stream, layout/seleção exata dos descritores, emissão dinâmica, filled-size e sincronização real dos eventos de stream-out. | Captura atual cobre stream 0 off-chip; seleção de buffers é heurística por stride/user data e contagem usa nós estáticos de emissão. Liverpool sinaliza `SoVgtStreamoutFlush` imediatamente. |
+| F01 | Feedback de attachments com escrita simultânea, preservando ordem e efeitos laterais sem replay incorreto. | `ValidateTargetRange` em [resource_bindings.cpp](../src/video_core/renderer_d3d12/resource_bindings.cpp) permite leituras simultâneas de attachments imutáveis: color com máscara zero e planos depth/stencil sem escrita/clear, inclusive aliases físicos. Usa o conteúdo sincronizado antes de um único draw; rejeita sobreposição quando shader ou attachment escreve. Escrita ordenada permanece pendente. |
+| F02 | Completar fetch coerente de índices com conversão de primitivas/restart e descritores de fetch modificados durante o draw. | Fetch shaders são traduzidos inline no VS e usam storage compartilhado com buffers/imagens, sem snapshot de dados da IA; aliases físicos, formatos, offsets e divisores seguem o tradutor GCN. Índices 16/32 bits com escrita no mesmo backing usam leitura programável no VS, com swaps, base e instâncias; indiretos com escrita passam pelo fallback de argumentos. Conversão/restart nesse feedback continua rejeitado. Código e descritores ainda são resolvidos na tradução CPU. |
+| F04 | CMASK além de 0/F, metadata comprimida/TC-compatible, DCC e HTILE com semântica real; FMASK com remapeamento/compressão guest em vez de valores constantes. | `MaterializeColorClearImpl` aceita 0/F sem compressão e separa clear/cor expandida de FMASK descomprimido em MSAA 2×/4×/8×, preservando seus bits; ainda rejeita EQAA, FMASK comprimido, DCC e TC-compatible quando requerem materialização. HTILE permanece sem decodificação; [resource_patching_pass.cpp](../src/shader_recompiler/ir/passes/resource_patching_pass.cpp) substitui leituras FMASK por constantes e não aceita storage FMASK. |
+| F05 | EQAA verdadeiro, em que samples e fragments diferem, e equivalência da frequência parcial de shading por sample. | `MAX_ANCHOR_SAMPLES` corrigido para três bits; `PS_ITER_SAMPLE` respeitado e contagem de iterações preservada. [draw_runtime.cpp](../src/video_core/renderer_d3d12/draw_runtime.cpp) rejeita EQAA e frequência parcial antes de traduzir/executar o draw, evitando multiplicar efeitos laterais. Falta o fallback de cobertura→fragment/anchor e shading agrupado com interpolação, depth/stencil, blend e FMASK coerentes. |
+| F06 | Completar amostragem de storage compartilhado: LOD implícito com cadeia de mips, filtragem entre mips, anisotropia, seleção min/mag/LOD/reduction fiel e cálculo geral de gradientes. | [Sample](../src/video_core/renderer_d3d12/image_buffer_alias.cpp) calcula derivadas implícitas no PS e gradientes 1D/2D/3D, seleciona mip point/linear, min/mag, bias/clamps e reduction; anisotropia por footprint até 16 taps e borda float tipada. Samplers entram nas dependências do cache de variantes. Ainda faltam equivalência GCN de precisão/controles secundários (aniso threshold/bias, bias secundário, trunc/ceil e seleção coarse por quad); o filtro anisotrópico 3D difere do volume nativo usado como referência no PC. [Homebrew](hardware/shared-sampling/README.md). |
+| F10 | Stream-out completo: draws sem GS, múltiplos streams/rast stream, layout/seleção exata dos descritores, emissão dinâmica, filled-size e sincronização real dos eventos de stream-out. | Captura guest atual cobre stream 0; seleção de buffers é heurística por stride/user data e contagem usa nós estáticos de emissão. Liverpool sinaliza `SoVgtStreamoutFlush` imediatamente. |
 | F11 | Tessellation Pow2 e combinações de domínio/topologia que exigem emulação/expansão adicional. | `CompileNativeSpirv` só mapeia Integer/FracOdd/FracEven e rejeita combinações sem equivalente. |
 | F12 | Modos polygon/bias diferentes por face com geometry/tessellation e com primitivas quad/polygon/rect atualmente rejeitadas; preservar efeitos laterais ao usar múltiplos passes. | Guardas de `mixed_mode`, `bias_split` e `face_passes` no rasterizer. |
 | F13 | Gate de cor por depth com shaders que escrevem storage/atomics, equivalência para depth/stencil que muda entre primitivas do mesmo draw e depth bounds em draw sem pixel shader. | `depth_gated` usa fail/base passes; `writes_memory` restringe efeitos laterais. A pass fail lê o depth anterior à pass que escreve. `DrawImpl` exige PS para o lowering de depth bounds. |
@@ -274,8 +325,8 @@ jogo depende de cada item.
 | F22 | Recuperação controlada após device loss/falha de gravação e restauração dos recursos/estado da sessão, se a continuidade sem reinício for exigida. | O runtime fica marcado como falho e exige recriação; diagnóstico/DRED e drenagem já existem, recuperação transparente não. |
 
 Os atômicos 32-bit listados em “Caminhos implementados”, aliases virtuais entre
-estágios, segmentos físicos repetidos, CMASK 0/F por tile e dirty tracking de
-imagens **não estão pendentes como recursos inteiros**. F01/F02/F06/F07/F21
+estágios, segmentos físicos repetidos, CMASK 0/F e MSAA descomprimido 2×/4×/8× por tile e dirty tracking de
+imagens **não estão pendentes como recursos inteiros**. F01/F02/F06/F21
 identificam os casos residuais concretos. Tampouco se exige coerência definida
 para data races que o próprio contrato guest não define: falta confrontar as
 políticas de sincronização/cache em usos válidos com hardware.
@@ -294,7 +345,7 @@ necessárias para desempenho aceitável nos jogos.
 | P03 | Implementado nos casos elegíveis: preparação GPU, ExecuteIndirect para draw/dispatch, expansão paralela de índices e byte swap. | Contagem e constantes dos SGPRs preservadas; restart, escrituras storage entre draws e passes especiais mantêm fallback CPU. |
 | P04 | Implementado: meta agregada adaptativa, pressão real do processo/dispositivo e redução em segundo plano UWP. | Recolhe caches após fences e preserva dirty por writeback; working sets e frames referenciados podem exceder a meta e são reportados. Pressão e suspensão reais no Xbox ainda exigem validação. |
 | P05 | Implementado: tiling por subrecurso para arrays/views parciais, volumes, planos MSAA e BC; conversão 4:4:4:4 e empacotamento de logic ops na GPU. | Upload usa SRV sobre staging e constantes root; elimina cópia/readback duplicados e snapshots CPU intermediários no caminho persistente. Planos depth/stencil especiais e casos sem orçamento mantêm CPU; logic ops ainda usam até 16 bytes nativos por texel/amostra. |
-| P06 | Profiling e otimizações implementados; ampliar cobertura de jogos/cenas e Series S. | Agregação CPU por etapa/lock/fence, hits de caches, bytes de apresentação e timestamps GPU; leitura curta de metadata e cópia residente direta quando a conversão é identidade. PAC-MAN medido no PC; Teddy bloqueado por backing guest não mapeado. Decisões de novas filas/precompilação dependem de mais sessões; blobs de driver no Xbox continuam desativados. |
+| P06 | Profiling e otimizações implementados; ampliar cobertura de jogos/cenas e Series S. | Agregação CPU por etapa/lock/fence, hits de caches, bytes de apresentação e timestamps GPU; leitura curta de metadata e cópia residente direta quando a conversão é identidade. PAC-MAN e startup de Teddy medidos no PC; consultas CPU sem backing e reentrada durante mapeamento foram corrigidas. Decisões de novas filas/precompilação dependem de mais sessões; blobs de driver no Xbox continuam desativados. |
 
 ### Profiling e decisões de throughput (P06)
 
@@ -349,18 +400,38 @@ a captura compartilhada nem o fence que protege seu conteúdo. O diagnóstico de
 CPU/GPU incluiu os dois casos diretos, sem erros D3D12. Não foi atribuído ganho de gameplay
 a essa otimização a partir do diagnóstico.
 
-Chronicles of Teddy iniciou, mas encerrou com `Guest GPU range lacks mapped physical backing`
-antes de produzir uma sessão útil. Esse resultado não conta como aprovação de compatibilidade
-ou desempenho. A cobertura de P06 continua vinculada a V02/V06, inclusive gameplay e Xbox.
+Chronicles of Teddy foi desbloqueado após corrigir a consulta de aliases usada por acessos
+CPU: uma escrita de 12 bytes na pilha da thread de áudio não pode exigir backing físico de
+recurso GPU. `BackingRangesOverlap` compara somente as partes Direct/Flexible/Pooled existentes,
+inclusive intervalos com lacunas, sem perder aliases físicos; a criação de recursos GPU mantém
+a validação estrita. A busca na tabela de páginas também verifica seus limites antes de
+indexar, mantendo o preenchimento com zeros das leituras esparsas não mapeadas.
+
+As repetições expuseram uma reentrada adicional quando o AvPlayer solicitava mapeamentos:
+um upload interno podia invalidar os buffers do contexto ou reiniciar sua lista ainda aberta.
+Acesso CPU interno durante gravação, sincronização ou conclusão não reinicia esse trabalho;
+consumidores CPU externos continuam passando pelos hazards/fences e pelos locks do runtime.
+A marcação de escrita de render targets/depth/stencil ocorre após registrar o draw, antes de
+preparar os downloads. O diagnóstico dirigido mantém um lease de mapeamento pendente durante
+três draws que leem um buffer no fragment shader e confere os pixels, além dos casos de
+pilha/lacunas/aliases e dos cenários P01–P04; zero erros D3D12.
+
+Com essas correções, duas sessões desktop de 45 s, com cache frio/quente, terminaram com
+`BOOT_RESULT=0`, `SHUTDOWN=0` e 15/16 apresentações. A repetição com o core do pacote final
+teve 17 apresentações em 45 s, também com boot/stop/shutdown sem erro. PAC-MAN terminou a
+regressão de 25 s com dez apresentações e os mesmos retornos de sucesso. A captura de Teddy
+mostra o logo AKSYS Games. Isso resolve as falhas de backing/reentrada reproduzidas, sem
+comprovar gameplay prolongado,
+correção de todas as cenas ou hardware Xbox. A cobertura de P06 continua vinculada a V02/V06.
 
 ### Validação necessária para declarar o renderer completo
 
 | ID | Evidência ainda necessária |
 | --- | --- |
-| V01 | Compilar e executar os homebrews OpenOrbis em PS4 físico; comparar valores, layouts, barreiras, atômicos, rasterização, metadata, blend/stencil e formatos com o backend. As fontes existentes não equivalem a resultados de hardware. |
+| V01 | Comparar valores, layouts, barreiras, atômicos, rasterização, metadata, blend/stencil e formatos com referências técnicas e diagnósticos no PC. |
 | V02 | Cobertura de jogos reais no PC e depois Series S: cenas, gameplay prolongado, transições, efeitos, vários formatos/estágios e comparação visual com referência. Chegar à tela inicial não fecha isso. |
 | V03 | Runtime UWP/AppContainer real para recursos/compiladores, resizing/DPI, HDR/SDR, apresentação, input e mudanças de estado do painel. Os diagnósticos desktop não exercitam todo esse ambiente. |
-| V04 | Medir luminância/gamut/primárias em tela HDR e conferir FP16/PQ contra PS4, inclusive transições e branco SDR. Readback FP16 sozinho não prova a saída física. |
+| V04 | Medir luminância/gamut/primárias em tela HDR e conferir FP16/PQ, inclusive transições e branco SDR. Readback FP16 sozinho não prova a saída física. |
 | V05 | Repetir carga/descarga, stop, suspensão/retomada, detach, pressão de memória e falhas de GPU, verificando ownership/threads, estabilidade e memória no PC e Xbox. O host já tem teardown; sua cobertura real não está concluída. |
 | V06 | Medir frame time, stalls, memória CPU/GPU e limites por aplicação em sessões prolongadas; ausência de retenção em 96 ciclos sintéticos não prova ausência de todo vazamento. |
 
@@ -372,17 +443,45 @@ estão ausentes: precisam de cobertura de cenários e eventual ampliação.
 ## Evidências já disponíveis
 
 Esta seção reúne registros anteriores e diagnósticos executados nas atualizações
-P01–P06. Os diagnósticos em `Build/` são artefatos locais temporários, não uma
+P01–P06 e F01–F09. Os diagnósticos em `Build/` são artefatos locais temporários, não uma
 suíte incluída no repositório nem execução de jogos no Xbox.
 
 | Evidência | Resultado registrado | Limite da conclusão |
 | --- | --- | --- |
+| `Build/f09-package-build.log` / `Build/f09-package-verification.log` | Core Release compilado, bundle assinado com CMS válido e payload/core de produção coincidentes. | Pacote não instalado nem executado no host UWP; sem validação Xbox desta revisão. |
+| `Build/f09-production-pacman.log` / `Build/real-game-frame.png` | PAC-MAN 256 chegou à tela inicial em 1920×1080, 56 apresentações em 75 s, `BOOT_RESULT=0` e `SHUTDOWN=0`; core com hash igual ao empacotado. | Conferência visual no harness PC, sem gameplay prolongado ou execução UWP/Xbox. |
+| `Build/f09-geometry-matrix-validation.log` | 33 comparações em SM6.4: point fill, wide/stipple, strips/cuts, emissão vazia, 2/32 invocações, saída de linhas, adjacency, múltiplas primitivas, rings ES→GS e entrada RectList; pixels e contador atômico conferidos, zero erros D3D12. | Referência GPU pelo caminho sem guest GS; os efeitos do GS ocorrem uma vez por invocação. Linha sólida tem verificação independente de intensidade por fragmento. |
+| `Build/f09-attributes-partial-validation.log` | 12 comparações de atributos completos/parciais, interpolação e flat pelo primeiro vértice nos três modos; zero erros D3D12. | Referência GPU e verificação independente do valor flat, em saída RGBA8. |
+| `Build/f09-feedback-validation.log` | Três comparações em que o PS lê o valor escrito pelo GS antes da expansão, com contador igual a 1; zero erros D3D12. | Coerência entre os dois draws no PC. |
+| `Build/f09-tessellation-validation.log` | Três comparações LS/HS/DS→GS contra LS/HS/DS nos modos point/wide/stipple, com rings ES e contador do GS igual a 1; zero erros D3D12. | Diagnóstico GPU no PC, sem gameplay Xbox. |
+| `Build/f09-geometry-async-validation.log` | Oito submissões assíncronas de captura/expansão, contador final 8 e zero erros D3D12. | A mesma escrita induz hazard; pico de um contexto em voo nessa amostra. |
+| `Build/f09-broad-regression-validation.log` | Regressão GCN/SM6.4, aliases, feedback, atômicos, tiling, MSAA e estágios; zero erros D3D12. | Diagnóstico nativo PC. |
+| `Build/f08-border-validation.log` / `Build/f08-border-boundary-validation.log` | 1536 casos em SM6.4: oito modos, point/linear, bordas fixas/customizadas, FLOAT/UNORM/SNORM/UINT/SINT, coordenadas negativas/fracionárias/limites exatos e imagens com/sem alias; zero erros D3D12. | Referência CPU por texel/tap; modos com equivalente também passam pelo sampler nativo PC. |
+| `Build/f08-border-bits-validation.log` | Dois casos FLOAT32 com/sem alias preservam os bits de zero negativo, infinito, NaN com payload e subnormal no custom border point; zero erros D3D12. | Readback float32 no PC; não valida hardware Xbox. |
+| `Build/f08-border-integer-bits-validation.log` | Quatro casos UINT/SINT com/sem alias preservam os 32 bits dos quatro componentes de custom border, observados por escrita em buffer após a amostragem; zero erros D3D12. | Readback de words no PC, sem conversão float no valor comparado. |
+| `Build/f08-broad-regression-validation.log` | Regressão GCN/SM6.4, aliases, feedback, tiling, atômicos, MSAA e estágios; zero erros D3D12. | Diagnóstico nativo PC. |
+| `Build/f08-production-pacman.log` / `Build/real-game-frame.png` | PAC-MAN 256 alcançou a tela inicial em 1920×1080, 84 apresentações em 75 s, `BOOT_RESULT=0` e `SHUTDOWN=0`; core com hash igual ao empacotado. | Conferência visual no harness PC; sem gameplay ou execução UWP/Xbox desta revisão. |
+| `Build/f08-package-build.log` / `Build/f08-package-verification.log` | Core Release compilado, bundle assinado com CMS válido e payload/core de produção coincidentes. | Pacote não instalado nem executado; sem validação Xbox desta revisão. |
+| `Build/f07-package-build.log` / `Build/f07-package-verification.log` | Core Release compilado, bundle assinado com CMS válido e payload/core de produção coincidentes. | Pacote não instalado nem executado; sem validação Xbox desta revisão. |
+| `Build/f07-production-pacman.log` / `Build/real-game-frame.png` | PAC-MAN 256 atingiu a tela inicial com prompt de início em 1920×1080; `BOOT_RESULT=0` e `SHUTDOWN=0`, usando o mesmo hash do core empacotado. | Harness PC de produção; sem gameplay nem execução UWP/Xbox nesta revisão. |
+| `Build/f07-bptc-validation.log` | 45 casos float BC6/BC7 em SM6.4, todos os modos e reservados, BC6 signed/unsigned, vários blocos/texels e bloco escrito por buffer antes da amostragem; zero erros D3D12. | Comparação com sampler nativo PC; BC6 coincide exatamente nos casos registrados. |
+| `Build/f07-query-cube-validation.log` | 16 comparações float: gather com borda/swizzle e imagem gravável, LOD limitado/sem clamp e dez faces de cube array; zero erros D3D12. | Sampler nativo PC; não mede desempenho em jogos. |
+| `Build/f07-formats-validation.log` / `Build/f07-numeric-validation.log` | 12 casos de packed/depth/pares e 18 casos SNORM/UINT/SINT; leitura/escrita e preservação de componentes inteiros, zero erros D3D12. | Quatro comparações com sampler nativo e 26 referências CPU de bits/conversões. Não cobre todas as combinações numéricas rejeitadas. |
+| `Build/f07-gather-validation.log` | 11 verificações de LOD fracionário, point/linear, bias, clamps, offsets e PCF; zero erros D3D12. | Referência analítica de mips/valores, sem prova geral da precisão GCN. |
+| `Build/f07-broad-regression-validation.log` | Regressão GCN/SM6.4, aliases, feedback, tiling, atômicos, MSAA e estágios; zero erros D3D12. | O ajuste final de swizzle/borda de gather foi verificado pelos 16 casos específicos acima. |
+| `Build/f06-storage-sampling-validation.log` / `Build/f06-minmag-validation.log` | 191 casos de amostragem e cinco casos adicionais de min/mag/clamps em SM6.4; zero erros D3D12. Inclui mips, derivadas, arrays, volume, sRGB, reduction, borda float e clamp do shader. | 187 comparações com sampler nativo e quatro verificações analíticas de anisotropia 3D; estas quatro diferem do filtro nativo PC. Precisão e controles GCN continuam pendentes. |
+| `Build/f06-broad-regression-validation.log` | Regressão GCN/SM6.4, aliases, feedback, tiling, atômicos e MSAA; zero erros D3D12. | Diagnóstico PC, anterior ao ajuste final de clamps coberto pela matriz de amostragem. |
+| `Build/f06-production-pacman.log` / `Build/real-game-frame.png` | PAC-MAN 256 atingiu a tela inicial com prompt de início em 1920×1080; `BOOT_RESULT=0` e `SHUTDOWN=0`, usando o mesmo hash do core empacotado. | Harness PC de produção; sem gameplay, execução UWP ou Xbox nesta revisão. |
+| `Build/f06-package-build.log` / `Build/f06-package-verification.log` | Core Release compilado, bundle assinado com CMS válido e payload/core de produção coincidentes. | Pacote não instalado nem executado; sem validação Xbox desta revisão. |
 | `Build/p06-profile-before.log` / `Build/p06-production-cold.log` / `Build/p06-production-warm.log` | PAC-MAN 256: leitura média de programa caiu de 62,7 para 16,9 ms; cache quente com seis hits SPIR-V, cinco blobs PSO e zero chamadas DXC; boot/teardown sem erro. | Logo de startup no harness PC; apresentações oscilaram de 15 a 25 por sessão, sem ganho consistente de throughput nem prova visual/gameplay/Xbox. |
 | `Build/p06-sm64-validation.log` | Regressão GCN/SM6.4, aliases, atômicos, feedback, tiling, MSAA e GS/tessellation; zero erros D3D12. | Diagnóstico PC; não substitui a cobertura de jogos/cenas/Xbox. |
 | `Build/p06-final-uwp-build.log` / `Build/p06-package-verification.log` | Release x64 compilado, bundle assinado e hashes dos payloads conferidos com o core de produção. | Compilação e pacote; não significa instalação/execução UWP nem validação Xbox. |
 | `Build/p06-direct-presenter-validation.log` | 72 comparações CPU/GPU, dois casos de cópia residente direta, HDR/FSR/resize e zero erros D3D12. | Diagnóstico desktop; não mede ganho de gameplay nem valida a saída física HDR/Xbox. |
-| `Build/p06-teddy-profile.log` | Falha por backing físico guest não mapeado; encerramento do host concluído. | Sessão inválida para concluir desempenho/compatibilidade. |
-| `Build/p05-tiling-validation.log` | 210 casos comparados byte a byte com a referência CPU: arrays parciais, volumes, MSAA 2/8, BC1–BC7, packed, máscaras 15/5/0, backing/padding e dispatch acima de 65535 grupos; upload persistente sem snapshot e sem readback duplicado, zero erros D3D12. | Diagnóstico nativo PC; não mede ganho de desempenho em jogos nem valida hardware Xbox/PS4. |
+| `Build/teddy-recursion-cold.log` / `Build/teddy-recursion-warm.log` | Teddy executou duas sessões de 45 s, com 15/16 apresentações e boot/stop/shutdown sem erro; captura do logo AKSYS. | Harness desktop e startup, sem aprovação de gameplay/Xbox. |
+| `Build/teddy-final-production.log` / `Build/teddy-fix-pacman-regression.log` | Core do pacote final: Teddy 45 s/17 apresentações e PAC-MAN 25 s/dez apresentações, boot/stop/shutdown sem erro. | Sessões de startup no PC, sem prova de gameplay prolongado ou Xbox. |
+| `Build/teddy-final-uwp-build.log` / `Build/teddy-final-package-verification.log` | Release x64 assinado; hashes de core/payloads conferidos com a produção. | O pacote não foi instalado/executado no AppContainer ou no Xbox. |
+| `Build/teddy-memory-final-validation.log` | 20 verificações de aliases/lacunas/pilha/limites, GPU estrita preservada, três draws com lease de mapeamento pendente e pixels corretos; regressão P01–P04, zero erros D3D12. | Diagnóstico PC. |
+| `Build/p05-tiling-validation.log` | 210 casos comparados byte a byte com a referência CPU: arrays parciais, volumes, MSAA 2/8, BC1–BC7, packed, máscaras 15/5/0, backing/padding e dispatch acima de 65535 grupos; upload persistente sem snapshot e sem readback duplicado, zero erros D3D12. | Diagnóstico nativo PC; não mede ganho de desempenho em jogos nem valida hardware Xbox. |
 | `Build/p05-residency-validation.log` | Regressão com memória guest real, argumentos indiretos/índices, ownership, aliases/dirty e quatro ciclos de pressão; zero erros D3D12. | Diagnóstico PC; não comprova gameplay Xbox. |
 | `Build/p05-sm64-validation.log` | Regressão GCN/SM6.4, aliases/atômicos/feedback, alternate tiling, MSAA e GS/tessellation; zero erros D3D12. | Runtime nativo PC; não comprova desempenho/gameplay Xbox. |
 | `Build/p05-presenter-validation.log` | 72 comparações CPU/residente, 88 capturas sem download e recriação FSR após trim com pixels preservados; zero erros D3D12. | Diagnóstico PC; não é instalação/execução UWP nem validação de suspensão Xbox. |
@@ -392,7 +491,7 @@ suíte incluída no repositório nem execução de jogos no Xbox.
 | `Build/p04-sm64-runtime.log` | Regressão GCN/SM6.4 com oito coletas induzidas durante os comandos, aliases, atômicos, tiling, MSAA e GS/tessellation; zero erros D3D12 e exit code 0. | Diagnóstico nativo PC; sem comprovação de gameplay ou pressão real UWP/Xbox. |
 | `Build/p04-uwp-build.log`, `Build/p04-package-verification.log` | Release x64 compilado, assinatura CMS válida e executável/seis DLLs conferidos contra os binários de produção. | Pacote não instalado/executado; Xbox não validado nesta etapa. |
 | `Build/p03-validation.log` | 705 combinações de índices, limite de 65536 grupos, contagem zero/limitada, strides 24/28, base signed/SGPRs, dispatch indireto e argumentos residentes sem readback; zero erros D3D12. | Diagnóstico nativo PC; não comprova gameplay Xbox. |
-| `Build/p03-guest-validation.log` | Caminho de produção DrawIndirect com contagem GPU e expansão de strips/provoking, mais regressão de residência; zero erros D3D12. | Não é execução de jogo nem PS4 físico. |
+| `Build/p03-guest-validation.log` | Caminho de produção DrawIndirect com contagem GPU e expansão de strips/provoking, mais regressão de residência; zero erros D3D12. | Não é execução de jogo. |
 | `Build/p03-presenter-validation.log` | 72 comparações CPU/residente e 88 capturas sem download; FSR/resize/HDR e zero erros D3D12. | Diagnóstico nativo PC. |
 | `Build/p03-sm64-validation.log` | Regressão GCN/SM6.4, aliases, atômicos, tiling, MSAA, GS/tessellation; 1529 submissões com timestamps e zero erros D3D12. | Não comprova desempenho/gameplay Xbox. |
 | `Build/p03-uwp-build.log`, `Build/p03-package-verification.log` | Release x64 compilado; bundle com assinatura CMS válida e executável/DLLs conferidos contra os binários de produção. | Pacote não instalado nem executado; Xbox não validado nesta etapa. |
@@ -408,16 +507,10 @@ suíte incluída no repositório nem execução de jogos no Xbox.
 | `Build/p01-residency-validation.log` | Residência, RTV→SRV sem download, aliases, CPU/GPU concorrentes, eviction, proteção e flush/destruição; zero erros D3D12. | Não comprova equivalência geral ao PS4. |
 | `Build/mixed-adaptations-sm64-validation.log` | Regressão GCN/SM6.4, aliases, atômicos, tiling, MSAA, GS/tessellation; zero erros D3D12; timestamps de 1529 submissões. | Não é compatibilidade geral com jogos/PS4/Xbox. |
 | Mesmo log | Quatro heaps reutilizados por 96 ciclos, staging CPU retido zero em 96 ciclos e upload parcial de quatro bytes em buffer de 1 MiB. | Evidência desses ciclos/intervalos, sem prova global de ausência de vazamentos. |
-| `Build/mixed-adaptations-guest-validation.log` | MIN/MAX, alpha constante nativo/fallback, bypass, depth bounds inativo, NONE, overflow e provoking vertex first/last/restart; coerência, eviction e destruição; zero erros. | Hipóteses guest ainda aguardam comparação em hardware. |
+| `Build/mixed-adaptations-guest-validation.log` | MIN/MAX, alpha constante nativo/fallback, bypass, depth bounds inativo, NONE, overflow e provoking vertex first/last/restart; coerência, eviction e destruição; zero erros. | Hipóteses guest ainda exigem validação adicional no PC. |
 | `Build/mixed-adaptations-presentation-validation.log` | 72 referências CPU/residente, 88 captures sem downloads, FSR/RCAS, HDR/float, tiling e resize; zero erros. | Composição nativa desktop, sem validar scanout HDR ou AppContainer/Xbox. |
 | `Build/mixed-adaptations-uwp-build.log` e `Build/mixed-adaptations-package-verification.log` | Release x64, bundle assinado (`CMS_SIGNATURE=PASS`), payload e núcleo de produção coincidentes. | Pacote compilado/assinado não comprova instalação ou runtime. |
 | Relato anterior do usuário | Tela inicial atingida no Xbox Series S. | Evidência de boot nesse cenário, sem validação prolongada desta revisão. |
-
-As fontes de comparação ficam em [hardware/d3d12-guest](hardware/d3d12-guest/README.md),
-[hardware/logic-ops](hardware/logic-ops/README.md) e
-[hardware/msaa](hardware/msaa/README.md). Não foram compiladas ou
-executadas em PS4 nesta revisão; o SDK local não foi identificado na integração
-anterior.
 
 ## Critério de conclusão
 

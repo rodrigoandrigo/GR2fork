@@ -46,10 +46,7 @@ recarga da DLL no mesmo processo. A pasta do ELF contém caracteres Unicode.
 O diagnóstico confirma o descarregamento consultando o loader após FreeLibrary.
 Os programas e logs ficam no diretório ignorado `Build`.
 
-O homebrew [embedding/main.cpp](hardware/embedding/main.cpp) fornece os casos
-OpenOrbis de leitura, pthreads e término normal, além da variante de parada pelo
-host. O SDK OpenOrbis não está instalado; esse homebrew não foi compilado ou
-executado no PS4.
+O homebrew [embedding/main.cpp](hardware/embedding/main.cpp) fornece os casos OpenOrbis de leitura, pthreads e término normal, além da variante de parada pelo host.
 
 Em 14/10/2026, o diagnóstico nativo no PC também iniciou PAC-MAN 256
 (CUSA05026, versão 01.00), usando o StorageFolder do jogo fornecido pelo usuário,

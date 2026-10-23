@@ -7,9 +7,9 @@
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/amdgpu/regs_vertex.h"
+#include "video_core/renderer_d3d12/gpu_commands.h"
 #include "video_core/renderer_d3d12/image_cache.h"
 #include "video_core/renderer_d3d12/memory_budget.h"
-#include "video_core/renderer_d3d12/gpu_commands.h"
 #include "video_core/renderer_d3d12/resource_bindings.h"
 #include "video_core/renderer_d3d12/resource_cache.h"
 #include "video_core/renderer_d3d12/shader_cache.h"
@@ -31,14 +31,18 @@ public:
         trim_external_memory = std::move(trim);
     }
     u64 MemoryBytes() const;
-    const MemoryBudget::Statistics& MemoryStatistics() const { return memory_budget.Stats(); }
+    const MemoryBudget::Statistics& MemoryStatistics() const {
+        return memory_budget.Stats();
+    }
     ResourceCache::UploadStatistics BufferStatistics(bool input = false) const;
     struct AsyncStatistics {
         u64 commands{}, batches{}, hazard_waits{}, capacity_waits{};
         u64 gpu_draw_batches{}, gpu_dispatches{}, gpu_index_expansions{};
         u32 peak_in_flight{};
     };
-    const AsyncStatistics& AsyncStats() const { return async_statistics; }
+    const AsyncStatistics& AsyncStats() const {
+        return async_statistics;
+    }
     void SetMemoryAccess(AcquireMemory acquire) {
         acquire_memory = std::move(acquire);
     }
@@ -98,8 +102,10 @@ public:
         bool provoking_last{};
         bool point_fill{};
         bool point_keep_front{};
+        bool point_cull{true};
         bool line_expand{};
         bool line_keep_front{};
+        bool line_cull{true};
         float line_width{1.f};
         u16 line_pattern{};
         u16 line_pattern_repeat{};
@@ -200,7 +206,8 @@ private:
     bool synchronizing_images{};
     u64 image_mapping_generation{};
     void BeginImages();
-    void SynchronizeBuffers(std::span<const ResourceCache::Range> ranges, bool invalidate, bool all = false);
+    void SynchronizeBuffers(std::span<const ResourceCache::Range> ranges, bool invalidate,
+                            bool all = false);
     std::vector<ImageCache::Watch> ResourceWatches() const;
     bool buffer_commands_open{};
     void UpdateImageWatches();

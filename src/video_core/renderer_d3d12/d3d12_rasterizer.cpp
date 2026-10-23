@@ -146,8 +146,8 @@ D3D12_BLEND_OP BlendOperation(AmdGpu::BlendControl::BlendFunc function) {
         throw std::runtime_error("Invalid guest blend operation");
     }
 }
-void NormalizeMinMaxBlend(D3D12_BLEND_OP& operation, D3D12_BLEND& source,
-                          D3D12_BLEND& destination, AmdGpu::NumberFormat format) {
+void NormalizeMinMaxBlend(D3D12_BLEND_OP& operation, D3D12_BLEND& source, D3D12_BLEND& destination,
+                          AmdGpu::NumberFormat format) {
     if (format != AmdGpu::NumberFormat::Unorm && format != AmdGpu::NumberFormat::Srgb)
         return;
     if (operation != D3D12_BLEND_OP_MIN && operation != D3D12_BLEND_OP_MAX)
@@ -322,8 +322,8 @@ u32 MappedIndexCount(Core::MemoryManager& memory, VAddr address, u64 count, u32 
         throw std::runtime_error("Guest index range exceeds D3D12 input budget");
     std::vector<Core::MemoryManager::BackingSpan> spans((u64(count) * bytes + 4095) / 4096 + 1);
     const auto mapped = [&](u32 length) {
-        return memory.ResolveBackingSpans(address, u64(length) * bytes, spans.data(),
-                                          spans.size(), false) != 0;
+        return memory.ResolveBackingSpans(address, u64(length) * bytes, spans.data(), spans.size(),
+                                          false) != 0;
     };
     if (mapped(count))
         return count;
@@ -343,14 +343,17 @@ void ReadIndexBuffer(Core::MemoryManager& memory, VAddr address, u32 capacity, u
     std::ranges::fill(output, 0);
     if (!capacity || output.empty())
         return;
-    const u32 unit = swap == AmdGpu::IndexSwapMode::None ? bytes :
-                     swap == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, bytes) : 4;
+    const u32 unit = swap == AmdGpu::IndexSwapMode::None     ? bytes
+                     : swap == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, bytes)
+                                                             : 4;
     const u64 size = (u64(output.size()) * bytes + prefix + unit - 1) & ~u64(unit - 1);
     std::vector<u8> packed(size);
     address -= prefix;
-    const auto count = MappedIndexCount(
-        memory, address, (u64(std::min<u64>(capacity, output.size())) * bytes + prefix + unit - 1) /
-                             unit * (unit / bytes), bytes);
+    const auto count =
+        MappedIndexCount(memory, address,
+                         (u64(std::min<u64>(capacity, output.size())) * bytes + prefix + unit - 1) /
+                             unit * (unit / bytes),
+                         bytes);
     read(address, std::span<u8>{packed.data(), u64(count) * bytes});
     SwapIndexBytes(packed, swap);
     for (u32 i = 0; i < std::min<u64>(output.size(), capacity); ++i)
@@ -365,9 +368,9 @@ std::vector<ResourceCache::Range> ResolveBacking(Core::MemoryManager& memory, VA
     std::vector<Core::MemoryManager::BackingSpan> spans((size + 4095) / 4096 + 1);
     const u32 count = memory.ResolveBackingSpans(address, size, spans.data(), spans.size(), false);
     if (!count)
-        throw std::runtime_error(fmt::format(
-            "Guest GPU range lacks mapped physical backing: address={:#x} size={:#x}",
-            address, size));
+        throw std::runtime_error(
+            fmt::format("Guest GPU range lacks mapped physical backing: address={:#x} size={:#x}",
+                        address, size));
     std::vector<ResourceCache::Range> result;
     u64 total{};
     for (u32 i = 0; i < count; ++i) {
@@ -488,22 +491,20 @@ std::array<VAddr, 4> ResolveStreamOutBases(
 } // namespace
 Rasterizer::Rasterizer(AmdGpu::Liverpool& gpu, Core::MemoryManager& manager)
     : liverpool{gpu}, memory{manager} {
-    runtime.Initialize([this](VAddr address, std::span<u8> data) { Read(address, data); },
-                       [this](VAddr address, std::span<const u8> data) { Write(address, data); },
-                       [this](VAddr address, u64 size) -> std::optional<VAddr> {
-                           const auto spans = ResolveBacking(memory, address, size);
-                           return spans.size() == 1 ? std::optional<VAddr>{spans[0].address}
-                                                    : std::nullopt;
-                       },
-                       [this](VAddr first, u64 first_size, VAddr second, u64 second_size) {
-                           return memory.BackingRangesOverlap(first, first_size, second,
-                                                               second_size);
-                       });
+    runtime.Initialize(
+        [this](VAddr address, std::span<u8> data) { Read(address, data); },
+        [this](VAddr address, std::span<const u8> data) { Write(address, data); },
+        [this](VAddr address, u64 size) -> std::optional<VAddr> {
+            const auto spans = ResolveBacking(memory, address, size);
+            return spans.size() == 1 ? std::optional<VAddr>{spans[0].address} : std::nullopt;
+        },
+        [this](VAddr first, u64 first_size, VAddr second, u64 second_size) {
+            return memory.BackingRangesOverlap(first, first_size, second, second_size);
+        });
     D3D12_FEATURE_DATA_D3D12_OPTIONS13 options{};
-    alpha_blend_factor_supported =
-        SUCCEEDED(runtime.Device().Device()->CheckFeatureSupport(
-            D3D12_FEATURE_D3D12_OPTIONS13, &options, sizeof(options))) &&
-        options.AlphaBlendFactorSupported;
+    alpha_blend_factor_supported = SUCCEEDED(runtime.Device().Device()->CheckFeatureSupport(
+                                       D3D12_FEATURE_D3D12_OPTIONS13, &options, sizeof(options))) &&
+                                   options.AlphaBlendFactorSupported;
     runtime.SetMemoryAccess([this](std::span<const ResourceCache::Range> ranges) {
         std::vector<std::pair<VAddr, u64>> access;
         access.reserve(ranges.size());
@@ -586,7 +587,8 @@ void Rasterizer::Dispatch(std::array<u32, 3> groups, VAddr indirect_address) {
     info.hw.cs.tgid_enable = {cs.IsTgidEnabled(0), cs.IsTgidEnabled(1), cs.IsTgidEnabled(2)};
     info.hw.cs.start_offsets = {cs.start_x, cs.start_y, cs.start_z};
     info.hw.cs.shared_memory_size = cs.SharedMemSize();
-    runtime.Dispatch(program.Params(), info, groups, liverpool.regs.ta_bc_base.Address(), indirect_address);
+    runtime.Dispatch(program.Params(), info, groups, liverpool.regs.ta_bc_base.Address(),
+                     indirect_address);
 }
 void Rasterizer::DispatchDirect() {
     Execute([&] {
@@ -709,8 +711,8 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     const bool has_geometry = regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry));
     const bool tessellation = regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Local));
     u32 strmout_buffer_mask{};
-    if (has_geometry && regs.vgt_gs_mode.onchip)
-        throw std::runtime_error("D3D12 on-chip geometry is not implemented");
+    if (has_geometry && regs.vgt_gs_mode.onchip == 2)
+        throw std::runtime_error("Invalid guest geometry on-chip mode");
     if (has_geometry && regs.vgt_strmout_config.raw) {
         const auto& config = regs.vgt_strmout_config;
         if (config.streamout_1_en || config.streamout_2_en || config.streamout_3_en ||
@@ -749,9 +751,8 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         throw std::runtime_error("Guest raster sample count exceeds D3D12 limits");
     if (draw.samples > 1) {
         const auto& values = regs.reg_array;
-        const u32 iterations = (values[0xa293] & (1u << 16))
-                                   ? 1u << ((values[0xa201] >> 4) & 7)
-                                   : 1u;
+        const u32 iterations =
+            (values[0xa293] & (1u << 16)) ? 1u << ((values[0xa201] >> 4) & 7) : 1u;
         if (iterations > draw.samples)
             throw std::runtime_error("Guest sample shading iterations exceed guest samples");
         draw.sample_iterations = iterations;
@@ -965,10 +966,10 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         normalize_alpha(target.DestBlendAlpha);
         for (auto* factor : {&target.SrcBlend, &target.DestBlend}) {
             if (target.BlendEnable && (target.RenderTargetWriteMask & 7)) {
-                constant_color_rgb |= *factor == D3D12_BLEND_BLEND_FACTOR ||
-                                      *factor == D3D12_BLEND_INV_BLEND_FACTOR;
-                constant_alpha_rgb |= *factor == D3D12_BLEND_ALPHA_FACTOR ||
-                                      *factor == D3D12_BLEND_INV_ALPHA_FACTOR;
+                constant_color_rgb |=
+                    *factor == D3D12_BLEND_BLEND_FACTOR || *factor == D3D12_BLEND_INV_BLEND_FACTOR;
+                constant_alpha_rgb |=
+                    *factor == D3D12_BLEND_ALPHA_FACTOR || *factor == D3D12_BLEND_INV_ALPHA_FACTOR;
             }
             if (!alpha_blend_factor_supported)
                 normalize_alpha(*factor);
@@ -988,6 +989,14 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         polygon.enable_polygon_mode ? polygon.polygon_mode_front : AmdGpu::PolygonMode::Fill;
     AmdGpu::PolygonMode back_mode =
         polygon.enable_polygon_mode ? polygon.polygon_mode_back : AmdGpu::PolygonMode::Fill;
+    const bool triangle_output =
+        has_geometry ? regs.vgt_gs_out_prim_type.GetPrimitiveType(0) ==
+                           AmdGpu::GsOutputPrimitiveType::TriangleStrip
+                     : !tessellation ||
+                           regs.tess_config.topology == AmdGpu::TessellationTopology::TriangleCw ||
+                           regs.tess_config.topology == AmdGpu::TessellationTopology::TriangleCcw;
+    if (!triangle_output)
+        front_mode = back_mode = AmdGpu::PolygonMode::Fill;
     const bool front_visible = !polygon.cull_front;
     const bool back_visible = !polygon.cull_back;
     AmdGpu::PolygonMode polygon_mode = front_visible ? front_mode : back_mode;
@@ -1007,9 +1016,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                                                     front_bias_scale != back_bias_scale);
     const bool face_passes =
         mixed_mode || (point_face && (polygon.cull_front || polygon.cull_back)) || bias_split;
-    const bool point_cpu = point_face && !face_passes;
-    if (point_face && (tessellation || has_geometry))
-        throw std::runtime_error("D3D12 point fill requires vertex-only primitive lowering");
+    const bool point_cpu = point_face && !face_passes && !tessellation && !has_geometry;
     if (bias_split && (tessellation || has_geometry))
         throw std::runtime_error(
             "D3D12 per-face depth bias requires per-face passes conflicting with guest "
@@ -1026,13 +1033,16 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             "D3D12 per-face guest fill or depth bias on polygon primitives requires per-face "
             "primitive lowering");
     const bool line_primitive =
-        regs.primitive_type == AmdGpu::PrimitiveType::LineList ||
-        regs.primitive_type == AmdGpu::PrimitiveType::LineStrip ||
-        regs.primitive_type == AmdGpu::PrimitiveType::LineLoop ||
-        regs.primitive_type == AmdGpu::PrimitiveType::AdjLineList ||
-        regs.primitive_type == AmdGpu::PrimitiveType::AdjLineStrip ||
-        (tessellation && regs.primitive_type == AmdGpu::PrimitiveType::PatchPrimitive &&
-         regs.tess_config.topology == AmdGpu::TessellationTopology::Line);
+        has_geometry
+            ? regs.vgt_gs_out_prim_type.GetPrimitiveType(0) ==
+                  AmdGpu::GsOutputPrimitiveType::LineStrip
+            : regs.primitive_type == AmdGpu::PrimitiveType::LineList ||
+                  regs.primitive_type == AmdGpu::PrimitiveType::LineStrip ||
+                  regs.primitive_type == AmdGpu::PrimitiveType::LineLoop ||
+                  regs.primitive_type == AmdGpu::PrimitiveType::AdjLineList ||
+                  regs.primitive_type == AmdGpu::PrimitiveType::AdjLineStrip ||
+                  (tessellation && regs.primitive_type == AmdGpu::PrimitiveType::PatchPrimitive &&
+                   regs.tess_config.topology == AmdGpu::TessellationTopology::Line);
     const float line_width = regs.line_control.Width();
     const float stipple_scale = regs.line_stipple_scale.Scale();
     const float line_pattern_scale =
@@ -1040,9 +1050,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     const bool line_stipple = regs.mode_control.line_stripple_enable;
     const bool line_expand = (line_width != 1.f || line_stipple) &&
                              (line_primitive || polygon_mode == AmdGpu::PolygonMode::Line);
-    if (line_expand && has_geometry)
-        throw std::runtime_error(
-            "D3D12 wide or stippled guest lines require guest geometry lowering");
+
     draw.rasterizer.FillMode = FillMode(polygon_mode);
     draw.rasterizer.CullMode = polygon.cull_front  ? D3D12_CULL_MODE_FRONT
                                : polygon.cull_back ? D3D12_CULL_MODE_BACK
@@ -1349,7 +1357,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         break;
     case AmdGpu::PrimitiveType::TriangleList:
     case AmdGpu::PrimitiveType::RectList:
-        draw.rectangles = regs.primitive_type == AmdGpu::PrimitiveType::RectList &&
+        draw.rectangles = !has_geometry && regs.primitive_type == AmdGpu::PrimitiveType::RectList &&
                           polygon_mode == AmdGpu::PolygonMode::Fill;
         if (draw.rectangles && has_geometry)
             throw std::runtime_error("D3D12 guest geometry cannot precede rectangle expansion");
@@ -1411,19 +1419,20 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             throw std::runtime_error("Guest index buffer address overflow");
         draw.index_buffer_bound = true;
         draw.index_address = base + u64(index_offset) * size;
-        u32 capacity = indirect
-                           ? regs.max_index_size - std::min(regs.max_index_size, index_offset)
-                           : regs.max_index_size;
+        u32 capacity = indirect ? regs.max_index_size - std::min(regs.max_index_size, index_offset)
+                                : regs.max_index_size;
         if (indirect && index_offset && capacity) {
             const u64 end = std::min<u64>(regs.max_index_size, u64(index_offset) + draw.count);
             const auto mapped = MappedIndexCount(memory, base, end, size);
             capacity = std::min(capacity, mapped - std::min(mapped, index_offset));
         }
         const u32 logical_count = std::min(draw.count, capacity);
-        const u32 unit = regs.index_buffer_type.swap_mode == AmdGpu::IndexSwapMode::None ? size :
-                         regs.index_buffer_type.swap_mode == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, size) : 4;
-        const u64 read_count = (u64(logical_count) + unit / size - 1) / (unit / size) *
-                               (unit / size);
+        const u32 unit = regs.index_buffer_type.swap_mode == AmdGpu::IndexSwapMode::None ? size
+                         : regs.index_buffer_type.swap_mode == AmdGpu::IndexSwapMode::Swap16
+                             ? std::max(2u, size)
+                             : 4;
+        const u64 read_count =
+            (u64(logical_count) + unit / size - 1) / (unit / size) * (unit / size);
         draw.index_read_count = MappedIndexCount(memory, draw.index_address, read_count, size);
         draw.index_capacity = std::min(logical_count, draw.index_read_count);
         draw.index_format = size == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
@@ -1477,8 +1486,8 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     const bool provoking_lines =
         remap_provoking && (regs.primitive_type == AmdGpu::PrimitiveType::LineList ||
                             regs.primitive_type == AmdGpu::PrimitiveType::LineStrip);
-    const bool wire_expand_conv =
-        line_expand && !line_primitive && polygon_mode == AmdGpu::PolygonMode::Line;
+    const bool wire_expand_conv = !has_geometry && !tessellation && line_expand &&
+                                  !line_primitive && polygon_mode == AmdGpu::PolygonMode::Line;
     const bool convert = regs.primitive_type == AmdGpu::PrimitiveType::LineLoop ||
                          regs.primitive_type == AmdGpu::PrimitiveType::TriangleFan ||
                          regs.primitive_type == AmdGpu::PrimitiveType::Polygon ||
@@ -1577,11 +1586,13 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     }
     const auto read_indices = [&](std::span<u32> output) {
         const u32 bytes = draw.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4;
-        const u32 unit = draw.index_swap == AmdGpu::IndexSwapMode::None ? bytes :
-                         draw.index_swap == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, bytes) : 4;
+        const u32 unit = draw.index_swap == AmdGpu::IndexSwapMode::None     ? bytes
+                         : draw.index_swap == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, bytes)
+                                                                            : 4;
         const u32 prefix = indirect ? (u64(index_offset) * bytes) % unit : 0;
         ReadIndexBuffer(memory, draw.index_address, draw.index_capacity, bytes, draw.index_swap,
-                        prefix, output, [&](VAddr address, std::span<u8> data) { Read(address, data); });
+                        prefix, output,
+                        [&](VAddr address, std::span<u8> data) { Read(address, data); });
     };
     if (!convert && !draw.expansion && indexed && indirect &&
         (draw.index_swap == AmdGpu::IndexSwapMode::Swap32 ||
@@ -1616,7 +1627,8 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                     "D3D12 expanded primitives preceding geometry require lowering");
             draw.converted_indices = ConvertPolygonEdges(regs.primitive_type, indices, restart);
         } else {
-            draw.converted_indices = ConvertPrimitiveIndices(regs.primitive_type, indices, restart, remap_provoking);
+            draw.converted_indices =
+                ConvertPrimitiveIndices(regs.primitive_type, indices, restart, remap_provoking);
         }
         draw.count = draw.converted_indices.size();
         draw.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
@@ -1670,10 +1682,19 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         }
     }
     const auto submit = [&](CommandRuntime::DrawRequest& pass) {
-        const bool pass_lines = pass.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE ||
-                                pass.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        if (point_face && !point_cpu && !face_passes) {
+            pass.point_fill = true;
+            pass.point_cull = false;
+            pass.rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+            pass.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        }
+        const bool pass_lines = has_geometry
+                                    ? line_primitive
+                                    : pass.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE ||
+                                          pass.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
         if (line_expand && (pass_lines || pass.rasterizer.FillMode == D3D12_FILL_MODE_WIREFRAME)) {
             pass.line_keep_front = pass.rasterizer.CullMode != D3D12_CULL_MODE_FRONT;
+            pass.line_cull = pass.rasterizer.CullMode != D3D12_CULL_MODE_NONE;
             pass.rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
             pass.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
             pass.line_expand = true;

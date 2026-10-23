@@ -19,6 +19,9 @@ void CheckWrapMode(AmdGpu::ClampMode mode) {
     case AmdGpu::ClampMode::ClampLastTexel:
     case AmdGpu::ClampMode::MirrorOnceLastTexel:
     case AmdGpu::ClampMode::ClampBorder:
+    case AmdGpu::ClampMode::ClampHalfBorder:
+    case AmdGpu::ClampMode::MirrorOnceHalfBorder:
+    case AmdGpu::ClampMode::MirrorOnceBorder:
         return;
     default:
         throw std::runtime_error(
@@ -37,6 +40,9 @@ D3D12_TEXTURE_ADDRESS_MODE AddressMode(AmdGpu::ClampMode mode) {
     case AmdGpu::ClampMode::MirrorOnceLastTexel:
         return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
     case AmdGpu::ClampMode::ClampBorder:
+    case AmdGpu::ClampMode::ClampHalfBorder:
+    case AmdGpu::ClampMode::MirrorOnceHalfBorder:
+    case AmdGpu::ClampMode::MirrorOnceBorder:
         return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
     default:
         throw std::runtime_error(
@@ -175,7 +181,7 @@ std::vector<ResourceCache::Range> ResourceBindings::AccessRanges(VAddr border_co
             const auto& resource = entry.shader->info.images[entry.index];
             const auto sharp = resource.GetSharp(entry.shader->info);
             if (sharp) {
-                const VideoCore::ImageInfo info{sharp, resource};
+                const auto info = ShaderImageLayout(sharp, resource);
                 ranges.push_back({info.guest_address, info.guest_size});
                 ranges.push_back({info.stencil_addr, info.stencil_size});
             }
@@ -199,7 +205,7 @@ std::vector<ResourceCache::Range> ResourceBindings::ImageRanges() const {
             const auto& resource = entry.shader->info.images[entry.index];
             const auto sharp = resource.GetSharp(entry.shader->info);
             if (sharp) {
-                const VideoCore::ImageInfo info{sharp, resource};
+                const auto info = ShaderImageLayout(sharp, resource);
                 result.push_back({info.guest_address, info.guest_size});
                 result.push_back({info.stencil_addr, info.stencil_size});
             }
@@ -220,7 +226,7 @@ void ResourceBindings::ValidateInputRange(VAddr address, u64 size) const {
             const auto& resource = entry.shader->info.images[entry.index];
             const auto sharp = resource.GetSharp(entry.shader->info);
             if (sharp && resource.is_written) {
-                const VideoCore::ImageInfo info{sharp, resource};
+                const auto info = ShaderImageLayout(sharp, resource);
                 if (Aliases(address, size, info.guest_address, info.guest_size))
                     throw std::runtime_error(
                         "D3D12 writable image/input alias requires coherent fetching");
@@ -244,10 +250,9 @@ void ResourceBindings::ValidateTargetRange(VAddr address, u64 size, bool written
             const auto& resource = entry.shader->info.images[entry.index];
             const auto sharp = resource.GetSharp(entry.shader->info);
             if (sharp) {
-                const VideoCore::ImageInfo info{sharp, resource};
-                const bool overlap =
-                    Aliases(address, size, info.guest_address, info.guest_size) ||
-                    Aliases(address, size, info.stencil_addr, info.stencil_size);
+                const auto info = ShaderImageLayout(sharp, resource);
+                const bool overlap = Aliases(address, size, info.guest_address, info.guest_size) ||
+                                     Aliases(address, size, info.stencil_addr, info.stencil_size);
                 if (overlap && (written || resource.is_written))
                     throw std::runtime_error(
                         "D3D12 writable attachment/image feedback requires ordered access");
@@ -295,7 +300,7 @@ void ResourceBindings::PrepareImages() {
         const bool array =
             type == AmdGpu::ImageType::Color1DArray || type == AmdGpu::ImageType::Color2DArray ||
             type == AmdGpu::ImageType::Color2DMsaaArray || type == AmdGpu::ImageType::Cube;
-        const VideoCore::ImageInfo info{sharp, resource};
+        const auto info = ShaderImageLayout(sharp, resource);
         auto format = ConvertFormat(info.pixel_format);
         const bool writable = entry.binding.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         if (resource.is_depth)
@@ -464,12 +469,11 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                     words[entry + 2] = std::bit_cast<u32>(sharp.MinLod());
                     words[entry + 3] = std::bit_cast<u32>(sharp.MaxLod());
                     words[entry + 4] = std::bit_cast<u32>(sharp.LodBias());
-                    words[entry + 5] = u32(sharp.xy_mag_filter.Value()) |
-                                      (u32(sharp.xy_min_filter.Value()) << 2) |
-                                      (u32(sharp.mip_filter.Value()) << 4) |
-                                      (u32(sharp.filter_mode.Value()) << 6) |
-                                      (u32(sharp.max_aniso.Value()) << 8) |
-                                      (u32(sharp.z_filter.Value()) << 11);
+                    words[entry + 5] =
+                        u32(sharp.xy_mag_filter.Value()) | (u32(sharp.xy_min_filter.Value()) << 2) |
+                        (u32(sharp.mip_filter.Value()) << 4) |
+                        (u32(sharp.filter_mode.Value()) << 6) |
+                        (u32(sharp.max_aniso.Value()) << 8) | (u32(sharp.z_filter.Value()) << 11);
                     for (u32 c = 0; c < 4; ++c)
                         words[entry + 6 + c] = std::bit_cast<u32>(border_float[c]);
                     std::memcpy(words.data() + entry + 12, &sharp, sizeof(sharp));
@@ -570,7 +574,7 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
             if (multisampled && (writable || sharp.NumSamples() == 1))
                 throw std::runtime_error(
                     "D3D12 multisample images require read-only views and at least two samples");
-            DXGI_FORMAT format = ConvertFormat(VideoCore::ImageInfo{sharp, resource}.pixel_format);
+            DXGI_FORMAT format = ConvertFormat(ShaderImageLayout(sharp, resource).pixel_format);
             if (resource.is_depth)
                 format = sharp.GetDataFmt() == AmdGpu::DataFormat::Format16 ? DXGI_FORMAT_R16_UNORM
                                                                             : DXGI_FORMAT_R32_FLOAT;
@@ -586,7 +590,7 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
             }
             ImageCache::Image* image{};
             if (sharp) {
-                const VideoCore::ImageInfo image_info{sharp, resource};
+                const auto image_info = ShaderImageLayout(sharp, resource);
                 for (const auto& bound : bound_images)
                     if (Aliases(image_info.guest_address, image_info.guest_size, bound.address,
                                 bound.size) &&

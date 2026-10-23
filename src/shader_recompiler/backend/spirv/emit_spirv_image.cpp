@@ -229,8 +229,10 @@ Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, 
                                     ctx.f32_zero_value, ctx.f32_zero_value);
 }
 
-Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
-                   const IR::Value& offset) {
+Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, const IR::Value& offset,
+                   const IR::Value& lod, const IR::Value& lod_clamp) {
+    if (!lod.IsEmpty() || !lod_clamp.IsEmpty())
+        throw std::runtime_error("Gather LOD operands require raw image lowering");
     RequireSampledReadOnly(ctx, handle);
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
@@ -247,7 +249,10 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
 }
 
 Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
-                       const IR::Value& offset, Id dref) {
+                       const IR::Value& offset, Id dref, const IR::Value& lod,
+                       const IR::Value& lod_clamp) {
+    if (!lod.IsEmpty() || !lod_clamp.IsEmpty())
+        throw std::runtime_error("Gather LOD operands require raw image lowering");
     RequireSampledReadOnly(ctx, handle);
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
@@ -298,7 +303,7 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
     }
 }
 
-Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords) {
+Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, const IR::Value&) {
     RequireSampledReadOnly(ctx, handle);
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = ctx.OpLoad(texture.image_type, texture.id);

@@ -330,7 +330,8 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
 
-    if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
+    if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw ||
+        inst.GetOpcode() == IR::Opcode::ImageQueryLod) {
         auto& lod_prod = resource.sharps[1].post_op_data.lod_prod;
         const u32 sampler_binding = descriptors.Add(SamplerResource{
             .sharp_fetch = ConstructSharpFetch<AmdGpu::Sampler>(resource.sharps[1]),
@@ -340,6 +341,8 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
             .is_depth = bool(inst_info.is_depth), // true for the _C (compare) opcodes
         });
         inst.SetArg(0, ir.Imm32(image_binding | sampler_binding << 16));
+        if (inst.GetOpcode() == IR::Opcode::ImageQueryLod)
+            inst.SetArg(2, {});
     } else {
         inst.SetArg(0, ir.Imm32(image_binding));
     }
@@ -810,9 +813,11 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         }
         if (inst_info.is_gather) {
             if (inst_info.is_depth) {
-                return ir.ImageGatherDref(handle, coords, offset, dref, inst_info);
+                return ir.ImageGatherDref(handle, coords, offset, dref, inst_info,
+                                          inst_info.has_lod ? lod : bias, lod_clamp);
             }
-            return ir.ImageGather(handle, coords, offset, inst_info);
+            return ir.ImageGather(handle, coords, offset, inst_info, inst_info.has_lod ? lod : bias,
+                                  lod_clamp);
         }
         if (inst_info.has_derivatives) {
             return ir.ImageGradient(handle, coords, derivatives_dx, derivatives_dy, offset,
