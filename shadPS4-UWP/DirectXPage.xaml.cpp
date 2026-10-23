@@ -67,6 +67,14 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
             }));
     };
     window = CoreWindow::GetForCurrentThread();
+    visibility_token = window->VisibilityChanged +=
+        ref new Windows::Foundation::TypedEventHandler<CoreWindow ^, VisibilityChangedEventArgs ^>(
+            [weak](CoreWindow ^, VisibilityChangedEventArgs ^ args) {
+                if (auto page = weak.Resolve<DirectXPage>())
+                    if (page->frontend)
+                        page->frontend->UpdateInput(
+                            [&](FrontendInput& input) { input.visible = args->Visible; });
+            });
     activation_token = window->Activated +=
         ref new Windows::Foundation::TypedEventHandler < CoreWindow ^
         , WindowActivatedEventArgs ^
@@ -185,6 +193,7 @@ void DirectXPage::OnUnloaded(Object ^, RoutedEventArgs ^) {
         window->KeyUp -= up_token;
         window->CharacterReceived -= character_token;
         window->Activated -= activation_token;
+        window->VisibilityChanged -= visibility_token;
         window = nullptr;
     }
     if (frontend) {

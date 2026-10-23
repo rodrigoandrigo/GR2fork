@@ -226,6 +226,26 @@ struct dzn_nir_options {
    const nir_shader_compiler_options *nir_opts;
 };
 
+static bool
+dzn_device_lowers_16bit(const struct dzn_device *device)
+{
+   const struct dzn_physical_device *pdev =
+      container_of(device->vk.physical, struct dzn_physical_device, vk);
+
+   return !pdev->options4.Native16BitShaderOpsSupported &&
+          (device->vk.enabled_extensions.KHR_shader_float16_int8 ||
+           device->vk.enabled_extensions.KHR_8bit_storage ||
+           device->vk.enabled_extensions.KHR_16bit_storage ||
+           device->vk.enabled_features.shaderFloat16 ||
+           device->vk.enabled_features.shaderInt16 ||
+           device->vk.enabled_features.shaderInt8 ||
+           device->vk.enabled_features.storageBuffer8BitAccess ||
+           device->vk.enabled_features.uniformAndStorageBuffer8BitAccess ||
+           device->vk.enabled_features.storagePushConstant8 ||
+           device->vk.enabled_features.storageBuffer16BitAccess ||
+           device->vk.enabled_features.uniformAndStorageBuffer16BitAccess);
+}
+
 static VkResult
 dzn_pipeline_get_nir_shader(struct dzn_device *device,
                             const struct dzn_pipeline_layout *layout,
@@ -261,6 +281,10 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
       *dxil_spirv_nir_get_spirv_options();
    spirv_opts.amd_trinary_minmax =
       device->vk.enabled_extensions.AMD_shader_trinary_minmax;
+   if (dzn_device_lowers_16bit(device)) {
+      spirv_opts.mediump_16bit_alu = false;
+      spirv_opts.mediump_16bit_derivatives = false;
+   }
 
    VkResult result =
       vk_pipeline_shader_stage_to_nir(&device->vk, pipeline_flags, stage_info,
@@ -476,11 +500,8 @@ dzn_pipeline_compile_shader(struct dzn_device *device,
       container_of(device->vk.physical, struct dzn_physical_device, vk);
    struct nir_to_dxil_options opts = {
       .environment = DXIL_ENVIRONMENT_VULKAN,
-      .lower_int16 = !pdev->options4.Native16BitShaderOpsSupported &&
       /* Don't lower 16-bit types if they can only come from min-precision */
-         (device->vk.enabled_extensions.KHR_shader_float16_int8 ||
-          device->vk.enabled_features.shaderFloat16 ||
-          device->vk.enabled_features.shaderInt16),
+      .lower_int16 = dzn_device_lowers_16bit(device),
       .shader_model_max = dzn_pipeline_get_shader_model(pdev,
                                                         nir->info.stage),
       .input_clip_size = input_clip_size,
@@ -978,9 +999,14 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
       if (ret != VK_SUCCESS)
          return ret;
 
-      if (cache_hit)
+      if (cache_hit) {
+         pipeline->base.cache_hit = true;
          return VK_SUCCESS;
+      }
    }
+
+   if (pipeline->base.flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
+      return VK_PIPELINE_COMPILE_REQUIRED;
 
    /* Second step: get NIR shaders for all stages. */
    nir_shader_compiler_options nir_opts;
@@ -1006,6 +1032,8 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
          _mesa_blake3_update(&nir_hash_ctx,
                              &device->vk.enabled_features.robustImageAccess2,
                              sizeof(device->vk.enabled_features.robustImageAccess2));
+         bool lowers_16bit = dzn_device_lowers_16bit(device);
+         _mesa_blake3_update(&nir_hash_ctx, &lowers_16bit, sizeof(lowers_16bit));
          if (stage != MESA_SHADER_FRAGMENT) {
             _mesa_blake3_update(&nir_hash_ctx, &lower_view_index, sizeof(lower_view_index));
             _mesa_blake3_update(&nir_hash_ctx, &force_sample_rate_shading, sizeof(force_sample_rate_shading));
@@ -1979,6 +2007,20 @@ dzn_graphics_pipeline_translate_zsa(struct dzn_device *device,
    }
 }
 
+static bool
+is_constant_alpha_blend_factor(VkBlendFactor factor)
+{
+   return factor == VK_BLEND_FACTOR_CONSTANT_ALPHA ||
+          factor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+}
+
+static bool
+is_constant_color_blend_factor(VkBlendFactor factor)
+{
+   return factor == VK_BLEND_FACTOR_CONSTANT_COLOR ||
+          factor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+}
+
 static D3D12_BLEND
 translate_blend_factor(VkBlendFactor in, bool is_alpha, bool support_alpha_blend_factor)
 {
@@ -2077,6 +2119,7 @@ dzn_graphics_pipeline_translate_blend(struct dzn_graphics_pipeline *pipeline,
    struct dzn_physical_device *pdev =
       container_of(device->vk.physical, struct dzn_physical_device, vk);
    bool support_alpha_blend_factor = pdev->options13.AlphaBlendFactorSupported;
+   bool constant_alpha = false, constant_color = false;
 
    d3d12_gfx_pipeline_state_stream_new_desc(out, BLEND, D3D12_BLEND_DESC, desc);
    D3D12_LOGIC_OP logicop =
@@ -2146,8 +2189,19 @@ dzn_graphics_pipeline_translate_blend(struct dzn_graphics_pipeline *pipeline,
             translate_blend_factor(attachment.dstAlphaBlendFactor, true, support_alpha_blend_factor);
          desc->RenderTarget[i].BlendOpAlpha =
             translate_blend_op(attachment.alphaBlendOp);
+
+         const VkPipelineColorBlendAttachmentState *att = &attachment;
+         if (att->blendEnable) {
+            constant_alpha |= is_constant_alpha_blend_factor(att->srcColorBlendFactor) ||
+                              is_constant_alpha_blend_factor(att->dstColorBlendFactor);
+            constant_color |= is_constant_color_blend_factor(att->srcColorBlendFactor) ||
+                              is_constant_color_blend_factor(att->dstColorBlendFactor);
+         }
       }
    }
+
+   pipeline->blend.splat_constant_alpha =
+      !support_alpha_blend_factor && constant_alpha && !constant_color;
 }
 
 
@@ -2237,6 +2291,29 @@ dzn_graphics_pipeline_cleanup_dxil_shaders(struct dzn_graphics_pipeline *pipelin
 }
 
 static void
+dzn_pipeline_set_creation_feedback(const void *create_info_next,
+                                   const struct dzn_pipeline *pipeline,
+                                   int64_t start_ns)
+{
+   const VkPipelineCreationFeedbackCreateInfo *info =
+      vk_find_struct_const(create_info_next, PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
+   if (!info)
+      return;
+
+   VkPipelineCreationFeedbackFlags flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT;
+   if (pipeline->cache_hit)
+      flags |= VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
+
+   info->pPipelineCreationFeedback->flags = flags;
+   info->pPipelineCreationFeedback->duration = os_time_get_nano() - start_ns;
+
+   for (uint32_t i = 0; i < info->pipelineStageCreationFeedbackCount; i++) {
+      info->pPipelineStageCreationFeedbacks[i].flags = flags;
+      info->pPipelineStageCreationFeedbacks[i].duration = 0;
+   }
+}
+
+static void
 dzn_graphics_pipeline_destroy(struct dzn_graphics_pipeline *pipeline,
                               const VkAllocationCallbacks *alloc)
 {
@@ -2298,6 +2375,7 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
         bias_representation->depthBiasExact))
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    D3D12_VIEW_INSTANCE_LOCATION vi_locs[D3D12_MAX_VIEW_INSTANCE_COUNT];
+   int64_t start_ns = os_time_get_nano();
 
    struct dzn_graphics_pipeline *pipeline =
       vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*pipeline), 8,
@@ -2730,10 +2808,12 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
    ret = VK_SUCCESS;
 
 out:
-   if (ret != VK_SUCCESS)
+   if (ret != VK_SUCCESS) {
       dzn_graphics_pipeline_destroy(pipeline, pAllocator);
-   else
+   } else {
+      dzn_pipeline_set_creation_feedback(pCreateInfo->pNext, &pipeline->base, start_ns);
       *out = dzn_graphics_pipeline_to_handle(pipeline);
+   }
 
    return ret;
 }
@@ -3330,26 +3410,6 @@ dzn_pipeline_creation_feedback_init(
    }
 }
 
-static void
-dzn_pipeline_creation_feedback_finish(
-   const VkPipelineCreationFeedbackCreateInfo *feedback_info,
-   int64_t pipeline_start)
-{
-   if (!feedback_info || !feedback_info->pPipelineCreationFeedback)
-      return;
-
-   /* The application cache stores DXIL shaders, not reusable D3D12 PSOs.
-    * Keep the pipeline-cache-hit bit clear because CreatePipelineState still
-    * creates the native PSO even when every shader came from that cache.
-    * Per-stage feedback is optional; the initialization above reports it as
-    * invalid rather than claiming that shader-cache hits avoided PSO work.
-    */
-   *feedback_info->pPipelineCreationFeedback = (VkPipelineCreationFeedback) {
-      .flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT,
-      .duration = (uint64_t)(os_time_get_nano() - pipeline_start),
-   };
-}
-
 VKAPI_ATTR VkResult VKAPI_CALL
 dzn_CreateGraphicsPipelines(VkDevice dev,
                             VkPipelineCache pipelineCache,
@@ -3369,23 +3429,17 @@ dzn_CreateGraphicsPipelines(VkDevice dev,
    }
 
    for (i = 0; i < count; i++) {
-      const VkPipelineCreationFeedbackCreateInfo *feedback_info =
-         vk_find_struct_const(pCreateInfos[i].pNext,
-                              PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
-      const int64_t pipeline_start = feedback_info ? os_time_get_nano() : 0;
       VkResult pipeline_result = VK_PIPELINE_COMPILE_REQUIRED;
       VkPipelineCreateFlags2KHR flags =
          vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
-      if (!(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR))
-         pipeline_result = dzn_graphics_pipeline_create(device,
+      pipeline_result = dzn_graphics_pipeline_create(device,
                                                         pipelineCache,
                                                         &pCreateInfos[i],
                                                         pAllocator,
                                                         &pPipelines[i]);
-      if (pipeline_result == VK_SUCCESS)
-         dzn_pipeline_creation_feedback_finish(feedback_info, pipeline_start);
       if (pipeline_result != VK_SUCCESS) {
-         result = pipeline_result;
+         if (result == VK_SUCCESS || result == VK_PIPELINE_COMPILE_REQUIRED)
+            result = pipeline_result;
          pPipelines[i] = VK_NULL_HANDLE;
          if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
             break;
@@ -3513,8 +3567,14 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
       ret = dzn_pipeline_cache_lookup_compute_pipeline(cache, pipeline_hash,
                                                        stream_desc, shader,
                                                        &cache_hit);
+      pipeline->base.cache_hit = cache_hit;
       if (ret != VK_SUCCESS || cache_hit)
          goto out;
+   }
+
+   if (pipeline->base.flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+      ret = VK_PIPELINE_COMPILE_REQUIRED;
+      goto out;
    }
 
    if (cache) {
@@ -3528,11 +3588,13 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
                           &device->vk.enabled_features.robustImageAccess2,
                           sizeof(device->vk.enabled_features.robustImageAccess2));
       _mesa_blake3_update(&nir_hash_ctx, layout->stages[MESA_SHADER_COMPUTE].hash, BLAKE3_KEY_LEN);
+      bool lowers_16bit = dzn_device_lowers_16bit(device);
+      _mesa_blake3_update(&nir_hash_ctx, &lowers_16bit, sizeof(lowers_16bit));
       _mesa_blake3_update(&nir_hash_ctx, spirv_hash, sizeof(spirv_hash));
       _mesa_blake3_final(&nir_hash_ctx, nir_hash);
    }
    nir_shader_compiler_options nir_opts;
-   const unsigned supported_bit_sizes = 16 | 32 | 64;
+   const unsigned supported_bit_sizes = (pdev->options4.Native16BitShaderOpsSupported ? 16 : 0) | 32 | 64;
    dxil_get_nir_compiler_options(&nir_opts, dzn_get_shader_model(pdev), supported_bit_sizes, supported_bit_sizes);
    struct dzn_nir_options options = {
       .robustness = robustness,
@@ -3600,6 +3662,7 @@ dzn_compute_pipeline_create(struct dzn_device *device,
 {
    VK_FROM_HANDLE(dzn_pipeline_layout, layout, pCreateInfo->layout);
    VK_FROM_HANDLE(vk_pipeline_cache, pcache, cache);
+   int64_t start_ns = os_time_get_nano();
 
    struct dzn_compute_pipeline *pipeline =
       vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*pipeline), 8,
@@ -3648,10 +3711,12 @@ dzn_compute_pipeline_create(struct dzn_device *device,
 
 out:
    free((void *)shader.pShaderBytecode);
-   if (ret != VK_SUCCESS)
+   if (ret != VK_SUCCESS) {
       dzn_compute_pipeline_destroy(pipeline, pAllocator);
-   else
+   } else {
+      dzn_pipeline_set_creation_feedback(pCreateInfo->pNext, &pipeline->base, start_ns);
       *out = dzn_compute_pipeline_to_handle(pipeline);
+   }
 
    return ret;
 }
@@ -3715,23 +3780,17 @@ dzn_CreateComputePipelines(VkDevice dev,
    }
 
    for (i = 0; i < count; i++) {
-      const VkPipelineCreationFeedbackCreateInfo *feedback_info =
-         vk_find_struct_const(pCreateInfos[i].pNext,
-                              PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
-      const int64_t pipeline_start = feedback_info ? os_time_get_nano() : 0;
       VkResult pipeline_result = VK_PIPELINE_COMPILE_REQUIRED;
       VkPipelineCreateFlags2KHR flags =
          vk_compute_pipeline_create_flags(&pCreateInfos[i]);
-      if (!(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR))
-         pipeline_result = dzn_compute_pipeline_create(device,
+      pipeline_result = dzn_compute_pipeline_create(device,
                                                        pipelineCache,
                                                        &pCreateInfos[i],
                                                        pAllocator,
                                                        &pPipelines[i]);
-      if (pipeline_result == VK_SUCCESS)
-         dzn_pipeline_creation_feedback_finish(feedback_info, pipeline_start);
       if (pipeline_result != VK_SUCCESS) {
-         result = pipeline_result;
+         if (result == VK_SUCCESS || result == VK_PIPELINE_COMPILE_REQUIRED)
+            result = pipeline_result;
          pPipelines[i] = VK_NULL_HANDLE;
          if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
             break;

@@ -18,6 +18,7 @@ enum class BlobType : u32 {
     ShaderBinary,
     PipelineKey,
     ShaderProfile,
+    DriverCache,
 };
 
 class DataBase {
@@ -28,6 +29,7 @@ public:
 
     void Open();
     void Close();
+    void Clear();
     [[nodiscard]] bool IsOpened() const {
         return opened;
     }

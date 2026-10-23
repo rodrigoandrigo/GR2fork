@@ -32,6 +32,8 @@ namespace {
 std::atomic<uint32_t> state{SHADPS4_UNINITIALIZED};
 std::atomic_bool stop_requested{};
 std::atomic_bool pause_requested{};
+bool user_paused{};
+bool host_active{true};
 std::atomic_bool guest_ready{};
 std::atomic_bool guest_started{};
 std::atomic_bool guest_threads_stopped{true};
@@ -44,7 +46,7 @@ std::mutex api_mutex;
 std::string last_error;
 std::shared_ptr<Core::Uwp::DozenHost> presentation;
 std::shared_ptr<Core::Uwp::NativeHost> native_presentation;
-std::atomic<uint32_t> graphics_backend{SHADPS4_GRAPHICS_D3D12_NATIVE};
+std::atomic<uint32_t> graphics_backend{SHADPS4_GRAPHICS_VULKAN_DOZEN};
 std::mutex presentation_mutex;
 void* panel{};
 ShadPS4ErrorCallback error_callback{};
@@ -154,6 +156,8 @@ bool PauseRequested() {
 void SetGuestReady(bool ready) {
     std::scoped_lock lock{guest_control_mutex};
     guest_ready.store(ready && !stop_requested.load());
+    if (guest_ready.load() && pause_requested.load())
+        DebugState.PauseGuestThreads();
 }
 } // namespace Core::Uwp
 
@@ -200,6 +204,8 @@ int32_t shadps4_shutdown() {
         if (native_presentation)
             native_presentation->DetachSurface();
         native_presentation.reset();
+        if (presentation)
+            presentation->DetachSurface();
         presentation.reset();
         Core::Uwp::ShutdownDozenDriver();
         Libraries::AudioOut::ShutdownAudioOut();
@@ -281,6 +287,8 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
         Common::Log::Setup("shadps4.log");
         stop_requested.store(false);
         pause_requested.store(false);
+        user_paused = false;
+        host_active = true;
         LOG_INFO(Core, "Embedded core initialized with host-owned storage");
         LOG_INFO(Core, "Graphics backend: {}", Core::Uwp::NativeGraphicsSelected()
                                                     ? "native D3D12" : "Vulkan / Dozen");
@@ -321,6 +329,19 @@ int32_t shadps4_set_host_state(int32_t active, int32_t input_captured) {
         state.load() == SHADPS4_UNINITIALIZED)
         return Fail("Invalid host input/audio state");
     try {
+        {
+            std::scoped_lock lock{guest_control_mutex};
+            host_active = active != 0;
+            const bool paused = user_paused || !host_active;
+            if (pause_requested.exchange(paused) != paused &&
+                state.load() == SHADPS4_RUNNING && guest_ready.load() &&
+                !stop_requested.load()) {
+                if (paused)
+                    DebugState.PauseGuestThreads();
+                else
+                    DebugState.ResumeGuestThreads();
+            }
+        }
         Core::Uwp::CaptureGamepadInput(!active || input_captured);
         Core::Uwp::SuspendAudio(!active);
         std::scoped_lock lock{presentation_mutex};
@@ -454,12 +475,15 @@ void shadps4_request_stop() {
 
 void shadps4_set_paused(int32_t paused) {
     std::scoped_lock lock{guest_control_mutex};
-    pause_requested.store(paused != 0);
+    user_paused = paused != 0;
+    const bool effective_pause = user_paused || !host_active;
+    if (pause_requested.exchange(effective_pause) == effective_pause)
+        return;
     if (state.load() != SHADPS4_RUNNING || !guest_ready.load() || stop_requested.load()) {
         return;
     }
     try {
-        if (paused) {
+        if (effective_pause) {
             DebugState.PauseGuestThreads();
         } else {
             DebugState.ResumeGuestThreads();

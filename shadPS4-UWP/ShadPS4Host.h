@@ -50,7 +50,7 @@ private:
         return reinterpret_cast<T>(address);
     }
 
-    uint32_t graphics_backend{SHADPS4_GRAPHICS_D3D12_NATIVE};
+    uint32_t graphics_backend{SHADPS4_GRAPHICS_VULKAN_DOZEN};
     HMODULE module{};
     Platform::Agile<Windows::UI::Xaml::Controls::SwapChainPanel> panel;
     decltype(&shadps4_initialize) initialize{};

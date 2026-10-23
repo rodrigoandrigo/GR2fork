@@ -264,7 +264,7 @@ dzn_image_create(struct dzn_device *device,
        image->vk.tiling == VK_IMAGE_TILING_OPTIMAL) {
 
       D3D12_FEATURE_DATA_FORMAT_SUPPORT dfmt_info =
-         dzn_physical_device_get_format_support(pdev, pCreateInfo->format, pCreateInfo->flags);
+         dzn_physical_device_get_format_support(pdev, pCreateInfo->format, 0);
       if (dfmt_info.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) {
          image->desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
          image->valid_access |= D3D12_BARRIER_ACCESS_RENDER_TARGET;
@@ -881,8 +881,18 @@ dzn_BindImageMemory2(VkDevice dev,
                                                    &IID_ID3D12Resource,
                                                    (void **)&image->res);
       }
-      if (FAILED(hres))
-         return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      if (FAILED(hres)) {
+         _debug_printf("Dozen image binding failed HRESULT=0x%08x format=%u extent=%llux%ux%u "
+                       "mips=%u samples=%u flags=0x%x offset=%llu\n", (unsigned)hres,
+                       image->desc.Format, (unsigned long long)image->desc.Width,
+                       image->desc.Height, image->desc.DepthOrArraySize, image->desc.MipLevels,
+                       image->desc.SampleDesc.Count, image->desc.Flags,
+                       (unsigned long long)bind_info->memoryOffset);
+         const VkResult error = hres == E_OUTOFMEMORY ? VK_ERROR_OUT_OF_DEVICE_MEMORY :
+            FAILED(ID3D12Device_GetDeviceRemovedReason(device->dev)) ?
+               VK_ERROR_DEVICE_LOST : VK_ERROR_UNKNOWN;
+         return vk_error(device, error);
+      }
    }
 
    return VK_SUCCESS;
@@ -952,6 +962,25 @@ dzn_GetImageMemoryRequirements2(VkDevice _device,
    if (image->vk.samples > 1 &&
        pMemoryRequirements->memoryRequirements.size < D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
       pMemoryRequirements->memoryRequirements.size = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+dzn_GetDeviceImageMemoryRequirements(VkDevice device,
+                                     const VkDeviceImageMemoryRequirements *pInfo,
+                                     VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VkImage image;
+   if (dzn_CreateImage(device, pInfo->pCreateInfo, NULL, &image) != VK_SUCCESS) {
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) { 0 };
+      return;
+   }
+
+   const VkImageMemoryRequirementsInfo2 info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+      .image = image,
+   };
+   dzn_GetImageMemoryRequirements2(device, &info, pMemoryRequirements);
+   dzn_DestroyImage(device, image, NULL);
 }
 
 VKAPI_ATTR void VKAPI_CALL

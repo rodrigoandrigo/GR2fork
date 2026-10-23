@@ -9,6 +9,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include <xxhash.h>
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -350,23 +351,22 @@ void PipelineCache::WarmUp() {
                                            std::move(profile_data));
         return;
     }
-    if (profile_data.size() != sizeof(Shader::Profile)) {
-        LOG_WARNING(Render,
-                    "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
-                    profile_data.size(), sizeof(Shader::Profile));
-        Storage::DataBase::Instance().Close();
-        return;
-    }
-
     Shader::Profile cached_profile{};
-    std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
-    if (cached_profile != profile) {
+    if (profile_data.size() == sizeof(cached_profile))
+        std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+    if (profile_data.size() != sizeof(cached_profile) || cached_profile != profile) {
         LOG_WARNING(Render,
-                    "Pipeline cache isn't compatible with current system. Ignoring the cache");
-        Storage::DataBase::Instance().Close();
+                    "Pipeline cache isn't compatible with current system. Rebuilding the cache");
+        Storage::DataBase::Instance().Clear();
+        Storage::DataBase::Instance().FinishPreload();
+        profile_data.resize(sizeof(profile));
+        std::memcpy(profile_data.data(), &profile, sizeof(profile));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                           std::move(profile_data));
         return;
     }
 
+    LoadDriverCache();
     u32 num_pipelines{};
     u32 num_total_pipelines{};
 
@@ -405,10 +405,59 @@ void PipelineCache::WarmUp() {
     }
 
     Storage::DataBase::Instance().FinishPreload();
+    SaveDriverCache();
 }
 
 void PipelineCache::Sync() {
+    SaveDriverCache();
     Storage::DataBase::Instance().Close();
+}
+
+void PipelineCache::LoadDriverCache() {
+    std::vector<u8> data;
+    Storage::DataBase::Instance().Load(Storage::BlobType::DriverCache, "driver", data);
+    if (data.size() < sizeof(VkPipelineCacheHeaderVersionOne))
+        return;
+    VkPipelineCacheHeaderVersionOne header{};
+    std::memcpy(&header, data.data(), sizeof(header));
+    const auto uuid = instance.GetPipelineCacheUUID();
+    if (header.headerSize < sizeof(header) || header.headerSize > data.size() ||
+        header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+        header.vendorID != instance.GetVendorID() || header.deviceID != instance.GetDeviceID() ||
+        std::memcmp(header.pipelineCacheUUID, uuid.data(), VK_UUID_SIZE) != 0) {
+        LOG_WARNING(Render_Vulkan, "Ignoring incompatible driver pipeline cache");
+        return;
+    }
+    const auto device = instance.GetDevice();
+    auto [result, loaded] = device.createPipelineCacheUnique(
+        vk::PipelineCacheCreateInfo{.initialDataSize = data.size(), .pInitialData = data.data()});
+    if (result != vk::Result::eSuccess ||
+        device.mergePipelineCaches(*pipeline_cache, *loaded) != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan, "Failed to load driver pipeline cache");
+        return;
+    }
+    driver_cache_hash = XXH3_64bits(data.data(), data.size());
+    LOG_INFO(Render_Vulkan, "Loaded {} bytes of driver pipeline cache", data.size());
+}
+
+void PipelineCache::SaveDriverCache() {
+    auto& storage = Storage::DataBase::Instance();
+    if (!storage.IsOpened() || !pipeline_cache)
+        return;
+    const auto device = instance.GetDevice();
+    size_t size{};
+    if (device.getPipelineCacheData(*pipeline_cache, &size, nullptr) != vk::Result::eSuccess ||
+        !size || size > 64 * 1024 * 1024)
+        return;
+    std::vector<u8> data(size);
+    if (device.getPipelineCacheData(*pipeline_cache, &size, data.data()) != vk::Result::eSuccess)
+        return;
+    data.resize(size);
+    const u64 hash = XXH3_64bits(data.data(), data.size());
+    if (hash == driver_cache_hash)
+        return;
+    if (storage.Save(Storage::BlobType::DriverCache, "driver", std::move(data)))
+        driver_cache_hash = hash;
 }
 
 } // namespace Vulkan

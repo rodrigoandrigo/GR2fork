@@ -34,5 +34,6 @@ private:
     Windows::Foundation::EventRegistrationToken up_token;
     Windows::Foundation::EventRegistrationToken character_token;
     Windows::Foundation::EventRegistrationToken activation_token;
+    Windows::Foundation::EventRegistrationToken visibility_token;
 };
 } // namespace shadPS4_UWP

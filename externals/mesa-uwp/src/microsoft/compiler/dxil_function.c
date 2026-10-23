@@ -34,7 +34,7 @@ struct predefined_func_descr {
 };
 
 static struct  predefined_func_descr predefined_funcs[] = {
-{"dx.op.atomicBinOp", "O", "i@iiiiO", DXIL_ATTR_KIND_READ_NONE},
+{"dx.op.atomicBinOp", "O", "i@iiiiO", DXIL_ATTR_KIND_NO_UNWIND},
 {"dx.op.cbufferLoad", "O", "i@ii", DXIL_ATTR_KIND_READ_ONLY},
 {"dx.op.cbufferLoadLegacy", "B", "i@i", DXIL_ATTR_KIND_READ_ONLY},
 {"dx.op.createHandle", "@", "iciib", DXIL_ATTR_KIND_READ_ONLY},
@@ -75,7 +75,7 @@ static struct  predefined_func_descr predefined_funcs[] = {
 {"dx.op.getDimensions", "D", "i@i", DXIL_ATTR_KIND_READ_ONLY},
 {"dx.op.calculateLOD", "f", "i@@fffb", DXIL_ATTR_KIND_READ_ONLY},
 {"dx.op.barrier", "v", "ii", DXIL_ATTR_KIND_NO_DUPLICATE},
-{"dx.op.atomicCompareExchange", "O", "i@iiiOO", DXIL_ATTR_KIND_READ_NONE},
+{"dx.op.atomicCompareExchange", "O", "i@iiiOO", DXIL_ATTR_KIND_NO_UNWIND},
 {"dx.op.textureStore", "v", "i@iiiOOOOc", DXIL_ATTR_KIND_NONE},
 {"dx.op.primitiveID", "i", "i", DXIL_ATTR_KIND_READ_NONE},
 {"dx.op.outputControlPointID", "i", "i", DXIL_ATTR_KIND_READ_NONE},

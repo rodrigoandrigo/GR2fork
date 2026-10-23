@@ -27,6 +27,7 @@ struct FrontendInput {
     bool captured{};
     bool suspended{};
     bool active{true};
+    bool visible{true};
     bool hdr_output{};
     float sdr_white_nits{80.0f};
     uint32_t width{1280};

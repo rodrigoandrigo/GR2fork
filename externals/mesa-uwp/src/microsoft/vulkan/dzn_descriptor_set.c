@@ -74,6 +74,7 @@ desc_type_to_range_type(VkDescriptorType in, bool writeable)
 
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
       return D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
 
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
@@ -109,6 +110,13 @@ dzn_desc_type_has_sampler(VkDescriptorType type)
 {
    return type == VK_DESCRIPTOR_TYPE_SAMPLER ||
           type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+}
+
+static uint32_t
+dzn_binding_desc_count(const VkDescriptorSetLayoutBinding *binding)
+{
+   return binding->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ?
+          1 : binding->descriptorCount;
 }
 
 static uint32_t
@@ -276,9 +284,9 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
          uint32_t factor =
             dzn_descriptor_type_depends_on_shader_usage(desc_type, device->bindless) ? 2 : 1;
          if (vk_descriptor_type_is_dynamic(desc_type))
-            dynamic_buffer_count += bindings[i].descriptorCount * factor;
+            dynamic_buffer_count += dzn_binding_desc_count(&bindings[i]) * factor;
          else
-            dynamic_ranges_offset += bindings[i].descriptorCount * factor;
+            dynamic_ranges_offset += dzn_binding_desc_count(&bindings[i]) * factor;
       }
 
       if (binding_flags && binding_flags->bindingCount &&
@@ -356,7 +364,7 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
       VkDescriptorType desc_type = ordered_bindings[i].descriptorType;
       uint32_t binding = ordered_bindings[i].binding;
-      uint32_t desc_count = ordered_bindings[i].descriptorCount;
+      uint32_t desc_count = dzn_binding_desc_count(&ordered_bindings[i]);
       bool has_sampler = dzn_desc_type_has_sampler(desc_type);
       bool has_immutable_samplers =
          has_sampler &&
@@ -418,6 +426,14 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
          } else {
             has_static_sampler = false;
          }
+      }
+
+      if (desc_type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+         binfos[binding].inline_offset = set_layout->inline_data_size;
+         binfos[binding].inline_size = ordered_bindings[i].descriptorCount;
+         set_layout->inline_data_size +=
+            ALIGN_POT(ordered_bindings[i].descriptorCount,
+                      D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
       }
 
       if (has_static_sampler) {
@@ -587,6 +603,7 @@ dzn_GetDescriptorSetLayoutSupport(VkDevice _device,
    bool invalid_push_descriptor_type = false;
    bool is_push_descriptor_layout =
       pCreateInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+   bool inline_size_supported = true;
 
    const VkDescriptorSetLayoutBindingFlagsCreateInfo *binding_flags =
       vk_find_struct_const(pCreateInfo->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
@@ -614,17 +631,23 @@ dzn_GetDescriptorSetLayoutSupport(VkDevice _device,
 
       if (binding_flags && binding_flags->bindingCount &&
           (binding_flags->pBindingFlags[i] & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT))
-         variable_count->maxVariableDescriptorCount = device->bindless ? INT32_MAX : upper_bound;
+         variable_count->maxVariableDescriptorCount =
+            desc_type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? DZN_INLINE_UNIFORM_BLOCK_MAX_SIZE :
+            device->bindless ? INT32_MAX : upper_bound;
+
+      if (desc_type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK &&
+          bindings[i].descriptorCount > DZN_INLINE_UNIFORM_BLOCK_MAX_SIZE)
+         inline_size_supported = false;
 
       if (has_sampler)
          sampler_count += bindings[i].descriptorCount;
       if (!is_sampler)
-         other_desc_count += bindings[i].descriptorCount;
+         other_desc_count += dzn_binding_desc_count(&bindings[i]);
       if (dzn_descriptor_type_depends_on_shader_usage(desc_type, device->bindless))
          other_desc_count += bindings[i].descriptorCount;
    }
 
-   pSupport->supported = (device->bindless ||
+   pSupport->supported = inline_size_supported && (device->bindless ||
       (sampler_count <= MAX_DESCS_PER_SAMPLER_HEAP &&
        other_desc_count <= MAX_DESCS_PER_CBV_SRV_UAV_HEAP)) &&
       (!is_push_descriptor_layout ||
@@ -1880,6 +1903,102 @@ dzn_descriptor_set_ptr_write_buffer_desc(struct dzn_device *device,
    dzn_descriptor_set_write_buffer_desc(device, desc_type, set, heap_offset, alt_heap_offset, bdesc);
 }
 
+static void
+dzn_descriptor_set_init_inline_descs(struct dzn_descriptor_set *set,
+                                     struct dzn_device *device)
+{
+   const struct dzn_descriptor_set_layout *layout = set->layout;
+   struct dzn_descriptor_pool *pool = set->pool;
+
+   for (uint32_t b = 0; b < layout->binding_count; b++) {
+      if (layout->bindings[b].type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+         continue;
+
+      uint32_t heap_offset =
+         dzn_descriptor_set_layout_get_heap_offset(layout, b, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                                   false, device->bindless);
+      if (heap_offset == ~0)
+         continue;
+
+      uint32_t data_offset = set->inline_offset + layout->bindings[b].inline_offset;
+      if (device->bindless) {
+         uint32_t w = data_offset / DZN_INLINE_UNIFORM_WINDOW_STRIDE;
+         volatile struct dxil_spirv_bindless_entry *entry =
+            &pool->bindless.map[set->heap_offsets[0] + heap_offset];
+         entry->buffer_idx = pool->inline_data.window_slots[w];
+         entry->buffer_offset = data_offset - w * DZN_INLINE_UNIFORM_WINDOW_STRIDE;
+      } else {
+         D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc = {
+            .BufferLocation = pool->inline_data.gpuva + data_offset,
+            .SizeInBytes = ALIGN_POT(layout->bindings[b].inline_size,
+                                     D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT),
+         };
+         D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            dzn_descriptor_heap_get_cpu_handle(&pool->heaps[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV],
+                                               set->heap_offsets[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV] +
+                                               heap_offset);
+         ID3D12Device1_CreateConstantBufferView(device->dev, &cbv_desc, handle);
+      }
+   }
+}
+
+static void
+dzn_descriptor_set_write_inline_data(struct dzn_descriptor_set *set,
+                                     uint32_t binding, uint32_t offset,
+                                     const void *data, uint32_t size)
+{
+   const struct dzn_descriptor_set_layout *layout = set->layout;
+   const uint8_t *src = data;
+
+   for (; size && binding < layout->binding_count; binding++, offset = 0) {
+      const struct dzn_descriptor_set_layout_binding *binfo = &layout->bindings[binding];
+      if (binfo->type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK || offset >= binfo->inline_size)
+         continue;
+
+      uint32_t n = MIN2(size, binfo->inline_size - offset);
+      memcpy(set->pool->inline_data.map + set->inline_offset + binfo->inline_offset + offset,
+             src, n);
+      src += n;
+      size -= n;
+   }
+}
+
+static void
+dzn_descriptor_set_copy_inline_data(struct dzn_descriptor_set *dst_set,
+                                    uint32_t dst_binding, uint32_t dst_offset,
+                                    const struct dzn_descriptor_set *src_set,
+                                    uint32_t src_binding, uint32_t src_offset,
+                                    uint32_t size)
+{
+   const struct dzn_descriptor_set_layout *dst_layout = dst_set->layout;
+   const struct dzn_descriptor_set_layout *src_layout = src_set->layout;
+
+   while (size && dst_binding < dst_layout->binding_count &&
+          src_binding < src_layout->binding_count) {
+      const struct dzn_descriptor_set_layout_binding *dst = &dst_layout->bindings[dst_binding];
+      const struct dzn_descriptor_set_layout_binding *src = &src_layout->bindings[src_binding];
+
+      if (dst_offset >= dst->inline_size) {
+         dst_binding++;
+         dst_offset = 0;
+         continue;
+      }
+      if (src_offset >= src->inline_size) {
+         src_binding++;
+         src_offset = 0;
+         continue;
+      }
+
+      uint32_t n = MIN3(size, dst->inline_size - dst_offset, src->inline_size - src_offset);
+      memmove(dst_set->pool->inline_data.map + dst_set->inline_offset + dst->inline_offset + dst_offset,
+              src_set->pool->inline_data.map + src_set->inline_offset + src->inline_offset + src_offset,
+              n);
+      dst_offset += n;
+      src_offset += n;
+      size -= n;
+   }
+}
+
 static VkResult
 dzn_descriptor_set_init(struct dzn_descriptor_set *set,
                         struct dzn_device *device,
@@ -1901,7 +2020,13 @@ dzn_descriptor_set_init(struct dzn_descriptor_set *set,
          set->heap_sizes[type] = layout->range_desc_count[type] + variable_descriptor_count[type];
          set->pool->free_offset[type] = set->heap_offsets[type] + set->heap_sizes[type];
       }
+      set->inline_offset = pool->inline_data.free_offset;
+      set->inline_size = layout->inline_data_size;
+      pool->inline_data.free_offset += set->inline_size;
    }
+
+   if (layout->inline_data_size)
+      dzn_descriptor_set_init_inline_descs(set, device);
 
    /* Pre-fill the immutable samplers */
    if (layout->immutable_sampler_count) {
@@ -1945,6 +2070,18 @@ dzn_descriptor_pool_destroy(struct dzn_descriptor_pool *pool,
 
    struct dzn_device *device = container_of(pool->base.device, struct dzn_device, vk);
 
+   if (pool->inline_data.window_slots) {
+      for (uint32_t w = 0; w < pool->inline_data.window_count; w++) {
+         if (pool->inline_data.window_slots[w] >= 0)
+            dzn_device_descriptor_heap_free_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                                 pool->inline_data.window_slots[w]);
+      }
+      vk_free2(&device->vk.alloc, pAllocator, pool->inline_data.window_slots);
+   }
+
+   if (pool->inline_data.buf)
+      ID3D12Resource_Release(pool->inline_data.buf);
+
    if (device->bindless) {
       if (pool->bindless.buf)
          ID3D12Resource_Release(pool->bindless.buf);
@@ -1957,6 +2094,62 @@ dzn_descriptor_pool_destroy(struct dzn_descriptor_pool *pool,
 
    vk_object_base_finish(&pool->base);
    vk_free2(&device->vk.alloc, pAllocator, pool);
+}
+
+static VkResult
+dzn_descriptor_pool_init_inline_data(struct dzn_device *device,
+                                     struct dzn_descriptor_pool *pool,
+                                     const VkAllocationCallbacks *pAllocator)
+{
+   D3D12_RESOURCE_DESC buf_desc = {
+      .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+      .Width = pool->inline_data.size,
+      .Height = 1, .DepthOrArraySize = 1,
+      .MipLevels = 1, .SampleDesc = {.Count = 1},
+      .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+   };
+   D3D12_HEAP_PROPERTIES heap_props = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+   if (FAILED(ID3D12Device_CreateCommittedResource(device->dev, &heap_props, 0, &buf_desc,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                                                   &IID_ID3D12Resource,
+                                                   (void **)&pool->inline_data.buf)))
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   pool->inline_data.gpuva = ID3D12Resource_GetGPUVirtualAddress(pool->inline_data.buf);
+   ID3D12Resource_Map(pool->inline_data.buf, 0, NULL, (void **)&pool->inline_data.map);
+   memset(pool->inline_data.map, 0, pool->inline_data.size);
+
+   if (!device->bindless)
+      return VK_SUCCESS;
+
+   pool->inline_data.window_count =
+      DIV_ROUND_UP(pool->inline_data.size, DZN_INLINE_UNIFORM_WINDOW_STRIDE);
+   pool->inline_data.window_slots =
+      vk_alloc2(&device->vk.alloc, pAllocator,
+                pool->inline_data.window_count * sizeof(*pool->inline_data.window_slots), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!pool->inline_data.window_slots)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   for (uint32_t w = 0; w < pool->inline_data.window_count; w++)
+      pool->inline_data.window_slots[w] = -1;
+
+   for (uint32_t w = 0; w < pool->inline_data.window_count; w++) {
+      int slot = dzn_device_descriptor_heap_alloc_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      if (slot < 0)
+         return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+      uint32_t start = w * DZN_INLINE_UNIFORM_WINDOW_STRIDE;
+      D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc = {
+         .BufferLocation = pool->inline_data.gpuva + start,
+         .SizeInBytes = MIN2(DZN_INLINE_UNIFORM_WINDOW_SIZE, pool->inline_data.size - start),
+      };
+      ID3D12Device1_CreateConstantBufferView(device->dev, &cbv_desc,
+                                             dzn_descriptor_heap_get_cpu_handle(&device->device_heaps[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].heap, slot));
+      pool->inline_data.window_slots[w] = slot;
+   }
+
+   return VK_SUCCESS;
 }
 
 static VkResult
@@ -1979,9 +2172,15 @@ dzn_descriptor_pool_create(struct dzn_device *device,
 
    vk_object_base_init(&device->vk, &pool->base, VK_OBJECT_TYPE_DESCRIPTOR_POOL);
 
+   uint32_t inline_bytes = 0;
    for (uint32_t p = 0; p < pCreateInfo->poolSizeCount; p++) {
       VkDescriptorType type = pCreateInfo->pPoolSizes[p].type;
       uint32_t num_desc = pCreateInfo->pPoolSizes[p].descriptorCount;
+
+      if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+         inline_bytes += num_desc;
+         continue;
+      }
 
       if (device->bindless) {
          if (!vk_descriptor_type_is_dynamic(type))
@@ -2014,6 +2213,18 @@ dzn_descriptor_pool_create(struct dzn_device *device,
             UNREACHABLE("Unsupported desc type");
          }
       }
+   }
+
+   if (inline_bytes) {
+      const VkDescriptorPoolInlineUniformBlockCreateInfo *inline_info =
+         vk_find_struct_const(pCreateInfo->pNext, DESCRIPTOR_POOL_INLINE_UNIFORM_BLOCK_CREATE_INFO);
+      uint32_t inline_bindings = inline_info && inline_info->maxInlineUniformBlockBindings ?
+         inline_info->maxInlineUniformBlockBindings : DIV_ROUND_UP(inline_bytes, 4);
+
+      pool->desc_count[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV] += inline_bindings;
+      pool->inline_data.size =
+         ALIGN_POT(inline_bytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) +
+         inline_bindings * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
    }
 
    if (device->bindless) {
@@ -2055,6 +2266,14 @@ dzn_descriptor_pool_create(struct dzn_device *device,
       }
    }
 
+   if (pool->inline_data.size) {
+      VkResult result = dzn_descriptor_pool_init_inline_data(device, pool, pAllocator);
+      if (result != VK_SUCCESS) {
+         dzn_descriptor_pool_destroy(pool, pAllocator);
+         return result;
+      }
+   }
+
    *out = dzn_descriptor_pool_to_handle(pool);
    return VK_SUCCESS;
 }
@@ -2092,6 +2311,8 @@ dzn_ResetDescriptorPool(VkDevice device,
       pool->free_offset[type] = 0;
       pool->used_desc_count[type] = 0;
    }
+   pool->inline_data.free_offset = 0;
+   pool->inline_data.used = 0;
    pool->used_set_count = 0;
 
    return VK_SUCCESS;
@@ -2219,6 +2440,9 @@ dzn_AllocateDescriptorSets(VkDevice dev,
       additional_desc_counts[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV] =
          variable_counts && variable_counts->descriptorSetCount ?
          variable_counts->pDescriptorCounts[i] : 0;
+      if (additional_desc_counts[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV] && layout->binding_count &&
+          layout->bindings[layout->binding_count - 1].type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+         additional_desc_counts[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV] = 1;
       additional_desc_counts[D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER] = 0;
       uint32_t total_desc_count[NUM_POOL_TYPES];
 
@@ -2228,6 +2452,11 @@ dzn_AllocateDescriptorSets(VkDevice dev,
             dzn_FreeDescriptorSets(dev, pAllocateInfo->descriptorPool, i, pDescriptorSets);
             return vk_error(device, VK_ERROR_OUT_OF_POOL_MEMORY);
          }
+      }
+
+      if (pool->inline_data.used + layout->inline_data_size > pool->inline_data.size) {
+         dzn_FreeDescriptorSets(dev, pAllocateInfo->descriptorPool, i, pDescriptorSets);
+         return vk_error(device, VK_ERROR_OUT_OF_POOL_MEMORY);
       }
 
       struct dzn_descriptor_set *set = NULL;
@@ -2247,6 +2476,8 @@ dzn_AllocateDescriptorSets(VkDevice dev,
                      break;
                   }
                }
+               if (pool->sets[set_idx].inline_size < layout->inline_data_size)
+                  is_reuse = false;
                if (!is_reuse)
                   continue;
             }
@@ -2269,6 +2500,10 @@ dzn_AllocateDescriptorSets(VkDevice dev,
                return vk_error(device, VK_ERROR_FRAGMENTED_POOL);
             }
          }
+         if (pool->inline_data.free_offset + layout->inline_data_size > pool->inline_data.size) {
+            dzn_FreeDescriptorSets(dev, pAllocateInfo->descriptorPool, i, pDescriptorSets);
+            return vk_error(device, VK_ERROR_FRAGMENTED_POOL);
+         }
       }
 
       VkResult result = dzn_descriptor_set_init(set, device, pool, layout, is_reuse, additional_desc_counts);
@@ -2280,6 +2515,7 @@ dzn_AllocateDescriptorSets(VkDevice dev,
       pool->used_set_count = MAX2(pool->used_set_count, set_idx + 1);
       dzn_foreach_pool_type(type)
          pool->used_desc_count[type] += total_desc_count[type];
+      pool->inline_data.used += set->inline_size;
       pDescriptorSets[i] = dzn_descriptor_set_to_handle(set);
    }
 
@@ -2303,6 +2539,7 @@ dzn_FreeDescriptorSets(VkDevice dev,
       assert(set->pool == pool);
       dzn_foreach_pool_type(type)
          pool->used_desc_count[type] -= set->heap_sizes[type];
+      pool->inline_data.used -= set->inline_size;
 
       dzn_descriptor_set_finish(set);
    }
@@ -2310,12 +2547,15 @@ dzn_FreeDescriptorSets(VkDevice dev,
    pool->used_set_count = 0;
    dzn_foreach_pool_type(type)
       pool->free_offset[type] = 0;
+   pool->inline_data.free_offset = 0;
 
    for (uint32_t s = 0; s < pool->set_count; s++) {
       const struct dzn_descriptor_set *set = &pool->sets[s];
 
       if (set->layout) {
          pool->used_set_count = MAX2(pool->used_set_count, s + 1);
+         pool->inline_data.free_offset =
+            MAX2(pool->inline_data.free_offset, set->inline_offset + set->inline_size);
          dzn_foreach_pool_type (type) {
             pool->free_offset[type] =
                MAX2(pool->free_offset[type],
@@ -2344,6 +2584,15 @@ dzn_descriptor_set_write(struct dzn_device *device,
    uint32_t d = 0;
    bool cube_as_2darray =
       pDescriptorWrite->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
+   if (pDescriptorWrite->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+      const VkWriteDescriptorSetInlineUniformBlock *inline_write =
+         vk_find_struct_const(pDescriptorWrite->pNext, WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK);
+      dzn_descriptor_set_write_inline_data(set, pDescriptorWrite->dstBinding,
+                                           pDescriptorWrite->dstArrayElement,
+                                           inline_write->pData, inline_write->dataSize);
+      return;
+   }
 
    switch (pDescriptorWrite->descriptorType) {
    case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -2459,6 +2708,17 @@ dzn_descriptor_set_copy(struct dzn_device *device,
    VK_FROM_HANDLE(dzn_descriptor_set, src_set, pDescriptorCopy->srcSet);
    VK_FROM_HANDLE(dzn_descriptor_set, dst_set, pDescriptorCopy->dstSet);
    struct dzn_descriptor_set_ptr src_ptr, dst_ptr;
+
+   if (pDescriptorCopy->srcBinding < src_set->layout->binding_count &&
+       src_set->layout->bindings[pDescriptorCopy->srcBinding].type ==
+       VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+      dzn_descriptor_set_copy_inline_data(dst_set, pDescriptorCopy->dstBinding,
+                                          pDescriptorCopy->dstArrayElement,
+                                          src_set, pDescriptorCopy->srcBinding,
+                                          pDescriptorCopy->srcArrayElement,
+                                          pDescriptorCopy->descriptorCount);
+      return;
+   }
 
    dzn_descriptor_set_ptr_init(src_set->layout, &src_ptr,
                                pDescriptorCopy->srcBinding,
@@ -2726,6 +2986,11 @@ dzn_descriptor_update_template_create(struct dzn_device *device,
       ASSERTED VkDescriptorType type = info->pDescriptorUpdateEntries[e].descriptorType;
       uint32_t d = 0;
 
+      if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+         entry_count++;
+         continue;
+      }
+
       while (dzn_descriptor_set_ptr_is_valid(&ptr) && d < desc_count) {
          uint32_t ndescs = dzn_descriptor_set_remaining_descs_in_binding(set_layout, &ptr);
 
@@ -2768,6 +3033,16 @@ dzn_descriptor_update_template_create(struct dzn_device *device,
       size_t user_data_offset = info->pDescriptorUpdateEntries[e].offset;
       size_t user_data_stride = info->pDescriptorUpdateEntries[e].stride;
       uint32_t d = 0;
+
+      if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+         entry->type = type;
+         entry->desc_count = desc_count;
+         entry->user_data.offset = user_data_offset;
+         entry->inline_binding = info->pDescriptorUpdateEntries[e].dstBinding;
+         entry->inline_offset = info->pDescriptorUpdateEntries[e].dstArrayElement;
+         ++entry;
+         continue;
+      }
 
       while (dzn_descriptor_set_ptr_is_valid(&ptr) && d < desc_count) {
          uint32_t ndescs = dzn_descriptor_set_remaining_descs_in_binding(set_layout, &ptr);
@@ -2944,6 +3219,12 @@ dzn_UpdateDescriptorSetWithTemplate(VkDevice _device,
 
             dzn_descriptor_set_write_dynamic_buffer_desc(device, set, dyn_buf_idx, &desc);
          }
+         break;
+
+      case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+         dzn_descriptor_set_write_inline_data(set, entry->inline_binding, entry->inline_offset,
+                                              (const uint8_t *)pData + entry->user_data.offset,
+                                              entry->desc_count);
          break;
 
       case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:

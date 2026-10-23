@@ -15,12 +15,15 @@ public:
     DozenHost();
     ~DozenHost();
     void Initialize(const ShadPS4Config& config);
+    void DetachSurface();
     void Resize(uint32_t width, uint32_t height);
     void Render();
     static void CheckEnvironment();
     void ReleaseBootstrap();
 
 private:
+    ShadPS4AttachSwapChain attach{};
+    void* attach_context{};
     std::unique_ptr<Frontend::WindowSDL> window;
     struct Bootstrap;
     std::unique_ptr<Bootstrap> bootstrap;

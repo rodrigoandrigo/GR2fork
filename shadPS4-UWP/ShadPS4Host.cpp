@@ -25,6 +25,7 @@ using namespace Windows::UI::Core;
 ShadPS4Host::ShadPS4Host(Windows::UI::Xaml::Controls::SwapChainPanel ^ target) : panel{target} {}
 
 ShadPS4Host::~ShadPS4Host() {
+    const HRESULT apartment = RoInitialize(RO_INIT_MULTITHREADED);
     Stop();
     Wait();
     {
@@ -45,6 +46,8 @@ ShadPS4Host::~ShadPS4Host() {
     if (module && released) {
         FreeLibrary(module);
     }
+    if (SUCCEEDED(apartment))
+        RoUninitialize();
 }
 
 void ShadPS4Host::SetLogConsumer(std::function<void(std::string)> consumer) {
@@ -104,12 +107,20 @@ void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width,
     set_log_callback(Log, this);
     set_error_callback(ReportError, nullptr);
     const auto values = Windows::Storage::ApplicationData::Current->LocalSettings->Values;
-    graphics_backend = SHADPS4_GRAPHICS_D3D12_NATIVE;
-    if (values->HasKey(L"shadps4.graphics.backend")) {
+    graphics_backend = SHADPS4_GRAPHICS_VULKAN_DOZEN;
+    if (!values->HasKey(L"shadps4.graphics.dozen_default.v1")) {
+        try {
+            values->Insert(L"shadps4.graphics.backend", ref new Platform::String(L"dozen"));
+            values->Insert(L"shadps4.graphics.dozen_default.v1", true);
+        } catch (Platform::Exception^ exception) {
+            UwpDiagnostics::Record("graphics_default_save_failed", exception->HResult);
+        }
+    } else if (values->HasKey(L"shadps4.graphics.backend")) {
         const auto selected = dynamic_cast<Platform::String^>(values->Lookup(L"shadps4.graphics.backend"));
-        if (selected && selected == L"dozen")
-            graphics_backend = SHADPS4_GRAPHICS_VULKAN_DOZEN;
+        if (selected && selected == L"d3d12")
+            graphics_backend = SHADPS4_GRAPHICS_D3D12_NATIVE;
     }
+    UwpDiagnostics::Record("graphics_backend selected", graphics_backend);
     const auto set_backend = Resolve<decltype(&shadps4_set_graphics_backend)>("shadps4_set_graphics_backend");
     if (set_backend(graphics_backend))
         throw ref new Platform::FailureException(ref new Platform::String(Error().c_str()));

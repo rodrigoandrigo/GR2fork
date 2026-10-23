@@ -118,7 +118,21 @@ struct DozenHost::Bootstrap {
 
 DozenHost::DozenHost() = default;
 DozenHost::~DozenHost() {
+    try {
+        DetachSurface();
+    } catch (const std::exception& error) {
+        LOG_ERROR(Render_Vulkan, "Dozen surface cleanup failed: {}", error.what());
+    }
     current_host = nullptr;
+    if (g_window == window.get())
+        g_window = nullptr;
+    if (driver) {
+        set_attach(nullptr, nullptr);
+        set_window(nullptr, 0, 0);
+    }
+}
+
+void DozenHost::DetachSurface() {
     if (liverpool)
         liverpool->StopProcessing();
     Libraries::VideoOut::ShutdownVideoOut();
@@ -127,11 +141,14 @@ DozenHost::~DozenHost() {
     if (presenter)
         Core::Memory::Instance()->SetRasterizer(nullptr);
     presenter.reset();
-    if (g_window == window.get())
-        g_window = nullptr;
-    if (driver) {
-        set_attach(nullptr, nullptr);
-        set_window(nullptr, 0, 0);
+    bootstrap.reset();
+    if (attach) {
+        const auto result = attach(attach_context, nullptr);
+        if (result < 0)
+            throw std::runtime_error("Could not detach the Dozen presentation surface: " +
+                                     std::to_string(static_cast<uint32_t>(result)));
+        attach = nullptr;
+        attach_context = nullptr;
     }
 }
 
@@ -148,7 +165,10 @@ void DozenHost::CheckEnvironment() {
     auto instance = std::move(result.value);
     dispatch.init(*instance);
     const auto devices = instance->enumeratePhysicalDevices(dispatch);
-    if (devices.result != vk::Result::eSuccess || devices.value.empty())
+    if (devices.result != vk::Result::eSuccess)
+        throw std::runtime_error("Dozen adapter enumeration failed: " +
+                                 vk::to_string(devices.result));
+    if (devices.value.empty())
         throw std::runtime_error("Dozen did not expose a D3D12 adapter");
 }
 
@@ -156,6 +176,8 @@ void DozenHost::Initialize(const ShadPS4Config& config) {
     LoadDriver();
     set_window(config.panel, config.width, config.height);
     set_attach(config.attach_swapchain, config.attach_context);
+    attach = config.attach_swapchain;
+    attach_context = config.attach_context;
     window = std::make_unique<Frontend::WindowSDL>(config.width, config.height, config.panel);
     g_window = window.get();
     current_host = this;

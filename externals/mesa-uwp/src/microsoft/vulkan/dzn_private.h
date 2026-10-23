@@ -846,9 +846,22 @@ struct dzn_descriptor_pool {
    uint32_t desc_count[NUM_POOL_TYPES];
    uint32_t used_desc_count[NUM_POOL_TYPES];
    uint32_t free_offset[NUM_POOL_TYPES];
+   struct {
+      ID3D12Resource *buf;
+      uint8_t *map;
+      uint64_t gpuva;
+      uint32_t size;
+      uint32_t used;
+      uint32_t free_offset;
+      uint32_t window_count;
+      int *window_slots;
+   } inline_data;
 };
 
 #define DZN_IMAGE_METADATA_BINDING 2
+#define DZN_INLINE_UNIFORM_BLOCK_MAX_SIZE 4096
+#define DZN_INLINE_UNIFORM_WINDOW_STRIDE (32 * 1024)
+#define DZN_INLINE_UNIFORM_WINDOW_SIZE (64 * 1024)
 
 #define MAX_SHADER_VISIBILITIES (D3D12_SHADER_VISIBILITY_PIXEL + 1)
 #define STATIC_SAMPLER_TAG (~0u - 1)
@@ -869,6 +882,8 @@ struct dzn_descriptor_set_layout_binding {
       uint32_t buffer_idx;
    };
    bool variable_size;
+   uint32_t inline_offset;
+   uint32_t inline_size;
 };
 
 struct dzn_descriptor_set_layout {
@@ -900,6 +915,7 @@ struct dzn_descriptor_set_layout {
 
    uint32_t binding_count;
    const struct dzn_descriptor_set_layout_binding *bindings;
+   uint32_t inline_data_size;
 };
 
 struct dzn_descriptor_set {
@@ -910,6 +926,8 @@ struct dzn_descriptor_set {
    uint32_t heap_offsets[NUM_POOL_TYPES];
    /* The number of descriptors needed for this set */
    uint32_t heap_sizes[NUM_POOL_TYPES];
+   uint32_t inline_offset;
+   uint32_t inline_size;
    /* Layout (and pool) is null for a freed descriptor set */
    const struct dzn_descriptor_set_layout *layout;
 };
@@ -977,6 +995,8 @@ struct dzn_descriptor_update_template_entry {
       size_t offset;
       size_t stride;
    } user_data;
+   uint32_t inline_binding;
+   uint32_t inline_offset;
 };
 
 struct dzn_descriptor_update_template {
@@ -1060,6 +1080,7 @@ struct dzn_pipeline {
    uint32_t image_metadata_offset;
    uint32_t dynamic_buffer_count;
    ID3D12PipelineState *state;
+   bool cache_hit;
 };
 
 extern const struct vk_pipeline_cache_object_ops dzn_cached_blob_ops;
@@ -1144,6 +1165,7 @@ struct dzn_graphics_pipeline {
    struct {
       bool dynamic_color_write_enable;
       bool dynamic_constants;
+      bool splat_constant_alpha;
       float constants[4];
    } blend;
 
@@ -1429,6 +1451,8 @@ enum dzn_debug_flags {
    DZN_DEBUG_NO_BINDLESS = 1 << 11,
    DZN_DEBUG_EXPERIMENTAL = 1 << 12,
    DZN_DEBUG_MULTIVIEW = 1 << 13,
+   DZN_DEBUG_NO_16BIT = 1 << 14,
+   DZN_DEBUG_NO_STENCIL_REF = 1 << 15,
 };
 
 struct dzn_instance {
@@ -1441,6 +1465,8 @@ struct dzn_instance {
       PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE serialize_root_sig;
    } d3d12;
    uint32_t debug_flags;
+   uint32_t max_shader_model;
+   uint32_t max_d3d12_options;
 
    struct vk_sync_binary_type sync_binary_type;
 

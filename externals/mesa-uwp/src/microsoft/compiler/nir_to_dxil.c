@@ -186,6 +186,8 @@ dxil_get_nir_compiler_options(nir_shader_compiler_options *options,
       options->lower_doubles_options = ~0;
       options->float_mul_add64 = 0;
    }
+   if (!(supported_int_sizes & 16) || !(supported_float_sizes & 16))
+      options->support_16bit_alu = false;
    if (shader_model_max >= SHADER_MODEL_6_4) {
       options->has_sdot_4x8 = true;
       options->has_udot_4x8 = true;
@@ -496,6 +498,34 @@ emit_srv_metadata(struct dxil_module *m, const struct dxil_type *elem_type,
    return dxil_get_metadata_node(m, fields, ARRAY_SIZE(fields));
 }
 
+static bool
+shader_has_coherent_ssbo_access(nir_shader *s)
+{
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_ssbo:
+            case nir_intrinsic_store_ssbo:
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+               if (nir_intrinsic_access(intr) & ACCESS_COHERENT)
+                  return true;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+
+   return false;
+}
+
 static const struct dxil_mdnode *
 emit_uav_metadata(struct dxil_module *m, const struct dxil_type *struct_type,
                   const char *name, const resource_array_layout *layout,
@@ -578,6 +608,7 @@ struct ntd_context {
 
    struct util_dynarray uav_metadata_nodes;
    const struct dxil_value *ssbo_handles[MAX_UAVS];
+   bool coherent_ssbos;
    const struct dxil_value *image_handles[MAX_UAVS];
    uint32_t num_uavs;
 
@@ -2061,6 +2092,9 @@ emit_metadata(struct ntd_context *ctx)
             break;
          }
       }
+
+      if (ctx->opts->tessellation_input_control_points)
+         ctx->tess_input_control_point_count = ctx->opts->tessellation_input_control_points;
 
       if (!emit_tag(ctx, DXIL_SHADER_TAG_HS_STATE, emit_hs_state(ctx)))
          return false;
@@ -4682,7 +4716,9 @@ emit_load_vulkan_descriptor(struct ntd_context *ctx, nir_intrinsic_instr *intr)
       if (!heap_index_value)
          return false;
       const struct dxil_value *unannotated_handle = emit_createhandle_heap(ctx, heap_index_value, false, true);
-      const struct dxil_value *res_props = dxil_module_get_buffer_res_props_const(&ctx->mod, resource_class, resource_kind);
+      const struct dxil_value *res_props =
+         dxil_module_get_buffer_res_props_const(&ctx->mod, resource_class, resource_kind,
+                                                ctx->coherent_ssbos);
       if (!unannotated_handle || !res_props)
          return false;
       handle = emit_annotate_handle(ctx, unannotated_handle, res_props);
@@ -6286,6 +6322,8 @@ emit_module(struct ntd_context *ctx, const struct nir_to_dxil_options *opts)
          return false;
 
    } else if (ctx->opts->environment == DXIL_ENVIRONMENT_VULKAN) {
+      ctx->coherent_ssbos = shader_has_coherent_ssbo_access(ctx->shader);
+
       /* Handle read/write SSBOs as UAVs */
       nir_foreach_variable_with_modes(var, ctx->shader, nir_var_mem_ssbo) {
          if ((var->data.access & ACCESS_NON_WRITEABLE) == 0) {
@@ -6294,7 +6332,9 @@ emit_module(struct ntd_context *ctx, const struct nir_to_dxil_options *opts)
                count = glsl_get_length(var->type);
             if (!emit_uav(ctx, var->data.binding, var->data.descriptor_set,
                         count, DXIL_COMP_TYPE_INVALID, 1,
-                        DXIL_RESOURCE_KIND_RAW_BUFFER, var->data.access, var->name))
+                        DXIL_RESOURCE_KIND_RAW_BUFFER,
+                        var->data.access | (ctx->coherent_ssbos ? ACCESS_COHERENT : 0),
+                        var->name))
                return false;
             
          }
@@ -6418,6 +6458,35 @@ get_dxil_shader_kind(struct nir_shader *s)
 static unsigned
 lower_bit_size_callback(const nir_instr* instr, void *data)
 {
+   const struct nir_to_dxil_options *opts = (const struct nir_to_dxil_options*)data;
+   unsigned min_bit_size = opts->lower_int16 ? 32 : 16;
+
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_read_invocation:
+      case nir_intrinsic_read_first_invocation:
+      case nir_intrinsic_shuffle:
+      case nir_intrinsic_shuffle_xor:
+      case nir_intrinsic_shuffle_up:
+      case nir_intrinsic_shuffle_down:
+      case nir_intrinsic_quad_broadcast:
+      case nir_intrinsic_quad_swap_horizontal:
+      case nir_intrinsic_quad_swap_vertical:
+      case nir_intrinsic_quad_swap_diagonal:
+      case nir_intrinsic_reduce:
+      case nir_intrinsic_inclusive_scan:
+      case nir_intrinsic_exclusive_scan:
+      case nir_intrinsic_vote_ieq:
+      case nir_intrinsic_vote_feq: {
+         unsigned bit_size = nir_src_bit_size(intr->src[0]);
+         return bit_size != 1 && bit_size < min_bit_size ? min_bit_size : 0;
+      }
+      default:
+         return 0;
+      }
+   }
+
    if (instr->type != nir_instr_type_alu)
       return 0;
    nir_alu_instr *alu = nir_instr_as_alu(instr);
@@ -6429,8 +6498,6 @@ lower_bit_size_callback(const nir_instr* instr, void *data)
       return 0;
 
    unsigned num_inputs = nir_op_infos[alu->op].num_inputs;
-   const struct nir_to_dxil_options *opts = (const struct nir_to_dxil_options*)data;
-   unsigned min_bit_size = opts->lower_int16 ? 32 : 16;
 
    unsigned ret = 0;
    for (unsigned i = 0; i < num_inputs; i++) {
@@ -6609,7 +6676,7 @@ void dxil_fill_validation_state(struct ntd_context *ctx,
       psv2->num_threads_x = MAX2(ctx->shader->info.workgroup_size[0], 1);
       psv2->num_threads_y = MAX2(ctx->shader->info.workgroup_size[1], 1);
       psv2->num_threads_z = MAX2(ctx->shader->info.workgroup_size[2], 1);
-      if (ctx->emitted_wave_size) {
+      if (ctx->mod.minor_version >= 6 && ctx->emitted_wave_size) {
          psv0->max_expected_wave_lane_count = ctx->emitted_wave_size;
          psv0->min_expected_wave_lane_count = ctx->emitted_wave_size;
       }

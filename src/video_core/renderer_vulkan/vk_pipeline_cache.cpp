@@ -1099,15 +1099,20 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         }
     }
     share_layouts = EmulatorSettings.IsDescLayoutShare();
-    WarmUp();
-
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+    WarmUp();
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    try {
+        Sync();
+    } catch (const std::exception& error) {
+        LOG_ERROR(Render_Vulkan, "Failed to save pipeline cache: {}", error.what());
+    }
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     ++graphics_lookups;
@@ -1182,6 +1187,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
+        if (num_new_pipelines % 64 == 1)
+            SaveDriverCache();
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -1443,6 +1450,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             *pipeline_cache, compute_key, *infos[0], modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
+        if (num_new_pipelines % 64 == 1)
+            SaveDriverCache();
 
         if (EmulatorSettings.IsShaderCollect()) {
             auto& m = modules[0];

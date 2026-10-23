@@ -24,7 +24,7 @@ struct std::hash<vk::ShaderModule> {
 };
 
 namespace AmdGpu {
-class Liverpool;
+struct Liverpool;
 }
 
 namespace Serialization {
@@ -237,6 +237,8 @@ public:
     void DumpSharpReadStats();
 
 private:
+    void LoadDriverCache();
+    void SaveDriverCache();
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages(bool track_hash_diff);
     bool ReuseGraphicsKey(u64 pipe_gen);
@@ -263,6 +265,7 @@ private:
     PipelineLayoutCache layouts; // destroyed after every pipeline
     bool share_layouts{};
     vk::UniquePipelineCache pipeline_cache;
+    u64 driver_cache_hash{};
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;

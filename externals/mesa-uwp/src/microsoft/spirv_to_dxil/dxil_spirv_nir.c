@@ -212,6 +212,47 @@ temp_var_info(const struct glsl_type* type, unsigned* size, unsigned* align)
    }
 }
 
+static uint64_t
+descriptor_key(uint32_t desc_set, uint32_t binding)
+{
+   return ((uint64_t)desc_set << 32) | binding;
+}
+
+static void
+gather_resource_index_bindings(nir_shader *nir, struct util_dynarray *bindings)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_vulkan_resource_index)
+               continue;
+
+            uint64_t key = descriptor_key(nir_intrinsic_desc_set(intr),
+                                          nir_intrinsic_binding(intr));
+            util_dynarray_append(bindings, key);
+         }
+      }
+   }
+}
+
+static bool
+can_remove_unused_ssbo(nir_variable *var, void *data)
+{
+   const struct util_dynarray *bindings = data;
+   uint64_t key = descriptor_key(var->data.descriptor_set, var->data.binding);
+
+   util_dynarray_foreach(bindings, uint64_t, used) {
+      if (*used == key)
+         return false;
+   }
+
+   return true;
+}
+
 static nir_variable *
 add_runtime_data_var(nir_shader *nir, unsigned desc_set, unsigned binding, bool split_viewports)
 {
@@ -468,6 +509,7 @@ lower_yz_flip(struct nir_builder *builder, nir_instr *instr,
    const struct dxil_spirv_runtime_conf *rt_conf = data->rt_conf;
 
    nir_def *pos = intrin->src[1].ssa;
+   nir_def *x_pos = nir_channel(builder, pos, 0);
    nir_def *y_pos = nir_channel(builder, pos, 1);
    nir_def *z_pos = nir_channel(builder, pos, 2);
    nir_def *y_flip_mask = NULL, *z_flip_mask = NULL, *dyn_yz_flip_mask = NULL;
@@ -515,6 +557,9 @@ lower_yz_flip(struct nir_builder *builder, nir_instr *instr,
 
    /* TODO: Multi-viewport */
 
+   if (rt_conf->yz_flip.mode & DXIL_SPIRV_X_FLIP_UNCONDITIONAL)
+      x_pos = nir_fneg(builder, x_pos);
+
    if (y_flip_mask) {
       nir_def *flip = nir_test_mask(builder, y_flip_mask, 1);
 
@@ -532,10 +577,10 @@ lower_yz_flip(struct nir_builder *builder, nir_instr *instr,
    }
 
    nir_def *def = nir_vec4(builder,
-                               nir_channel(builder, pos, 0),
-                               y_pos,
-                               z_pos,
-                               nir_channel(builder, pos, 3));
+                           x_pos,
+                           y_pos,
+                           z_pos,
+                           nir_channel(builder, pos, 3));
    nir_src_rewrite(&intrin->src[1], def);
    return true;
 }
@@ -1215,6 +1260,17 @@ dxil_spirv_nir_passes(nir_shader *nir,
               nir_var_system_value | nir_var_mem_shared,
               NULL);
 
+   struct util_dynarray used_bindings;
+   util_dynarray_init(&used_bindings, NULL);
+   gather_resource_index_bindings(nir, &used_bindings);
+   const nir_remove_dead_variables_options unused_ssbo_options = {
+      .can_remove_var = can_remove_unused_ssbo,
+      .can_remove_var_data = &used_bindings,
+   };
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_ssbo,
+            &unused_ssbo_options);
+   util_dynarray_fini(&used_bindings);
+
    uint32_t push_constant_size = 0;
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
               nir_address_format_32bit_offset);
@@ -1246,8 +1302,8 @@ dxil_spirv_nir_passes(nir_shader *nir,
           nir->info.shared_size > 0) {
          /* DXIL's TGSM lowering backs shared memory with uint words. */
          const unsigned chunk_size = 4;
-         const unsigned shared_size = align(nir->info.shared_size, chunk_size);
-         NIR_PASS(_, nir, nir_zero_initialize_shared_memory, shared_size,
+         nir->info.shared_size = align(nir->info.shared_size, chunk_size);
+         NIR_PASS(_, nir, nir_zero_initialize_shared_memory, nir->info.shared_size,
                   chunk_size);
       }
       NIR_PASS(_, nir, dxil_nir_scratch_and_shared_to_dxil);

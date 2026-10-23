@@ -828,9 +828,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
 #ifdef SHADPS4_UWP
     Uwp::SetGuestReady(true);
-    if (Uwp::PauseRequested() && !Uwp::StopRequested()) {
-        DebugState.PauseGuestThreads();
-    }
     while (!Uwp::StopRequested())
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     Uwp::SetGuestReady(false);

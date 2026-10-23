@@ -359,13 +359,13 @@ void ImGuiFrontend::Run(std::wstring root) {
       if (game_running && pressed && !menu_pressed)
         menu_open = !menu_open;
       menu_pressed = pressed;
-      if (set_host_state(!snapshot.suspended && snapshot.active,
+      if (set_host_state(!snapshot.suspended && snapshot.active && snapshot.visible,
                          snapshot.captured ||
                              (game_running
                                   ? menu_open
                                   : io.NavActive || io.WantCaptureKeyboard)))
         throw std::runtime_error(Utf8(core->Error()));
-      if (snapshot.suspended || !snapshot.active) {
+      if (snapshot.suspended || !snapshot.active || !snapshot.visible) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
       }

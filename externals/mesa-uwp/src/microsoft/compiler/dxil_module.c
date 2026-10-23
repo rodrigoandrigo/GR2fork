@@ -2179,7 +2179,8 @@ dxil_module_get_uav_res_props_const(struct dxil_module *m,
 const struct dxil_value *
 dxil_module_get_buffer_res_props_const(struct dxil_module *m,
                                        enum dxil_resource_class class,
-                                       enum dxil_resource_kind kind)
+                                       enum dxil_resource_kind kind,
+                                       bool globally_coherent)
 {
    const struct dxil_type *type = dxil_module_get_res_props_type(m);
    if (!type)
@@ -2191,8 +2192,9 @@ dxil_module_get_buffer_res_props_const(struct dxil_module *m,
       dwords[1] = 4096 /* vec4s */ * 4 /* components */ * 4 /* bytes */;
    } else {
       dwords[0] = get_basic_srv_uav_res_props_dword(class == DXIL_RESOURCE_CLASS_UAV,
-                                                    false, false /*TODO*/, false,
-                                                    kind);
+                                                    false,
+                                                    class == DXIL_RESOURCE_CLASS_UAV && globally_coherent,
+                                                    false, kind);
       dwords[1] = 0;
    }
 

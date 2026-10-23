@@ -21,8 +21,6 @@
 
 namespace {
 
-std::mutex submit_mutex{};
-u32 num_requests{};
 std::condition_variable_any request_cv{};
 std::queue<std::packaged_task<void()>> req_queue{};
 std::mutex m_request{};
@@ -37,34 +35,20 @@ namespace Storage {
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
 
-    while (!stoken.stop_requested()) {
+    for (;;) {
+        std::packaged_task<void()> request{};
         {
-            std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
-        }
-
-        if (stoken.stop_requested()) {
-            break;
-        }
-
-        while (num_requests) {
-            std::packaged_task<void()> request{};
-            {
-                std::scoped_lock lock{m_request};
-                if (req_queue.empty()) {
-                    continue;
-                }
-                request = std::move(req_queue.front());
-                req_queue.pop();
+            std::unique_lock lock{m_request};
+            Common::CondvarWait(request_cv, lock, stoken, [&] { return !req_queue.empty(); });
+            if (req_queue.empty()) {
+                if (stoken.stop_requested())
+                    break;
+                continue;
             }
-
-            if (request.valid()) {
-                request();
-                request.get_future().wait();
-            }
-
-            --num_requests;
+            request = std::move(req_queue.front());
+            req_queue.pop();
         }
+        request();
     }
 }
 
@@ -82,6 +66,9 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     case BlobType::ShaderProfile: {
         return "bin";
     }
+    case BlobType::DriverCache: {
+        return "vkcache";
+    }
     default:
         UNREACHABLE();
     }
@@ -96,6 +83,7 @@ void DataBase::Open() {
 
     using namespace Common::FS;
     if (EmulatorSettings.IsPipelineCacheArchived()) {
+        ar_is_read_only = true;
         mz_zip_zero_struct(&zip_ar);
 
         cache_path = GetUserPath(PathType::CacheDir) /
@@ -108,6 +96,7 @@ void DataBase::Open() {
                      cache_path.string().c_str());
             mz_zip_reader_end(&zip_ar);
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
+            ar_is_read_only = false;
         }
     } else {
         cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
@@ -126,11 +115,16 @@ void DataBase::Close() {
     }
 
     io_worker.request_stop();
+    request_cv.notify_all();
     io_worker.join();
 
     if (EmulatorSettings.IsPipelineCacheArchived()) {
-        mz_zip_writer_finalize_archive(&zip_ar);
-        mz_zip_writer_end(&zip_ar);
+        if (ar_is_read_only) {
+            mz_zip_reader_end(&zip_ar);
+        } else {
+            mz_zip_writer_finalize_archive(&zip_ar);
+            mz_zip_writer_end(&zip_ar);
+        }
     }
 
     opened = false;
@@ -140,8 +134,8 @@ void DataBase::Close() {
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {
-        auto request = std::packaged_task<void()>{[=]() {
-            auto path{path_};
+        auto request = std::packaged_task<void()>{[type, path = std::move(path_),
+                                                 v = std::move(v)]() mutable {
             path.replace_extension(GetBlobFileExtension(type));
             if (EmulatorSettings.IsPipelineCacheArchived()) {
                 ASSERT_MSG(!ar_is_read_only,
@@ -152,16 +146,26 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                 }
             } else {
                 using namespace Common::FS;
-                const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(v);
+                auto temporary = path;
+                temporary += ".tmp";
+                {
+                    const auto file = IOFile{temporary, FileAccessMode::Create};
+                    if (!file.IsOpen() || file.Write(v) != v.size() || !file.Flush()) {
+                        LOG_ERROR(Render, "Failed to write cache blob {}", path.string());
+                        return;
+                    }
+                }
+                std::error_code error;
+                std::filesystem::rename(temporary, path, error);
+                if (error)
+                    LOG_ERROR(Render, "Failed to replace cache blob {}: {}", path.string(),
+                              error.message());
             }
         }};
         std::scoped_lock lock{m_request};
         req_queue.emplace(std::move(request));
     }
 
-    std::scoped_lock lk{submit_mutex};
-    ++num_requests;
     request_cv.notify_one();
     return true;
 }
@@ -179,8 +183,12 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v) {
         }
         mz_zip_archive_file_stat stat{};
         mz_zip_reader_file_stat(&zip_ar, index, &stat);
+        if (stat.m_uncomp_size % sizeof(T) ||
+            (type == BlobType::DriverCache && stat.m_uncomp_size > 64 * 1024 * 1024))
+            return;
         v.resize(stat.m_uncomp_size / sizeof(T));
-        mz_zip_reader_extract_to_mem(&zip_ar, index, v.data(), stat.m_uncomp_size, 0);
+        if (!mz_zip_reader_extract_to_mem(&zip_ar, index, v.data(), stat.m_uncomp_size, 0))
+            v.clear();
     } else {
         std::error_code ec;
         if (!std::filesystem::exists(path, ec) && !ec) {
@@ -190,8 +198,12 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v) {
         if (!file.IsOpen()) {
             return;
         }
-        v.resize(file.GetSize() / sizeof(T));
-        file.Read(v);
+        const auto size = file.GetSize();
+        if (size % sizeof(T) || (type == BlobType::DriverCache && size > 64 * 1024 * 1024))
+            return;
+        v.resize(size / sizeof(T));
+        if (file.Read(v) != v.size())
+            v.clear();
     }
 }
 
@@ -267,10 +279,36 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
 }
 
 void DataBase::FinishPreload() {
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
+    if (EmulatorSettings.IsPipelineCacheArchived() && ar_is_read_only) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;
     }
+}
+
+void DataBase::Clear() {
+    if (!opened)
+        return;
+    Close();
+    std::error_code error;
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        std::filesystem::remove(cache_path, error);
+    } else {
+        for (const auto& entry : std::filesystem::directory_iterator{cache_path, error}) {
+            if (!entry.is_regular_file())
+                continue;
+            const auto extension = entry.path().extension();
+            if (extension == ".meta" || extension == ".spv" || extension == ".key" ||
+                extension == ".bin" || extension == ".vkcache") {
+                std::filesystem::remove(entry.path(), error);
+                if (error)
+                    break;
+            }
+        }
+    }
+    if (error)
+        throw std::filesystem::filesystem_error("Could not clear incompatible pipeline cache",
+                                                cache_path, error);
+    Open();
 }
 
 } // namespace Storage

@@ -93,7 +93,7 @@ icd_file_name = libname_prefix + 'vulkan_dzn.' + libname_suffix
 
 icd_command = [
    prog_python, '@INPUT0@',
-   '--api-version', '1.2', '--xml', '@INPUT1@',
+   '--api-version', '1.3', '--xml', '@INPUT1@',
    '--sizeof-pointer', sizeof_pointer,
    '--icd-lib-path', vulkan_icd_lib_path,
    '--icd-filename', icd_file_name,
@@ -102,7 +102,7 @@ icd_command = [
 
 icd_dev_command = [
    prog_python, '@INPUT0@',
-   '--api-version', '1.2', '--xml', '@INPUT1@',
+   '--api-version', '1.3', '--xml', '@INPUT1@',
    '--sizeof-pointer', sizeof_pointer,
    '--icd-lib-path', meson.current_build_dir(),
    '--icd-filename', icd_file_name,

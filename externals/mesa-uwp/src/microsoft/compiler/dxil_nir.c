@@ -2603,10 +2603,10 @@ set_deref_variables_coherent(nir_shader *s, nir_deref_instr *deref)
       return;
    }
 
-   /* For derefs with casts, we only support pre-lowered Vulkan accesses */
    assert(deref->deref_type == nir_deref_type_cast);
-   nir_intrinsic_instr *cast_src = nir_def_as_intrinsic(deref->parent.ssa);
-   assert(cast_src->intrinsic == nir_intrinsic_load_vulkan_descriptor);
+   nir_intrinsic_instr *cast_src = nir_src_as_intrinsic(deref->parent);
+   if (!cast_src || cast_src->intrinsic != nir_intrinsic_load_vulkan_descriptor)
+      return;
    nir_binding binding = nir_chase_binding(cast_src->src[0]);
    set_binding_variables_coherent(s, binding, nir_var_mem_ssbo);
 }
@@ -2650,7 +2650,7 @@ lower_coherent_load_store(nir_builder *b, nir_intrinsic_instr *intr, void *conte
    case nir_intrinsic_load_ssbo:
    case nir_intrinsic_image_deref_load:
    case nir_intrinsic_image_load: {
-      if (intr->def.bit_size < 32 || intr->def.num_components > 1) {
+      if (intr->def.bit_size != 32 || intr->def.num_components > 1) {
          if (intr->intrinsic == nir_intrinsic_load_deref)
             set_deref_variables_coherent(b->shader, nir_src_as_deref(intr->src[0]));
          else {
@@ -2676,7 +2676,7 @@ lower_coherent_load_store(nir_builder *b, nir_intrinsic_instr *intr, void *conte
          intr->intrinsic == nir_intrinsic_store_deref ? 1 : 3;
       unsigned num_components = nir_intrinsic_has_write_mask(intr) ?
          util_bitcount(nir_intrinsic_write_mask(intr)) : intr->src[value_idx].ssa->num_components;
-      if (intr->src[value_idx].ssa->bit_size < 32 || num_components > 1) {
+      if (intr->src[value_idx].ssa->bit_size != 32 || num_components > 1) {
          if (intr->intrinsic == nir_intrinsic_store_deref)
             set_deref_variables_coherent(b->shader, nir_src_as_deref(intr->src[resource_idx]));
          else {
