@@ -96,8 +96,8 @@ Instance::Instance(bool enable_validation, bool enable_crash_diagnostic)
 
 Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                    bool enable_validation /*= false*/, bool enable_crash_diagnostic /*= false*/)
-    : instance{CreateInstance(window.GetWindowInfo().type, enable_validation,
-                              enable_crash_diagnostic)},
+    : instance{
+          CreateInstance(window.GetWindowInfo().type, enable_validation, enable_crash_diagnostic)},
       physical_devices{EnumeratePhysicalDevices(instance)} {
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
@@ -394,11 +394,35 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
-    const vk::DeviceQueueCreateInfo queue_info = {
-        .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
-        .pQueuePriorities = queue_priorities.data(),
+    // The readback copy lanes take up to two queues of a transfer-only family, so their copies
+    // never queue behind the graphics work they read back.
+    u32 copy_queue_count = 0;
+    constexpr auto other_engines = vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute |
+                                   vk::QueueFlagBits::eVideoDecodeKHR |
+                                   vk::QueueFlagBits::eVideoEncodeKHR |
+                                   vk::QueueFlagBits::eOpticalFlowNV;
+    for (std::size_t i = 0; EmulatorSettings.IsReadbackOffload() && i < family_properties.size();
+         i++) {
+        const auto flags = family_properties[i].queueFlags;
+        if ((flags & vk::QueueFlagBits::eTransfer) && !(flags & other_engines)) {
+            copy_queue_family_index = static_cast<u32>(i);
+            copy_queue_count = std::min(2u, family_properties[i].queueCount);
+            break;
+        }
+    }
+
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    const std::array queue_infos = {
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = queue_family_index,
+            .queueCount = 1u,
+            .pQueuePriorities = queue_priorities.data(),
+        },
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = copy_queue_family_index,
+            .queueCount = copy_queue_count,
+            .pQueuePriorities = queue_priorities.data(),
+        },
     };
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
@@ -406,8 +430,8 @@ bool Instance::CreateDevice() {
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = copy_queue_count != 0 ? 2u : 1u,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -478,12 +502,17 @@ bool Instance::CreateDevice() {
             .maintenance4 = vk13_features.maintenance4,
         },
 #ifdef SHADPS4_UWP
-        vk::PhysicalDeviceDynamicRenderingFeaturesKHR{.dynamicRendering = vk13_features.dynamicRendering},
-        vk::PhysicalDeviceSynchronization2FeaturesKHR{.synchronization2 = vk13_features.synchronization2},
+        vk::PhysicalDeviceDynamicRenderingFeaturesKHR{.dynamicRendering =
+                                                          vk13_features.dynamicRendering},
+        vk::PhysicalDeviceSynchronization2FeaturesKHR{.synchronization2 =
+                                                          vk13_features.synchronization2},
         vk::PhysicalDeviceMaintenance4FeaturesKHR{.maintenance4 = vk13_features.maintenance4},
-        vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT{.subgroupSizeControl = vk13_features.subgroupSizeControl},
-        vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT{.shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation},
-        vk::PhysicalDeviceImageRobustnessFeaturesEXT{.robustImageAccess = vk13_features.robustImageAccess},
+        vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT{.subgroupSizeControl =
+                                                             vk13_features.subgroupSizeControl},
+        vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT{
+            .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation},
+        vk::PhysicalDeviceImageRobustnessFeaturesEXT{.robustImageAccess =
+                                                         vk13_features.robustImageAccess},
         vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT{.extendedDynamicState = true},
         vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT{.extendedDynamicState2 = true},
 #endif
@@ -637,6 +666,9 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    for (u32 i = 0; i < copy_queue_count; ++i) {
+        copy_queues.push_back(device->getQueue(copy_queue_family_index, i));
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
@@ -767,12 +799,13 @@ void Instance::CollectPhysicalMemoryInfo() {
         // We reserve some memory for the system.
         const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
         total_memory_budget -= system_memory;
-        return;
+    } else {
+        // Leave at least 8 GB for the system on integrated GPUs.
+        const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
+        total_memory_budget =
+            static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
     }
-    // Leave at least 8 GB for the system on integrated GPUs.
-    const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
-    total_memory_budget =
-        static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
+    LOG_INFO(Render_Vulkan, "GPU memory budget is {} MiB", total_memory_budget / 1_MB);
 }
 
 void Instance::CollectImageFormatInfo() {

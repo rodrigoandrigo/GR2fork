@@ -1,5 +1,13 @@
 # Renderer D3D12: estado de implementação
 
+Integração de 24/10/2026: [melhorias do EXODUS](EXODUS-INTEGRATION.md).
+O recompilador compartilhado recebeu correções de fluxo, PHI, barreiras de memória,
+derivadas coarse e indefinidos de 64 bits. `fast_shader_math` é opcional e permanece
+desligado por padrão nos perfis Vulkan e D3D12. A gravação Vulkan em outra thread e
+as filas Vulkan de readback pertencem ao caminho Dozen; não são recursos do
+renderer D3D12 nativo. As pendências de fidelidade abaixo continuam separadas
+dessas melhorias e da validação em Xbox.
+
 Revisão do código local em **21/10/2026**. Este documento separa implementação,
 restrições funcionais, desempenho e validação. Desde 23/10/2026, Vulkan/Dozen é
 o padrão do host UWP; o renderer D3D12 nativo permanece como opção experimental.

@@ -7,6 +7,7 @@
 #include <deque>
 #include <vector>
 
+#include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_manager.h"
 
@@ -55,36 +56,69 @@ public:
         return true;
     }
 
-    /// Unmark region as modified from the host GPU
+    /// Mark region as modified from the host GPU without uploading it again
+    void MarkRegionAsGpuModified(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages<true>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->template ChangeRegionState<StateOp::None, StateOp::Set>(offset, size);
+        });
+    }
+
+    /// Unmark region as modified from the host GPU and erase its GPU writes
     void UnmarkRegionAsGpuModified(VAddr cpu_addr, u64 size, bool is_write) noexcept {
         IteratePages(cpu_addr, size, [is_write](RegionManager* manager, u64 offset, u64 size) {
             if (is_write) {
-                manager->template ChangeRegionState<StateOp::Set, StateOp::Clear>(offset, size);
+                manager->template UnmarkGpuModified<StateOp::Set>(offset, size);
             } else {
-                manager->template ChangeRegionState<StateOp::None, StateOp::Clear>(offset, size);
+                manager->template UnmarkGpuModified<StateOp::None>(offset, size);
             }
         });
     }
 
-    /// Returns a value that changes whenever a GPU write is marked in a range of one region.
-    u64 GpuWriteSeq(VAddr cpu_addr, u64 size) noexcept {
-        return top_tier[cpu_addr >> HIGHER_PAGE_BITS]->GpuWriteSeq(cpu_addr & HIGHER_PAGE_MASK,
-                                                                   size);
+    /// Stamps a GPU written range with the tick of the batch holding the write.
+    void StampGpuWrite(VAddr cpu_addr, u64 size, u64 tick) noexcept {
+        IteratePages<true>(cpu_addr, size, [tick](RegionManager* manager, u64 offset, u64 size) {
+            manager->StampGpuWrite(offset, size, tick);
+        });
     }
 
-    /// Unmarks a range of one region as GPU modified and returns true if no GPU write was marked
-    /// in it since GpuWriteSeq returned write_seq.
-    bool TryUnmarkRegionAsGpuModified(VAddr cpu_addr, u64 size, u64 write_seq) noexcept {
-        auto* manager = top_tier[cpu_addr >> HIGHER_PAGE_BITS];
-        const u64 offset = cpu_addr & HIGHER_PAGE_MASK;
-        const auto bounds = manager->GetBounds(offset, size);
-        manager->Lock(bounds);
-        const bool unwritten = manager->GpuWriteSeq(offset, size) == write_seq;
-        if (unwritten) {
-            manager->template ChangeRegionState<StateOp::None, StateOp::Clear, false>(offset, size);
-        }
-        manager->Unlock(bounds);
-        return unwritten;
+    /// Calls func(begin, end, tick) for each GPU write of the range, one region lock at a time.
+    void ForEachGpuWrite(VAddr cpu_addr, u64 size, auto&& func) {
+        IteratePages(cpu_addr, size, [&func](RegionManager* manager, u64 offset, u64 size) {
+            manager->ForEachGpuWrite(offset, size, func);
+        });
+    }
+
+    /// Erases the GPU writes of the range stamped up to known_tick and clears the pages left
+    /// without a newer one. The pages are cleared whole, so the writes are erased whole as well.
+    void ConsumeGpuWrites(VAddr cpu_addr, u64 size, u64 known_tick) {
+        const VAddr page_start = Common::AlignDown(cpu_addr, BYTES_PER_PAGE);
+        const VAddr page_end = Common::AlignUp(cpu_addr + size, BYTES_PER_PAGE);
+        IteratePages(page_start, page_end - page_start,
+                     [known_tick](RegionManager* manager, u64 offset, u64 size) {
+                         manager->ConsumeGpuWrites(offset, size, known_tick);
+                     });
+    }
+
+    /// Erases the GPU writes of the range.
+    void SubtractGpuWrites(VAddr cpu_addr, u64 size) {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->SubtractGpuWrites(offset, size);
+        });
+    }
+
+    /// Holds the readback words of the range, region by region in ascending order. With create
+    /// the missing regions are made, which only the GPU thread may do.
+    template <bool create>
+    void AcquireReadback(VAddr cpu_addr, u64 size) {
+        IteratePages<create>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->AcquireReadback(offset, size);
+        });
+    }
+
+    void ReleaseReadback(VAddr cpu_addr, u64 size) {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->ReleaseReadback(offset, size);
+        });
     }
 
     /// Mark region as modified from the CPU
@@ -101,15 +135,14 @@ public:
         }
         bool should_flush = false;
         IteratePages(cpu_addr, size, [&should_flush](RegionManager* manager, u64 offset, u64 size) {
-            const auto bounds = manager->GetBounds(offset, size);
-            manager->Lock(bounds);
+            manager->Lock();
             const bool modified = manager->template IsRegionModified<Type::GPU>(offset, size);
             if (!modified) {
                 manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
                                                                                         size);
             }
             should_flush |= modified;
-            manager->Unlock(bounds);
+            manager->Unlock();
         });
         if (should_flush) {
             on_flush();
@@ -182,6 +215,8 @@ private:
             manager_pool.emplace_back();
             auto& last_pool = manager_pool.back();
             for (size_t i = 0; i < MANAGER_POOL_SIZE; i++) {
+                // The array default-constructs each manager, whose GPU write map can own storage.
+                std::destroy_at(&last_pool[i]);
                 std::construct_at(&last_pool[i], tracker, 0);
                 free_managers.push_back(&last_pool[i]);
             }

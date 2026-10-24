@@ -405,6 +405,7 @@ bool BrokeredFile::Map(u8* addr, u64 size, u64 offset, u32 prot,
 void BrokeredFile::Stat(FileSys::FileStat& out) {
     out = {};
     out.size = Size();
+    out.inode = inode;
     if (handle) {
         FILE_BASIC_INFO info{};
         winrt::check_bool(GetFileInformationByHandleEx(handle, FileBasicInfo, &info, sizeof(info)));
@@ -422,19 +423,27 @@ std::unique_ptr<BrokeredFile> OpenStorageFile(void* object, uint32_t mode) {
     winrt::Windows::Foundation::IInspectable source{nullptr};
     winrt::copy_from_abi(source, object);
     const auto file = source.as<StorageFile>();
+    const auto inode = FileSys::GetGuestInode(FileSys::FileIdentity{
+        .kind = FileSys::FileIdentity::Kind::VirtualFile,
+        .path = winrt::to_string(file.Path())}).value_or(0);
     if (const auto access = source.try_as<IStorageItemHandleAccess>()) {
         winrt::handle handle;
         const auto permissions = mode == SHADPS4_FILE_READ ? HAO_READ : HAO_READ | HAO_WRITE;
         if (SUCCEEDED(access->Create(permissions,
                                      HSO_SHARE_READ | HSO_SHARE_WRITE | HSO_SHARE_DELETE,
-                                     HO_OVERLAPPED, nullptr, handle.put())))
-            return std::make_unique<BrokeredFile>(handle.get(), mode);
+                                     HO_OVERLAPPED, nullptr, handle.put()))) {
+            auto result = std::make_unique<BrokeredFile>(handle.get(), mode);
+            result->SetInode(inode);
+            return result;
+        }
     }
     const auto stream =
         file.OpenAsync(mode == SHADPS4_FILE_READ ? FileAccessMode::Read : FileAccessMode::ReadWrite,
                        StorageOpenOptions::AllowReadersAndWriters)
             .get();
-    return std::make_unique<BrokeredFile>(stream, mode);
+    auto result = std::make_unique<BrokeredFile>(stream, mode);
+    result->SetInode(inode);
+    return result;
 }
 
 BrokeredFsBackend::BrokeredFsBackend(void* folder, bool read_only) : read_only{read_only} {
@@ -593,11 +602,24 @@ FileSys::FileStat BrokeredFsBackend::Stat(std::string_view relative) const {
     const auto item = Item(relative);
     const auto properties = item.GetBasicPropertiesAsync().get();
     FileSys::FileStat result{};
+    result.inode = FileSys::GetGuestInode(FileSys::FileIdentity{
+        .kind = FileSys::FileIdentity::Kind::VirtualFile,
+        .path = winrt::to_string(item.Path())}).value_or(0);
     result.is_directory = item.IsOfType(StorageItemTypes::Folder);
     result.size = result.is_directory ? 0 : properties.Size();
     result.mtime_sec =
         properties.DateModified().time_since_epoch().count() / 10000000 - 11644473600LL;
     return result;
+}
+bool BrokeredFsBackend::Stat(std::string_view relative, FileSys::FileStat& out) {
+    try {
+        out = Stat(relative);
+        return out.inode != 0;
+    } catch (const winrt::hresult_error& error) {
+        if (Missing(error))
+            return false;
+        throw;
+    }
 }
 void BrokeredFsBackend::CreateSubdirectory(std::string_view relative) {
     if (read_only || (metadata && (relative == "sce_sys" || relative.starts_with("sce_sys/")))) {

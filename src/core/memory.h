@@ -37,6 +37,8 @@ class MemoryMapViewer;
 namespace Core {
 
 constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
+constexpr u64 GUEST_PAGE_BITS = 14;
+constexpr u64 GUEST_PAGE_SIZE = 1ULL << GUEST_PAGE_BITS;
 
 enum class MemoryProt : u32 {
     NoAccess = 0,
@@ -309,7 +311,7 @@ public:
 
     /// A contiguous run of the never-protected physical backing view.
     struct BackingSpan {
-        const u8* ptr;
+        u8* ptr;
         u64 size;
     };
     /// Resolves [virtual_addr, virtual_addr + size) to backing spans for the

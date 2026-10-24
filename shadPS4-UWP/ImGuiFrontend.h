@@ -26,6 +26,7 @@ struct FrontendInput {
     bool left{};
     bool right{};
     bool captured{};
+    bool system_pointer{};
     bool suspended{};
     bool active{true};
     bool visible{true};
@@ -73,6 +74,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     std::function<void(std::wstring)> failure;
     std::function<void()> ready;
     std::function<void()> toggle_fullscreen;
+    std::function<void(bool)> set_pointer_mode;
 
   private:
     struct Setting {
@@ -126,6 +128,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     std::shared_ptr<ShadPS4Host> core;
     bool game_surface{}, game_running{}, menu_open{true}, menu_pressed{};
     bool session_pending{}, session_paused{};
+    bool pointer_visible{true};
     Platform::Agile<Windows::UI::Xaml::Controls::SwapChainPanel> panel;
     Platform::Agile<Windows::UI::Core::CoreDispatcher> dispatcher;
     std::unique_ptr<FrontendRenderer> renderer;

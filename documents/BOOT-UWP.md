@@ -81,3 +81,56 @@ Uma execução adicional com a DLL exata do pacote assinado apresentou 768
 frames em 25 segundos, com boot e shutdown retornando zero e erro vazio.
 Os hashes do core, Dozen, SDL3, DXC, DXIL e frontend dentro do pacote
 correspondem aos artefatos Release; a assinatura CMS foi verificada.
+
+## Falha de inicialização no Xbox: `0x80131515`
+
+Os logs recebidos registram `app_launched` seguido de `xaml_unhandled_hresult`
+com `0x80131515`, sem registro de carregamento do núcleo. Eles delimitam a falha
+à inicialização da interface, mas não contêm mensagem da exceção ou pilha para
+comprovar a chamada individual que falhou.
+
+`RequiresPointerMode` estava sendo alterado em `OnLaunched`. A configuração
+foi movida para o construtor de `App`, após `InitializeComponent`, seguindo o
+[exemplo oficial da Microsoft](https://learn.microsoft.com/en-us/windows/uwp/ui-input/gamepad-and-remote-interactions).
+Assim a política do ponteiro é definida antes de criar o conteúdo da janela.
+Uma indisponibilidade dessa política, da escala de layout ou dos limites da
+janela passa a ser registrada individualmente e não interrompe o restante
+da inicialização. Foi removida a atribuição desnecessária a `DebugSettings`
+durante o lançamento.
+
+Os logs agora registram criação de XAML, política do ponteiro, escala, limites,
+navegação e ativação da janela. Exceções XAML também incluem sua mensagem; uma
+falha no construtor da página preserva o HRESULT e a mensagem originais.
+Suspensão e retomada verificam se a página já existe.
+
+A validação desta correção compreende build Release do frontend, assinatura
+CMS e comparação do conteúdo do pacote com os artefatos de build. A execução
+da revisão corrigida no Xbox ainda precisa ser confirmada. Evidências em
+`Build/xbox-startup-fix-build.log`, `Build/xbox-startup-fix-signature.log` e
+`Build/xbox-startup-fix-package-verification.log`.
+
+## Ponteiro do Xbox na biblioteca e durante os jogos
+
+A política global permanece em `WhenRequested`, definida uma única vez no
+construtor. A página da interface solicita `RequiresPointer="WhenFocused"`;
+a página que recebe o foco durante o jogo utiliza `RequiresPointer="Never"`.
+As duas compartilham as superfícies existentes, sem recriar o núcleo ou os
+swapchains na troca de foco.
+
+O frontend sinaliza a mudança ao iniciar a sessão, abrir/fechar o menu e
+retornar à biblioteca. O foco é alterado pelo dispatcher da UI. Enquanto o
+jogo está ativo sem menus, a página da interface também é desabilitada para
+evitar que a navegação direcional devolva o foco ao ponteiro. Diálogos mantêm
+seu foco até fecharem, e a reativação da janela reaplica a página apropriada.
+O caminho de navegação gamepad do ImGui é suprimido enquanto o sistema usa o
+controle para mover e clicar com o ponteiro, evitando ações duplicadas.
+
+A composição das páginas e as propriedades foram carregadas em um probe
+XAML nativo no PC (`Build/xbox-pointer-page-probe.log`). O frontend Release
+foi recompilado e o pacote assinado/verificado. Logs em
+`Build/xbox-pointer-lifecycle-build.log`,
+`Build/xbox-pointer-lifecycle-signature.log` e
+`Build/xbox-pointer-lifecycle-package-verification.log`.
+Essa verificação não substitui a confirmação do ponteiro visível/oculto no
+Xbox. O evento `xbox_pointer_page visible/focused` registra a transição e
+se a solicitação de foco foi aceita.

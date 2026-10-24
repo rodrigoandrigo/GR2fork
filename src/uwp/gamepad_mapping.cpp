@@ -52,4 +52,58 @@ Input::State MapGamepadReading(const GamepadReading& reading) {
     return result;
 }
 
+void GamepadTouchpadMapper::Reset() {
+    touching = false;
+    blocked_until_release = true;
+    touch = {};
+    started_at = 0;
+}
+
+void GamepadTouchpadMapper::Apply(const GamepadReading& reading, Input::State& state) {
+    using Button = Libraries::Pad::OrbisPadButtonDataOffset;
+    const bool view = (reading.Buttons & GamepadButtons::View) != GamepadButtons::None;
+    state.buttonsState &= ~Button::TouchPad;
+    state.touchpad[0] = {};
+    state.touchpad[1] = {};
+    state.touch_time_since_held_down = 0;
+    if (!state.connected) {
+        Reset();
+        return;
+    }
+    if (!view) {
+        touching = false;
+        blocked_until_release = false;
+        touch.state = false;
+        state.touchpad[0] = touch;
+        state.touch_time_since_held_down = 0;
+        return;
+    }
+    state.axes[0] = 128;
+    state.axes[1] = 128;
+    state.buttonsState &= ~Button::L3;
+    if (blocked_until_release)
+        return;
+    const auto axis = [](double value) {
+        return std::isfinite(value) ? std::clamp(value, -1.0, 1.0) : 0.0;
+    };
+    const auto x = axis(reading.LeftThumbstickX);
+    const auto y = axis(reading.LeftThumbstickY);
+    const bool click = (reading.Buttons & GamepadButtons::LeftThumbstick) != GamepadButtons::None;
+    if (!touching && (click || std::hypot(x, y) > 0.25)) {
+        touching = true;
+        started_at = state.time;
+        next_id = next_id == 127 ? 1 : next_id + 1;
+        touch.ID = next_id;
+    }
+    if (click)
+        state.buttonsState |= Button::TouchPad;
+    touch.state = touching;
+    if (touching) {
+        touch.x = static_cast<u16>(std::min((x + 1.0) * 960.0, 1919.0));
+        touch.y = static_cast<u16>((1.0 - y) * 470.5);
+        state.touch_time_since_held_down = state.time >= started_at ? state.time - started_at : 0;
+    }
+    state.touchpad[0] = touch;
+}
+
 } // namespace Core::Uwp

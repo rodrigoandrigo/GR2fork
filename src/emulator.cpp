@@ -41,9 +41,12 @@
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/music/music_player_service.h"
 #include "core/libraries/np/np_handler/np_handler.h"
+#include "core/libraries/np/np_auth/np_auth.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/save_data/save_backup.h"
+#include "core/libraries/usbd/usbstorage.h"
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/user_settings.h"
@@ -113,6 +116,7 @@ void Emulator::Shutdown() {
     }
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
+    Libraries::MusicPlayerService::Shutdown();
     Storage::DataBase::Instance().Close();
     play_time_thread.request_stop();
     if (play_time_thread.joinable()) {
@@ -584,11 +588,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU textureLruLazyTouch: {}", EmulatorSettings.IsTextureLruLazyTouch());
     LOG_INFO(Config, "GPU gatherInputMemo: {}", EmulatorSettings.IsGatherInputMemo());
     LOG_INFO(Config, "GPU trackerLockSpinRounds: {}", EmulatorSettings.GetTrackerLockSpinRounds());
-    LOG_INFO(Config, "GPU gpuThreadCoreReserve: {}", EmulatorSettings.IsGpuThreadCoreReserve());
-    LOG_INFO(Config, "GPU oneThreadPerCore: {}", EmulatorSettings.IsOneThreadPerCore());
-    if (EmulatorSettings.IsOneThreadPerCore()) {
-        Common::RestrictProcessToOneThreadPerCore();
-    }
+    LOG_INFO(Config, "GPU oneCoreGpuThreadPin: {}", EmulatorSettings.IsOneCoreGpuThreadPin());
+    LOG_INFO(Config, "GPU vkRecordThread: {}", EmulatorSettings.IsVkRecordThread());
     LOG_INFO(Config, "GPU vertexLayoutMemo: {}", EmulatorSettings.IsVertexLayoutMemo());
     LOG_INFO(Config, "GPU coveredRangeSkip: {}", EmulatorSettings.IsCoveredRangeSkip());
     LOG_INFO(Config, "GPU residencyBitmap: {}", EmulatorSettings.IsResidencyBitmap());
@@ -608,6 +609,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU userfaultfdTracking: {}", EmulatorSettings.IsUserfaultfdTracking());
 #endif
     LOG_INFO(Config, "GPU inlineFetchShader: {}", EmulatorSettings.IsInlineFetchShader());
+    LOG_INFO(Config, "GPU fastShaderMath: {}", EmulatorSettings.IsFastShaderMath());
     LOG_INFO(Config, "Vulkan gpuId: {}", EmulatorSettings.GetGpuId());
     LOG_INFO(Config, "Vulkan vkValidation: {}", EmulatorSettings.IsVkValidationEnabled());
     LOG_INFO(Config, "Vulkan vkValidationCore: {}", EmulatorSettings.IsVkValidationCoreEnabled());
@@ -729,10 +731,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     // Mounting temp folders
     const auto& mount_temp_dir = Common::FS::GetUserPath(Common::FS::PathType::TempDataDir) / id;
-    if (std::filesystem::exists(mount_temp_dir)) {
-        // Temp folder should be cleared on each boot.
-        std::filesystem::remove_all(mount_temp_dir);
-    }
     std::filesystem::create_directory(mount_temp_dir);
     mnt->Mount(mount_temp_dir, "/temp0");
     mnt->Mount(mount_temp_dir, "/temp");
@@ -747,6 +745,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         Common::FS::GetUserPath(Common::FS::PathType::DownloadDir) / (id + "-download1");
     std::filesystem::create_directories(mount_download_secondary_dir);
     mnt->Mount(mount_download_secondary_dir, "/download1");
+
+    const auto mount_usb_dir = Libraries::UsbStorage::GetUsbMountPath();
+    std::error_code ec_usb;
+    std::filesystem::create_directories(mount_usb_dir, ec_usb);
+    mnt->Mount(mount_usb_dir, "/mnt/usb0");
 
     const auto& mount_captures_dir = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
     if (!std::filesystem::exists(mount_captures_dir)) {
@@ -848,6 +851,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 void Emulator::StopGuest() {
     Uwp::SetGuestReady(false);
     Uwp::StopGuestWorkers();
+    Libraries::Np::NpAuth::Shutdown();
     DebugState.ResumeGuestThreads();
     if (linker) {
         Libraries::Kernel::StopGuestThreads();
@@ -856,6 +860,7 @@ void Emulator::StopGuest() {
     Libraries::GnmDriver::StopGpuCommandProcessor();
     Libraries::VideoOut::ShutdownVideoOut();
     Libraries::AudioOut::ShutdownAudioOut();
+    Libraries::MusicPlayerService::Shutdown();
     Libraries::Ajm::ShutdownAjm();
     Libraries::Vdecsw::ShutdownVdecsw();
     Libraries::Np::NpHandler::GetInstance().Shutdown();

@@ -30,6 +30,11 @@ public:
     virtual void CpSync() = 0;
     virtual u64 Flush() = 0;
     virtual void Finish() = 0;
+    virtual void RequestFlush(u64) {
+        Flush();
+    }
+    virtual void FlushRequested(bool = false) {}
+    virtual void MarkAsGuestMemoryChanged(VAddr, const void*, u64) {}
     virtual void OnSubmit() = 0;
     virtual void OnFence() {
         ProcessDownloadImages();

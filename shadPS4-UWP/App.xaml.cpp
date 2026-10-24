@@ -32,6 +32,7 @@ App::App()
     UwpDiagnostics::Initialize(std::wstring(ApplicationData::Current->LocalFolder->Path->Data()) + L"\\shadPS4");
     UnhandledException += ref new UnhandledExceptionEventHandler([](Object^, UnhandledExceptionEventArgs^ e) {
         UwpDiagnostics::Write(UwpDiagnostics::crash_file, "xaml_unhandled_hresult", static_cast<uint32_t>(e->Exception.Value));
+        UwpDiagnostics::Text(UwpDiagnostics::crash_file, "xaml_unhandled_message", e->Message->Data());
     });
     try {
         Windows::System::MemoryManager::AppMemoryUsageIncreased += ref new EventHandler<Object^>([](Object^, Object^) {
@@ -41,7 +42,19 @@ App::App()
         UwpDiagnostics::Record("memory_event_unavailable hresult", static_cast<uint32_t>(error->HResult));
     }
     UwpDiagnostics::Memory("app_memory bytes/limit");
+    UwpDiagnostics::Record("app_xaml_initializing");
 	InitializeComponent();
+    UwpDiagnostics::Record("app_xaml_initialized");
+    if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily == "Windows.Xbox") {
+        UwpDiagnostics::Record("xbox_pointer_policy_initializing");
+        try {
+            RequiresPointerMode = ApplicationRequiresPointerMode::WhenRequested;
+            UwpDiagnostics::Record("xbox_pointer_policy_ready");
+        } catch (Exception^ error) {
+            UwpDiagnostics::Record("xbox_pointer_policy_unavailable hresult", static_cast<uint32_t>(error->HResult));
+            UwpDiagnostics::Text(UwpDiagnostics::session_file, "xbox_pointer_policy_message", error->Message->Data());
+        }
+    }
 	Suspending += ref new SuspendingEventHandler(this, &App::OnSuspending);
 	Resuming += ref new EventHandler<Object^>(this, &App::OnResuming);
 }
@@ -55,13 +68,25 @@ App::App()
 void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEventArgs^ e)
 {
     UwpDiagnostics::Record("app_launched previous_execution_state", static_cast<uint32_t>(e->PreviousExecutionState));
-	DebugSettings->EnableFrameRateCounter = false;
 	if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily == "Windows.Xbox")
 	{
-        RequiresPointerMode = ApplicationRequiresPointerMode::WhenRequested;
-		Windows::UI::ViewManagement::ApplicationViewScaling::TrySetDisableLayoutScaling(true);
-		Windows::UI::ViewManagement::ApplicationView::GetForCurrentView()->SetDesiredBoundsMode(
-			Windows::UI::ViewManagement::ApplicationViewBoundsMode::UseCoreWindow);
+        try {
+            UwpDiagnostics::Record("xbox_layout_scaling_initializing");
+            const auto disabled = Windows::UI::ViewManagement::ApplicationViewScaling::TrySetDisableLayoutScaling(true);
+            UwpDiagnostics::Record("xbox_layout_scaling_ready disabled", disabled);
+        } catch (Exception^ error) {
+            UwpDiagnostics::Record("xbox_layout_scaling_unavailable hresult", static_cast<uint32_t>(error->HResult));
+            UwpDiagnostics::Text(UwpDiagnostics::session_file, "xbox_layout_scaling_message", error->Message->Data());
+        }
+        try {
+            UwpDiagnostics::Record("xbox_bounds_initializing");
+            const auto applied = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView()->SetDesiredBoundsMode(
+                Windows::UI::ViewManagement::ApplicationViewBoundsMode::UseCoreWindow);
+            UwpDiagnostics::Record("xbox_bounds_ready applied", applied);
+        } catch (Exception^ error) {
+            UwpDiagnostics::Record("xbox_bounds_unavailable hresult", static_cast<uint32_t>(error->HResult));
+            UwpDiagnostics::Text(UwpDiagnostics::session_file, "xbox_bounds_message", error->Message->Data());
+        }
 	}
 
 	auto rootFrame = dynamic_cast<Frame^>(Window::Current->Content);
@@ -72,6 +97,7 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 	{
 		// Criar um Quadro para agir como o contexto de navegação e associá-lo a
 		// uma chave SuspensionManager
+        UwpDiagnostics::Record("root_frame_initializing");
 		rootFrame = ref new Frame();
 
 		rootFrame->NavigationFailed += ref new Windows::UI::Xaml::Navigation::NavigationFailedEventHandler(this, &App::OnNavigationFailed);
@@ -85,7 +111,9 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 		// Quando a pilha de navegação não for restaurada, navegar para a primeira página,
 		// configurando a nova página passando as informações necessárias como um parâmetro
 		// parâmetro
+        UwpDiagnostics::Record("main_page_navigating");
 		rootFrame->Navigate(TypeName(DirectXPage::typeid), e->Arguments);
+        UwpDiagnostics::Record("main_page_navigated");
 	}
 
 	if (m_directXPage == nullptr)
@@ -99,7 +127,9 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 	}
 	
 	// Verifique se a janela atual está ativa
+    UwpDiagnostics::Record("window_activating");
 	Window::Current->Activate();
+    UwpDiagnostics::Record("window_activated");
 	if (!m_backNavigationRegistered)
 	{
 		try
@@ -130,7 +160,8 @@ void App::OnSuspending(Object^ sender, SuspendingEventArgs^ e)
 	(void) e;	// Parâmetro não usado
 
     UwpDiagnostics::Memory("app_suspending bytes/limit");
-	m_directXPage->SaveInternalState(ApplicationData::Current->LocalSettings->Values);
+	if (m_directXPage)
+        m_directXPage->SaveInternalState(ApplicationData::Current->LocalSettings->Values);
 }
 
 /// <summary>
@@ -143,7 +174,8 @@ void App::OnResuming(Object ^sender, Object ^args)
 	(void) sender; // Parâmetro não usado
 	(void) args; // Parâmetro não usado
 
-	m_directXPage->LoadInternalState(ApplicationData::Current->LocalSettings->Values);
+	if (m_directXPage)
+        m_directXPage->LoadInternalState(ApplicationData::Current->LocalSettings->Values);
 }
 
 /// <summary>

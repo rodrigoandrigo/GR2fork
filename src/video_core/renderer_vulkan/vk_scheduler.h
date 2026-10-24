@@ -8,14 +8,19 @@
 #include <bit>
 #include <condition_variable>
 #include <cstring>
+#include <exception>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <queue>
 
+#include "common/assert.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/vk_command_chunk.h"
+#include "video_core/renderer_vulkan/vk_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "vulkan/vulkan.hpp"
@@ -27,6 +32,9 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
+class RecordThread;
+class Scheduler;
+struct SubmitRequest;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -212,8 +220,12 @@ struct DynamicState {
     /// Counts mask changes no pipeline declares dynamic; drained per 300 frames.
     u64 color_write_mask_skips_{};
 
-    /// Commits the dynamic state to the provided command buffer.
-    void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
+    /// Commits the dynamic state to the scheduler's current command buffer.
+    void Commit(const Instance& instance, Scheduler& scheduler);
+
+    /// Emits the dirty state through cmdbuf's dynamic state setters.
+    template <typename CmdBuf>
+    void CommitTo(const Instance& instance, CmdBuf& cmdbuf);
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
@@ -415,7 +427,7 @@ using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
 class Scheduler {
 public:
-    explicit Scheduler(const Instance& instance);
+    explicit Scheduler(const Instance& instance, bool threaded_recording = false);
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -428,15 +440,16 @@ public:
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
+    void DrainPriorityOperations();
 
     /// Where a blocking wait came from, so the cost can be attributed; one
-    /// counter pair per site, summed on the waiting thread.
+    /// counter pair per site, summed on the waiting thread. A RecordDrain stall
+    /// inside a Finish, FaultBuffer or DownloadImage wait counts under both sites.
     enum class WaitSite : u8 {
         Finish,
-        StreamRing,
         FaultBuffer,
-        DownloadBuffer,
         DownloadImage,
+        RecordDrain,
         Count,
     };
     struct WaitStat {
@@ -476,8 +489,17 @@ public:
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
+    /// Blocks until the record thread has issued the submit that signals the given tick.
+    void WaitSubmitted(u64 tick);
+
+    /// Resets the current command buffer; follows a Finish at shutdown.
+    void ResetCommandBuffer();
+
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
+
+    /// Executes every operation whose tick the GPU has caught up with, without throttling.
+    void DrainPendingOperations();
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
@@ -511,9 +533,45 @@ public:
         return dynamic_state;
     }
 
+    /// Returns a recorder for the current command buffer.
+    [[nodiscard]] CommandRecorder CommandBuffer() noexcept {
+        return CommandRecorder{*this};
+    }
+
     /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
+    [[nodiscard]] vk::CommandBuffer RawCommandBuffer() const {
+        ASSERT_MSG(!threaded_recording, "The recording thread owns the command buffer");
         return sessions.back().primary;
+    }
+
+    /// Whether the command buffer is recorded on a dedicated thread.
+    [[nodiscard]] bool HasRecordingThread() const noexcept {
+        return threaded_recording;
+    }
+
+    /// Runs func(cmdbuf) on the current command buffer: at once, or on the record thread in
+    /// recording order. func holds values only, never pointers into caller memory.
+    template <typename F>
+    void Record(F&& func) {
+        if (!threaded_recording) {
+            func(sessions.back().primary);
+            return;
+        }
+        if (!chunk->Fits<F>(0)) {
+            DispatchChunk();
+        }
+        chunk->Record(std::forward<F>(func));
+    }
+
+    /// Threaded recording only: like Record, with size payload bytes the caller fills before the
+    /// next record; func runs as func(cmdbuf, payload).
+    template <typename F>
+    [[nodiscard]] std::byte* RecordWithPayload(size_t size, F&& func) {
+        ASSERT_MSG(threaded_recording, "RecordWithPayload needs the recording thread");
+        if (!chunk->Fits<F>(size)) {
+            DispatchChunk();
+        }
+        return chunk->RecordWithPayload(size, std::forward<F>(func));
     }
 
     /// Returns the current command buffer tick.
@@ -560,14 +618,6 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
-    using SubmitHook = void (*)(void*);
-    /// Runs on the submitting thread before the queue submit; the rasterizer
-    /// arms its pending read watchers there.
-    void SetSubmitHook(SubmitHook hook, void* user) {
-        submit_hook_ = hook;
-        submit_hook_user_ = user;
-    }
-
     static std::mutex submit_mutex;
 
 private:
@@ -575,11 +625,12 @@ private:
 
     void SubmitExecution(SubmitInfo& info);
 
+    /// Hands the current chunk, and the submit to issue after it, to the record thread.
+    void DispatchChunk(const SubmitRequest* request = nullptr);
+
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
-    SubmitHook submit_hook_{};
-    void* submit_hook_user_{};
     const Instance& instance;
     Semaphore work_semaphore;
     CommandPool command_pool;
@@ -590,6 +641,8 @@ private:
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
     };
+    // The recorder's inline path reads sessions directly.
+    friend class CommandRecorder;
     std::vector<Session> sessions;
     std::condition_variable_any event_cv;
     struct PendingOp {
@@ -606,6 +659,8 @@ private:
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
+    bool priority_operation_running{};
+    std::exception_ptr priority_failure;
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
@@ -614,6 +669,9 @@ private:
     u64 rs_restarts_{};
     u64 rs_interrupted_{};
     tracy::VkCtxScope* profiler_scope{};
+    const bool threaded_recording;
+    std::unique_ptr<RecordThread> record_thread;
+    std::unique_ptr<CommandChunk> chunk;
 };
 
 } // namespace Vulkan

@@ -104,7 +104,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     const bool sc_enabled = sc_mode != AdaptiveSkipCachesMode::SkipCachesDisabled;
     skipcache.Init(static_cast<Skipcache::Mode>(sc_mode));
     skipcache.RegisterInvalidate(&Rasterizer::BrInvalidateThunk, this);
-    br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
+    br_readback_gate_ = texture_cache.ReadbackLinearImages();
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     vertex_layout_memo_ = EmulatorSettings.IsVertexLayoutMemo();
     bind_prefetch_ = EmulatorSettings.IsBindLinePrefetch();
@@ -197,6 +197,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
+        // A packet still being bound records into the batch this submit opens.
+        StampBoundWrites(false);
         buffer_cache.SubmitPendingArenaBinds(info);
     });
 }
@@ -704,29 +706,48 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
 
     ResetBindings(false);
+    // The flushes submit; they must not run under the guest-copy shared lock.
+    copy_scope.reset();
+    FlushRequested();
     if (flush_draw_interval_ != 0) {
-        // The flush submits; it must not run under the guest-copy shared lock.
-        copy_scope.reset();
-        MaybeIntervalFlush(false);
+        MaybeIntervalFlush();
     }
 }
 
-void Rasterizer::MaybeIntervalFlush(bool prone_write) {
-    if (prone_write) {
-        prone_run_ = true;
-        ++prone_run_draws_;
+void Rasterizer::RequestFlush(u64 tick) {
+    if (tick >= scheduler.CurrentTick()) {
+        flush_request_tick_ = tick;
     }
-    // The run is submitted once a draw that does not write a prone buffer
-    // ends it, or every 64 draws inside it; a flush the depth-clear guard
-    // refuses leaves the run pending for the next draw.
-    const bool force = prone_run_ && (!prone_write || prone_run_draws_ >= 64);
+    FlushRequested();
+}
+
+void Rasterizer::MarkAsGuestMemoryChanged(VAddr address, const void* data, u64 size) {
+    texture_cache.MarkAsGuestMemoryChanged(address, data, size);
+}
+
+void Rasterizer::FlushRequested(bool force) {
+    // No request pending, or a flush since the request submitted the batch the waiter needs.
+    if (flush_request_tick_ < scheduler.CurrentTick()) {
+        flush_request_tick_ = 0;
+        return;
+    }
+    const auto& ds = scheduler.GetRenderState().depth_stencil_attachment;
+    if (!force && scheduler.IsRendering() && (ds.depth_clear || ds.stencil_clear)) {
+        return;
+    }
+    DropCopyHold(hold_drops_flush_);
+    scheduler.Flush();
+    flush_request_tick_ = 0;
+}
+
+void Rasterizer::MaybeIntervalFlush() {
     const u64 tick = scheduler.CurrentTick();
     if (tick != flush_tick_) {
         flush_tick_ = tick;
         draws_since_flush_ = 0;
     }
     bool drain = false;
-    if (!force && (flush_draw_interval_ == 0 || ++draws_since_flush_ < flush_draw_interval_)) {
+    if (flush_draw_interval_ == 0 || ++draws_since_flush_ < flush_draw_interval_) {
         // If the GPU has retired everything submitted so far it is recording
         // into an idle ring; hand it this much of the open batch now.
         if (ring_drain_flush_draws_ == 0 || draws_since_flush_ < ring_drain_flush_draws_ ||
@@ -739,7 +760,7 @@ void Rasterizer::MaybeIntervalFlush(bool prone_write) {
         // pass could never flush; do not pay its query. (A firing drain reads
         // the attachment again there; the second read cannot differ.)
         const auto& clear_ds = scheduler.GetRenderState().depth_stencil_attachment;
-        if (clear_ds.depth_clear || clear_ds.stencil_clear) {
+        if (scheduler.IsRendering() && (clear_ds.depth_clear || clear_ds.stencil_clear)) {
             return;
         }
         ++drain_polls_;
@@ -753,7 +774,7 @@ void Rasterizer::MaybeIntervalFlush(bool prone_write) {
     // BeginRendering re-derives the clear load op, so a scope re-begun after
     // a flush would clear the attachment a second time.
     const auto& ds = scheduler.GetRenderState().depth_stencil_attachment;
-    if (ds.depth_clear || ds.stencil_clear) {
+    if (scheduler.IsRendering() && (ds.depth_clear || ds.stencil_clear)) {
         return;
     }
     DropCopyHold(hold_drops_flush_);
@@ -764,11 +785,7 @@ void Rasterizer::MaybeIntervalFlush(bool prone_write) {
         drain_draw_max_ = std::max(drain_draw_max_, draws_since_flush_);
     }
     draws_since_flush_ = 0;
-    if (force) {
-        prone_run_ = false;
-        prone_run_draws_ = 0;
-        ++writer_flushes_;
-    } else if (!drain) {
+    if (!drain) {
         ++interval_flushes_;
     }
 }
@@ -858,14 +875,14 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     const auto size = stride * max_count;
-    const auto [buffer, base] = buffer_cache.ObtainBuffer(arg_address + offset, size, false);
+    const auto [buffer, base] = buffer_cache.ObtainBuffer(arg_address + offset, size);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
     bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
-        std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
+        std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
         bound_buffers.emplace_back(count_buffer, count_offset, 4,
                                    vk::AccessFlagBits2::eIndirectCommandRead);
@@ -950,9 +967,11 @@ void Rasterizer::DispatchDirect() {
     DebugState.IncDispatch();
 
     ResetBindings(true);
+    // The flushes submit; they must not run under the guest-copy shared lock.
+    copy_scope.reset();
+    FlushRequested();
     if (flush_draw_interval_ != 0) {
-        copy_scope.reset();
-        MaybeIntervalFlush(false);
+        MaybeIntervalFlush();
     }
 }
 
@@ -975,7 +994,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
-    const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
+    const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
     bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
 
@@ -1084,11 +1103,18 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
     }
     auto& ws = scheduler.WaitStats();
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] WAITS finish={}/{}ms ring={}/{}ms fault={}/{}ms "
-             "dlbuf={}/{}ms dlimg={}/{}ms per300f",
+             "[SkipCache] WAITS finish={}/{}ms fault={}/{}ms dlimg={}/{}ms rdrain={}/{}ms per300f",
              ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count, ms(ws[2].ns),
-             ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
+             ws[3].count, ms(ws[3].ns));
     ws = {};
+    if (const auto os = buffer_cache.DrainOffloadStats();
+        os.faults || os.direct || os.lane_copies) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] OFFLOAD faults={} direct={}/{}KiB lane={}/{}KiB/{}ms flushreq={} "
+                 "waited={}/{}ms per300f",
+                 os.faults, os.direct, os.direct_bytes / 1024, os.lane_copies, os.lane_bytes / 1024,
+                 os.lane_wait_ns / 1000000, os.flush_requests, os.waits, os.wait_ns / 1000000);
+    }
     if (tracker_lock_spin_) {
         const auto tl = VideoCore::RegionLock::Drain();
         LOG_INFO(Render_Skipcache,
@@ -1487,6 +1513,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                 buffer_cache.PrepareBufferRange(buffer.base_address, buffer.GetSize());
         }
     }
+    bind_tick_ = scheduler.CurrentTick();
     draw_samples_target_ = false;
     if (pipeline->IsCompute() && TakeComputeShortcut(pipeline)) [[unlikely]] {
         return false;
@@ -1781,8 +1808,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false);
+        std::tie(range.buffer, range.offset) = buffer_cache.ObtainBuffer(range.base_address, size);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         bound_buffers.emplace_back(range.buffer, range.offset, size,
                                    vk::AccessFlagBits2::eVertexAttributeRead);
@@ -1829,20 +1855,20 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
     const vk::IndexType index_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
     const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
-    const VAddr index_address =
-        regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+    const VAddr base_address = regs.index_base_address.Address<VAddr>();
+    const VAddr index_address = base_address + u64(index_offset) * index_size;
 
     // Bind index buffer.
     const u32 num_indices =
         is_indirect ? regs.max_index_size : std::min(regs.num_indices, regs.max_index_size);
     const u64 requested_size = u64(num_indices) * index_size;
-    const u64 mapped_size = memory->ClampRangeSize(index_address, requested_size);
+    const u64 mapped_size =
+        base_address != 0 ? memory->ClampRangeSize(index_address, requested_size) : 0;
     u32 index_buffer_size = static_cast<u32>(Common::AlignDown(mapped_size, index_size));
     vk::Buffer index_buffer{};
     u64 buffer_offset{};
     if (index_buffer_size != 0) {
-        const auto [buffer, offset] =
-            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+        const auto [buffer, offset] = buffer_cache.ObtainBuffer(index_address, index_buffer_size);
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
         bound_buffers.emplace_back(buffer, offset, index_buffer_size,
                                    vk::AccessFlagBits2::eIndexRead);
@@ -1865,9 +1891,29 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     }
 }
 
+void Rasterizer::StampBoundWrites(bool mark) {
+    for (const auto [buffer, offset, size, src_access] : bound_buffers) {
+        if (buffer->mem_type != VideoCore::MemoryType::Sparse ||
+            !(src_access & vk::AccessFlagBits2::eShaderWrite)) {
+            continue;
+        }
+        const VAddr addr = buffer->CpuAddr() + offset;
+        if (mark) {
+            buffer_cache.RestampGpuWrite(addr, size);
+        } else {
+            buffer_cache.StampGpuWrite(addr, size);
+        }
+    }
+}
+
 void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
+    }
+    // A flush between the binds and the record lets a readback on this thread consume the
+    // packet's own writes.
+    if (scheduler.CurrentTick() != bind_tick_) {
+        StampBoundWrites(true);
     }
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
@@ -2130,8 +2176,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos[info_n++] = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                VideoCore::ObtainBufferFlags flags = {};
+                if (desc.is_written) {
+                    flags |= VideoCore::ObtainBufferFlags::IsWritten;
+                }
+                if (desc.is_formatted) {
+                    flags |= VideoCore::ObtainBufferFlags::IsTexelBuffer;
+                }
+                const auto [buffer, offset] =
+                    buffer_cache.ObtainBuffer(vsharp.base_address, size, flags);
                 // Power-of-two Vulkan alignment: the generic AlignDown emitted a
                 // hardware divide here at binding rate.
                 const u64 offset_aligned = offset & ~(alignment - 1);
@@ -3009,7 +3062,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (is_gds) {
             return {buffer_cache.GetGdsBuffer(), address};
         }
-        return buffer_cache.ObtainBuffer(address, num_bytes, true);
+        return buffer_cache.ObtainBuffer(address, num_bytes,
+                                         VideoCore::ObtainBufferFlags::IsWritten);
     }();
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
@@ -3035,13 +3089,16 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (src_gds) {
             return {gds_buffer, src};
         }
-        return buffer_cache.ObtainBuffer(src, num_bytes, false, true);
+        return buffer_cache.ObtainBuffer(src, num_bytes,
+                                         VideoCore::ObtainBufferFlags::IsTexelBuffer);
     }();
     const auto [dst_buffer, dst_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (dst_gds) {
             return {gds_buffer, dst};
         }
-        return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
+        return buffer_cache.ObtainBuffer(dst, num_bytes,
+                                         VideoCore::ObtainBufferFlags::IsWritten |
+                                             VideoCore::ObtainBufferFlags::IsTexelBuffer);
     }();
     const vk::BufferCopy copy = {
         .srcOffset = src_offset,
@@ -3080,7 +3137,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.ReadMemory(addr, size, false, assume_locks);
+    buffer_cache.ReadMemory(addr, size, false, false, assume_locks);
     Skipcache::Framework::Instance().BumpMemGen();
     return true;
 }
@@ -3254,7 +3311,7 @@ bool Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
             skipcache->RecordVerifyClean(CacheId::DynState);
         }
     }
-    dynamic_state.Commit(instance, scheduler.CommandBuffer());
+    dynamic_state.Commit(instance, scheduler);
 
     if (probing && !dyn_would_hit) {
         auto& ctr = skipcache->Counters(CacheId::DynState);

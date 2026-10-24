@@ -22,8 +22,7 @@ std::atomic_bool captured{};
 struct SyntheticEvent {
     std::chrono::milliseconds when{};
     std::chrono::milliseconds hold{150};
-    Libraries::Pad::OrbisPadButtonDataOffset button{
-        Libraries::Pad::OrbisPadButtonDataOffset::None};
+    Libraries::Pad::OrbisPadButtonDataOffset button{Libraries::Pad::OrbisPadButtonDataOffset::None};
 };
 std::vector<SyntheticEvent> ParseSchedule(const std::string& schedule) {
     static const std::map<std::string_view, Libraries::Pad::OrbisPadButtonDataOffset> names{
@@ -46,9 +45,8 @@ std::vector<SyntheticEvent> ParseSchedule(const std::string& schedule) {
     std::vector<SyntheticEvent> events;
     for (size_t start = 0; start < schedule.size();) {
         const auto stop = schedule.find(',', start);
-        const auto entry = schedule.substr(start, stop == std::string::npos
-                                                      ? std::string::npos
-                                                      : stop - start);
+        const auto entry =
+            schedule.substr(start, stop == std::string::npos ? std::string::npos : stop - start);
         const auto at = entry.find('@');
         if (at == std::string::npos)
             throw std::runtime_error("Invalid synthetic pad event");
@@ -88,6 +86,7 @@ void StartGamepadInput() {
         bool started{};
         std::array<Gamepad, 4> slots{nullptr, nullptr, nullptr, nullptr};
         std::array<uint16_t, 4> vibration{};
+        std::array<GamepadTouchpadMapper, 4> touchpads;
         std::vector<SyntheticEvent> synthetic;
         if (const char* schedule = std::getenv("GAME_SYNTH_PAD"); schedule && *schedule)
             synthetic = ParseSchedule(schedule);
@@ -113,6 +112,7 @@ void StartGamepadInput() {
                         }
                         slots[slot] = nullptr;
                         vibration[slot] = 0;
+                        touchpads[slot].Reset();
                         (*controllers)[slot]->UpdateNativeState({});
                     }
                 }
@@ -136,9 +136,8 @@ void StartGamepadInput() {
                                 state.buttonsState |= event.button;
                         }
                         state.connected = true;
-                        state.time = std::chrono::duration_cast<std::chrono::microseconds>(
-                                         elapsed)
-                                         .count();
+                        state.time =
+                            std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
                         (*controllers)[0]->UpdateNativeState(state);
                         continue;
                     }
@@ -147,12 +146,17 @@ void StartGamepadInput() {
                     auto* controller = (*controllers)[slot];
                     try {
                         const bool intercept = captured.load();
-                        auto state = intercept ? Input::State{}
-                                               : MapGamepadReading(slots[slot].GetCurrentReading());
+                        const auto reading =
+                            intercept ? GamepadReading{} : slots[slot].GetCurrentReading();
+                        auto state = intercept ? Input::State{} : MapGamepadReading(reading);
                         state.connected = true;
                         state.time = std::chrono::duration_cast<std::chrono::microseconds>(
                                          std::chrono::steady_clock::now() - started_at)
                                          .count();
+                        if (intercept)
+                            touchpads[slot].Reset();
+                        else
+                            touchpads[slot].Apply(reading, state);
                         if (intercept)
                             state.buttonsState =
                                 Libraries::Pad::OrbisPadButtonDataOffset::Intercepted;
@@ -169,6 +173,7 @@ void StartGamepadInput() {
                             vibration[slot] = requested;
                         }
                     } catch (const winrt::hresult_error& error) {
+                        touchpads[slot].Reset();
                         controller->UpdateNativeState({});
                         slots[slot] = nullptr;
                         vibration[slot] = 0;
@@ -212,7 +217,5 @@ void StopGamepadInput() {
         polling.join();
     }
 }
-void CaptureGamepadInput(bool value) {
-    captured.store(value);
-}
+void CaptureGamepadInput(bool value) { captured.store(value); }
 } // namespace Core::Uwp

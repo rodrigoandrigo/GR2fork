@@ -25,6 +25,9 @@ private:
     void EditText(std::string label, std::string value, bool secret,
                   std::function<void(std::string)> completed);
     void Capture(bool captured);
+    void SetPointerMode(bool visible);
+    bool pointer_visible{true};
+    bool dialog_open{};
     void OnPointerLost(Platform::Object ^ sender,
                        Windows::UI::Xaml::Input::PointerRoutedEventArgs ^ args);
     void OnCompositionScaleChanged(Windows::UI::Xaml::Controls::SwapChainPanel ^ sender,

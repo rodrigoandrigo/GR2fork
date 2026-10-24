@@ -14,6 +14,8 @@ As configurações ficam em uma única janela com abas e perfis globais ou por j
 
 O modo de exibição, o tamanho das capas e a disposição do painel de logs são preservados entre inicializações. O aplicativo mantém navegação por teclado e controle, além dos seletores de pastas do UWP.
 
+No Xbox, a biblioteca e os menus solicitam o ponteiro do sistema. Ele é ocultado ao iniciar o jogo e restaurado ao voltar à interface, encerrar a sessão ou cancelar uma inicialização que falhou.
+
 ## Jogos em PKG
 
 Use **Arquivo > Adicionar PKG…** para selecionar um pacote individual, ou adicione uma pasta que contenha arquivos `.pkg`. A autorização de acesso fica salva na biblioteca do aplicativo.
@@ -21,6 +23,14 @@ Use **Arquivo > Adicionar PKG…** para selecionar um pacote individual, ou adic
 Pacotes PS4 no formato FPKG são acessados diretamente, com leitura, descriptografia e descompressão sob demanda, seguindo a implementação do Prosperity. O jogo é montado no sistema de arquivos virtual como `/app0`, sem extrair o pacote inteiro para o armazenamento do aplicativo.
 
 A coluna **Formato** distingue **PKG** e **Pasta**; a grade também mostra essa informação. Título, serial, versão e capa são lidos do pacote. Atualizações e DLCs recebem identificação própria e não são iniciados como jogos independentes.
+
+## Touchpad no controle Xbox
+
+Segure **View** e mova o **analógico esquerdo** para posicionar o dedo no touchpad do PS4. O contato começa ao mover o analógico além da zona inicial ou pressioná-lo, e continua enquanto View estiver segurado, inclusive ao voltar o analógico ao centro.
+
+Use **View + L3** para clicar no touchpad. Soltar apenas L3 libera o clique e mantém o dedo em contato; soltar View levanta o dedo e devolve o analógico à função normal do jogo. Cada jogador tem seu próprio gesto e identificador de contato.
+
+O menu, a perda de foco e a desconexão liberam o contato. Depois disso, solte View antes de começar outro gesto. As mesmas instruções ficam na aba **Entrada**, sem criar uma configuração paralela.
 
 ## Requisitos de build
 

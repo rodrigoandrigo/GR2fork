@@ -250,7 +250,6 @@ struct NetworkSettings {
     Setting<bool> shad_net_enabled{false};
     Setting<std::string> shadnet_server{"srv.shadps4.net:31313"};
     Setting<std::string> shadnet_webapi_server{"http://srv.shadps4.net:31315"};
-    Setting<std::string> signaling_info{};
     Setting<bool> enable_upnp{true};
     Setting<int> p2p_port{3658}; // 0 is any free port, 3658 is the default PS4 port. With UPnP
                                  // enabled it is forwarded on the router.
@@ -264,7 +263,6 @@ struct NetworkSettings {
             make_override<NetworkSettings>("shadnet_server", &NetworkSettings::shadnet_server),
             make_override<NetworkSettings>("shadnet_webapi_server",
                                            &NetworkSettings::shadnet_webapi_server),
-            make_override<NetworkSettings>("signaling_info", &NetworkSettings::signaling_info),
             make_override<NetworkSettings>("enable_upnp", &NetworkSettings::enable_upnp),
             make_override<NetworkSettings>("p2p_port", &NetworkSettings::p2p_port),
             make_override<NetworkSettings>("disable_https", &NetworkSettings::disable_https)};
@@ -272,8 +270,8 @@ struct NetworkSettings {
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(NetworkSettings, connected_to_network, shad_net_enabled,
-                                   shadnet_server, shadnet_webapi_server, signaling_info,
-                                   enable_upnp, p2p_port, disable_https)
+                                   shadnet_server, shadnet_webapi_server, enable_upnp, p2p_port,
+                                   disable_https)
 
 // -------------------------------
 // Log settings
@@ -361,6 +359,7 @@ struct InputSettings {
     Setting<s32> camera_id{-1};
     Setting<bool> use_mice_as_mice{false};
     Setting<bool> use_keyboard_as_keyboard{false};
+    Setting<bool> vibration_enabled{true}; // specific
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -384,7 +383,8 @@ struct InputSettings {
             make_override<InputSettings>("camera_id", &InputSettings::camera_id),
             make_override<InputSettings>("use_mice_as_mice", &InputSettings::use_mice_as_mice),
             make_override<InputSettings>("use_keyboard_as_keyboard",
-                                         &InputSettings::use_keyboard_as_keyboard)};
+                                         &InputSettings::use_keyboard_as_keyboard),
+            make_override<InputSettings>("vibration_enabled", &InputSettings::vibration_enabled)};
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_timeout,
@@ -393,7 +393,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_time
                                    gyro_invert_x, gyro_invert_roll, use_unified_input_config,
                                    default_controller_id, background_controller_input,
                                    ime_accessibility_enabled, ime_url_mail_short_panel, camera_id,
-                                   is_circle_enter, use_mice_as_mice, use_keyboard_as_keyboard)
+                                   is_circle_enter, use_mice_as_mice, use_keyboard_as_keyboard,
+                                   vibration_enabled)
 // -------------------------------
 // Audio settings
 // -------------------------------
@@ -471,12 +472,10 @@ struct GPUSettings {
     // 5 s. Without it the OS can park a busy thread on the command thread's sibling hyperthread,
     // which costs it a quarter to a third of its speed. Hosts with fewer than 6 logical CPUs or
     // 4 physical cores are left alone.
-    Setting<bool> gpu_thread_core_reserve{true};
-    // Windows only. Restrict the whole process to the first logical CPU of every physical core,
-    // the same thing as ticking only the even CPUs in Task Manager: no two emulator or guest
-    // threads can then share a core. Windows otherwise packs busy threads onto both hyperthreads
-    // of a few cores while others idle. Works together with gpu_thread_core_reserve.
-    Setting<bool> one_thread_per_core{false};
+    Setting<bool> one_core_gpu_thread_pin{false};
+    // Record the draw scheduler's Vulkan commands and issue its queue submits on a dedicated
+    // thread; the GPU command thread stores each call as a closure instead of calling the driver.
+    Setting<bool> vk_record_thread{true};
     // Rebuild the vertex input layout only when the pipeline, the instance step rates or an
     // attribute's format or stride changed, instead of on every draw.
     Setting<bool> vertex_layout_memo{true};
@@ -493,9 +492,10 @@ struct GPUSettings {
     // Look at the CPU modified bits of a read-only bind before taking the tracker lock, and skip
     // the locked walk over them when none is set.
     Setting<bool> clean_sync_peek{true};
-    // The GPU command thread submits a readback download without waiting for it; the faulting
-    // thread waits and writes the bytes back. A GPU write marked in the window meanwhile keeps
-    // the window GPU modified for the next fault.
+    // The faulting thread performs its readback and the GPU command thread never waits for it:
+    // retired GPU writes are read straight out of a host visible arena, otherwise a copy lane with
+    // a queue of its own copies them; a GPU write marked in the window meanwhile keeps its pages
+    // GPU modified.
     Setting<bool> readback_offload{false};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
@@ -725,6 +725,7 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
+    Setting<bool> fast_shader_math{false};
 
 #define GPU_OVERRIDE(field) make_override<GPUSettings>(#field, &GPUSettings::field)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -751,8 +752,8 @@ struct GPUSettings {
             GPU_OVERRIDE(texture_lru_lazy_touch),
             GPU_OVERRIDE(gather_input_memo),
             GPU_OVERRIDE(tracker_lock_spin_rounds),
-            GPU_OVERRIDE(gpu_thread_core_reserve),
-            GPU_OVERRIDE(one_thread_per_core),
+            GPU_OVERRIDE(one_core_gpu_thread_pin),
+            GPU_OVERRIDE(vk_record_thread),
             GPU_OVERRIDE(vertex_layout_memo),
             GPU_OVERRIDE(covered_range_skip),
             GPU_OVERRIDE(residency_bitmap),
@@ -817,6 +818,7 @@ struct GPUSettings {
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
+            make_override<GPUSettings>("fast_shader_math", &GPUSettings::fast_shader_math),
         };
     }
 #undef GPU_OVERRIDE
@@ -847,10 +849,11 @@ struct GPUSettings {
     pending_pop_throttle, stream_copy_workers, dyn_state_memo, bind_write_plan, \
     findimg_memo_first, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
     draw_glue_memo, image_fast_state, guest_copy_lock_batch, spec_fp_cache, \
-    runtime_info_stamp_gate, userfaultfd, gpu_thread_core_reserve, one_thread_per_core, \
+    runtime_info_stamp_gate, userfaultfd, \
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
-    clean_sync_peek, readback_offload
+    clean_sync_peek, readback_offload, fast_shader_math, \
+    one_core_gpu_thread_pin, vk_record_thread
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1145,7 +1148,6 @@ public:
     SETTING_FORWARD_BOOL(m_network, ConnectedToNetwork, connected_to_network)
     SETTING_FORWARD(m_network, ShadNetServer, shadnet_server)
     SETTING_FORWARD(m_network, ShadNetWebApiServer, shadnet_webapi_server)
-    SETTING_FORWARD(m_network, SignalingInfo, signaling_info)
     SETTING_FORWARD_BOOL(m_network, UPnPEnabled, enable_upnp)
     SETTING_FORWARD(m_network, P2PPort, p2p_port)
     SETTING_FORWARD_BOOL(m_network, ForcedHttpsDisabled, disable_https)
@@ -1185,8 +1187,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, TextureLruLazyTouch, texture_lru_lazy_touch)
     SETTING_FORWARD_BOOL(m_gpu, GatherInputMemo, gather_input_memo)
     SETTING_FORWARD(m_gpu, TrackerLockSpinRounds, tracker_lock_spin_rounds)
-    SETTING_FORWARD_BOOL(m_gpu, GpuThreadCoreReserve, gpu_thread_core_reserve)
-    SETTING_FORWARD_BOOL(m_gpu, OneThreadPerCore, one_thread_per_core)
+    SETTING_FORWARD_BOOL(m_gpu, OneCoreGpuThreadPin, one_core_gpu_thread_pin)
+    SETTING_FORWARD_BOOL(m_gpu, VkRecordThread, vk_record_thread)
     SETTING_FORWARD_BOOL(m_gpu, VertexLayoutMemo, vertex_layout_memo)
     SETTING_FORWARD_BOOL(m_gpu, CoveredRangeSkip, covered_range_skip)
     SETTING_FORWARD_BOOL(m_gpu, ResidencyBitmap, residency_bitmap)
@@ -1274,6 +1276,7 @@ public:
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, FastShaderMath, fast_shader_math)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
@@ -1310,6 +1313,7 @@ public:
     SETTING_FORWARD_BOOL(m_input, CircleEnter, is_circle_enter)
     SETTING_FORWARD_BOOL(m_input, MiceUsedAsMice, use_mice_as_mice)
     SETTING_FORWARD_BOOL(m_input, KeyboardUsedAsKeyboard, use_keyboard_as_keyboard)
+    SETTING_FORWARD_BOOL(m_input, VibrationEnabled, vibration_enabled)
 
     // Vulkan settings
     SETTING_FORWARD(m_vulkan, GpuId, gpu_id)

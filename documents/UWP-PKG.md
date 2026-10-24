@@ -8,7 +8,7 @@ O leitor foi adaptado de `prosperity/delta/formats/pkg_filesystem.cc`, preservan
 
 A interface exibe o formato na tabela e na grade, permite pesquisar e ordenar por formato e mostra o motivo quando um pacote não pode ser iniciado. A configuração por jogo continua identificada pelo serial e compartilha a mesma API das versões em pasta. Pacotes identificados como atualização ou DLC não são tratados como executáveis independentes.
 
-## Validação no PC
+## Validação inicial no PC
 
 Comparação de leituras do PKG com as cópias extraídas dos mesmos títulos, incluindo início, fim e offsets distribuídos em cada arquivo:
 
@@ -30,6 +30,6 @@ Execução direta dos mesmos PKGs no harness desktop com Dozen:
 
 Nos três casos: montagem inicializável, `BOOT_RESULT=0`, `SHUTDOWN=0` e `D3D_INFO_QUEUE_MESSAGES=0`. As capturas confirmam apresentação de imagem; não representam validação completa de gameplay. O seletor e a restauração da FutureAccessList foram compilados, mas não exercitados em aplicativo instalado nesta revisão.
 
-O bundle Release foi assinado com `CMS_SIGNATURE=PASS`, e seus arquivos foram comparados com o runtime e o executável produzidos pelo build. O núcleo empacotado tem SHA-256 `02cdab2cef84344ed13e1a6ee126d2e1120fe26ecc0b53b401d9ef6fa09d2d56`, igual ao núcleo usado nas execuções acima.
+O bundle Release dessa validação inicial foi assinado com `CMS_SIGNATURE=PASS`, e seus arquivos foram comparados com o runtime e o executável produzidos pelo build. O núcleo dessa revisão tem SHA-256 `02cdab2cef84344ed13e1a6ee126d2e1120fe26ecc0b53b401d9ef6fa09d2d56`, igual ao núcleo usado nas execuções acima. Revisões posteriores podem incorporar outras mudanças ao núcleo.
 
 Evidências locais ficam em `Build/pkg-*-compare.log`, `Build/pkg-*-boot.log`, `Build/pkg-frontend-build.log` e `Build/pkg-core-build.log`. Boot e apresentação em harness desktop, validação do pacote e execução instalada no Xbox são verificações distintas.

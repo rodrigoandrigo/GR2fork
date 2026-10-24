@@ -24,6 +24,9 @@ public:
     bool Map(u8* addr, u64 size, u64 offset, u32 prot, const FileSys::FileMapContext& ctx) override;
     void Stat(FileSys::FileStat& out) override;
     bool SetSize(u64 size) override;
+    void SetInode(u32 value) {
+        inode = value;
+    }
 
 private:
     s64 Transfer(void* data, u64 size, bool write);
@@ -31,6 +34,7 @@ private:
     void* handle{};
     uint32_t mode{};
     u64 position{};
+    u32 inode{};
     mutable std::recursive_mutex mutex;
 };
 
@@ -46,6 +50,7 @@ public:
     std::filesystem::path RootPath() const override;
     std::optional<std::vector<u8>> ReadFile(std::string_view relative) const override;
     FileSys::FileStat Stat(std::string_view relative) const;
+    bool Stat(std::string_view relative, FileSys::FileStat& out) override;
     void CreateSubdirectory(std::string_view relative);
     void Delete(std::string_view relative);
     void Rename(std::string_view from, std::string_view to);

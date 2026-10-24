@@ -574,9 +574,15 @@ void ImGuiFrontend::Run(std::wstring root) {
             if (game_running && pressed && !menu_pressed)
                 menu_open = !menu_open;
             menu_pressed = pressed;
+            const bool show_pointer = (!(game_running || session_pending) || menu_open || snapshot.captured);
+            if (show_pointer != pointer_visible) {
+                pointer_visible = show_pointer;
+                if (set_pointer_mode)
+                    set_pointer_mode(show_pointer);
+            }
             if (set_host_state(
                     !snapshot.suspended && snapshot.active && snapshot.visible,
-                    snapshot.captured ||
+                    snapshot.captured || snapshot.system_pointer ||
                         (game_running ? menu_open : io.NavActive || io.WantCaptureKeyboard)))
                 throw std::runtime_error(Utf8(core->Error()));
             if (snapshot.suspended || !snapshot.active || !snapshot.visible) {
@@ -1167,7 +1173,7 @@ void ImGuiFrontend::SubmitInput(const FrontendInput& snapshot) {
     Windows::Gaming::Input::GamepadReading pad{};
     try {
         const auto pads = Windows::Gaming::Input::Gamepad::Gamepads;
-        if (pads->Size && !capture) {
+        if (pads->Size && !capture && !snapshot.system_pointer) {
             pad = pads->GetAt(0)->GetCurrentReading();
             io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
         }
@@ -1593,6 +1599,7 @@ void ImGuiFrontend::StartGame() {
     active_game_path = game.path;
     const auto executable = game.executable;
     session_pending = true;
+    menu_open = false;
     status = "Iniciando jogo…";
     const auto weak = weak_from_this();
     if (!Queue([this, executable, weak] {
@@ -1757,6 +1764,12 @@ void ImGuiFrontend::DrawSettings() {
             if (requested)
                 requested_settings_group.clear();
             ImGui::BeginChild("page-options", {0, 0}, false);
+            if (std::string_view(page) == "Entrada") {
+                ImGui::TextUnformatted("Touchpad no controle Xbox");
+                ImGui::TextWrapped("Segure View e mova o analógico esquerdo para tocar e deslizar. Pressione o analógico esquerdo (L3) com View segurado para clicar. Solte View para levantar o dedo.");
+                ImGui::Separator();
+            }
+
             if (std::string_view(page) == "Gráficos") {
                 ImGui::TextUnformatted("Renderização");
                 ImGui::Separator();

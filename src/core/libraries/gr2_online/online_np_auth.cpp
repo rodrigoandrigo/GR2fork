@@ -6,7 +6,7 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/gr2_online/online_np_auth.h"
 #include "core/libraries/libs.h"
-#include "core/libraries/np/np_auth.h"
+#include "core/libraries/np/np_auth/np_auth.h"
 
 // The emulator's library defines these and keeps the requests; its header does not declare them.
 namespace Libraries::Np::NpAuth {

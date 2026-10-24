@@ -29,6 +29,8 @@ MouseMode GetMouseMode();
 void SetMouseToJoystick(int joystick);
 void SetMouseParams(float mouse_deadzone_offset, float mouse_speed, float mouse_speed_offset);
 void SetMouseGyroRollMode(bool mode);
+// While held, the mouse drives the gyro regardless of the mouse mode.
+void SetMouseGyroHold(bool held);
 // Global and per-axis (horizontal, vertical) mouse-to-joystick sensitivity multipliers.
 void SetMouseSensitivity(float global, float horizontal, float vertical);
 // Touchscreen/mouse swipes played back as PS4 touchpad swipes; independent of the mouse mode.

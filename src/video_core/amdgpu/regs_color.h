@@ -120,7 +120,7 @@ struct ColorBufferMask {
 // no bounds check. Zero-component format codes keep the default entry: skipping
 // them keeps the builder off mrt_swizzles[...][components - 1 == 0xFFFFFFFF],
 // and operator bool() rejects code 0 while no color target carries the others.
-namespace detail {
+namespace tables {
 consteval std::array<CompMapping, 128> BuildColorSwizzleLut() {
     // clang-format off
     constexpr std::array<std::array<CompMapping, 4>, 4> mrt_swizzles{{
@@ -168,7 +168,7 @@ consteval std::array<CompMapping, 128> BuildColorSwizzleLut() {
     return lut;
 }
 inline constexpr auto kColorSwizzleLut = BuildColorSwizzleLut();
-} // namespace detail
+} // namespace tables
 
 struct ColorBuffer {
     enum class EndianSwap : u32 {
@@ -316,7 +316,7 @@ struct ColorBuffer {
     }
 
     CompMapping Swizzle() const {
-        return detail::kColorSwizzleLut[static_cast<u32>(info.comp_swap) << 5 | info.format];
+        return tables::kColorSwizzleLut[static_cast<u32>(info.comp_swap) << 5 | info.format];
     }
 
     NumberFormat GetFixedNumberFormat() const {

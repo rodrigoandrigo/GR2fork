@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "DirectXPage.xaml.h"
+#include "UwpDiagnostics.h"
 #include <algorithm>
 #include <ppltasks.h>
 using namespace concurrency;
@@ -27,14 +28,30 @@ std::string Utf8(const std::wstring& text) {
 }
 } // namespace
 DirectXPage::DirectXPage() {
-    InitializeComponent();
+    UwpDiagnostics::Record("main_page_xaml_initializing");
+    try {
+        InitializeComponent();
+        UwpDiagnostics::Record("main_page_xaml_initialized");
+    } catch (Exception^ error) {
+        UwpDiagnostics::Write(UwpDiagnostics::crash_file, "main_page_xaml_failed hresult", static_cast<uint32_t>(error->HResult));
+        UwpDiagnostics::Text(UwpDiagnostics::crash_file, "main_page_xaml_message", error->Message->Data());
+        throw;
+    }
 }
 void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
+    UwpDiagnostics::Record("main_page_loaded");
     if (frontend)
         return;
     frontend = std::make_shared<ImGuiFrontend>(swapChainPanel, gameSwapChainPanel);
     WeakReference weak(this);
     const auto dispatch = Dispatcher;
+    frontend->set_pointer_mode = [weak, dispatch](bool visible) {
+        dispatch->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([weak, visible] {
+            if (auto page = weak.Resolve<DirectXPage>())
+                if (page->frontend)
+                    page->SetPointerMode(visible);
+        }));
+    };
     frontend->toggle_fullscreen = [dispatch] {
         dispatch->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([] {
             const auto view = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView();
@@ -72,6 +89,7 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
                 if (auto page = weak.Resolve<DirectXPage>()) {
                     page->statusText->Text = ref new String(message.c_str());
                     page->statusText->Visibility = Windows::UI::Xaml::Visibility::Visible;
+                    page->SetPointerMode(true);
                 }
             }));
     };
@@ -88,7 +106,7 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
         ref new Windows::Foundation::TypedEventHandler < CoreWindow ^
         , WindowActivatedEventArgs ^
               > ([weak](CoreWindow ^, WindowActivatedEventArgs ^ args) {
-                    if (auto page = weak.Resolve<DirectXPage>())
+                    if (auto page = weak.Resolve<DirectXPage>()) {
                         if (page->frontend)
                             page->frontend->UpdateInput([&](FrontendInput& input) {
                                 input.active = args->WindowActivationState !=
@@ -100,6 +118,9 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
                                     input.wheel = 0;
                                 }
                             });
+                        if (args->WindowActivationState != CoreWindowActivationState::Deactivated)
+                            page->SetPointerMode(page->pointer_visible);
+                    }
                 });
     down_token = window->KeyDown += ref new Windows::Foundation::TypedEventHandler < CoreWindow ^,
     KeyEventArgs ^ > ([weak](CoreWindow ^, KeyEventArgs ^ args) {
@@ -194,6 +215,11 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
                     page->frontend->SetFolders(*roots);
         },
         task_continuation_context::use_current());
+    dispatch->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([weak] {
+        if (auto page = weak.Resolve<DirectXPage>())
+            if (page->frontend)
+                page->SetPointerMode(page->pointer_visible);
+    }));
 }
 void DirectXPage::OnUnloaded(Object ^, RoutedEventArgs ^) {
     if (display_information) {
@@ -214,6 +240,7 @@ void DirectXPage::OnUnloaded(Object ^, RoutedEventArgs ^) {
     }
 }
 void DirectXPage::Capture(bool captured) {
+    dialog_open = captured;
     if (frontend)
         frontend->UpdateInput([&](FrontendInput& input) {
             input.captured = captured;
@@ -221,6 +248,34 @@ void DirectXPage::Capture(bool captured) {
             input.characters.clear();
             input.left = input.right = false;
             input.wheel = 0;
+        });
+    if (!captured)
+        SetPointerMode(pointer_visible);
+}
+void DirectXPage::SetPointerMode(bool visible) {
+    pointer_visible = visible;
+    if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily != "Windows.Xbox")
+        return;
+    interfacePage->IsHitTestVisible = visible;
+    interfacePage->IsTabStop = visible;
+    interfacePage->IsEnabled = visible;
+    if (dialog_open)
+        return;
+    bool focused = false;
+    try {
+        focused = visible ? interfacePage->Focus(Windows::UI::Xaml::FocusState::Programmatic)
+                          : Focus(Windows::UI::Xaml::FocusState::Programmatic);
+        UwpDiagnostics::Record("xbox_pointer_page visible/focused", visible, focused);
+    } catch (Exception^ error) {
+        UwpDiagnostics::Record("xbox_pointer_page_failed hresult", static_cast<uint32_t>(error->HResult));
+        UwpDiagnostics::Text(UwpDiagnostics::session_file, "xbox_pointer_page_message", error->Message->Data());
+    }
+    if (frontend)
+        frontend->UpdateInput([visible, focused](FrontendInput& input) {
+            input.system_pointer = visible && focused;
+            input.left = input.right = false;
+            input.wheel = 0;
+            input.x = input.y = -10000;
         });
 }
 void DirectXPage::OnPointer(Object ^, Windows::UI::Xaml::Input::PointerRoutedEventArgs ^ args) {

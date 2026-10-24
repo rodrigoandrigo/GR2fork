@@ -928,7 +928,7 @@ void ControllerOutput::AddUpdate(InputEvent event) {
 
     } else if (axis != SDL_GAMEPAD_AXIS_INVALID) {
         *new_param = (event.active ? event.axis_value : 0) + *new_param;
-        analog_source |= event.input.type == InputType::Axis;
+        analog_source |= event.analog_source;
     }
 }
 
@@ -1109,6 +1109,18 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         case MOUSE_GYRO_ROLL_MODE:
             SetMouseGyroRollMode(new_button_state);
             break;
+        case MOUSE_GYRO_HOLD:
+            SetMouseGyroHold(new_button_state);
+            break;
+        case MOTION_TILT_LEFT:
+            controller->SetMotionTilt(1, new_button_state);
+            break;
+        case MOTION_TILT_RIGHT:
+            controller->SetMotionTilt(-1, new_button_state);
+            break;
+        case MOTION_SHAKE:
+            controller->SetMotionShake(new_button_state);
+            break;
         default: // is a normal key (hopefully)
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
@@ -1260,6 +1272,7 @@ InputEvent BindingConnection::ProcessBinding() {
                 }
                 if (pressed_it->first.input.type == InputType::Axis) {
                     event.axis_value = pressed_it->first.axis_value;
+                    event.analog_source = true;
                 }
                 ++pressed_it;
                 break;

@@ -3,13 +3,15 @@
 
 #pragma once
 
-#include <numeric>
+#include <atomic>
 #include <utility>
+#include <boost/container/small_vector.hpp>
 
 #include "common/adaptive_mutex.h"
 #include "common/cpu_pause.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
+#include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 
@@ -95,8 +97,7 @@ class RegionManager {
 public:
     explicit RegionManager(PageManager* tracker_, VAddr cpu_addr_)
         : tracker{tracker_}, cpu_addr{cpu_addr_},
-          readbacks_mode{EmulatorSettings.GetReadbacksMode()},
-          readback_offload{EmulatorSettings.IsReadbackOffload()} {
+          readbacks_mode{EmulatorSettings.GetReadbacksMode()} {
         cpu.Fill(true);
         gpu.Fill(false);
     }
@@ -180,6 +181,35 @@ public:
         }
     }
 
+    /// ChangeRegionState over the pages a word mask selects, under the lock the caller holds.
+    template <StateOp cpu_op, StateOp gpu_op>
+    void ChangeRegionStateMasked(const std::array<u64, NUM_REGION_WORDS>& pages) {
+        bool update_watchers{};
+        // The watcher update reads every word between the first and the last changed one, and
+        // only the words the mask selects are computed below.
+        RegionBits write_prot{};
+        RegionBits read_prot{};
+        Bounds watcher_bounds = MIN_BOUNDS;
+        for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+            if (pages[index] != 0) {
+                update_watchers |= UpdateProtection<cpu_op, gpu_op>(
+                    write_prot, read_prot, watcher_bounds, index, pages[index]);
+            }
+        }
+        const auto write_op = GetPageOp<Type::CPU>(cpu_op);
+        const auto read_op = GetPageOp<Type::GPU>(gpu_op);
+        update_watchers &= write_op != PageOp::None || read_op != PageOp::None;
+        if (update_watchers) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
+                                                 write_op, read_op);
+        }
+        for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+            if (pages[index] != 0) {
+                UpdateState<cpu_op, gpu_op>(index, pages[index]);
+            }
+        }
+    }
+
     template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true>
     void ForEachModifiedRange(u64 offset, s64 size, auto&& func) {
         auto bounds = GetBounds(offset, size);
@@ -251,23 +281,113 @@ public:
         }
     }
 
-    /// Sums the GPU write sequences of the words covering a range. Each sequence only grows, so
-    /// the sum changes whenever a GPU write is marked in the range.
-    u64 GpuWriteSeq(u64 offset, u64 size) const noexcept {
-        const auto bounds = GetBounds(offset, size);
-        return std::accumulate(gpu_write_seq.begin() + bounds.start_word,
-                               gpu_write_seq.begin() + bounds.end_word + 1, u64{0});
-    }
-
-    void Lock(const Bounds& bounds) noexcept {
+    void Lock() noexcept {
         mutex.lock();
     }
 
-    void Unlock(const Bounds& bounds) noexcept {
+    void Unlock() noexcept {
         mutex.unlock();
     }
 
+    /// Stamps a GPU written range with the tick of the batch holding the write.
+    void StampGpuWrite(u64 offset, u64 size, u64 tick) {
+        std::scoped_lock lk{mutex};
+        gpu_writes.Set(cpu_addr + offset, size, tick);
+    }
+
+    /// Calls func(begin, end, tick) for each GPU write of the range, under the region lock.
+    void ForEachGpuWrite(u64 offset, u64 size, auto&& func) {
+        std::scoped_lock lk{mutex};
+        gpu_writes.ForEachInRange(cpu_addr + offset, size, func);
+    }
+
+    /// Erases the GPU writes of the page aligned range that are stamped up to known_tick and
+    /// clears the pages left without a newer one.
+    void ConsumeGpuWrites(u64 offset, u64 size, u64 known_tick) {
+        std::array<u64, NUM_REGION_WORDS> consumed{};
+        std::array<u64, NUM_REGION_WORDS> kept{};
+        const auto mark_pages = [&](std::array<u64, NUM_REGION_WORDS>& pages, VAddr begin,
+                                    VAddr end) {
+            IterateWords(GetBounds(begin - cpu_addr, end - begin),
+                         [&](u64 index, u64 mask) { pages[index] |= mask; });
+        };
+        boost::container::small_vector<std::pair<VAddr, u64>, 32> erased;
+        // A write stamped meanwhile either shows up here with a newer tick and keeps its pages,
+        // or finds the pages clear afterwards and sets them again.
+        std::scoped_lock lk{mutex};
+        gpu_writes.ForEachInRange(cpu_addr + offset, size, [&](VAddr begin, VAddr end, u64 tick) {
+            if (tick <= known_tick) {
+                mark_pages(consumed, begin, end);
+                erased.emplace_back(begin, end - begin);
+            } else {
+                mark_pages(kept, begin, end);
+            }
+        });
+        for (const auto& [begin, erased_size] : erased) {
+            gpu_writes.Subtract(begin, erased_size);
+        }
+        for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+            consumed[index] &= ~kept[index];
+        }
+        ChangeRegionStateMasked<StateOp::None, StateOp::Clear>(consumed);
+    }
+
+    /// Erases the GPU writes of the range.
+    void SubtractGpuWrites(u64 offset, u64 size) {
+        std::scoped_lock lk{mutex};
+        gpu_writes.Subtract(cpu_addr + offset, size);
+    }
+
+    /// Clears the GPU modified pages of the range and erases its GPU writes in one step.
+    template <StateOp cpu_op>
+    void UnmarkGpuModified(u64 offset, u64 size) {
+        std::scoped_lock lk{mutex};
+        ChangeRegionState<cpu_op, StateOp::Clear, false>(offset, size);
+        gpu_writes.Subtract(cpu_addr + offset, size);
+    }
+
+    /// Holds the words of the range for a readback, waiting until no other readback holds any
+    /// of them.
+    void AcquireReadback(u64 offset, u64 size) noexcept {
+        const u64 mask = WordMask(offset, size);
+        u64 held = readback_words.load(std::memory_order_relaxed);
+        while (true) {
+            if ((held & mask) == 0) {
+                if (readback_words.compare_exchange_weak(held, held | mask,
+                                                         std::memory_order_acquire)) {
+                    return;
+                }
+                continue;
+            }
+            // A release that cleared the words before the waiter count went up is seen by
+            // the second load; one after it bumps readback_wakes.
+            readback_waiters.fetch_add(1);
+            const u32 wakes = readback_wakes.load();
+            if ((readback_words.load() & mask) != 0) {
+                readback_wakes.wait(wakes);
+            }
+            readback_waiters.fetch_sub(1, std::memory_order_relaxed);
+            held = readback_words.load(std::memory_order_relaxed);
+        }
+    }
+
+    void ReleaseReadback(u64 offset, u64 size) noexcept {
+        readback_words.fetch_and(~WordMask(offset, size));
+        if (readback_waiters.load() != 0) {
+            readback_wakes.fetch_add(1);
+            readback_wakes.notify_all();
+        }
+    }
+
 private:
+    static_assert(NUM_REGION_WORDS == 64);
+
+    /// The words a range covers, one bit per word.
+    static constexpr u64 WordMask(u64 offset, u64 size) {
+        const Bounds bounds = GetBounds(offset, size);
+        return ((u64{2} << bounds.end_word) - 1) & ~((u64{1} << bounds.start_word) - 1);
+    }
+
     template <StateOp op>
     constexpr static u64 Apply(u64 word, u64 mask) {
         if constexpr (op == StateOp::Clear) {
@@ -321,9 +441,6 @@ private:
         }
         if constexpr (gpu_op != StateOp::None) {
             gpu[index] = Apply<gpu_op>(gpu[index], mask);
-            if constexpr (gpu_op == StateOp::Set) {
-                ++gpu_write_seq[index];
-            }
             gpu.set_summary =
                 gpu[index] ? (gpu.set_summary | summary_bit) : (gpu.set_summary & ~summary_bit);
             gpu.clear_summary = gpu[index] != ~u64{0} ? (gpu.clear_summary | summary_bit)
@@ -372,9 +489,7 @@ private:
         if constexpr (iter_type == Type::GPU) {
             return any_set(gpu);
         } else if constexpr (gpu_op == StateOp::Set) {
-            // With readback_offload a mark of pages already GPU modified still advances
-            // gpu_write_seq, so it is never skipped.
-            return readback_offload || any_clear(gpu);
+            return any_clear(gpu);
         } else if constexpr (gpu_op == StateOp::Clear) {
             return any_set(gpu);
         } else {
@@ -414,12 +529,17 @@ private:
     PageManager* tracker;
     VAddr cpu_addr{};
     u32 readbacks_mode;
-    bool readback_offload{};
     RegionBits cpu;
     RegionBits gpu;
-    /// Advanced by every GPU mark of a word, including marks of pages already GPU modified.
-    std::array<u64, NUM_REGION_WORDS> gpu_write_seq{};
     RegionLock mutex;
+    /// GPU written ranges of the region with the scheduler tick of the batch holding the write;
+    /// the newest write of a byte sets its tick. Guarded by mutex.
+    RangeMap<u64> gpu_writes;
+    /// One bit per word a readback holds, from its copy to its consume.
+    std::atomic<u64> readback_words{};
+    std::atomic<u32> readback_waiters{};
+    /// Bumped by a release that finds waiters, which sleep on it.
+    std::atomic<u32> readback_wakes{};
 };
 
 } // namespace VideoCore

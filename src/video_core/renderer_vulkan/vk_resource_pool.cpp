@@ -125,6 +125,7 @@ PipelineLayoutCache::Layouts PipelineLayoutCache::Acquire(
         put(b.descriptorCount);
         put(static_cast<u32>(b.stageFlags));
     }
+    std::scoped_lock lock{mutex};
     auto [it, inserted] = layouts.try_emplace(std::move(key));
     if (inserted) {
         const auto device = instance.GetDevice();

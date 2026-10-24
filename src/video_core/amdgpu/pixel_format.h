@@ -376,7 +376,7 @@ constexpr NumberConversion MapNumberConversionCases(const NumberFormat num_fmt,
 // the compiler lowers the nested switches to mispredicting jump tables. The
 // lookup tables are built at compile time by evaluating the case bodies, so
 // the mapping stays defined in one place.
-namespace detail {
+namespace tables {
 template <auto MapFn>
 consteval std::array<std::array<u8, 64>, 16> BuildFormatLut() {
     std::array<std::array<u8, 64>, 16> lut{};
@@ -390,17 +390,17 @@ consteval std::array<std::array<u8, 64>, 16> BuildFormatLut() {
 }
 inline constexpr auto kRemapNumberFormatLut = BuildFormatLut<RemapNumberFormatCases>();
 inline constexpr auto kMapNumberConversionLut = BuildFormatLut<MapNumberConversionCases>();
-} // namespace detail
+} // namespace tables
 
 constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFormat data_format) {
     return static_cast<NumberFormat>(
-        detail::kRemapNumberFormatLut[static_cast<u32>(format) & 15]
+        tables::kRemapNumberFormatLut[static_cast<u32>(format) & 15]
                                      [static_cast<u32>(data_format) & 63]);
 }
 
 constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
                                                const DataFormat data_fmt) {
-    const u8 conv = detail::kMapNumberConversionLut[static_cast<u32>(num_fmt) & 15]
+    const u8 conv = tables::kMapNumberConversionLut[static_cast<u32>(num_fmt) & 15]
                                                    [static_cast<u32>(data_fmt) & 63];
     if (conv == kInvalidNumberConversion) {
         UNREACHABLE_MSG("num_fmt = {}, data_fmt = {}", u32(num_fmt), u32(data_fmt));

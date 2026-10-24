@@ -3,10 +3,6 @@
 
 #pragma once
 
-#include <algorithm>
-#include <mutex>
-#include <span>
-#include <vector>
 #include <boost/icl/discrete_interval.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/split_interval_map.hpp>
@@ -23,56 +19,20 @@ using RangeSetsAllocator =
     boost::fast_pool_allocator<T, boost::default_user_allocator_new_delete,
                                boost::details::pool::default_mutex, 1024, 2048>;
 
-// Node-pool mutex of the GPU-modified range set: every operation on that set
-// runs on the GPU command thread, so the lock is skipped once the setting
-// latches; the skip count feeds the WRANGE line.
-struct GpuRangeSetMutex {
-    static inline bool lockfree = false;
-    static inline u64 skips = 0;
-    void lock() {
-        if (lockfree) {
-            ++skips;
-            return;
-        }
-        mutex.lock();
-    }
-    void unlock() {
-        if (!lockfree) {
-            mutex.unlock();
-        }
-    }
-    std::mutex mutex;
-};
-
-template <class T>
-using GpuRangeSetAllocator = boost::fast_pool_allocator<T, boost::default_user_allocator_new_delete,
-                                                        GpuRangeSetMutex, 1024, 2048>;
-
-template <template <class> class Alloc>
-struct BasicRangeSet {
-    using IntervalSet = boost::icl::interval_set<
-        VAddr, std::less, ICL_INTERVAL_INSTANCE(ICL_INTERVAL_DEFAULT, VAddr, std::less), Alloc>;
+struct RangeSet {
+    using IntervalSet =
+        boost::icl::interval_set<VAddr, std::less,
+                                 ICL_INTERVAL_INSTANCE(ICL_INTERVAL_DEFAULT, VAddr, std::less),
+                                 RangeSetsAllocator>;
     using IntervalType = typename IntervalSet::interval_type;
 
-    explicit BasicRangeSet() = default;
-    ~BasicRangeSet() = default;
+    explicit RangeSet() = default;
+    ~RangeSet() = default;
 
     void Add(VAddr base_address, size_t size) {
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};
         m_ranges_set.add(interval);
-    }
-
-    using Iterator = typename IntervalSet::iterator;
-    Iterator End() {
-        return m_ranges_set.end();
-    }
-    /// Hinted insert for ascending batches: returns the node holding the
-    /// added interval, which is the hint for the next one.
-    Iterator Add(Iterator hint, VAddr base_address, size_t size) {
-        const VAddr end_address = base_address + size;
-        IntervalType interval{base_address, end_address};
-        return m_ranges_set.add(hint, interval);
     }
 
     void Subtract(VAddr base_address, size_t size) {
@@ -112,7 +72,7 @@ struct BasicRangeSet {
 
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (m_ranges_set.empty()) {
+        if (m_ranges_set.empty() || size == 0) {
             return;
         }
         const VAddr start_address = base_addr;
@@ -153,258 +113,6 @@ struct BasicRangeSet {
     IntervalSet m_ranges_set;
 };
 
-using RangeSet = BasicRangeSet<RangeSetsAllocator>;
-using GpuRangeSet = BasicRangeSet<GpuRangeSetAllocator>;
-
-// Sorted, disjoint, non-touching intervals in a vector: the canonical form of
-// the joining interval set above, with its edge semantics (a zero-size add or
-// subtract is a no-op; a zero-size query is contained).
-// GPU command thread only, like the set it stands in for.
-class FlatRangeSet {
-public:
-    struct Interval {
-        VAddr lo;
-        VAddr hi;
-    };
-    struct Stats {
-        u64 batches;
-        u64 batched;
-        u64 moved;
-        u64 subs;
-    };
-
-    /// Called once from the BufferCache constructor when the flat arm is latched on.
-    void Reserve() {
-        v_.reserve(4096);
-        scratch_.reserve(4096);
-        merged_.reserve(4096);
-    }
-
-    void Add(VAddr base, size_t size) {
-        if (size == 0) {
-            return;
-        }
-        const Interval one{base, base + size};
-        MergeRun(std::span<const Interval>{&one, 1});
-    }
-
-    /// Ascending batch sorted by (addr, size) and unique on the pair; entries
-    /// may nest or overlap, so they are coalesced with a running end first.
-    template <class T>
-    void AddSortedBatch(std::span<const T> batch) {
-        if (batch.empty()) {
-            return;
-        }
-        ++stats_.batches;
-        stats_.batched += batch.size();
-        scratch_.clear();
-        for (const auto& e : batch) {
-            if (e.size == 0) {
-                continue;
-            }
-            const VAddr lo = e.addr;
-            const VAddr hi = e.addr + e.size;
-            if (!scratch_.empty() && lo <= scratch_.back().hi) {
-                scratch_.back().hi = std::max<VAddr>(scratch_.back().hi, hi);
-            } else {
-                scratch_.push_back(Interval{lo, hi});
-            }
-        }
-        if (!scratch_.empty()) {
-            MergeRun(std::span<const Interval>{scratch_});
-        }
-    }
-
-    void Subtract(VAddr base, size_t size) {
-        if (size == 0 || v_.empty()) {
-            return;
-        }
-        ++stats_.subs;
-        const VAddr s = base;
-        const VAddr e = base + size;
-        auto it = std::upper_bound(v_.begin(), v_.end(), s,
-                                   [](VAddr x, const Interval& i) { return x < i.hi; });
-        if (it == v_.end() || it->lo >= e) {
-            return;
-        }
-        if (it->lo < s && it->hi > e) {
-            // A strictly covering interval splits in two.
-            const VAddr hi = it->hi;
-            it->hi = s;
-            stats_.moved += static_cast<u64>(v_.end() - it);
-            v_.insert(it + 1, Interval{e, hi});
-            return;
-        }
-        auto first_erase = it;
-        if (it->lo < s) {
-            it->hi = s; // the head keeps [lo, s)
-            first_erase = it + 1;
-        }
-        auto last = first_erase;
-        while (last != v_.end() && last->hi <= e) {
-            ++last;
-        }
-        if (last != v_.end() && last->lo < e) {
-            last->lo = e; // the tail keeps [e, hi)
-        }
-        stats_.moved += static_cast<u64>(v_.end() - last);
-        v_.erase(first_erase, last);
-    }
-
-    bool Contains(VAddr base, size_t size) const {
-        if (size == 0) {
-            return true;
-        }
-        const VAddr e = base + size;
-        auto it = std::upper_bound(v_.begin(), v_.end(), base,
-                                   [](VAddr x, const Interval& i) { return x < i.lo; });
-        if (it == v_.begin()) {
-            return false;
-        }
-        --it;
-        return it->hi >= e;
-    }
-
-    bool Intersects(VAddr base, size_t size) const {
-        if (size == 0 || v_.empty()) {
-            return false;
-        }
-        const VAddr e = base + size;
-        auto it = std::upper_bound(v_.begin(), v_.end(), base,
-                                   [](VAddr x, const Interval& i) { return x < i.hi; });
-        return it != v_.end() && it->lo < e;
-    }
-
-    template <typename Func>
-    void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (size == 0 || v_.empty()) {
-            return;
-        }
-        const VAddr s = base_addr;
-        const VAddr e = base_addr + size;
-        auto it = std::upper_bound(v_.begin(), v_.end(), s,
-                                   [](VAddr x, const Interval& i) { return x < i.hi; });
-        for (; it != v_.end() && it->lo < e; ++it) {
-            func(std::max<VAddr>(it->lo, s), std::min<VAddr>(it->hi, e));
-        }
-    }
-
-    template <typename Func>
-    void ForEach(Func&& func) const {
-        for (const Interval& i : v_) {
-            func(i.lo, i.hi);
-        }
-    }
-
-    u64 Size() const {
-        return v_.size();
-    }
-
-    Stats DrainStats() {
-        const Stats out = stats_;
-        stats_ = {};
-        return out;
-    }
-
-private:
-    // Merges a sorted, disjoint batch into the run of v_ it touches (every
-    // interval with hi >= batch.lo and lo <= batch.hi): the union is built in
-    // merged_ and replaces the run with one tail move.
-    void MergeRun(std::span<const Interval> in) {
-        const VAddr blo = in.front().lo;
-        const VAddr bhi = in.back().hi;
-        auto first = std::lower_bound(v_.begin(), v_.end(), blo,
-                                      [](const Interval& i, VAddr x) { return i.hi < x; });
-        auto last = std::upper_bound(first, v_.end(), bhi,
-                                     [](VAddr x, const Interval& i) { return x < i.lo; });
-        merged_.clear();
-        const auto emit = [&](Interval x) {
-            if (!merged_.empty() && x.lo <= merged_.back().hi) {
-                merged_.back().hi = std::max<VAddr>(merged_.back().hi, x.hi);
-            } else {
-                merged_.push_back(x);
-            }
-        };
-        auto a = first;
-        size_t b = 0;
-        while (a != last || b != in.size()) {
-            if (b == in.size() || (a != last && a->lo < in[b].lo)) {
-                emit(*a++);
-            } else {
-                emit(in[b++]);
-            }
-        }
-        const size_t pos = static_cast<size_t>(first - v_.begin());
-        const size_t old_n = static_cast<size_t>(last - first);
-        const size_t new_n = merged_.size();
-        const size_t common = std::min(old_n, new_n);
-        std::copy_n(merged_.begin(), common, v_.begin() + pos);
-        if (new_n > old_n) {
-            v_.insert(v_.begin() + pos + common, merged_.begin() + common, merged_.end());
-        } else if (old_n > new_n) {
-            v_.erase(v_.begin() + pos + common, v_.begin() + pos + old_n);
-        }
-        if (new_n != old_n) {
-            stats_.moved += static_cast<u64>(v_.size() - (pos + new_n));
-        }
-    }
-
-    std::vector<Interval> v_;
-    std::vector<Interval> scratch_;
-    std::vector<Interval> merged_;
-    Stats stats_{};
-};
-
-// The GPU-modified set behind one flag latched before any operation: the
-// interval tree today, the flat vector when the flag is set.
-struct GpuModifiedRangeSet {
-    static inline bool flat = false;
-    GpuRangeSet tree;
-    FlatRangeSet vec;
-
-    void Add(VAddr base, size_t size) {
-        if (flat) {
-            vec.Add(base, size);
-        } else {
-            tree.Add(base, size);
-        }
-    }
-    /// Ascending, (addr, size)-unique batch: one merge in the flat arm, the
-    /// hinted insert loop in the tree arm.
-    template <class T>
-    void AddSortedBatch(std::span<const T> batch) {
-        if (flat) {
-            vec.AddSortedBatch(batch);
-            return;
-        }
-        auto hint = tree.End();
-        for (const auto& e : batch) {
-            hint = tree.Add(hint, e.addr, e.size);
-        }
-    }
-    void Subtract(VAddr base, size_t size) {
-        if (flat) {
-            vec.Subtract(base, size);
-        } else {
-            tree.Subtract(base, size);
-        }
-    }
-    bool Contains(VAddr base, size_t size) const {
-        return flat ? vec.Contains(base, size) : tree.Contains(base, size);
-    }
-    template <typename Func>
-    void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (flat) {
-            vec.ForEachInRange(base_addr, size, std::forward<Func>(func));
-        } else {
-            tree.ForEachInRange(base_addr, size, std::forward<Func>(func));
-        }
-    }
-    u64 Size() const {
-        return flat ? vec.Size() : tree.m_ranges_set.iterative_size();
-    }
-};
-
 template <typename T>
 class RangeMap {
 public:
@@ -429,6 +137,22 @@ public:
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};
         m_ranges_map.add({interval, value});
+    }
+
+    /// Maps the range to the value, replacing the values it held; ranges that end up with equal
+    /// values join. A range already mapped to the value is left alone.
+    void Set(VAddr base_address, size_t size, const T& value) {
+        if (size == 0) {
+            return;
+        }
+        const VAddr end_address = base_address + size;
+        IntervalType interval{base_address, end_address};
+        const auto it = m_ranges_map.find(base_address);
+        if (it != m_ranges_map.end() && it->second == value &&
+            boost::icl::contains(it->first, interval)) {
+            return;
+        }
+        m_ranges_map.set({interval, value});
     }
 
     void Subtract(VAddr base_address, size_t size) {
@@ -468,7 +192,7 @@ public:
 
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (m_ranges_map.empty()) {
+        if (m_ranges_map.empty() || size == 0) {
             return;
         }
         const VAddr start_address = base_addr;
@@ -504,6 +228,10 @@ public:
         if (base_addr != end_addr) {
             func(base_addr, end_addr - base_addr);
         }
+    }
+
+    size_t Size() const {
+        return m_ranges_map.iterative_size();
     }
 
 private:
@@ -572,7 +300,7 @@ public:
 
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (m_ranges_map.empty()) {
+        if (m_ranges_map.empty() || size == 0) {
             return;
         }
         const VAddr start_address = base_addr;

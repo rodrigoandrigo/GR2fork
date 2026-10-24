@@ -87,6 +87,13 @@ public:
         VideoOut,
     };
 
+    enum class DownloadMemoryFlags : u32 {
+        None = 0,
+        Sync = 1 << 0,
+        Priority = 1 << 1,
+        DiscardBufferCache = 1 << 2,
+    };
+
     struct ImageDesc {
         // Lazy for shader-resource bindings, materialized by Info() only on routes that reach
         // FindImage. Target ctors (CB/DB/VideoOut) stay eager: FindRenderTarget and FindDepthTarget
@@ -176,7 +183,7 @@ public:
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                  Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache,
-                 PageManager& tracker);
+                 PageManager& page_manager);
     ~TextureCache();
 
     TileManager& GetTileManager() noexcept {
@@ -194,6 +201,12 @@ public:
 
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+
+    /// Marks all images as maybe GPU dirty within the provided range.
+    void MarkAsMaybeGpuDirty(VAddr addr, size_t size);
+
+    /// Marks maybe GPU dirty images in the range whose memory differs from the data to be written.
+    void MarkAsGuestMemoryChanged(VAddr addr, const void* data, u64 size);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
@@ -458,7 +471,8 @@ private:
     }
 
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    void DownloadImageMemory(ImageId image_id,
+                             DownloadMemoryFlags flags = DownloadMemoryFlags::None);
 
     /// readback_linear_images_async: records the copy of one queued image into its own staging
     /// buffer; a background thread writes the pixels to guest memory once the GPU finishes.
@@ -504,6 +518,9 @@ private:
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
 
+    /// Marks the image CPU dirty if the guest wrote to its untracked head or tail page.
+    void MarkDirtyIfEdgesModified(Image& image);
+
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
     void RegisterMeta(VAddr address, MetaDataInfo info);
@@ -516,6 +533,10 @@ private:
     /// With texture_lru_lazy_touch only the gc tick is stamped; the garbage collector
     /// walk relinks the entry when it meets it.
     void TouchImage(Image& image) {
+        // Image is still valid
+        if (image.gpu_dirty_episode.load(std::memory_order_relaxed) != 0) {
+            image.gpu_dirty_episode.store(0, std::memory_order_relaxed);
+        }
         if (lru_lazy_touch) {
             image.gc_tick_accessed_last = gc_tick;
             return;
@@ -665,6 +686,10 @@ public:
     bool BindNoopMemo() const noexcept {
         return bind_noop;
     }
+    /// Whether linear images are read back, after the per-title overrides.
+    bool ReadbackLinearImages() const noexcept {
+        return readback_linear_images;
+    }
     bool MemoFirst() const noexcept {
         return memo_first;
     }
@@ -779,7 +804,7 @@ private:
     Vulkan::Runtime& runtime;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
-    PageManager& tracker;
+    PageManager& page_manager;
     PageTable page_table;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
@@ -788,6 +813,10 @@ private:
     TileManager tile_manager;
     absl::flat_hash_map<u64, SamplerId> samplers;
     absl::flat_hash_set<ImageId> download_images;
+    boost::container::small_vector<ImageId, 8> gc_compare_images;
+    std::atomic<bool> gc_comparing{};
+    std::mutex gc_compare_mutex;
+    u64 gpu_dirty_episodes{};
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
@@ -962,5 +991,6 @@ private:
         }
     }
 };
+DECLARE_ENUM_FLAG_OPERATORS(TextureCache::DownloadMemoryFlags)
 
 } // namespace VideoCore

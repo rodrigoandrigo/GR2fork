@@ -56,6 +56,24 @@ inline void Write(HANDLE file, const char *event, uint64_t a = 0,
 inline void Record(const char *event, uint64_t a = 0, uint64_t b = 0) noexcept {
   Write(session_file, event, a, b);
 }
+inline void Text(HANDLE file, const char* stage, const wchar_t* message) noexcept {
+  if (!message)
+    return;
+  char utf8[768]{};
+  const auto length = static_cast<int>(wcsnlen_s(message, 160));
+  const auto count = WideCharToMultiByte(CP_UTF8, 0, message, length, utf8,
+                                        sizeof(utf8) - 1, nullptr, nullptr);
+  if (count <= 0)
+    return;
+  utf8[count] = 0;
+  char event[2048]{};
+  auto* cursor = event;
+  Append(cursor, stage);
+  *cursor++ = ' ';
+  Append(cursor, utf8);
+  *cursor = 0;
+  Write(file, event);
+}
 inline LONG WINAPI Unhandled(EXCEPTION_POINTERS *exception) noexcept {
   if (!reporting.test_and_set()) {
     if (exception && exception->ExceptionRecord) {

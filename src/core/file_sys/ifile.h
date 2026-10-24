@@ -30,8 +30,23 @@ struct DirEntry {
     u64 size{0};
 };
 
+struct FileIdentity {
+    enum class Kind : u8 {
+        HostFile,
+        ArchiveEntry,
+        VirtualFile,
+    };
+    Kind kind{Kind::HostFile};
+    Common::FS::FileIdentity host{};
+    u32 node{0};
+    std::string path;
+
+    bool operator==(const FileIdentity&) const = default;
+};
+
 struct FileStat {
     u64 size{0};
+    u32 inode{0};
     s64 mtime_sec{0};
     s64 mtime_nsec{0};
     s64 atime_sec{0};
@@ -200,6 +215,8 @@ public:
                                         Common::FS::FileAccessMode mode) = 0;
     virtual std::unique_ptr<IDirectory> OpenDir(std::string_view rel_path) = 0;
 
+    virtual bool Stat(std::string_view rel_path, FileStat& out) = 0;
+
     virtual bool IsReadOnly() const = 0;
     virtual std::optional<std::filesystem::path> RootHostPath() const {
         return std::nullopt;
@@ -208,6 +225,9 @@ public:
     virtual std::filesystem::path RootPath() const = 0;
     virtual std::optional<std::vector<u8>> ReadFile(std::string_view rel_path) const = 0;
 };
+
+// Equal identities get the same guest inode for the lifetime of the process.
+[[nodiscard]] std::optional<u32> GetGuestInode(const FileIdentity& identity);
 
 // True if path is a regular file with a ".zar" extension
 [[nodiscard]] bool IsZArchiveFile(const std::filesystem::path& path);

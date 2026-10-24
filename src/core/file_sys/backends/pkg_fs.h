@@ -16,10 +16,12 @@ class PkgBackend final : public IBackend {
     std::filesystem::path RootPath() const override;
     std::optional<std::vector<u8>> ReadFile(std::string_view relative) const override;
     FileStat Stat(std::string_view relative) const;
+    bool Stat(std::string_view relative, FileStat& out) override;
     bool CanBoot() const;
 
   private:
     std::shared_ptr<PkgReader> reader;
+    u32 source_inode{};
     std::map<std::string, u64> files;
     std::map<std::string, std::vector<u8>> metadata;
     std::map<std::string, std::vector<DirEntry>> directories;

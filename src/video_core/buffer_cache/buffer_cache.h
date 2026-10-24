@@ -3,18 +3,22 @@
 
 #pragma once
 
-#include <condition_variable>
+#include <atomic>
 #include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
+#include "common/enum.h"
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/texture_cache/image.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -29,6 +33,7 @@ class GraphicsPipeline;
 struct SubmitInfo;
 class Runtime;
 class StagingBufferPool;
+struct StagingBufferRef;
 } // namespace Vulkan
 
 namespace VideoCore {
@@ -36,6 +41,16 @@ namespace VideoCore {
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+class ReadbackLanes;
+
+enum class ObtainBufferFlags {
+    None = 0,
+    IsWritten = 1 << 0,
+    IsTexelBuffer = 1 << 1,
+    IgnoreStreamBuffer = 1 << 2,
+    InvalidateTextureCache = 1 << 3,
+};
+DECLARE_ENUM_FLAG_OPERATORS(ObtainBufferFlags)
 
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
@@ -46,6 +61,11 @@ class BufferCache {
     static constexpr u64 STREAM_THRESHOLD = 16_KB;
 
 public:
+    /// A readback serves the GPU writes of one window at a time.
+    static constexpr u64 READBACK_WINDOW_SIZE = 512_KB;
+    /// Readbacks own memory in units of this size, one word of the tracker's page bits.
+    static constexpr u64 READBACK_LOCK_SIZE = 256_KB;
+
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
                          TextureCache& texture_cache, PageManager& tracker);
@@ -90,13 +110,39 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
+    /// Unmark a region as modified from the GPU.
+    void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
-    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
+    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool async = false,
+                    bool assume_locks = false);
+
+    /// Flushes GPU modified ranges of the uncovered part of the edge pages of an image. The caller
+    /// owns the image's readback windows.
+    void ReadEdgeImagePages(const Image& image);
+
+    /// One downloader owns memory at a time, in units of READBACK_LOCK_SIZE: a GPU thread
+    /// download from its record to its write-back, a faulting thread from its copy to the
+    /// consume, the texture cache across an image download. Acquiring waits for the current
+    /// owners. Called on the GPU thread.
+    void AcquireWindows(VAddr device_addr, u64 size);
+    void ReleaseWindows(VAddr device_addr, u64 size);
+
+    using ReadbackCopies = boost::container::small_vector<vk::BufferCopy, 2>;
+
+    /// Appends the GPU writes of a range stamped up to tick as copies from the arena into a staging
+    /// buffer, packed behind the copies already listed. Returns the packed size of the list.
+    u64 CollectWrites(const Buffer* arena, VAddr device_addr, u64 size, u64 tick,
+                      ReadbackCopies& copies);
+
+    /// Writes the copies of a staging buffer, whose host mapping starts at staging_offset, back to
+    /// guest memory.
+    void WriteBack(VAddr arena_base, const ReadbackCopies& copies, const u8* mapped,
+                   u64 staging_offset) const;
 
     /// Finds a buffer for the specified region.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
-                                                             bool is_written,
-                                                             bool is_texel_buffer = false);
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(
+        VAddr device_addr, u32 size, ObtainBufferFlags flags = ObtainBufferFlags::None);
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -106,6 +152,16 @@ public:
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+
+    /// Mark region as modified from the GPU
+    void MarkRegionAsGpuModified(VAddr addr, size_t size);
+
+    /// Stamps a GPU write with the tick of the open batch.
+    void StampGpuWrite(VAddr device_addr, u64 size);
+
+    /// Stamps a GPU write again and marks its pages GPU modified, for a packet whose writes a
+    /// readback consumed between its binds and its record.
+    void RestampGpuWrite(VAddr device_addr, u64 size);
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
@@ -124,6 +180,21 @@ public:
         return std::exchange(fast_stats, {});
     }
 
+    /// readback_offload telemetry, reset on read.
+    struct OffloadStats {
+        u64 faults;
+        u64 waits;
+        u64 wait_ns;
+        u64 direct;
+        u64 direct_bytes;
+        u64 lane_copies;
+        u64 lane_bytes;
+        /// Time the faulting threads spent waiting for lane copies.
+        u64 lane_wait_ns;
+        u64 flush_requests;
+    };
+    OffloadStats DrainOffloadStats();
+
 private:
     struct ArenaBinds {
         const Buffer* arena;
@@ -131,6 +202,7 @@ private:
     };
 
     ArenaBinds* BindsForArena(const Buffer* arena) {
+        std::scoped_lock lk{arena_mutex};
         auto it = std::ranges::find(pending_binds, arena, &ArenaBinds::arena);
         if (it != pending_binds.end()) {
             return std::addressof(*it);
@@ -146,31 +218,33 @@ private:
     /// True when every block in [first_block, last_block] has its residency bit set.
     bool AllResident(u64 first_block, u64 last_block) const;
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
 
-    struct Readback;
-    using DownloadCopies = boost::container::small_vector<vk::BufferCopy, 1>;
+    /// Serves a fault from the thread that took it, inside one readback window, while the GPU
+    /// thread keeps running. Returns false when the request has to take the synchronous download.
+    bool FaultReadback(VAddr device_addr, u64 size, bool is_write);
 
-    /// Moves the GPU modified ranges of a span out of gpu_modified_ranges into copies from the
-    /// arena, packed from offset 0. Returns the packed size.
-    u64 CollectDownloads(const Buffer* arena, VAddr device_addr, u64 size, DownloadCopies& copies);
+    /// Serves a fault out of the arena's host mapping: waits for the newest GPU write of the
+    /// faulting page, submitting the open batch when it holds that write (the GPU thread flushes
+    /// in place, a guest thread asks it to), then copies every retired write of the window into
+    /// guest memory and consumes it. Returns false when the synchronous download has to serve
+    /// it.
+    bool DirectReadback(VAddr device_addr);
 
-    /// Downloads a request inside one readback window while the GPU thread keeps running.
-    /// Returns false when the request has to take the synchronous download.
-    bool OffloadReadback(VAddr device_addr, u64 size, bool is_write);
+    /// A read fault taken on the GPU thread, served by DirectReadback. Returns false when the
+    /// synchronous download has to serve it.
+    bool GpuThreadReadback(VAddr device_addr, u64 size, bool is_write);
 
-    /// Records and submits the download of a readback window. Runs on the GPU thread.
-    void RecordReadback(Readback& job);
+    /// Streams a GPU written range from the arena's host mapping into guest memory. Returns false
+    /// when a block has no host mapping or the guest range has no backing.
+    bool DirectRead(VAddr device_addr, u64 size);
 
-    /// Writes a signaled readback to guest memory and unmarks its window if no GPU write was
-    /// marked in it since the copy.
-    void FinishReadback(const Readback& job);
+    /// Waits for a submitted tick, counting the waits that block.
+    void WaitForTick(u64 tick);
 
-    /// True when a pending readback window overlaps the range. Requires readback_mutex.
-    bool IsReadbackPending(VAddr addr, u64 size) const;
-
-    /// Merges the vetoed readback ranges back into gpu_modified_ranges. Requires readback_mutex.
-    void MergeReadbackReturns();
+    /// The arena holding an address and the bind semaphore value its binds signal, for the copy
+    /// lanes; nullptr while binds of the arena are still queued for the next submit.
+    const Buffer* ArenaOf(VAddr device_addr, u64& bind_tick);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -193,7 +267,10 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
-    RangeSet gpu_modified_ranges;
+    struct Range {
+        VAddr addr;
+        u64 size;
+    };
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
@@ -209,16 +286,30 @@ private:
     struct Backing : public Interval {
         vk::DeviceMemory memory;
         u64 offset;
+        /// Host mapping of the allocation; nullptr when its memory type has no host access.
+        u8* host;
         constexpr bool CanMergeWith(const Backing& other) const noexcept {
             return memory == other.memory && offset + (end - start) == other.offset;
         }
         constexpr Backing SubRange(u64 a, u64 b) const noexcept {
-            return {{a, b}, memory, offset + (a - start)};
+            return {{a, b}, memory, offset + (a - start), host};
         }
     };
+    /// Guards resident_ranges, address_space and pending_binds between the GPU thread, which
+    /// grows them, and the faulting threads, which look arenas and blocks up.
+    std::mutex arena_mutex;
     IntervalList<Backing> resident_ranges;
+    /// memory_semaphore value of the last sparse bind submission. Guarded by arena_mutex.
+    u64 last_bind_tick{};
 
-    u32 arena_memory_type_index{};
+    /// Host visible device memory for the arenas; nullopt without the offload or without a type
+    /// whose heap is the video memory.
+    std::optional<u32> arena_host_type_index;
+    /// Plain device memory, the arena type without a host visible one and the fallback once the
+    /// host visible heap is spent.
+    u32 arena_device_type_index{};
+    /// Set once a host visible allocation failed; later allocations take device memory.
+    bool arena_host_spent{};
     u32 block_size{};
     u32 block_shift{};
     u32 blocks_per_arena_page{};
@@ -231,13 +322,18 @@ private:
     FastPathStats fast_stats{};
 
     bool readback_offload{};
-    std::mutex readback_mutex;
-    std::condition_variable readback_cv;
-    /// Readback windows with a submitted download that the faulting thread has yet to finish,
-    /// at most one per window.
-    std::vector<VAddr> pending_readbacks;
-    /// Ranges of vetoed readbacks, merged back into gpu_modified_ranges on the GPU thread.
-    std::vector<std::pair<VAddr, u64>> readback_returns;
+    /// Bumped from the faulting threads and the GPU thread alike.
+    std::atomic<u64> offload_faults{};
+    std::atomic<u64> offload_waits{};
+    std::atomic<u64> offload_wait_ns{};
+    std::atomic<u64> offload_direct{};
+    std::atomic<u64> offload_direct_bytes{};
+    std::atomic<u64> offload_lane_copies{};
+    std::atomic<u64> offload_lane_bytes{};
+    std::atomic<u64> offload_lane_wait_ns{};
+    std::atomic<u64> offload_flush_requests{};
+    /// Last member: the lane threads stop before anything they use goes away.
+    std::unique_ptr<ReadbackLanes> copy_lanes;
 };
 
 } // namespace VideoCore

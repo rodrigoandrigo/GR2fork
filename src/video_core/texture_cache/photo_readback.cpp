@@ -68,7 +68,7 @@ bool PhotoReadback::DownloadOnGpuThread(Vulkan::Rasterizer& rasterizer, Frame& f
     if (download_size == 0 || download_size > MaxDownloadSize) {
         return false;
     }
-    // Same copy as the synchronous arm of TextureCache::DownloadImageMemory, one layer only.
+    // A linear single-layer, single-mip copy into host-cached staging.
     download = runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16);
     const vk::BufferImageCopy image_download = {
         .bufferOffset = download.offset,

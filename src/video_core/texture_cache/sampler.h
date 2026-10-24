@@ -30,6 +30,11 @@ public:
         return *handle;
     }
 
+    /// Gives up the handle, so its destruction can be deferred past the sampler's.
+    vk::UniqueSampler ReleaseHandle() noexcept {
+        return std::move(handle);
+    }
+
     u64 hash;
 
 private:

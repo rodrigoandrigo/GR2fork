@@ -1005,6 +1005,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .fast_shader_math = EmulatorSettings.IsFastShaderMath(),
     };
     spec_mru_perm_probe = EmulatorSettings.IsSpecMruPermProbe();
     // The stamp arms once at Liverpool construction; a runtime-enabled
@@ -2341,10 +2342,18 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
         for (auto& key : pipeline_keys) {
             if (std::holds_alternative<GraphicsPipelineKey>(key)) {
                 auto& graphics_key = std::get<GraphicsPipelineKey>(key);
-                graphics_pipelines.erase(graphics_key);
+                if (auto it = graphics_pipelines.find(graphics_key);
+                    it != graphics_pipelines.end()) {
+                    scheduler.DeferOperation([pipeline = std::move(it.value())] {});
+                    graphics_pipelines.erase(it);
+                }
             } else if (std::holds_alternative<ComputePipelineKey>(key)) {
                 auto& compute_key = std::get<ComputePipelineKey>(key);
-                compute_pipelines.erase(compute_key);
+                if (auto it = compute_pipelines.find(compute_key);
+                    it != compute_pipelines.end()) {
+                    scheduler.DeferOperation([pipeline = std::move(it.value())] {});
+                    compute_pipelines.erase(it);
+                }
             }
         }
     }

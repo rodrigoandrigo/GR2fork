@@ -26,6 +26,9 @@ extern std::list<std::pair<InputEvent, bool>> pressed_keys;
 int mouse_joystick_binding = 0;
 float mouse_deadzone_offset = 0.5, mouse_speed = 1, mouse_speed_offset = 0.1250;
 bool mouse_gyro_roll_mode = false;
+bool mouse_gyro_hold = false;
+// Hold state last applied by MousePolling, which runs on the SDL timer thread.
+bool mouse_gyro_hold_applied = false;
 Uint32 mouse_polling_id = 0;
 MouseMode mouse_mode = MouseMode::Off;
 // Mouse-to-joystick sensitivity: global multiplies both axes, the pair scales each axis; applied
@@ -150,6 +153,14 @@ void SetMouseGyroRollMode(bool mode) {
     mouse_gyro_roll_mode = mode;
 }
 
+void SetMouseGyroHold(bool held) {
+    mouse_gyro_hold = held;
+    // Joystick and gyro modes already capture the mouse.
+    if (mouse_mode != MouseMode::Joystick && mouse_mode != MouseMode::Gyro) {
+        SDL_SetWindowRelativeMouseMode(g_window->GetSDLWindow(), held);
+    }
+}
+
 void SetMouseSensitivity(float global, float horizontal, float vertical) {
     mouse_sensitivity = global;
     mouse_sensitivity_x = horizontal;
@@ -176,19 +187,33 @@ bool IsTouchpadSwipeEnabled() {
     return touchpad_swipe_enabled;
 }
 
-void EmulateJoystick(GameController* controller, u32 interval) {
-
-    Axis axis_x, axis_y;
+static bool GetMouseJoystickAxes(Axis& axis_x, Axis& axis_y) {
     switch (mouse_joystick_binding) {
     case 1:
         axis_x = Axis::LeftX;
         axis_y = Axis::LeftY;
-        break;
+        return true;
     case 2:
         axis_x = Axis::RightX;
         axis_y = Axis::RightY;
-        break;
+        return true;
     default:
+        return false;
+    }
+}
+
+static void CenterMouseJoystick(GameController* controller) {
+    Axis axis_x, axis_y;
+    if (GetMouseJoystickAxes(axis_x, axis_y)) {
+        controller->Axis(axis_x, GetAxis(-0x80, 0x7f, 0), false);
+        controller->Axis(axis_y, GetAxis(-0x80, 0x7f, 0), false);
+    }
+}
+
+void EmulateJoystick(GameController* controller, u32 interval) {
+
+    Axis axis_x, axis_y;
+    if (!GetMouseJoystickAxes(axis_x, axis_y)) {
         return; // no update needed
     }
 
@@ -323,7 +348,20 @@ void ApplyMouseInputBlockers() {
 
 Uint32 MousePolling(void* param, Uint32 id, Uint32 interval) {
     auto* controller = (GameController*)param;
-    switch (mouse_mode) {
+    if (mouse_gyro_hold != mouse_gyro_hold_applied) {
+        mouse_gyro_hold_applied = mouse_gyro_hold;
+        if (mouse_gyro_hold_applied) {
+            // The stick would keep its last deflection while the mouse drives the gyro.
+            if (mouse_mode == MouseMode::Joystick) {
+                CenterMouseJoystick(controller);
+            }
+        } else {
+            // The gyro would keep reporting the last mouse rotation.
+            constexpr float no_rotation[3] = {0.0f, 0.0f, 0.0f};
+            controller->UpdateGyro(no_rotation);
+        }
+    }
+    switch (mouse_gyro_hold_applied ? MouseMode::Gyro : mouse_mode) {
     case MouseMode::Joystick:
         EmulateJoystick(controller, interval);
         break;

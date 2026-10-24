@@ -478,6 +478,7 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     profile.max_shared_memory_size = D3D12_CS_TGSM_REGISTER_COUNT * sizeof(u32);
     profile.support_int64 = options.Int64ShaderOps;
     profile.supports_shader_stencil_export = true;
+    profile.fast_shader_math = EmulatorSettings.IsFastShaderMath();
     profile.needs_image_load_feedback = true;
     profile.needs_subword_buffer_emulation = true;
     profile.needs_signed_atomic32_emulation = true;

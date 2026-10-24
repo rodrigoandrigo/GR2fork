@@ -1,6 +1,7 @@
 #include "core/file_sys/backends/pkg_fs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -32,8 +33,9 @@ std::string Normalize(std::string_view path) {
 
 class PkgFile final : public IFile {
   public:
-    PkgFile(std::shared_ptr<PkgReader> source, const PkgReader::Node* entry, std::vector<u8> bytes)
-        : reader(std::move(source)), node(entry), data(std::move(bytes)) {}
+    PkgFile(std::shared_ptr<PkgReader> source, const PkgReader::Node* entry, std::vector<u8> bytes,
+            u32 inode)
+        : reader(std::move(source)), node(entry), data(std::move(bytes)), inode(inode) {}
     s64 Read(void* destination, u64 length) override {
         std::scoped_lock lock{mutex};
         const auto got = ReadAt(destination, position, length);
@@ -62,6 +64,9 @@ class PkgFile final : public IFile {
     bool Flush() override { return true; }
     bool IsOpen() const override { return reader != nullptr; }
     bool IsReadOnly() const override { return true; }
+    void Stat(FileStat& out) override {
+        out = {.size = Size(), .inode = inode};
+    }
     MmapPolicy GetMmapPolicy() const override { return MmapPolicy::Copy; }
     bool Map(u8* address, u64 length, u64 offset, u32 protection,
              const FileMapContext& context) override {
@@ -90,6 +95,7 @@ class PkgFile final : public IFile {
     const PkgReader::Node* node{};
     std::vector<u8> data;
     u64 position{};
+    u32 inode{};
     mutable std::mutex mutex;
 };
 
@@ -110,8 +116,17 @@ class PkgDirectory final : public IDirectory {
 };
 } // namespace
 
-PkgBackend::PkgBackend(std::unique_ptr<IFile> source)
-    : reader(std::make_shared<PkgReader>(std::move(source))) {
+PkgBackend::PkgBackend(std::unique_ptr<IFile> source) {
+    FileStat stat{};
+    source->Stat(stat);
+    static std::atomic<u64> next_source{};
+    source_inode = stat.inode;
+    if (!source_inode) {
+        source_inode = GetGuestInode(FileIdentity{
+            .kind = FileIdentity::Kind::VirtualFile,
+            .path = "pkg-source:" + std::to_string(++next_source)}).value_or(0);
+    }
+    reader = std::make_shared<PkgReader>(std::move(source));
     std::vector<std::string> paths;
     reader->Paths(paths);
     for (const auto& path : paths) {
@@ -178,7 +193,8 @@ std::unique_ptr<IFile> PkgBackend::Open(std::string_view relative,
         return nullptr;
     const auto found = metadata.find(path);
     return std::make_unique<PkgFile>(reader, reader->Find(path.c_str()),
-                                     found == metadata.end() ? std::vector<u8>{} : found->second);
+                                     found == metadata.end() ? std::vector<u8>{} : found->second,
+                                     Stat(path).inode);
 }
 std::unique_ptr<IDirectory> PkgBackend::OpenDir(std::string_view relative) {
     const auto found = directories.find(Normalize(relative));
@@ -204,7 +220,17 @@ FileStat PkgBackend::Stat(std::string_view relative) const {
         result.size = found->second;
     else
         throw std::runtime_error("Arquivo não encontrado no PKG.");
+    result.inode = GetGuestInode(FileIdentity{
+        .kind = FileIdentity::Kind::VirtualFile,
+        .host = {.device = source_inode},
+        .path = path}).value_or(0);
     return result;
+}
+bool PkgBackend::Stat(std::string_view relative, FileStat& out) {
+    if (!Exists(relative))
+        return false;
+    out = Stat(relative);
+    return out.inode != 0;
 }
 bool PkgBackend::CanBoot() const { return reader->Valid() && files.contains("eboot.bin"); }
 } // namespace Core::FileSys

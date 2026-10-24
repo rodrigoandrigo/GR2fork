@@ -30,7 +30,7 @@ void SetThreadName(void* thread, const char* name);
 /// Linux and Windows; a no-op returning false elsewhere.
 bool SetCurrentThreadAffinityMask(u64 mask);
 
-/// Turns the GPU command thread core reservation on (gpu_thread_core_reserve). While it is off
+/// Turns the GPU command thread core reservation on (one_core_gpu_thread_pin). While it is off
 /// every mask below reads 0 and the walk does nothing.
 void SetCoreReservationEnabled(bool enabled);
 
@@ -46,10 +46,6 @@ unsigned ExcludeReservedCoresFromAllOtherThreads();
 
 /// Re-runs the walk every 5 s: Windows threads do not inherit their creator's affinity.
 void StartPeriodicAffinityRewalk();
-
-/// one_thread_per_core: Windows only, a no-op elsewhere. Restricts the process to the first
-/// logical CPU of every physical core. Call before the emulator's threads exist.
-void RestrictProcessToOneThreadPerCore();
 
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    bool interruptible);

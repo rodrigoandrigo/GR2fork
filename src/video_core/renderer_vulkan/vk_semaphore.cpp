@@ -62,7 +62,14 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WaitTimeout) != vk::Result::eSuccess) {
+    while (true) {
+        const auto result = instance.GetDevice().waitSemaphores(&wait_info, WaitTimeout);
+        if (result == vk::Result::eSuccess) {
+            break;
+        }
+        if (result != vk::Result::eTimeout) {
+            Check(result);
+        }
     }
     Refresh();
 }

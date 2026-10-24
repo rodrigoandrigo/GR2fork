@@ -58,6 +58,7 @@ struct Profile {
     bool needs_signed_atomic32_emulation{};
     bool needs_inline_vertex_fetch{};
     bool needs_unified_buffer_types{};
+    bool fast_shader_math{};
 
     bool operator==(const Profile&) const = default;
 };

@@ -24,6 +24,8 @@ std::string Unsupported(std::string_view group, std::string_view key, const json
         return "As ferramentas de validação/captura desktop não estão incluídas no pacote UWP.";
     if (group == "GPU" && key == "userfaultfd")
         return "userfaultfd é uma API Linux, indisponível no UWP.";
+    if (group == "GPU" && key == "one_core_gpu_thread_pin")
+        return "A afinidade dos processadores é controlada pelo sistema no AppContainer.";
     if (group == "GPU" && key == "direct_memory_access_enabled")
         return "O Dozen usa descritores com limites; acesso BDA direto não está habilitado neste caminho.";
     if (group == "General") {

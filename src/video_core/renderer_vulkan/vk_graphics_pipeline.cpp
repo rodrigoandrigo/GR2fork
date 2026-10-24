@@ -33,7 +33,7 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
-    SerializationSupport& sdata, bool preloading)
+    SerializationSupport& sdata, bool preloading, std::span<const AmdGpu::Buffer> vertex_sharps)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, layouts}, key{key_} {
     if (fetch_shader_) {
         fetch_shader = *fetch_shader_;
@@ -48,8 +48,15 @@ GraphicsPipeline::GraphicsPipeline(
         VertexInputs<AmdGpu::Buffer> guest_buffers;
         if (!instance.IsVertexInputDynamicState()) {
             const auto& vs_info = runtime_infos[u32(Shader::SwStage::Vertex)].sw.vs;
-            GetVertexInputs(sdata.vertex_attributes, sdata.vertex_bindings, sdata.divisors,
-                            guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1);
+            // A compile worker is handed the sharps read at its draw, as the guest may have
+            // rewritten the memory they come from since.
+            if (!vertex_sharps.empty()) {
+                GetVertexInputs(sdata.vertex_attributes, sdata.vertex_bindings, sdata.divisors,
+                                vertex_sharps, vs_info.step_rate_0, vs_info.step_rate_1);
+            } else {
+                GetVertexInputs(sdata.vertex_attributes, sdata.vertex_bindings, sdata.divisors,
+                                guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1);
+            }
         }
     }
 

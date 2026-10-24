@@ -105,6 +105,10 @@ public:
     }
     void OwnRasterizer(std::unique_ptr<VideoCore::GpuCommandSink> renderer);
 
+    VideoCore::GpuCommandSink* GetRasterizer() const noexcept {
+        return rasterizer;
+    }
+
     /// True when a submit or a queued command is waiting for the parser. Work
     /// the GPU command thread runs while otherwise idle polls this to yield.
     bool HasPendingWork() const noexcept {
@@ -242,12 +246,12 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    Task ProcessGraphics(std::span<const u32> dcb);
     /// Consumes every graphics packet whose handling cannot suspend the parser.
     /// Returns empty when dcb is exhausted, else the cursor on the unconsumed
     /// packet the coroutine must handle. Out of line by contract: inlined back
     /// into the coroutine, `this` becomes an escaped-frame load again.
-    SHAD_NO_INLINE std::span<const u32> RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
+    SHAD_NO_INLINE std::span<const u32> RunGraphicsPackets(std::span<const u32> dcb,
                                                            uintptr_t base_addr);
     // The two hottest packet arms, shared by the pre-dispatch fast path and
     // their switch cases so the routes cannot drift. The hot bodies inline into
@@ -274,6 +278,7 @@ private:
         }
     }
     void DrainCommands();
+    void ProcessCeQueue();
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
@@ -286,6 +291,7 @@ private:
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
+    std::queue<Task::Handle> ce_submits;
     u32 num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
@@ -297,18 +303,11 @@ private:
     bool reg_run_{};
 
     struct ConstantEngine {
-        void Reset() {
-            ce_count = 0;
-            de_count = 0;
-            ce_compare_count = 0;
-        }
-
         [[nodiscard]] u32 Diff() const {
             ASSERT_MSG(ce_count >= de_count, "DE counter is ahead of CE");
             return ce_count - de_count;
         }
 
-        u32 ce_compare_count{};
         u32 ce_count{};
         u32 de_count{};
         static std::array<u8, 48_KB> constants_heap;

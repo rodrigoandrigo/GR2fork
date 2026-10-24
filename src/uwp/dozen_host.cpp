@@ -207,24 +207,28 @@ void DozenHost::Render() {
     auto cmdbuf = scheduler.CommandBuffer();
     const vk::ImageSubresourceRange range{
         .aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1};
-    const vk::ImageMemoryBarrier barrier{.dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+    const vk::ImageMemoryBarrier2 barrier{.srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
+                                         .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                         .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
                                          .oldLayout = vk::ImageLayout::eUndefined,
                                          .newLayout = vk::ImageLayout::eTransferDstOptimal,
                                          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                                          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                                          .image = chain.Image(),
                                          .subresourceRange = range};
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                           vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, barrier);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                               .pImageMemoryBarriers = &barrier});
     cmdbuf.clearColorImage(chain.Image(), vk::ImageLayout::eTransferDstOptimal,
                            vk::ClearColorValue{std::array<float, 4>{0, 0, 0, 1}}, range);
     auto present_barrier = barrier;
-    present_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    present_barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+    present_barrier.dstStageMask = vk::PipelineStageFlagBits2::eBottomOfPipe;
+    present_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
     present_barrier.dstAccessMask = {};
     present_barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
     present_barrier.newLayout = vk::ImageLayout::ePresentSrcKHR;
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                           vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, {}, present_barrier);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                               .pImageMemoryBarriers = &present_barrier});
     Vulkan::SubmitInfo info{};
     info.AddWait(chain.GetImageAcquiredSemaphore());
     info.AddSignal(chain.GetPresentReadySemaphore());

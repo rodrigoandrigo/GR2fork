@@ -16,7 +16,11 @@
 #include <io.h>
 #include <share.h>
 #include <windows.h>
+#ifdef SHADPS4_UWP
+#include <fileapifromapp.h>
+#endif
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -31,6 +35,84 @@ namespace Common::FS {
 namespace fs = std::filesystem;
 
 namespace {
+
+#ifdef _WIN32
+
+std::optional<FileInfo> GetFileInfoFromHandle(HANDLE handle) {
+#ifdef SHADPS4_UWP
+    FILE_STANDARD_INFO stat{};
+    FILE_BASIC_INFO basic{};
+    if (!GetFileInformationByHandleEx(handle, FileStandardInfo, &stat, sizeof(stat)) ||
+        !GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic))) {
+        return std::nullopt;
+    }
+#else
+    BY_HANDLE_FILE_INFORMATION stat{};
+    FILE_BASIC_INFO basic{};
+    if (!GetFileInformationByHandle(handle, &stat) ||
+        !GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic))) {
+        return std::nullopt;
+    }
+#endif
+    FileInfo info{};
+    FILE_ID_INFO id{};
+    if (GetFileInformationByHandleEx(handle, FileIdInfo, &id, sizeof(id))) {
+        info.identity.device = id.VolumeSerialNumber;
+        std::memcpy(&info.identity.file_lo, id.FileId.Identifier, sizeof(u64));
+        std::memcpy(&info.identity.file_hi, id.FileId.Identifier + sizeof(u64), sizeof(u64));
+    } else {
+#ifdef SHADPS4_UWP
+        return std::nullopt;
+#else
+        info.identity.device = stat.dwVolumeSerialNumber;
+        info.identity.file_lo = (u64{stat.nFileIndexHigh} << 32) | stat.nFileIndexLow;
+#endif
+    }
+#ifdef SHADPS4_UWP
+    info.size = static_cast<u64>(stat.EndOfFile.QuadPart);
+    info.is_directory = stat.Directory;
+#else
+    info.size = (u64{stat.nFileSizeHigh} << 32) | stat.nFileSizeLow;
+    info.is_directory = (stat.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#endif
+    const auto set_time = [](const LARGE_INTEGER& time, s64& seconds, s64& nanoseconds) {
+        const u64 ticks = static_cast<u64>(time.QuadPart);
+        seconds = static_cast<s64>(ticks / 10'000'000) - 11'644'473'600;
+        nanoseconds = static_cast<s64>(ticks % 10'000'000) * 100;
+    };
+    set_time(basic.LastWriteTime, info.mtime_sec, info.mtime_nsec);
+    set_time(basic.LastAccessTime, info.atime_sec, info.atime_nsec);
+    set_time(basic.ChangeTime, info.ctime_sec, info.ctime_nsec);
+    return info;
+}
+
+#else
+
+FileInfo GetFileInfoFromStat(const struct stat& stat) {
+    FileInfo info{};
+    info.identity.device = static_cast<u64>(stat.st_dev);
+    info.identity.file_lo = static_cast<u64>(stat.st_ino);
+    info.size = static_cast<u64>(stat.st_size);
+    info.is_directory = S_ISDIR(stat.st_mode);
+#ifdef __APPLE__
+    info.mtime_sec = stat.st_mtimespec.tv_sec;
+    info.mtime_nsec = stat.st_mtimespec.tv_nsec;
+    info.atime_sec = stat.st_atimespec.tv_sec;
+    info.atime_nsec = stat.st_atimespec.tv_nsec;
+    info.ctime_sec = stat.st_ctimespec.tv_sec;
+    info.ctime_nsec = stat.st_ctimespec.tv_nsec;
+#else
+    info.mtime_sec = stat.st_mtim.tv_sec;
+    info.mtime_nsec = stat.st_mtim.tv_nsec;
+    info.atime_sec = stat.st_atim.tv_sec;
+    info.atime_nsec = stat.st_atim.tv_nsec;
+    info.ctime_sec = stat.st_ctim.tv_sec;
+    info.ctime_nsec = stat.st_ctim.tv_nsec;
+#endif
+    return info;
+}
+
+#endif
 
 #ifdef _WIN32
 
@@ -354,6 +436,53 @@ bool IOFile::SetSize(u64 size) const {
     }
 
     return set_size_result;
+}
+
+std::optional<FileInfo> GetFileInfo(const std::filesystem::path& path) {
+#ifdef _WIN32
+#ifdef SHADPS4_UWP
+    CREATEFILE2_EXTENDED_PARAMETERS parameters{sizeof(parameters)};
+    parameters.dwFileFlags = FILE_FLAG_BACKUP_SEMANTICS;
+    const HANDLE handle = CreateFile2FromAppW(
+        path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        OPEN_EXISTING, &parameters);
+#else
+    const HANDLE handle =
+        CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+#endif
+    if (handle == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    const auto info = GetFileInfoFromHandle(handle);
+    CloseHandle(handle);
+    return info;
+#else
+    struct stat stat{};
+    if (::stat(path.c_str(), &stat) != 0) {
+        return std::nullopt;
+    }
+    return GetFileInfoFromStat(stat);
+#endif
+}
+
+std::optional<FileInfo> IOFile::GetInfo() const {
+    if (!IsOpen()) {
+        return std::nullopt;
+    }
+#ifdef _WIN32
+    const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(file)));
+    if (handle == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    return GetFileInfoFromHandle(handle);
+#else
+    struct stat stat{};
+    if (::fstat(fileno(file), &stat) != 0) {
+        return std::nullopt;
+    }
+    return GetFileInfoFromStat(stat);
+#endif
 }
 
 u64 IOFile::GetSize() const {

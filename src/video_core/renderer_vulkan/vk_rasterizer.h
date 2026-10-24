@@ -105,6 +105,9 @@ public:
 
     u64 Flush() override;
     void Finish() override;
+    void RequestFlush(u64 tick) override;
+    void FlushRequested(bool force = false) override;
+    void MarkAsGuestMemoryChanged(VAddr address, const void* data, u64 size) override;
     void OnSubmit() override;
     void OnFence() override;
 
@@ -179,6 +182,9 @@ private:
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
 
+    /// Stamps the arena writes of the packet being bound with the open batch's tick. If mark is
+    /// true, their pages are marked GPU modified again as well.
+    void StampBoundWrites(bool mark);
     void ResetBindings(bool is_compute);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
@@ -237,12 +243,11 @@ private:
     u32 flush_draw_interval_{};
     u32 draws_since_flush_{};
     u64 flush_tick_{};
-    // Inside a run of draws writing readback-prone
-    // buffers, and the run's length; flushes it adds, for the log.
+    // The tick a readback thread asked RequestFlush to submit; 0 = none pending.
+    u64 flush_request_tick_{};
+    // The tick when the packet being bound started its binds, compared after its record.
+    u64 bind_tick_{};
     bool tracker_lock_spin_{};
-    bool prone_run_{};
-    u32 prone_run_draws_{};
-    u64 writer_flushes_{};
     u64 interval_flushes_{};
     // ring_drain_flush_draws: boot-latched, clamped to >= 32 and rounded up to
     // the multiple of 32 that actually fires; 0 = off.
@@ -270,9 +275,8 @@ private:
     VideoCore::Skipcache::CacheCounters dynstate_last_{};
     u64 dyn_stamp_last_{};
     u64 gfx_stamp_last_{};
-    /// Flushes at the draw interval, or now when the prone-write run the
-    /// draw just recorded belongs to is due for its flush.
-    void MaybeIntervalFlush(bool prone_write);
+    /// Flushes at the draw interval, or earlier when the GPU has run dry.
+    void MaybeIntervalFlush();
     bool bind_prefetch_{};
     // One guest-copy shared hold per packet run (guest_copy_hold_segment).
     // The hold may cover GPU waits, never a wait on a guest thread; every
