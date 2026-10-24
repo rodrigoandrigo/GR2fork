@@ -6,6 +6,7 @@
 namespace Core::Uwp {
 bool StopRequested();
 bool PauseRequested();
+std::stop_token GuestStopToken();
 void RegisterGuestWorker(std::stop_source source);
 void StopGuestWorkers();
 void SetGuestReady(bool ready);

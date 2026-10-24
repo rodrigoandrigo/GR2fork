@@ -1,20 +1,21 @@
 #pragma once
 
+#include "FrontendRenderer.h"
+#include "ShadPS4Host.h"
+#include <agile.h>
 #include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include <nlohmann/json.hpp>
-#include <agile.h>
-#include "FrontendRenderer.h"
-#include "ShadPS4Host.h"
 
 struct FrontendInput {
     std::array<bool, 256> keys{};
@@ -41,15 +42,22 @@ struct FrontendGame {
     std::string serial;
     std::string version;
     std::string metadata_path;
+    std::string region;
+    std::string firmware;
+    std::string format{"Pasta"};
+    std::string executable;
+    std::string launch_error;
+    std::string source_path;
 };
 struct FrontendRoot {
     Platform::Agile<Windows::Storage::StorageFolder> folder;
     std::string token;
     bool enabled{true};
+    Platform::Agile<Windows::Storage::StorageFile> file;
 };
 
 class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
-public:
+  public:
     explicit ImGuiFrontend(Windows::UI::Xaml::Controls::SwapChainPanel ^ panel,
                            Windows::UI::Xaml::Controls::SwapChainPanel ^ game_panel = nullptr);
     ~ImGuiFrontend();
@@ -58,13 +66,15 @@ public:
     void UpdateInput(const std::function<void(FrontendInput&)>& update);
     void SetFolder(Platform::Agile<Windows::Storage::StorageFolder> folder, std::string token);
     void SetFolders(std::vector<FrontendRoot> folders);
+    void SetPackage(Platform::Agile<Windows::Storage::StorageFile> file, std::string token);
     void ImportFolder(Platform::Agile<Windows::Storage::StorageFolder> folder, std::wstring target);
     std::function<void(std::wstring)> choose_folder;
     std::function<void(std::string, std::string, bool, std::function<void(std::string)>)> edit_text;
     std::function<void(std::wstring)> failure;
     std::function<void()> ready;
+    std::function<void()> toggle_fullscreen;
 
-private:
+  private:
     struct Setting {
         std::string group;
         std::string key;
@@ -94,8 +104,8 @@ private:
     bool Queue(std::function<void()> job, bool thumbnail = false);
     void Complete(std::function<void()> update);
     void LoadSettings(std::string profile = {}, uint64_t request = 0);
-    void SaveSetting(const Setting& setting, nlohmann::json value);
     void Scan();
+    void ReadMetadata(FrontendGame& game);
     void ChangeRoot(std::string token, bool enabled, bool remove);
     void PersistRoots();
     void Filter();
@@ -105,7 +115,11 @@ private:
     void Draw();
     void DrawLibrary();
     void DrawSettings();
+    void DrawSetting(Setting& setting);
     void DrawLogs();
+    void StartGame();
+    void ApplySettings(bool close);
+    bool ToolbarButton(const char* label, const char* icon, bool enabled = true);
     void ReportFailure(const std::wstring& message) noexcept;
     void SubmitInput(const FrontendInput& input);
     HRESULT Attach(IDXGISwapChain* chain);
@@ -141,8 +155,18 @@ private:
     std::deque<ThumbnailPixels> decoded;
     std::deque<std::string> logs;
     size_t excluded{};
-    int tab{};
-    int settings_tab{};
+    bool settings_open{}, about_open{};
+    bool show_game_list{true}, show_game_log{true}, grid_view{};
+    float icon_size{48.0f};
+    int sort_column{1};
+    bool sort_descending{};
+    float log_height{140.0f};
+    std::string launcher_layout;
+    std::string active_game_path;
+    bool restart_requested{};
+    std::string requested_settings_group;
+    std::map<std::pair<std::string, std::string>, nlohmann::json> settings_changes;
+    bool settings_saving{};
     size_t selection{};
     float ui_scale{1.0f};
     bool show_fps{};
@@ -161,6 +185,8 @@ private:
     decltype(&shadps4_set_setting) set_setting{};
     decltype(&shadps4_reset_settings) reset_settings{};
     decltype(&shadps4_mount_storage_folder) mount{};
+    decltype(&shadps4_mount_pkg) mount_pkg{};
+    decltype(&shadps4_mount_pkg_file) mount_pkg_file{};
     decltype(&shadps4_storage_enumerate) enumerate{};
     decltype(&shadps4_storage_stat) stat{};
     decltype(&shadps4_open_mounted_file) open{};

@@ -169,8 +169,17 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
                 LOG_ERROR(Kernel_Fs, "Creating {} failed, path is read-only", raw_path);
                 return -1;
             }
-            // Create a file if it doesn't exist
-            Common::FS::IOFile out(file->m_host_name, Common::FS::FileAccessMode::Create);
+            std::unique_ptr<Core::FileSys::IFile> out;
+            try {
+                out = mnt->Open(file->m_guest_name, Common::FS::FileAccessMode::Create);
+            } catch (...) {
+                LOG_ERROR(Kernel_Fs, "Creating {} failed in the filesystem backend", raw_path);
+            }
+            if (!out || !out->IsOpen()) {
+                h->DeleteHandle(handle);
+                *__Error() = POSIX_EIO;
+                return -1;
+            }
         }
     } else if (!exists) {
         // If we're not creating a file, and it doesn't exist, return ENOENT
@@ -180,14 +189,15 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
         return -1;
     }
 
-    if (mnt->IsDirectory(file->m_guest_name) || directory) {
+    const bool is_directory = mnt->IsDirectory(file->m_guest_name);
+    if (is_directory || directory) {
         // Directories can be opened even if the directory flag isn't set.
         // In these cases, error behavior is identical to the directory code path.
         directory = true;
     }
 
     if (directory) {
-        if (!mnt->IsDirectory(file->m_guest_name)) {
+        if (!is_directory) {
             // If the opened file is not a directory, return ENOTDIR.
             // This will trigger when create & directory is specified, this is expected.
             h->DeleteHandle(handle);
@@ -262,8 +272,16 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
         }
 
         if (truncate) {
-            if (auto* host = file->handle->GetHostFile()) {
-                host->SetSize(0);
+            bool resized = false;
+            try {
+                resized = file->handle->SetSize(0);
+            } catch (...) {
+                LOG_ERROR(Kernel_Fs, "Truncating {} failed in filesystem backend", raw_path);
+            }
+            if (!resized) {
+                h->DeleteHandle(handle);
+                *__Error() = POSIX_EIO;
+                return -1;
             }
         }
     }
@@ -931,6 +949,7 @@ s32 PS4_SYSV_ABI posix_ftruncate(s32 fd, s64 length) {
         return -1;
     }
 
+    std::scoped_lock lk{file->m_mutex};
     if (file->type == Core::FileSys::FileType::Device) {
         s32 result = file->device->ftruncate(length);
         if (result < 0) {
@@ -940,17 +959,23 @@ s32 PS4_SYSV_ABI posix_ftruncate(s32 fd, s64 length) {
         return result;
     }
 
-    if (file->m_host_name.empty()) {
-        *__Error() = POSIX_EACCES;
+    if (length < 0) {
+        *__Error() = POSIX_EINVAL;
         return -1;
     }
-    auto* host = file->GetHostFile();
-    if (host == nullptr) {
-        *__Error() = POSIX_EROFS;
+    if (!file->handle || file->handle->IsReadOnly()) {
+        *__Error() = POSIX_EBADF;
         return -1;
     }
-    host->SetSize(length);
-    return ORBIS_OK;
+    try {
+        if (file->handle->SetSize(length)) {
+            return ORBIS_OK;
+        }
+    } catch (...) {
+        LOG_ERROR(Kernel_Fs, "Resizing fd {} failed in filesystem backend", fd);
+    }
+    *__Error() = POSIX_EIO;
+    return -1;
 }
 
 s32 PS4_SYSV_ABI sceKernelFtruncate(s32 fd, s64 length) {

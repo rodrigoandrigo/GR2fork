@@ -692,6 +692,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     BindPipelineDedup(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), first_index,
                            s32(vertex_offset), instance_offset);
@@ -700,6 +701,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+
 
     ResetBindings(false);
     if (flush_draw_interval_ != 0) {

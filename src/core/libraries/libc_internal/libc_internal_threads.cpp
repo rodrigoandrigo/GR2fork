@@ -1,11 +1,37 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+
 #include "core/libraries/kernel/threads.h"
 #include "core/libraries/libc_internal/libc_internal_threads.h"
 #include "core/libraries/libs.h"
 
 namespace Libraries::LibcInternal {
+
+s32 PS4_SYSV_ABI internal_cxa_guard_acquire(u64* guard) {
+    std::atomic_ref<u64> state{*guard};
+    for (;;) {
+        u64 expected = 0;
+        if (state.compare_exchange_strong(expected, 0x100, std::memory_order_acquire))
+            return 1;
+        if (expected & 0xff)
+            return 0;
+        state.wait(expected, std::memory_order_acquire);
+    }
+}
+
+void PS4_SYSV_ABI internal_cxa_guard_release(u64* guard) {
+    std::atomic_ref<u64> state{*guard};
+    state.store(1, std::memory_order_release);
+    state.notify_all();
+}
+
+void PS4_SYSV_ABI internal_cxa_guard_abort(u64* guard) {
+    std::atomic_ref<u64> state{*guard};
+    state.store(0, std::memory_order_release);
+    state.notify_all();
+}
 
 void getMutexName(char* buf, u64 size, const char* name) {
     if (name != nullptr) {
@@ -56,6 +82,12 @@ s32 PS4_SYSV_ABI internal__Mtxdst(Libraries::Kernel::PthreadMutexT* mtx) {
 }
 
 void RegisterlibSceLibcInternalThreads(Core::Loader::SymbolsResolver* sym) {
+    LIB_FUNCTION("3GPpjQdAMTw", "libSceLibcInternal", 1, "libSceLibcInternal",
+                 internal_cxa_guard_acquire);
+    LIB_FUNCTION("9rAeANT2tyE", "libSceLibcInternal", 1, "libSceLibcInternal",
+                 internal_cxa_guard_release);
+    LIB_FUNCTION("2emaaluWzUw", "libSceLibcInternal", 1, "libSceLibcInternal",
+                 internal_cxa_guard_abort);
     LIB_FUNCTION("z7STeF6abuU", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Mtxinit);
     LIB_FUNCTION("pE4Ot3CffW0", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Mtxlock);
     LIB_FUNCTION("cMwgSSmpE5o", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Mtxunlock);

@@ -1387,7 +1387,9 @@ if(SHADPS4_UWP)
         message(FATAL_ERROR "Build Dozen first with scripts/build-dozen.ps1 or use scripts/build-uwp.ps1")
     endif()
     target_sources(shadps4 PRIVATE src/uwp/dozen_host.cpp src/uwp/dozen_host.h)
-    target_sources(shadps4 PRIVATE src/uwp/brokered_fs.cpp src/uwp/brokered_fs.h src/uwp/brokered_api.cpp)
+    target_sources(shadps4 PRIVATE src/uwp/brokered_fs.cpp src/uwp/brokered_fs.h src/uwp/brokered_api.cpp
+        src/core/file_sys/backends/pkg_reader.cpp src/core/file_sys/backends/pkg_reader.h
+        src/core/file_sys/backends/pkg_fs.cpp src/core/file_sys/backends/pkg_fs.h)
     target_sources(shadps4 PRIVATE src/uwp/settings_api.cpp)
     set(SHADPS4_DXC_RUNTIME_DIR "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64" CACHE PATH "DXC runtime directory")
     target_sources(shadps4 PRIVATE src/uwp/xaudio2_output.cpp

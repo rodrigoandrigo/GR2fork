@@ -14,6 +14,9 @@
 
 #include "core/net/guest_net.h"
 #include "core/net/p2p_transport.h"
+#ifdef SHADPS4_UWP
+#include "uwp/session.h"
+#endif
 
 namespace Core::Net {
 
@@ -319,18 +322,30 @@ public:
             entry_error_ = Error::NoBufs;
             return;
         }
-        std::scoped_lock lock{s_.wait_mutex};
-        waiter_.wake->Drain(); // stale signal from a previous call
-        if (s_.closing) {
-            entry_error_ = Error::BadF;
-        } else if (std::exchange(s_.pending_abort[static_cast<size_t>(side)], false)) {
-            entry_error_ = AbortedError;
-        } else {
-            s_.waiters.push_back(&waiter_);
-            registered_ = true;
+        {
+            std::scoped_lock lock{s_.wait_mutex};
+            waiter_.wake->Drain(); // stale signal from a previous call
+            if (s_.closing) {
+                entry_error_ = Error::BadF;
+            } else if (std::exchange(s_.pending_abort[static_cast<size_t>(side)], false)) {
+                entry_error_ = AbortedError;
+            } else {
+                s_.waiters.push_back(&waiter_);
+                registered_ = true;
+            }
         }
+#ifdef SHADPS4_UWP
+        stop_callback_.emplace(Uwp::GuestStopToken(), [this] {
+            std::scoped_lock lock{s_.wait_mutex};
+            waiter_.aborted = true;
+            waiter_.wake->Signal();
+        });
+#endif
     }
     ~WaitScope() {
+#ifdef SHADPS4_UWP
+        stop_callback_.reset();
+#endif
         if (registered_) {
             std::scoped_lock lock{s_.wait_mutex};
             std::erase(s_.waiters, &waiter_);
@@ -355,6 +370,9 @@ private:
     Waiter waiter_{};
     Error entry_error_ = Error::Ok;
     bool registered_ = false;
+#ifdef SHADPS4_UWP
+    std::optional<std::stop_callback<std::function<void()>>> stop_callback_;
+#endif
 };
 
 // Called with wait_mutex held. Returns which sides had a blocked call.

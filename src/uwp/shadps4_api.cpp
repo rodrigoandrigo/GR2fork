@@ -42,6 +42,7 @@ std::mutex session_mutex;
 std::mutex guest_control_mutex;
 std::mutex worker_stop_mutex;
 std::vector<std::stop_source> worker_stops;
+std::stop_source guest_stop_source;
 std::mutex api_mutex;
 std::string last_error;
 std::shared_ptr<Core::Uwp::DozenHost> presentation;
@@ -118,6 +119,9 @@ bool CanExecuteGuestCode() {
 } // namespace
 
 namespace Core::Uwp {
+std::stop_token GuestStopToken() {
+    return guest_stop_source.get_token();
+}
 void RegisterGuestWorker(std::stop_source source) {
     {
         std::scoped_lock lock{worker_stop_mutex};
@@ -127,6 +131,7 @@ void RegisterGuestWorker(std::stop_source source) {
         source.request_stop();
 }
 void StopGuestWorkers() {
+    guest_stop_source.request_stop();
     std::vector<std::stop_source> sources;
     {
         std::scoped_lock lock{worker_stop_mutex};

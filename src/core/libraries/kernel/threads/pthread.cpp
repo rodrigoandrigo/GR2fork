@@ -731,6 +731,8 @@ namespace {
 #ifdef _WIN32
 void PthreadCancelApc(void*, void*, void*, PCONTEXT context) {
 #ifdef SHADPS4_UWP
+    if (!NtCurrentTeb()->ThreadLocalStoragePointer || (g_curthread && g_curthread->cancelling))
+        return;
     if (Core::Uwp::StopRequested() && g_curthread && context) {
         auto& space = Core::Memory::Instance()->GetAddressSpace();
         const auto address = context->Rip;
@@ -786,6 +788,11 @@ void InstallPthreadCancelSignalHandler() {
 
 void InterruptPthreadForCancellation(Pthread* thread) noexcept {
 #ifdef _WIN32
+#ifdef SHADPS4_UWP
+    if (thread->cancelling.load(std::memory_order_acquire) ||
+        thread->tid.load(std::memory_order_acquire) == TidTerminated)
+        return;
+#endif
     USER_APC_OPTION option{};
     option.UserApcFlags = QueueUserApcFlagsSpecialUserApc;
     const u64 result = NtQueueApcThreadEx(reinterpret_cast<HANDLE>(thread->native_thr->GetHandle()),

@@ -301,8 +301,13 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
    /* Apply the clip-volume conversion before shared DXIL passes apply any
     * viewport-driven Z reversal to the last rasterization stage.
     */
-   if (options->lower_clip_halfz)
+   if (options->lower_clip_halfz) {
+      NIR_PASS(_, *nir, nir_lower_io_vars_to_temporaries,
+                 nir_shader_get_entrypoint(*nir), nir_var_shader_out);
+      NIR_PASS(_, *nir, nir_split_var_copies);
+      NIR_PASS(_, *nir, nir_lower_var_copies);
       NIR_PASS(_, *nir, nir_lower_clip_halfz);
+   }
 
    bool robust_images = options->robustness.images ==
                             VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT ||
@@ -917,7 +922,7 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
       info->pInputAssemblyState->topology != VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
    if (pipeline->use_gs_for_provoking_vertex)
       last_raster_stage = MESA_SHADER_GEOMETRY;
-   const uint32_t provoking_compile_key = 0x50560003u ^
+   const uint32_t provoking_compile_key = 0x50560005u ^
       ((uint32_t)pipeline->provoking_vertex_last << 24) ^
       ((uint32_t)device->vk.enabled_features.provokingVertexLast << 25) ^
       ((uint32_t)info->pInputAssemblyState->topology << 16);

@@ -17,6 +17,9 @@
 #include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_matching2/np_matching2_internal.h"
 #include "shadnet.pb.h"
+#ifdef SHADPS4_UWP
+#include "uwp/session.h"
+#endif
 
 namespace Libraries::Np::NpMatching2 {
 
@@ -1734,8 +1737,19 @@ void FireEvent(const PendingEvent& ev) {
 PS4_SYSV_ABI void* EventDispatcherThreadMain(void*) {
     Common::SetCurrentThreadName("Matching2:Dispatch");
     auto& state = NpHandler::GetInstance().GetMatching2State();
+#ifdef SHADPS4_UWP
+    const auto stop = Core::Uwp::GuestStopToken();
+    std::stop_callback wake{stop, [&state] {
+                                std::scoped_lock lock{state.queue_mutex};
+                                state.queue_cv.notify_all();
+                            }};
+#endif
     std::unique_lock lock(state.queue_mutex);
-    while (state.dispatch_running.load()) {
+    while (state.dispatch_running.load()
+#ifdef SHADPS4_UWP
+           && !stop.stop_requested()
+#endif
+    ) {
         const auto now = std::chrono::steady_clock::now();
 
         std::vector<PendingEvent> ready;

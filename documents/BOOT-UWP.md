@@ -1,5 +1,8 @@
 # Boot brokered e sessões UWP
 
+O estado das correções de inicialização de 23/10/2026, com evidências e limites
+por jogo, está em [UWP-GAME-STARTUP.md](UWP-GAME-STARTUP.md).
+
 `shadps4_run` é uma chamada bloqueante para um worker MTA. Seu argumento é um
 caminho virtual de uma pasta previamente montada pela API, por exemplo
 `/library0/titulo/eboot.bin`. A DLL obtém a subpasta pelo StorageFolder autorizado

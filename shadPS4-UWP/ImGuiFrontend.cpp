@@ -7,14 +7,15 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
-#include <numeric>
-#include <fstream>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <imgui.h>
+#include <numeric>
 #include <ppltasks.h>
 #include <roapi.h>
 #include <wincodec.h>
 #include <windows.ui.xaml.media.dxinterop.h>
-#include <imgui.h>
 #include <winrt/base.h>
 
 using Microsoft::WRL::ComPtr;
@@ -51,10 +52,192 @@ std::string Lower(std::string text) {
     return text;
 }
 std::string Label(std::string text) {
+    static const std::unordered_map<std::string, std::string> labels{
+        {"big_picture_scale", "Escala da interface (1000 = 100%)"},
+        {"big_picture_folder_depth", "Profundidade de busca de jogos"},
+        {"show_fps_counter", "Exibir contador de FPS"},
+        {"console_language", "Idioma do console"},
+        {"volume_slider", "Volume (%)"},
+        {"audio_backend", "Backend de áudio"},
+        {"neo_mode", "Emular PS4 Pro"},
+        {"dev_kit_mode", "Modo de desenvolvimento"},
+        {"extra_dmem_in_mbytes", "Memória direta adicional (MB)"},
+        {"extra_fmem_in_mbytes", "Memória flexível adicional (MB)"},
+        {"full_screen", "Iniciar em tela cheia"},
+        {"full_screen_mode", "Modo de tela cheia"},
+        {"window_width", "Largura da janela"},
+        {"window_height", "Altura da janela"},
+        {"internal_screen_width", "Largura da resolução interna"},
+        {"internal_screen_height", "Altura da resolução interna"},
+        {"hdr_allowed", "Habilitar HDR"},
+        {"fsr_enabled", "Habilitar FSR"},
+        {"rcas_enabled", "Habilitar RCAS (nitidez)"},
+        {"rcas_attenuation", "Atenuação RCAS"},
+        {"vblank_frequency", "Frequência de VBlank"},
+        {"null_gpu", "Habilitar NULL GPU"},
+        {"gpu_id", "Dispositivo gráfico"},
+        {"pipeline_cache_enabled", "Habilitar cache de pipelines"},
+        {"pipeline_cache_archived", "Compactar cache de pipelines"},
+        {"use_keyboard_as_keyboard", "Usar teclado como teclado do PS4"},
+        {"use_mice_as_mice", "Usar mouse como mouse do PS4"},
+        {"is_circle_enter", "Usar círculo para confirmar"},
+        {"use_unified_input_config", "Compartilhar configuração de entrada"},
+        {"special_pad_class", "Tipo de controle especial"},
+        {"default_controller_id", "Controle padrão"},
+        {"vblank_div", "Divisor de VBlank"},
+        {"is_pro", "Emular PS4 Pro"},
+        {"fullscreen", "Iniciar jogos em tela cheia"},
+        {"log_filter", "Filtro de log"},
+        {"flush_level", "Nível de gravação do log"}};
+    if (const auto found = labels.find(text); found != labels.end())
+        return found->second;
     std::replace(text.begin(), text.end(), '_', ' ');
     if (!text.empty())
         text[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(text[0])));
     return text;
+}
+void LoadLauncherFont() {
+    static const ImWchar ranges[]{0x0020, 0x00ff, 0x2000, 0x206f, 0};
+    try {
+        ComPtr<IDWriteFactory> factory;
+        Check(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                  reinterpret_cast<IUnknown**>(factory.GetAddressOf())));
+        ComPtr<IDWriteFontCollection> collection;
+        Check(factory->GetSystemFontCollection(&collection));
+        UINT32 index{};
+        BOOL exists{};
+        Check(collection->FindFamilyName(L"Segoe UI", &index, &exists));
+        if (!exists)
+            throw std::runtime_error("Segoe UI");
+        ComPtr<IDWriteFontFamily> family;
+        Check(collection->GetFontFamily(index, &family));
+        ComPtr<IDWriteFont> font;
+        Check(family->GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                           DWRITE_FONT_STYLE_NORMAL, &font));
+        ComPtr<IDWriteFontFace> face;
+        Check(font->CreateFontFace(&face));
+        UINT32 count{};
+        Check(face->GetFiles(&count, nullptr));
+        if (count != 1)
+            throw std::runtime_error("Font files");
+        ComPtr<IDWriteFontFile> file;
+        Check(face->GetFiles(&count, file.GetAddressOf()));
+        const void* key{};
+        UINT32 key_size{};
+        Check(file->GetReferenceKey(&key, &key_size));
+        ComPtr<IDWriteFontFileLoader> loader;
+        Check(file->GetLoader(&loader));
+        ComPtr<IDWriteFontFileStream> stream;
+        Check(loader->CreateStreamFromKey(key, key_size, &stream));
+        UINT64 size{};
+        Check(stream->GetFileSize(&size));
+        if (!size || size > 32 * 1024 * 1024)
+            throw std::runtime_error("Font size");
+        auto* memory = IM_ALLOC(static_cast<size_t>(size));
+        if (!memory)
+            throw std::bad_alloc();
+        const void* fragment{};
+        void* context{};
+        const auto result = stream->ReadFileFragment(&fragment, 0, size, &context);
+        if (FAILED(result)) {
+            IM_FREE(memory);
+            Check(result);
+        }
+        std::memcpy(memory, fragment, static_cast<size_t>(size));
+        stream->ReleaseFileFragment(context);
+        if (ImGui::GetIO().Fonts->AddFontFromMemoryTTF(memory, static_cast<int>(size), 15.0f,
+                                                       nullptr, ranges))
+            return;
+    } catch (...) {
+    }
+    ImFontConfig font;
+    font.SizePixels = 15.0f;
+    ImGui::GetIO().Fonts->AddFontDefault(&font);
+}
+std::string SettingsSection(const std::string& group, const std::string& key) {
+    if (group == "Vulkan")
+        return key == "gpu_id" || key.compare(0, 15, "pipeline_cache_") == 0 ? "Dispositivo e cache"
+                                                                             : "Avançado";
+    if (group == "GPU") {
+        if (key == "gpu_id" || key == "null_gpu")
+            return "Dispositivo e cache";
+        if (key == "fsr_enabled" || key == "rcas_enabled" || key == "rcas_attenuation")
+            return "FSR";
+        if (key == "full_screen" || key == "full_screen_mode" || key == "hdr_allowed" ||
+            key == "window_width" || key == "window_height" || key == "internal_screen_width" ||
+            key == "internal_screen_height" || key == "vblank_frequency")
+            return "Vídeo";
+        return "Avançado";
+    }
+    if (group == "Input")
+        return key == "use_keyboard_as_keyboard" || key == "use_mice_as_mice" ||
+                       key.compare(0, 4, "ime_") == 0
+                   ? "Teclado e mouse"
+                   : "Controle";
+    if (group == "Audio" || key == "volume_slider")
+        return "Saída de áudio";
+    return "Opções";
+}
+std::string SettingsPage(const std::string& group, const std::string& key) {
+    if (group == "GPU" || group == "Vulkan")
+        return "Gráficos";
+    if (group == "Input")
+        return "Entrada";
+    if (group == "Audio")
+        return "Áudio";
+    if (group == "Network")
+        return "Rede";
+    if (group == "General") {
+        if (key == "volume_slider")
+            return "Áudio";
+        if (key == "big_picture_folder_depth")
+            return "Pastas";
+        if (key.compare(0, 12, "big_picture_") == 0 || key == "show_fps_counter")
+            return "Interface";
+        if (key == "console_language" || key.compare(0, 5, "user_") == 0)
+            return "Usuário";
+        return "Geral";
+    }
+    return group;
+}
+void LauncherStyle() {
+    auto& style = ImGui::GetStyle();
+    style.WindowRounding = 0;
+    style.ChildRounding = 0;
+    style.FrameRounding = 2;
+    style.TabRounding = 2;
+    style.WindowBorderSize = 1;
+    style.FrameBorderSize = 1;
+    style.WindowPadding = {10, 8};
+    style.FramePadding = {8, 5};
+    style.ItemSpacing = {8, 6};
+    const ImVec4 window{50 / 255.0f, 50 / 255.0f, 50 / 255.0f, 1};
+    const ImVec4 base{20 / 255.0f, 20 / 255.0f, 20 / 255.0f, 1};
+    const ImVec4 button{53 / 255.0f, 53 / 255.0f, 53 / 255.0f, 1};
+    const ImVec4 accent{42 / 255.0f, 130 / 255.0f, 218 / 255.0f, 1};
+    style.Colors[ImGuiCol_TitleBg] = window;
+    style.Colors[ImGuiCol_TitleBgActive] = window;
+    style.Colors[ImGuiCol_WindowBg] = window;
+    style.Colors[ImGuiCol_ChildBg] = base;
+    style.Colors[ImGuiCol_PopupBg] = window;
+    style.Colors[ImGuiCol_MenuBarBg] = window;
+    style.Colors[ImGuiCol_FrameBg] = {0.12f, 0.12f, 0.12f, 1};
+    style.Colors[ImGuiCol_Button] = button;
+    style.Colors[ImGuiCol_ButtonHovered] = {0.28f, 0.28f, 0.28f, 1};
+    style.Colors[ImGuiCol_ButtonActive] = accent;
+    style.Colors[ImGuiCol_Header] = {0.2f, 0.2f, 0.2f, 1};
+    style.Colors[ImGuiCol_HeaderHovered] = {0.22f, 0.36f, 0.49f, 1};
+    style.Colors[ImGuiCol_HeaderActive] = accent;
+    style.Colors[ImGuiCol_TableHeaderBg] = button;
+    style.Colors[ImGuiCol_TableRowBg] = base;
+    style.Colors[ImGuiCol_TableRowBgAlt] = {0.085f, 0.085f, 0.085f, 1};
+    style.Colors[ImGuiCol_Tab] = button;
+    style.Colors[ImGuiCol_TabActive] = {0.26f, 0.26f, 0.26f, 1};
+    style.Colors[ImGuiCol_TabHovered] = accent;
+    style.Colors[ImGuiCol_CheckMark] = accent;
+    style.Colors[ImGuiCol_SliderGrab] = accent;
+    style.Colors[ImGuiCol_Border] = {0.32f, 0.32f, 0.32f, 1};
+    style.Colors[ImGuiCol_Separator] = {0.4f, 0.4f, 0.4f, 1};
 }
 std::unordered_map<std::string, std::string> Sfo(const std::vector<uint8_t>& bytes) {
     std::unordered_map<std::string, std::string> result;
@@ -76,13 +259,18 @@ std::unordered_map<std::string, std::string> Sfo(const std::vector<uint8_t>& byt
         std::memcpy(&key, bytes.data() + record, 2);
         std::memcpy(&format, bytes.data() + record + 2, 2);
         const auto length = u32(record + 4), offset = u32(record + 12);
-        if (format != 0x0204 || key >= bytes.size() - keys || offset > bytes.size() - data ||
-            length > bytes.size() - data - offset)
+        if ((format != 0x0204 && format != 0x0404) || key >= bytes.size() - keys ||
+            offset > bytes.size() - data || length > bytes.size() - data - offset)
             continue;
         const auto* name = reinterpret_cast<const char*>(bytes.data() + keys + key);
         const auto* end = static_cast<const char*>(std::memchr(name, 0, bytes.size() - keys - key));
         if (!end)
             continue;
+        if (format == 0x0404) {
+            if (length >= 4)
+                result.emplace(std::string(name, end), std::to_string(u32(data + offset)));
+            continue;
+        }
         const auto* value = reinterpret_cast<const char*>(bytes.data() + data + offset);
         const auto* last = static_cast<const char*>(std::memchr(value, 0, length));
         result.emplace(std::string(name, end), std::string(value, last ? last : value + length));
@@ -113,9 +301,7 @@ ImGuiFrontend::ImGuiFrontend(Windows::UI::Xaml::Controls::SwapChainPanel ^ targe
                              Windows::UI::Xaml::Controls::SwapChainPanel ^ game_panel)
     : core{std::make_shared<ShadPS4Host>(game_panel ? game_panel : target)},
       game_surface{game_panel != nullptr}, panel{target}, dispatcher{target->Dispatcher} {}
-ImGuiFrontend::~ImGuiFrontend() {
-    Stop();
-}
+ImGuiFrontend::~ImGuiFrontend() { Stop(); }
 void ImGuiFrontend::Start(std::wstring root) {
     const auto self = shared_from_this();
     std::thread([self, root] { self->Run(root); }).detach();
@@ -157,8 +343,8 @@ void ImGuiFrontend::Work() {
         {
             std::unique_lock<std::mutex> lock{work_mutex};
             work_ready.wait(lock, [this] {
-                return stopping.load() || worker_stopping.load() || !commands.empty() || filter_job ||
-                       !thumbnail_jobs.empty();
+                return stopping.load() || worker_stopping.load() || !commands.empty() ||
+                       filter_job || !thumbnail_jobs.empty();
             });
             if (stopping.load() || worker_stopping.load())
                 break;
@@ -221,224 +407,251 @@ HRESULT ImGuiFrontend::Attach(IDXGISwapChain* chain) {
 
 void ImGuiFrontend::ResolveApi() {
 #define RESOLVE(member, name) member = core->GetApi<decltype(member)>(name)
-  RESOLVE(get_settings, "shadps4_get_settings");
-  RESOLVE(set_host_state, "shadps4_set_host_state");
-  RESOLVE(set_hdr_output, "shadps4_set_hdr_output");
-  RESOLVE(set_setting, "shadps4_set_setting");
-  RESOLVE(reset_settings, "shadps4_reset_settings");
-  RESOLVE(mount, "shadps4_mount_storage_folder");
-  RESOLVE(unmount, "shadps4_unmount_storage_folder");
-  RESOLVE(enumerate, "shadps4_storage_enumerate");
-  RESOLVE(stat, "shadps4_storage_stat");
-  RESOLVE(open, "shadps4_open_mounted_file");
-  RESOLVE(read, "shadps4_file_read");
-  RESOLVE(size, "shadps4_file_get_size");
-  RESOLVE(close, "shadps4_file_close");
-  RESOLVE(get_game_settings, "shadps4_get_game_settings");
-  RESOLVE(set_game_setting, "shadps4_set_game_setting");
-  RESOLVE(delete_game_settings, "shadps4_delete_game_settings");
+    RESOLVE(get_settings, "shadps4_get_settings");
+    RESOLVE(set_host_state, "shadps4_set_host_state");
+    RESOLVE(set_hdr_output, "shadps4_set_hdr_output");
+    RESOLVE(set_setting, "shadps4_set_setting");
+    RESOLVE(reset_settings, "shadps4_reset_settings");
+    RESOLVE(mount, "shadps4_mount_storage_folder");
+    RESOLVE(mount_pkg, "shadps4_mount_pkg");
+    RESOLVE(mount_pkg_file, "shadps4_mount_pkg_file");
+    RESOLVE(unmount, "shadps4_unmount_storage_folder");
+    RESOLVE(enumerate, "shadps4_storage_enumerate");
+    RESOLVE(stat, "shadps4_storage_stat");
+    RESOLVE(open, "shadps4_open_mounted_file");
+    RESOLVE(read, "shadps4_file_read");
+    RESOLVE(size, "shadps4_file_get_size");
+    RESOLVE(close, "shadps4_file_close");
+    RESOLVE(get_game_settings, "shadps4_get_game_settings");
+    RESOLVE(set_game_setting, "shadps4_set_game_setting");
+    RESOLVE(delete_game_settings, "shadps4_delete_game_settings");
 #undef RESOLVE
 }
 
 void ImGuiFrontend::ReportFailure(const std::wstring& message) noexcept {
-  try {
-    const auto directory = std::filesystem::path(user_root) / L"log";
-    std::filesystem::create_directories(directory);
-    std::ofstream output(directory / L"frontend-d3d12.log", std::ios::app);
-    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    output << timestamp << " " << Utf8(message) << std::endl;
-  } catch (...) {
-  }
-  try {
-    if (failure)
-      failure(message);
-  } catch (...) {
-  }
+    try {
+        const auto directory = std::filesystem::path(user_root) / L"log";
+        std::filesystem::create_directories(directory);
+        std::ofstream output(directory / L"frontend-d3d12.log", std::ios::app);
+        const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+        output << timestamp << " " << Utf8(message) << std::endl;
+    } catch (...) {
+    }
+    try {
+        if (failure)
+            failure(message);
+    } catch (...) {
+    }
 }
 
 void ImGuiFrontend::Run(std::wstring root) {
-  const auto apartment = RoInitialize(RO_INIT_MULTITHREADED);
-  try {
-    Check(apartment);
-    user_root = root;
-    FrontendInput initial;
-    {
-      std::lock_guard<std::mutex> lock{input_mutex};
-      initial = input;
-    }
-    core->SetLogConsumer([this](std::string message) {
-      std::lock_guard<std::mutex> lock{work_mutex};
-      if (pending_logs.size() == 256)
-        pending_logs.pop_front();
-      pending_logs.push_back(message.substr(0, 4096));
-    });
-    D3D12DeviceContext::EnableDiagnostics();
-    core->Initialize(root, initial.width, initial.height, true, game_surface);
-    ResolveApi();
-    set_hdr_output(initial.hdr_output, initial.sdr_white_nits);
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    auto &io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    io.ConfigFlags |=
-        ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
-    ImGui::StyleColorsDark();
-    renderer = std::make_unique<FrontendRenderer>();
-    renderer->Initialize(
-        initial.width, initial.height,
-        [this](IDXGISwapChain *chain) { return Attach(chain); });
-    worker = std::thread([this] { Work(); });
-    Queue([this] { LoadSettings(); });
-    if (ready)
-      ready();
-    auto last = std::chrono::steady_clock::now();
-    auto last_memory_sample = last;
-    while (!stopping.load()) {
-      const auto memory_time = std::chrono::steady_clock::now();
-      if (memory_time - last_memory_sample >= std::chrono::seconds(1)) {
-        UwpDiagnostics::Memory("memory_sample bytes/limit");
-        last_memory_sample = memory_time;
-      }
-      FrontendInput snapshot;
-      {
-        std::lock_guard<std::mutex> lock{input_mutex};
-        snapshot = input;
-        input.wheel = 0;
-        input.characters.clear();
-      }
-      std::deque<std::function<void()>> updates;
-      {
-        std::lock_guard<std::mutex> lock{work_mutex};
-        updates.swap(completed);
-        while (!pending_logs.empty()) {
-          logs.push_back(std::move(pending_logs.front()));
-          pending_logs.pop_front();
-          if (logs.size() > 512)
-            logs.pop_front();
+    const auto apartment = RoInitialize(RO_INIT_MULTITHREADED);
+    try {
+        Check(apartment);
+        user_root = root;
+        try {
+            const auto values = ApplicationData::Current->LocalSettings->Values;
+            if (values->HasKey(L"shadps4.launcher.layout")) {
+                const auto stored =
+                    safe_cast<Platform::String ^>(values->Lookup(L"shadps4.launcher.layout"));
+                const auto layout = nlohmann::json::parse(Utf8(stored->Data()));
+                show_game_list = layout.value("game_list", true);
+                show_game_log = layout.value("game_log", true);
+                grid_view = layout.value("grid", false);
+                icon_size = std::clamp(layout.value("icon_size", 48.0f), 24.0f, 128.0f);
+                log_height = std::clamp(layout.value("log_height", 140.0f), 60.0f, 600.0f);
+            }
+        } catch (...) {
+            status = "Preferências de interface restauradas.";
         }
-      }
-      work_ready.notify_all();
-      for (auto &update : updates)
-        update();
-      if (reload_core) {
-        worker_stopping.store(true);
-        work_ready.notify_all();
-        if (worker.joinable())
-          worker.join();
+
+        FrontendInput initial;
         {
-          std::lock_guard<std::mutex> lock{work_mutex};
-          commands.clear();
-          thumbnail_jobs.clear();
-          filter_job = {};
-          completed.clear();
+            std::lock_guard<std::mutex> lock{input_mutex};
+            initial = input;
         }
-        pending_images.clear();
-        decoded.clear();
-        core->Reload(user_root, snapshot.width, snapshot.height, true,
-                     game_surface);
-        ResolveApi();
-        root_mounts.clear();
-        reload_core = false;
-        session_pending = false;
-        session_paused = false;
-        worker_stopping.store(false);
-        worker = std::thread([this] { Work(); });
-        scanning.store(true);
-        Queue([this] {
-          Scan();
-          LoadSettings();
+        core->SetLogConsumer([this](std::string message) {
+            std::lock_guard<std::mutex> lock{work_mutex};
+            if (pending_logs.size() == 256)
+                pending_logs.pop_front();
+            pending_logs.push_back(message.substr(0, 4096));
         });
-      }
-      const bool running = core->State() == SHADPS4_RUNNING;
-      if (running != game_running) {
-        game_running = running;
-        menu_open = !running;
-      }
-      const bool pressed = snapshot.keys[27];
-      if (game_running && pressed && !menu_pressed)
-        menu_open = !menu_open;
-      menu_pressed = pressed;
-      if (set_host_state(!snapshot.suspended && snapshot.active && snapshot.visible,
-                         snapshot.captured ||
-                             (game_running
-                                  ? menu_open
-                                  : io.NavActive || io.WantCaptureKeyboard)))
-        throw std::runtime_error(Utf8(core->Error()));
-      if (snapshot.suspended || !snapshot.active || !snapshot.visible) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        continue;
-      }
-      set_hdr_output(snapshot.hdr_output, snapshot.sdr_white_nits);
-      renderer->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
-      if (game_surface)
-        core->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
-      renderer->SetTransparent(game_running);
-      const auto now = std::chrono::steady_clock::now();
-      const auto delta = std::chrono::duration<float>(now - last).count();
-      last = now;
-      SubmitInput(snapshot);
-      io.FontGlobalScale = std::clamp(
-          std::min(snapshot.width / 1280.0f, snapshot.height / 720.0f) *
-              ui_scale,
-          0.75f, 3.0f);
-      renderer->BeginFrame(delta);
-      unsigned uploads{};
-      while (!decoded.empty() && uploads < 2) {
-        if (!renderer->Upload(decoded.front()))
-          break;
-        pending_images.erase(decoded.front().key);
-        decoded.pop_front();
-        ++uploads;
-      }
-      Draw();
-      renderer->EndFrame();
+        D3D12DeviceContext::EnableDiagnostics();
+        core->Initialize(root, initial.width, initial.height, true, game_surface);
+        ResolveApi();
+        set_hdr_output(initial.hdr_output, initial.sdr_white_nits);
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        auto& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+        ImGui::StyleColorsDark();
+        LauncherStyle();
+        LoadLauncherFont();
+        renderer = std::make_unique<FrontendRenderer>();
+        renderer->Initialize(initial.width, initial.height,
+                             [this](IDXGISwapChain* chain) { return Attach(chain); });
+        worker = std::thread([this] { Work(); });
+        Queue([this] { LoadSettings(); });
+        if (ready)
+            ready();
+        auto last = std::chrono::steady_clock::now();
+        auto last_memory_sample = last;
+        while (!stopping.load()) {
+            const auto memory_time = std::chrono::steady_clock::now();
+            if (memory_time - last_memory_sample >= std::chrono::seconds(1)) {
+                UwpDiagnostics::Memory("memory_sample bytes/limit");
+                last_memory_sample = memory_time;
+            }
+            FrontendInput snapshot;
+            {
+                std::lock_guard<std::mutex> lock{input_mutex};
+                snapshot = input;
+                input.wheel = 0;
+                input.characters.clear();
+            }
+            std::deque<std::function<void()>> updates;
+            {
+                std::lock_guard<std::mutex> lock{work_mutex};
+                updates.swap(completed);
+                while (!pending_logs.empty()) {
+                    logs.push_back(std::move(pending_logs.front()));
+                    pending_logs.pop_front();
+                    if (logs.size() > 512)
+                        logs.pop_front();
+                }
+            }
+            work_ready.notify_all();
+            for (auto& update : updates)
+                update();
+            if (reload_core) {
+                worker_stopping.store(true);
+                work_ready.notify_all();
+                if (worker.joinable())
+                    worker.join();
+                {
+                    std::lock_guard<std::mutex> lock{work_mutex};
+                    commands.clear();
+                    thumbnail_jobs.clear();
+                    filter_job = {};
+                    completed.clear();
+                }
+                pending_images.clear();
+                decoded.clear();
+                core->Reload(user_root, snapshot.width, snapshot.height, true, game_surface);
+                ResolveApi();
+                root_mounts.clear();
+                reload_core = false;
+                session_pending = false;
+                session_paused = false;
+                worker_stopping.store(false);
+                worker = std::thread([this] { Work(); });
+                scanning.store(true);
+                Queue([this] {
+                    Scan();
+                    LoadSettings({}, settings_request.load());
+                });
+            }
+            const bool running = core->State() == SHADPS4_RUNNING;
+            if (running != game_running) {
+                game_running = running;
+                menu_open = !running;
+            }
+            if (restart_requested && !game_running && !session_pending && !scanning.load() &&
+                core->State() == SHADPS4_READY && library) {
+                restart_requested = false;
+                const auto found = std::find_if(
+                    library->games.begin(), library->games.end(),
+                    [this](const auto& game) { return game.path == active_game_path; });
+                if (found != library->games.end()) {
+                    selection = static_cast<size_t>(found - library->games.begin());
+                    StartGame();
+                }
+            }
+            const bool pressed = snapshot.keys[27];
+            if (game_running && pressed && !menu_pressed)
+                menu_open = !menu_open;
+            menu_pressed = pressed;
+            if (set_host_state(
+                    !snapshot.suspended && snapshot.active && snapshot.visible,
+                    snapshot.captured ||
+                        (game_running ? menu_open : io.NavActive || io.WantCaptureKeyboard)))
+                throw std::runtime_error(Utf8(core->Error()));
+            if (snapshot.suspended || !snapshot.active || !snapshot.visible) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+            set_hdr_output(snapshot.hdr_output, snapshot.sdr_white_nits);
+            renderer->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
+            if (game_surface)
+                core->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
+            renderer->SetTransparent(game_running);
+            const auto now = std::chrono::steady_clock::now();
+            const auto delta = std::chrono::duration<float>(now - last).count();
+            last = now;
+            SubmitInput(snapshot);
+            io.FontGlobalScale =
+                std::clamp(std::min(snapshot.width / 1280.0f, snapshot.height / 720.0f) * ui_scale,
+                           0.75f, 3.0f);
+            renderer->BeginFrame(delta);
+            unsigned uploads{};
+            while (!decoded.empty() && uploads < 2) {
+                if (!renderer->Upload(decoded.front()))
+                    break;
+                pending_images.erase(decoded.front().key);
+                decoded.pop_front();
+                ++uploads;
+            }
+            Draw();
+            renderer->EndFrame();
+        }
+    } catch (const winrt::hresult_error& error) {
+        try {
+            ReportFailure(L"D3D12 HRESULT " +
+                          std::to_wstring(static_cast<uint32_t>(error.code().value)) + L": " +
+                          std::wstring(error.message()));
+        } catch (...) {
+        }
+    } catch (Platform::Exception ^ error) {
+        try {
+            ReportFailure(error->Message->Data());
+        } catch (...) {
+        }
+    } catch (const std::exception& error) {
+        try {
+            ReportFailure(Wide(error.what()));
+        } catch (...) {
+        }
+    } catch (...) {
+        try {
+            ReportFailure(L"Falha inesperada no frontend.");
+        } catch (...) {
+        }
     }
-  } catch (const winrt::hresult_error &error) {
+    stopping.store(true);
+    work_ready.notify_all();
+    if (worker.joinable())
+        worker.join();
+    core->Stop();
+    core->Wait();
+    {
+        std::lock_guard<std::mutex> lock{work_mutex};
+        commands.clear();
+        thumbnail_jobs.clear();
+        completed.clear();
+    }
+    renderer.reset();
+    if (ImGui::GetCurrentContext())
+        ImGui::DestroyContext();
     try {
-      ReportFailure(L"D3D12 HRESULT " +
-                std::to_wstring(static_cast<uint32_t>(error.code().value)) +
-                L": " + std::wstring(error.message()));
+        Attach(nullptr);
     } catch (...) {
     }
-  } catch (Platform::Exception ^ error) {
-    try {
-      ReportFailure(error->Message->Data());
-    } catch (...) {
-    }
-  } catch (const std::exception &error) {
-    try {
-      ReportFailure(Wide(error.what()));
-    } catch (...) {
-    }
-  } catch (...) {
-    try {
-      ReportFailure(L"Falha inesperada no frontend.");
-    } catch (...) {
-    }
-  }
-  stopping.store(true);
-  work_ready.notify_all();
-  if (worker.joinable())
-    worker.join();
-  core->Stop();
-  core->Wait();
-  {
-    std::lock_guard<std::mutex> lock{work_mutex};
-    commands.clear();
-    thumbnail_jobs.clear();
-    completed.clear();
-  }
-  renderer.reset();
-  if (ImGui::GetCurrentContext())
-    ImGui::DestroyContext();
-  try {
-    Attach(nullptr);
-  } catch (...) {
-  }
-  core->SetLogConsumer({});
-  if (SUCCEEDED(apartment))
-    RoUninitialize();
+    core->SetLogConsumer({});
+    if (SUCCEEDED(apartment))
+        RoUninitialize();
 }
 
 void ImGuiFrontend::SetFolder(Platform::Agile<StorageFolder> source, std::string token) {
@@ -449,13 +662,32 @@ void ImGuiFrontend::SetFolder(Platform::Agile<StorageFolder> source, std::string
             throw std::runtime_error("Limite de 64 pastas de biblioteca.");
         }
         for (const auto& root : roots)
-            if (root.folder.Get()->IsEqual(source.Get())) {
+            if (root.folder.Get() && root.folder.Get()->IsEqual(source.Get())) {
                 Windows::Storage::AccessCache::StorageApplicationPermissions::FutureAccessList
                     ->Remove(ref new Platform::String(Wide(token).c_str()));
                 Complete([this] { status = "Esta pasta já está na biblioteca."; });
                 return;
             }
         roots.push_back({source, token, true});
+        PersistRoots();
+        Scan();
+    });
+}
+void ImGuiFrontend::SetPackage(Platform::Agile<StorageFile> source, std::string token) {
+    Queue([this, source, token] {
+        const auto access =
+            Windows::Storage::AccessCache::StorageApplicationPermissions::FutureAccessList;
+        if (roots.size() >= 64) {
+            access->Remove(ref new Platform::String(Wide(token).c_str()));
+            throw std::runtime_error("Limite de 64 fontes de biblioteca.");
+        }
+        for (const auto& root : roots)
+            if (root.file.Get() && root.file.Get()->IsEqual(source.Get())) {
+                access->Remove(ref new Platform::String(Wide(token).c_str()));
+                Complete([this] { status = "Este PKG já está na biblioteca."; });
+                return;
+            }
+        roots.push_back({{}, token, true, source});
         PersistRoots();
         Scan();
     });
@@ -514,9 +746,7 @@ std::vector<uint8_t> ImGuiFrontend::ReadFile(const std::string& path, uint64_t l
     struct Lease {
         uint64_t token;
         decltype(close) release;
-        ~Lease() {
-            release(token);
-        }
+        ~Lease() { release(token); }
     } lease{token, close};
     uint64_t length{};
     if (size(token, &length) || length > limit)
@@ -536,6 +766,56 @@ std::vector<uint8_t> ImGuiFrontend::ReadFile(const std::string& path, uint64_t l
     return bytes;
 }
 
+void ImGuiFrontend::ReadMetadata(FrontendGame& game) {
+    try {
+        const auto metadata = Sfo(ReadFile(game.metadata_path + "/param.sfo", 256 * 1024));
+        if (metadata.find("TITLE") != metadata.end())
+            game.title = metadata.at("TITLE");
+        if (metadata.find("TITLE_ID") != metadata.end())
+            game.serial = metadata.at("TITLE_ID");
+        if (metadata.find("APP_VER") != metadata.end())
+            game.version = metadata.at("APP_VER");
+        if (game.format == "PKG") {
+            const auto category = metadata.find("CATEGORY");
+            if (category != metadata.end() && (category->second == "gp" || category->second == "ac")) {
+                game.format = category->second == "gp" ? "PKG (atualização)" : "PKG (DLC)";
+                game.executable.clear();
+                game.launch_error = "Este pacote é um complemento. Inicie o jogo base correspondente.";
+            }
+        }
+
+        if (const auto found = metadata.find("CONTENT_ID");
+            found != metadata.end() && !found->second.empty()) {
+            switch (found->second.front()) {
+            case 'U':
+                game.region = "EUA";
+                break;
+            case 'E':
+                game.region = "Europa";
+                break;
+            case 'J':
+                game.region = "Japão";
+                break;
+            case 'H':
+                game.region = "Ásia";
+                break;
+            case 'K':
+                game.region = "Coreia";
+                break;
+            }
+        }
+        if (const auto found = metadata.find("PS4_SYSTEM_VER"); found != metadata.end()) {
+            const auto version = std::stoul(found->second);
+            char text[24]{};
+            std::snprintf(text, sizeof(text), "%x.%02x", static_cast<unsigned>(version >> 24),
+                          static_cast<unsigned>((version >> 16) & 255));
+            game.firmware = text;
+        }
+
+    } catch (...) {
+    }
+}
+
 void ImGuiFrontend::Scan() {
     scanning.store(true);
     scanned.store(0);
@@ -546,13 +826,20 @@ void ImGuiFrontend::Scan() {
         unmount(previous.c_str());
     root_mounts.clear();
     std::deque<std::pair<std::string, uint32_t>> folders;
+    std::vector<std::string> package_paths;
+    std::vector<std::pair<std::string, Platform::Agile<StorageFile>>> selected_packages;
     std::unordered_map<std::string, std::string> names;
     for (size_t index = 0; index < roots.size(); ++index) {
         const auto& root = roots[index];
-        const auto label = Utf8(root.folder.Get()->Name->Data());
+        const auto label =
+            Utf8(root.file.Get() ? root.file.Get()->Name->Data() : root.folder.Get()->Name->Data());
         result->roots.push_back({label, root.token, root.enabled});
         if (!root.enabled)
             continue;
+        if (root.file.Get()) {
+            selected_packages.emplace_back("pkgfile:" + root.token, root.file);
+            continue;
+        }
         const auto path = "/library" + std::to_string(index);
         if (mount(path.c_str(), reinterpret_cast<IInspectable*>(root.folder.Get()), 1))
             throw std::runtime_error(Utf8(core->Error()));
@@ -571,42 +858,75 @@ void ImGuiFrontend::Scan() {
             if (!level && names.find(path) != names.end())
                 game.title = names.at(path);
             game.metadata_path = path + "/sce_sys";
-            if (stat((game.metadata_path + "/param.sfo").c_str(), &info) &&
-                path.size() >= 7 && path.compare(path.size() - 7, 7, "/Image0") == 0) {
+            if (stat((game.metadata_path + "/param.sfo").c_str(), &info) && path.size() >= 7 &&
+                path.compare(path.size() - 7, 7, "/Image0") == 0) {
                 const auto candidate = path.substr(0, path.find_last_of('/')) + "/Sc0";
                 if (!stat((candidate + "/param.sfo").c_str(), &info))
                     game.metadata_path = candidate;
             }
-            try {
-                const auto metadata = Sfo(ReadFile(game.metadata_path + "/param.sfo", 256 * 1024));
-                if (metadata.find("TITLE") != metadata.end())
-                    game.title = metadata.at("TITLE");
-                if (metadata.find("TITLE_ID") != metadata.end())
-                    game.serial = metadata.at("TITLE_ID");
-                if (metadata.find("APP_VER") != metadata.end())
-                    game.version = metadata.at("APP_VER");
-            } catch (...) {
-            }
+            game.executable = path + "/eboot.bin";
+            if (game.metadata_path.find("/Sc0") != std::string::npos)
+                game.format = "Pasta (Image0/Sc0)";
+            ReadMetadata(game);
             result->games.push_back(std::move(game));
             continue;
         }
-        if (level >= depth)
-            continue;
         struct Context {
             std::deque<std::pair<std::string, uint32_t>>* folders;
             std::string parent;
             uint32_t depth;
-        } context{&folders, path, level + 1};
+            uint32_t maximum;
+            std::vector<std::string>* packages;
+        } context{&folders, path, level + 1, depth, &package_paths};
         if (enumerate(
                 path.c_str(),
                 [](void* user, const char* name, const ShadPS4FileInfo* entry) {
                     auto* context = static_cast<Context*>(user);
-                    if (entry->is_directory && name[0] != '.')
+                    if (entry->is_directory && name[0] != '.' && context->depth <= context->maximum)
                         context->folders->emplace_back(context->parent + "/" + name,
                                                        context->depth);
+                    else if (!entry->is_directory) {
+                        const auto extension = Lower(name);
+                        if (extension.size() >= 4 &&
+                            extension.compare(extension.size() - 4, 4, ".pkg") == 0)
+                            context->packages->push_back(context->parent + "/" + name);
+                    }
                 },
                 &context))
             throw std::runtime_error(Utf8(core->Error()));
+    }
+    std::sort(package_paths.begin(), package_paths.end());
+    for (const auto& path : package_paths)
+        selected_packages.emplace_back(path, Platform::Agile<StorageFile>{});
+    for (size_t index = 0; index < selected_packages.size() && !stopping.load(); ++index) {
+        const auto& [source, file] = selected_packages[index];
+        FrontendGame game{source, source.substr(source.find_last_of('/') + 1), {}, {}};
+        game.format = "PKG";
+        if (file.Get()) {
+            game.title = Utf8(file.Get()->Name->Data());
+            game.source_path = Utf8(file.Get()->Path->Data());
+            if (game.source_path.empty())
+                game.source_path = game.title;
+        }
+        const auto point = "/pkg" + std::to_string(index);
+        int32_t bootable{};
+        const auto result_code =
+            file.Get() ? mount_pkg_file(point.c_str(), reinterpret_cast<IInspectable*>(file.Get()),
+                                        &bootable)
+                       : mount_pkg(point.c_str(), source.c_str(), &bootable);
+        if (result_code) {
+            game.launch_error = Utf8(core->Error());
+        } else {
+            root_mounts.push_back(point);
+            game.metadata_path = point + "/sce_sys";
+            if (bootable)
+                game.executable = point + "/eboot.bin";
+            else
+                game.launch_error = "PKG sem executável acessível. Verifique se é um jogo base em "
+                                    "formato FPKG compatível.";
+            ReadMetadata(game);
+        }
+        result->games.push_back(std::move(game));
     }
     std::stable_sort(result->games.begin(), result->games.end(),
                      [](const auto& a, const auto& b) { return Lower(a.title) < Lower(b.title); });
@@ -637,16 +957,42 @@ void ImGuiFrontend::Filter() {
     const auto source = library;
     const auto query = Lower(search);
     const auto request = ++filter_generation;
+    const auto column = sort_column;
+    const auto descending = sort_descending;
     std::lock_guard<std::mutex> lock{work_mutex};
-    filter_job = [this, source, query, request] {
+    filter_job = [this, source, query, request, column, descending] {
         auto indices = std::make_shared<std::vector<size_t>>();
         indices->reserve(source->games.size());
         for (size_t index = 0; index < source->games.size(); ++index) {
             const auto& game = source->games[index];
             if (query.empty() || Lower(game.title).find(query) != std::string::npos ||
-                Lower(game.serial).find(query) != std::string::npos)
+                Lower(game.serial).find(query) != std::string::npos ||
+                Lower(game.format).find(query) != std::string::npos)
                 indices->push_back(index);
         }
+        const auto value = [column](const FrontendGame& game) -> const std::string& {
+            switch (column) {
+            case 2:
+                return game.serial;
+            case 3:
+                return game.region;
+            case 4:
+                return game.firmware;
+            case 5:
+                return game.version;
+            case 6:
+                return game.path;
+            case 7:
+                return game.format;
+            default:
+                return game.title;
+            }
+        };
+        std::stable_sort(indices->begin(), indices->end(), [&](size_t a, size_t b) {
+            const auto left = Lower(value(source->games[a]));
+            const auto right = Lower(value(source->games[b]));
+            return descending ? left > right : left < right;
+        });
         Complete([this, source, indices, request] {
             if (library == source && request == filter_generation)
                 visible = indices;
@@ -690,32 +1036,34 @@ void ImGuiFrontend::LoadSettings(std::string profile, uint64_t request) {
         values.push_back(std::move(setting));
     }
     scan_depth.store(depth);
-    Complete([this, values = std::move(values), hidden, scale, fps, request]() mutable {
+    Complete([this, values = std::move(values), hidden, scale, fps, profile, request]() mutable {
         if (request != settings_request.load())
             return;
         settings = std::move(values);
+        settings_profile = profile;
         excluded = hidden;
         ui_scale = scale;
         show_fps = fps;
         status = "Configurações carregadas.";
     });
 }
-void ImGuiFrontend::SaveSetting(const Setting& setting, nlohmann::json value) {
-    const auto group = setting.group, key = setting.key;
-    const auto profile = setting.profile;
-    const auto request = settings_request.load();
-    if (!Queue([this, group, key, value, profile, request] {
-            if (profile.empty() ? set_setting(group.c_str(), key.c_str(), value.dump().c_str())
-                                : set_game_setting(profile.c_str(), group.c_str(), key.c_str(),
-                                                   value.dump().c_str()))
-                throw std::runtime_error(Utf8(core->Error()));
-            LoadSettings(profile, request);
-        }))
-        status = "Aguarde as operações pendentes.";
-}
-
 ThumbnailPixels ImGuiFrontend::Decode(const std::string& key, const std::string& path) {
-    auto bytes = ReadFile(path, 16 * 1024 * 1024);
+    std::vector<uint8_t> bytes;
+    if (key.compare(0, 9, "launcher:") == 0) {
+        const auto installed = Windows::ApplicationModel::Package::Current->InstalledLocation;
+        const auto filename =
+            std::filesystem::path(installed->Path->Data()) / L"Assets" / L"Launcher" / Wide(path);
+        std::ifstream stream(filename, std::ios::binary | std::ios::ate);
+        const auto length = stream.tellg();
+        if (!stream || length <= 0 || length > 1024 * 1024)
+            throw std::runtime_error("Ícone do launcher inválido.");
+        bytes.resize(static_cast<size_t>(length));
+        stream.seekg(0);
+        if (!stream.read(reinterpret_cast<char*>(bytes.data()), bytes.size()))
+            throw std::runtime_error("Não foi possível ler o ícone do launcher.");
+    } else {
+        bytes = ReadFile(path, 16 * 1024 * 1024);
+    }
     ComPtr<IWICImagingFactory> factory;
     Check(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                            IID_PPV_ARGS(&factory)));
@@ -747,6 +1095,10 @@ ThumbnailPixels ImGuiFrontend::Decode(const std::string& key, const std::string&
     output.pixels.resize(static_cast<size_t>(output.width) * output.height * 4);
     Check(converter->CopyPixels(nullptr, output.width * 4, output.pixels.size(),
                                 output.pixels.data()));
+    if (key.compare(0, 9, "launcher:") == 0)
+        for (size_t index = 0; index < output.pixels.size(); index += 4)
+            for (size_t channel = 0; channel < 3; ++channel)
+                output.pixels[index + channel] = 255 - output.pixels[index + channel];
     return output;
 }
 void ImGuiFrontend::RequestImage(const std::string& key, const std::string& path) {
@@ -855,295 +1207,676 @@ void ImGuiFrontend::SubmitInput(const FrontendInput& snapshot) {
     analog(ImGuiKey_GamepadR2, pad.RightTrigger);
 }
 
+bool ImGuiFrontend::ToolbarButton(const char* label, const char* icon, bool enabled) {
+    const float scale = ImGui::GetIO().FontGlobalScale;
+    ImGui::PushID(label);
+    ImGui::BeginDisabled(!enabled);
+    const auto position = ImGui::GetCursorScreenPos();
+    const float width = std::max(72.0f * scale, ImGui::CalcTextSize(label).x + 16 * scale);
+    const bool pressed = ImGui::Button("##tool", {width, 76 * scale});
+    const auto key = std::string{"launcher:"} + icon;
+    const auto texture = renderer->Image(key);
+    auto* draw = ImGui::GetWindowDrawList();
+    if (texture) {
+        const float left = position.x + (width - 40 * scale) / 2;
+        draw->AddImage(reinterpret_cast<ImTextureID>(texture), {left, position.y + 6 * scale},
+                       {left + 40 * scale, position.y + 46 * scale}, {0, 0}, {1, 1},
+                       ImGui::GetColorU32(ImGuiCol_Text));
+    } else {
+        RequestImage(key, icon);
+    }
+    const auto size = ImGui::CalcTextSize(label);
+    draw->AddText({position.x + (width - size.x) / 2, position.y + 54 * scale},
+                  ImGui::GetColorU32(ImGuiCol_Text), label);
+    ImGui::EndDisabled();
+    ImGui::PopID();
+    return pressed;
+}
+
 void ImGuiFrontend::Draw() {
     if (game_running && !menu_open)
         return;
     const auto display = ImGui::GetIO().DisplaySize;
+    const float scale = ImGui::GetIO().FontGlobalScale;
+    const bool idle = !session_pending && !game_running;
+    const bool can_play =
+        game_surface && idle && !scanning.load() && core->State() == SHADPS4_READY && library &&
+        selection < library->games.size() && !library->games[selection].executable.empty();
+    const auto open_settings = [&](const char* page = "") {
+        settings_open = true;
+        requested_settings_group = page;
+    };
     ImGui::SetNextWindowPos({0, 0});
     ImGui::SetNextWindowSize(display);
-    ImGui::Begin("shadPS4", nullptr,
+    ImGui::Begin("shadPS4-UWP", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoSavedSettings);
-    ImGui::TextUnformatted("shadPS4  |  UWP / Direct3D 12");
-    if (show_fps) {
-        ImGui::SameLine();
-        ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar);
+    if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("Arquivo")) {
+            if (ImGui::MenuItem("Adicionar pasta de jogos…", nullptr, false,
+                                idle && !scanning.load()) &&
+                choose_folder)
+                choose_folder(L"library");
+            if (ImGui::MenuItem("Adicionar PKG…", nullptr, false, idle && !scanning.load()) &&
+                choose_folder)
+                choose_folder(L"pkg");
+            if (ImGui::MenuItem("Iniciar jogo", nullptr, false, can_play))
+                StartGame();
+            if (ImGui::BeginMenu("Importar", idle)) {
+                if (ImGui::MenuItem("Módulos de sistema…") && choose_folder)
+                    choose_folder(L"sys_modules");
+                if (ImGui::MenuItem("Fontes…") && choose_folder)
+                    choose_folder(L"fonts");
+                if (ImGui::MenuItem("DLCs…") && choose_folder)
+                    choose_folder(L"addcont");
+                ImGui::EndMenu();
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Exibir")) {
+            ImGui::MenuItem("Lista de jogos", nullptr, &show_game_list);
+            ImGui::MenuItem("Log do jogo", nullptr, &show_game_log);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Modo lista", nullptr, !grid_view))
+                grid_view = false;
+            if (ImGui::MenuItem("Modo grade", nullptr, grid_view))
+                grid_view = true;
+            if (ImGui::MenuItem("Tela cheia") && toggle_fullscreen)
+                toggle_fullscreen();
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Configurações")) {
+            if (ImGui::MenuItem("Configurar…", nullptr, false, idle))
+                open_settings();
+            if (ImGui::MenuItem("Controles e teclado…", nullptr, false, idle))
+                open_settings("Entrada");
+            if (ImGui::MenuItem("Pastas da biblioteca…", nullptr, false, idle))
+                open_settings("Pastas");
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Ajuda")) {
+            if (ImGui::MenuItem("Sobre o ShadPS4-UWP"))
+                about_open = true;
+            ImGui::EndMenu();
+        }
+        ImGui::EndMenuBar();
     }
-    constexpr std::array labels{"Biblioteca", "Configurações", "Logs"};
-    for (int index = 0; index < labels.size(); ++index) {
-        if (index)
-            ImGui::SameLine();
-        if (ImGui::Button(labels[index]))
-            tab = index;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
+    ImGui::BeginChild("toolbar", {0, 90 * scale}, false, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::PushStyleColor(ImGuiCol_Button, {0, 0, 0, 0});
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {2 * scale, 4 * scale});
+    if (ToolbarButton(game_running ? (session_paused ? "Continuar" : "Pausar") : "Iniciar",
+                      game_running && !session_paused ? "pause_icon.png" : "play_icon.png",
+                      game_running || can_play)) {
+        if (game_running) {
+            session_paused = !session_paused;
+            core->Pause(session_paused);
+        } else {
+            StartGame();
+        }
     }
     ImGui::SameLine();
-    ImGui::BeginDisabled(scanning.load() || session_pending || game_running);
-    if (ImGui::Button("Adicionar pasta") && choose_folder)
-        choose_folder(L"library");
+    if (ToolbarButton("Parar", "stop_icon.png", game_running)) {
+        restart_requested = false;
+        status = "Encerrando sessão…";
+        core->Stop();
+    }
     ImGui::SameLine();
-    if (ImGui::Button("Atualizar biblioteca"))
+    if (ToolbarButton("Reiniciar", "restart_game_icon.png", game_running)) {
+        restart_requested = true;
+        status = "Reiniciando jogo…";
+        core->Stop();
+    }
+    ImGui::SameLine();
+    if (ToolbarButton("Configurações", "settings_icon.png", idle))
+        open_settings();
+    ImGui::SameLine();
+    if (ToolbarButton("Tela cheia", "fullscreen_icon.png") && toggle_fullscreen)
+        toggle_fullscreen();
+    ImGui::SameLine();
+    if (ToolbarButton("Controles", "controller_icon.png", idle))
+        open_settings("Entrada");
+    ImGui::SameLine();
+    if (ToolbarButton("Teclado", "keyboard_icon.png", idle))
+        open_settings("Entrada");
+    ImGui::SameLine();
+    ImGui::Dummy({2 * scale, 76 * scale});
+    ImGui::SameLine();
+    if (ToolbarButton("Atualizar lista", "refreshlist_icon.png", idle && !scanning.load()))
         Queue([this] { Scan(); });
-    ImGui::EndDisabled();
-    if (ImGui::BeginMenu("Importar", !session_pending && !game_running)) {
-        if (ImGui::MenuItem("Módulos de sistema") && choose_folder)
-            choose_folder(L"sys_modules");
-        if (ImGui::MenuItem("Fontes") && choose_folder)
-            choose_folder(L"fonts");
-        if (ImGui::MenuItem("DLCs") && choose_folder)
-            choose_folder(L"addcont");
-        ImGui::EndMenu();
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::SetNextItemWidth(180 * scale);
+    ImGui::SliderFloat("##icon-size", &icon_size, 24, 128, "Tamanho: %.0f");
+    ImGui::SetNextItemWidth(220 * scale);
+    if (ImGui::InputTextWithHint("##search", "Pesquisar…", search, sizeof(search)))
+        Filter();
+    ImGui::EndGroup();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+    ImGui::EndChild();
+    ImGui::Separator();
+    const float footer = ImGui::GetFrameHeightWithSpacing();
+    const float available = ImGui::GetContentRegionAvail().y - footer;
+    const float minimum = std::min(60 * scale, std::max(0.0f, available / 3));
+    const float log_size = show_game_log ? std::clamp(log_height * scale, minimum,
+                                                      std::max(minimum, available - minimum))
+                                         : 0;
+    if (show_game_list) {
+        ImGui::TextUnformatted("Lista de jogos");
+        ImGui::BeginChild(
+            "game-list",
+            {0, std::max(1.0f, available - (show_game_log ? log_size + 12 * scale : 0) -
+                                   ImGui::GetFrameHeight())},
+            true);
+        DrawLibrary();
+        ImGui::EndChild();
     }
-    ImGui::TextWrapped("%s", status.c_str());
+    if (show_game_log) {
+        if (show_game_list) {
+            ImGui::InvisibleButton("log-splitter", {-1, 5 * scale});
+            if (ImGui::IsItemActive())
+                log_height = std::clamp(log_height - ImGui::GetIO().MouseDelta.y / scale, 60.0f,
+                                        std::max(60.0f, available / scale - 60));
+            if (ImGui::IsItemHovered())
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        ImGui::BeginChild("game-log", {0, -footer}, true);
+        ImGui::TextUnformatted("Log do jogo");
+        DrawLogs();
+        ImGui::EndChild();
+    }
+    ImGui::Separator();
+    ImGui::Text("Jogos: %zu", visible ? visible->size() : 0);
+    ImGui::SameLine();
     if (scanning.load())
         ImGui::Text("Examinando pastas: %u", scanned.load());
-    ImGui::Separator();
-    if (tab == 0)
-        DrawLibrary();
-    else if (tab == 1) {
-        ImGui::BeginDisabled(session_pending || game_running);
-        DrawSettings();
-        ImGui::EndDisabled();
-    }
     else
-        DrawLogs();
+        ImGui::TextUnformatted(status.c_str());
+    if (show_fps) {
+        ImGui::SameLine();
+        ImGui::Text("| %.1f FPS", ImGui::GetIO().Framerate);
+    }
+
+    const auto layout = nlohmann::json{
+        {"game_list", show_game_list},
+        {"game_log", show_game_log},
+        {"grid", grid_view},
+        {"icon_size", icon_size},
+        {"log_height",
+         log_height}}.dump();
+    if (layout != launcher_layout && !ImGui::IsMouseDown(0)) {
+        launcher_layout = layout;
+        try {
+            ApplicationData::Current->LocalSettings->Values->Insert(
+                L"shadps4.launcher.layout", ref new Platform::String(Wide(layout).c_str()));
+        } catch (Platform::Exception ^) {
+            status = "Não foi possível salvar a disposição da interface.";
+        }
+    }
     ImGui::End();
+    if (settings_open) {
+        ImGui::SetNextWindowSize(
+            {std::min(1000 * scale, display.x - 24), std::min(740 * scale, display.y - 24)},
+            ImGuiCond_Appearing);
+        ImGui::SetNextWindowPos({display.x / 2, display.y / 2}, ImGuiCond_Appearing, {0.5f, 0.5f});
+        if (ImGui::Begin("Configurações", &settings_open, ImGuiWindowFlags_NoCollapse)) {
+            ImGui::BeginDisabled(!idle || settings_saving);
+            DrawSettings();
+            ImGui::EndDisabled();
+        }
+        ImGui::End();
+        if (!settings_open && !settings_saving) {
+            settings_changes.clear();
+            next_graphics_backend = static_cast<int>(core->GraphicsBackend());
+            const auto profile = settings_profile;
+            const auto request = settings_request.load();
+            Queue([this, profile, request] { LoadSettings(profile, request); });
+        }
+    }
+    if (about_open) {
+        ImGui::SetNextWindowSize({440 * scale, 180 * scale}, ImGuiCond_Appearing);
+        if (ImGui::Begin("Sobre o ShadPS4-UWP", &about_open, ImGuiWindowFlags_NoCollapse)) {
+            ImGui::TextUnformatted("shadPS4-UWP");
+            ImGui::TextWrapped("Emulador de PlayStation 4 para Windows e Xbox UWP.");
+            ImGui::Separator();
+            ImGui::TextWrapped("Interface adaptada do shadPS4 Qt Launcher.\nshadPS4 "
+                               "Emulator Project — GPL-2.0-or-later.");
+        }
+        ImGui::End();
+    }
 }
 
 void ImGuiFrontend::DrawLibrary() {
-    if (library && ImGui::TreeNode("Pastas da biblioteca")) {
-        ImGui::BeginDisabled(scanning.load() || session_pending || game_running);
-        for (const auto& root : library->roots) {
-            ImGui::PushID(root.token.c_str());
-            bool enabled = root.enabled;
-            if (ImGui::Checkbox(root.name.c_str(), &enabled))
-                ChangeRoot(root.token, enabled, false);
-            ImGui::SameLine();
-            if (ImGui::Button("Remover"))
-                ChangeRoot(root.token, enabled, true);
-            ImGui::PopID();
-        }
-        ImGui::EndDisabled();
-        ImGui::TreePop();
-    }
-    ImGui::SetNextItemWidth(std::min(500.0f, ImGui::GetContentRegionAvail().x));
-    if (ImGui::InputText("Pesquisar", search, sizeof(search)))
-        Filter();
     if (!library || !visible || visible->empty()) {
-        ImGui::TextUnformatted("Selecione uma pasta com jogos PS4. Para Image0/Sc0, escolha a pasta que contém ambas.");
+        ImGui::TextWrapped("Nenhum jogo encontrado. Use Arquivo > Adicionar pasta de jogos. Para "
+                           "Image0/Sc0, escolha a pasta que contém ambas.");
         return;
     }
-    ImGui::Text("%zu jogos | %zu/64 capas residentes", visible->size(), renderer->ImageCount());
-    const float row_height = 78 * ImGui::GetIO().FontGlobalScale;
-    ImGui::BeginChild("catalogue", {0, -44 * ImGui::GetIO().FontGlobalScale}, true);
-    ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(visible->size()), row_height);
-    while (clipper.Step())
-        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-            const auto index = (*visible)[row];
-            const auto& game = library->games[index];
-            ImGui::PushID(static_cast<int>(index));
-            const auto start = ImGui::GetCursorPos();
-            const auto key = std::to_string(library->generation) + ":" + game.path;
-            const auto texture = renderer->Image(key);
-            const float icon = 64 * ImGui::GetIO().FontGlobalScale;
-            if (texture)
-                ImGui::Image(reinterpret_cast<ImTextureID>(texture), {icon, icon});
-            else {
-                ImGui::Dummy({icon, icon});
+    const float scale = ImGui::GetIO().FontGlobalScale;
+    const auto draw_game = [&](size_t index, bool grid) {
+        const auto& game = library->games[index];
+        ImGui::PushID(static_cast<int>(index));
+        const auto key = std::to_string(library->generation) + ":" + game.path;
+        const auto texture = renderer->Image(key);
+        const float size = (grid ? std::max(icon_size, 96.0f) : icon_size) * scale;
+        if (texture)
+            ImGui::Image(reinterpret_cast<ImTextureID>(texture), {size, size});
+        else {
+            ImGui::Dummy({size, size});
+            if (!game.metadata_path.empty())
                 RequestImage(key, game.metadata_path + "/icon0.png");
-            }
-            ImGui::SameLine();
-            ImGui::BeginGroup();
-            if (ImGui::Selectable(game.title.c_str(), selection == index))
-                selection = index;
-            ImGui::Text("%s  %s", game.serial.c_str(), game.version.c_str());
-            ImGui::EndGroup();
-            ImGui::SetCursorPos({start.x, start.y + row_height});
-            ImGui::PopID();
         }
-    ImGui::EndChild();
-    ImGui::BeginDisabled(!game_surface || scanning.load() || session_pending ||
-                         core->State() != SHADPS4_READY || !library ||
-                         selection >= library->games.size());
-    if (ImGui::Button("Iniciar jogo")) {
-      const auto executable = library->games[selection].path + "/eboot.bin";
-      session_pending = true;
-      status = "Iniciando jogo…";
-      const auto weak = weak_from_this();
-      if (!Queue([this, executable, weak] {
+        if (grid && ImGui::IsItemClicked())
+            selection = index;
+        if (!grid)
+            ImGui::TableSetColumnIndex(1);
+        if (ImGui::Selectable(game.title.c_str(), selection == index,
+                              ImGuiSelectableFlags_AllowDoubleClick |
+                                  (grid ? 0 : ImGuiSelectableFlags_SpanAllColumns),
+                              {0, grid ? 0 : size})) {
+            selection = index;
+            if (!game.launch_error.empty())
+                status = game.launch_error;
+            if (ImGui::IsMouseDoubleClicked(0) || ImGui::IsKeyPressed(ImGuiKey_Enter) ||
+                ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown))
+                StartGame();
+        }
+        if (ImGui::BeginPopupContextItem("game-actions")) {
+            selection = index;
+            if (ImGui::MenuItem("Iniciar", nullptr, false, !game_running && !session_pending))
+                StartGame();
+            if (ImGui::MenuItem("Configurações do jogo…", nullptr, false,
+                                !game_running && !session_pending && !game.serial.empty() &&
+                                    settings_changes.empty())) {
+                const auto serial = game.serial;
+                const auto request = ++settings_request;
+                if (Queue([this, serial, request] { LoadSettings(serial, request); })) {
+                    settings_profile = serial;
+                    settings.clear();
+                    settings_open = true;
+                }
+            }
+            ImGui::EndPopup();
+        }
+        if (grid) {
+            ImGui::TextUnformatted(game.serial.c_str());
+            ImGui::TextWrapped("%s", game.format.c_str());
+        } else {
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(game.serial.c_str());
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted(game.region.c_str());
+            ImGui::TableSetColumnIndex(4);
+            ImGui::TextUnformatted(game.firmware.c_str());
+            ImGui::TableSetColumnIndex(5);
+            ImGui::TextUnformatted(game.version.c_str());
+            ImGui::TableSetColumnIndex(6);
+            ImGui::TextUnformatted(game.source_path.empty() ? game.path.c_str()
+                                                            : game.source_path.c_str());
+            ImGui::TableSetColumnIndex(7);
+            ImGui::TextUnformatted(game.format.c_str());
+        }
+        ImGui::PopID();
+    };
+    if (grid_view) {
+        const float cell = (std::max(icon_size, 96.0f) + 32) * scale;
+        const int columns =
+            std::clamp(static_cast<int>(ImGui::GetContentRegionAvail().x / cell), 1, 64);
+        const float row_height = std::max(icon_size, 96.0f) * scale +
+            ImGui::GetTextLineHeightWithSpacing() * 4 + ImGui::GetStyle().CellPadding.y * 2;
+
+        if (ImGui::BeginTable("game-grid", columns)) {
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>((visible->size() + columns - 1) / columns),
+                          row_height);
+            while (clipper.Step())
+                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                    ImGui::TableNextRow(0, row_height);
+                    for (int column = 0; column < columns; ++column) {
+                        const size_t position = static_cast<size_t>(row) * columns + column;
+                        if (position >= visible->size())
+                            break;
+                        ImGui::TableSetColumnIndex(column);
+                        draw_game((*visible)[position], true);
+                    }
+                }
+            ImGui::EndTable();
+        }
+    } else if (ImGui::BeginTable("game-table", 8,
+                                 ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
+                                     ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                     ImGuiTableFlags_ScrollX | ImGuiTableFlags_Reorderable |
+                                     ImGuiTableFlags_Hideable | ImGuiTableFlags_Sortable)) {
+        ImGui::TableSetupScrollFreeze(2, 1);
+        ImGui::TableSetupColumn("Ícone",
+                                ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                                icon_size * scale + 8);
+        ImGui::TableSetupColumn("Nome", ImGuiTableColumnFlags_WidthStretch, 3);
+        ImGui::TableSetupColumn("Serial", ImGuiTableColumnFlags_WidthFixed, 120 * scale);
+        ImGui::TableSetupColumn("Região", ImGuiTableColumnFlags_WidthFixed, 80 * scale);
+        ImGui::TableSetupColumn("Firmware", ImGuiTableColumnFlags_WidthFixed, 80 * scale);
+        ImGui::TableSetupColumn("Versão", ImGuiTableColumnFlags_WidthFixed, 80 * scale);
+        ImGui::TableSetupColumn("Caminho", ImGuiTableColumnFlags_WidthStretch, 2);
+        ImGui::TableSetupColumn("Formato", ImGuiTableColumnFlags_WidthFixed, 140 * scale);
+        ImGui::TableHeadersRow();
+        if (const auto specs = ImGui::TableGetSortSpecs();
+            specs && specs->SpecsDirty && specs->SpecsCount) {
+            sort_column = specs->Specs[0].ColumnIndex;
+            sort_descending = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+            Filter();
+            specs->SpecsDirty = false;
+        }
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(visible->size()), icon_size * scale + 4);
+        while (clipper.Step())
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                ImGui::TableNextRow(0, icon_size * scale + 4);
+                ImGui::TableSetColumnIndex(0);
+                draw_game((*visible)[row], false);
+            }
+        ImGui::EndTable();
+    }
+}
+
+void ImGuiFrontend::StartGame() {
+    if (!game_surface || scanning.load() || session_pending || game_running ||
+        core->State() != SHADPS4_READY || !library || selection >= library->games.size())
+        return;
+    const auto& game = library->games[selection];
+    if (game.executable.empty()) {
+        status = game.launch_error.empty() ? "O jogo não possui executável acessível."
+                                           : game.launch_error;
+        return;
+    }
+    active_game_path = game.path;
+    const auto executable = game.executable;
+    session_pending = true;
+    status = "Iniciando jogo…";
+    const auto weak = weak_from_this();
+    if (!Queue([this, executable, weak] {
             core->Run(Wide(executable), [weak](std::wstring message) {
-              if (const auto self = weak.lock())
-                self->Complete([self, message] {
-                  self->reload_core = self->core->State() != SHADPS4_READY;
-                  self->session_pending = self->reload_core;
-                  self->session_paused = false;
-                  self->status = Utf8(message);
-                });
+                if (const auto self = weak.lock())
+                    self->Complete([self, message] {
+                        self->reload_core = self->core->State() != SHADPS4_READY;
+                        self->session_pending = self->reload_core;
+                        self->session_paused = false;
+                        self->status = Utf8(message);
+                    });
             });
-          })) {
+        })) {
         session_pending = false;
         status = "O worker está ocupado.";
-      }
+    }
+}
+
+void ImGuiFrontend::ApplySettings(bool close_window) {
+    if (settings_saving)
+        return;
+    const auto changes = settings_changes;
+    const auto profile = settings_profile;
+    const auto request = settings_request.load();
+    const int backend = next_graphics_backend;
+    if (Queue([this, changes, profile, request, backend, close_window] {
+            try {
+                for (const auto& [identity, value] : changes) {
+                    const auto& [group, key] = identity;
+                    const auto json = value.dump();
+                    if (profile.empty() ? set_setting(group.c_str(), key.c_str(), json.c_str())
+                                        : set_game_setting(profile.c_str(), group.c_str(),
+                                                           key.c_str(), json.c_str()))
+                        throw std::runtime_error(Utf8(core->Error()));
+                }
+                if (backend >= 0)
+                    ApplicationData::Current->LocalSettings->Values->Insert(
+                        L"shadps4.graphics.backend",
+                        ref new Platform::String(backend ? L"d3d12" : L"dozen"));
+                LoadSettings(profile, request);
+                Complete([this, backend, close_window] {
+                    settings_changes.clear();
+                    settings_saving = false;
+                    if (close_window)
+                        settings_open = false;
+                    reload_core =
+                        backend >= 0 && backend != static_cast<int>(core->GraphicsBackend());
+                    session_pending = reload_core;
+                    status = "Configurações salvas.";
+                });
+            } catch (...) {
+                Complete([this] { settings_saving = false; });
+                throw;
+            }
+        }))
+        settings_saving = true;
+    else
+        status = "Aguarde as operações pendentes.";
+}
+
+void ImGuiFrontend::DrawSetting(Setting& setting) {
+    ImGui::PushID(setting.group.c_str());
+    ImGui::PushID(setting.key.c_str());
+    ImGui::BeginDisabled(!setting.editable);
+    if (!setting.value.is_boolean())
+        ImGui::TextUnformatted(setting.label.c_str());
+    ImGui::SetNextItemWidth(-1);
+    const auto stage = [&](nlohmann::json value) {
+        setting.value = value;
+        settings_changes[{setting.group, setting.key}] = std::move(value);
+    };
+    if (!setting.choices.empty()) {
+        std::string label = setting.value.dump();
+        for (const auto& choice : setting.choices)
+            if (choice.at("value") == setting.value)
+                label = choice.at("label");
+        if (ImGui::BeginCombo("##value", label.c_str())) {
+            for (const auto& choice : setting.choices)
+                if (ImGui::Selectable(choice.at("label").get_ref<const std::string&>().c_str(),
+                                      choice.at("value") == setting.value))
+                    stage(choice.at("value"));
+            ImGui::EndCombo();
+        }
+    } else if (setting.value.is_boolean()) {
+        bool value = setting.value;
+        if (ImGui::Checkbox(setting.label.c_str(), &value))
+            stage(value);
+    } else if (setting.value.is_number_integer()) {
+        int64_t value = setting.value;
+        if (ImGui::InputScalar("##value", ImGuiDataType_S64, &value))
+            stage(std::clamp(value, static_cast<int64_t>(setting.minimum),
+                             static_cast<int64_t>(setting.maximum)));
+    } else if (setting.value.is_number()) {
+        double value = setting.value;
+        if (ImGui::InputDouble("##value", &value, 0, 0, "%.3f"))
+            stage(std::clamp(value, setting.minimum, setting.maximum));
+    } else {
+        ImGui::TextWrapped("%s", setting.value.get_ref<const std::string&>().c_str());
+        if (ImGui::Button("Editar…") && edit_text) {
+            const auto copy = setting;
+            const auto request = settings_request.load();
+            edit_text(setting.label, setting.value, false,
+                      [self = shared_from_this(), copy, request](std::string value) {
+                          self->Complete([self, copy, request, value] {
+                              if (request != self->settings_request.load())
+                                  return;
+                              for (auto& entry : self->settings)
+                                  if (entry.group == copy.group && entry.key == copy.key) {
+                                      entry.value = value;
+                                      self->settings_changes[{copy.group, copy.key}] = value;
+                                      break;
+                                  }
+                          });
+                      });
+        }
     }
     ImGui::EndDisabled();
-    if (game_running) {
-      ImGui::SameLine();
-      if (ImGui::Button(session_paused ? "Continuar" : "Pausar")) {
-        session_paused = !session_paused;
-        core->Pause(session_paused);
-      }
-      ImGui::SameLine();
-      if (ImGui::Button("Parar")) {
-        status = "Encerrando sessão…";
-        core->Stop();
-      }
-    }
+    if (!setting.editable && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Opção global herdada pelo perfil do jogo.");
+    ImGui::PopID();
+    ImGui::PopID();
 }
 
 void ImGuiFrontend::DrawSettings() {
-  if (next_graphics_backend < 0)
-    next_graphics_backend = static_cast<int>(core->GraphicsBackend());
-  const char* backends[] = {"Vulkan / Dozen", "D3D12 nativo (experimental)"};
-  if (ImGui::Combo("Backend grafico", &next_graphics_backend, backends, 2)) {
-    try {
-      ApplicationData::Current->LocalSettings->Values->Insert(
-          L"shadps4.graphics.backend",
-          ref new Platform::String(next_graphics_backend ? L"d3d12" : L"dozen"));
-      reload_core = next_graphics_backend != static_cast<int>(core->GraphicsBackend());
-      session_pending = reload_core;
-      status = reload_core ? "Aplicando backend grafico e recarregando a biblioteca…"
-                           : "Backend grafico selecionado.";
-    } catch (Platform::Exception^) {
-      next_graphics_backend = static_cast<int>(core->GraphicsBackend());
-      status = "Nao foi possivel salvar o backend grafico.";
+    if (next_graphics_backend < 0)
+        next_graphics_backend = static_cast<int>(core->GraphicsBackend());
+    const bool dirty = !settings_changes.empty() ||
+                       next_graphics_backend != static_cast<int>(core->GraphicsBackend());
+    ImGui::BeginDisabled(dirty);
+    ImGui::SetNextItemWidth(360 * ImGui::GetIO().FontGlobalScale);
+    if (ImGui::BeginCombo("Perfil",
+                          settings_profile.empty() ? "Global" : settings_profile.c_str())) {
+        const size_t count = library ? library->profiles.size() + 1 : 1;
+        for (size_t index = 0; index < count; ++index) {
+            const auto serial = index ? library->profiles[index - 1].second : std::string{};
+            const auto label = index ? library->profiles[index - 1].first + " (" + serial + ")"
+                                     : std::string{"Global"};
+            if (ImGui::Selectable(label.c_str(), settings_profile == serial)) {
+                const auto request = ++settings_request;
+                if (Queue([this, serial, request] { LoadSettings(serial, request); })) {
+                    settings_profile = serial;
+                    settings.clear();
+                }
+            }
+        }
+        ImGui::EndCombo();
     }
-  }
-  ImGui::TextWrapped("Backend ativo: %s. A selecao sera usada ao iniciar jogos.",
-                    backends[core->GraphicsBackend()]);
-  if (next_graphics_backend == SHADPS4_GRAPHICS_D3D12_NATIVE)
-    ImGui::TextWrapped("Compatibilidade experimental: alguns jogos ainda nao iniciam.");
+    ImGui::EndDisabled();
+    const float scale = ImGui::GetIO().FontGlobalScale;
+    const float description_height =
+        std::clamp(ImGui::GetContentRegionAvail().y * 0.2f, 44 * scale, 130 * scale);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
+    ImGui::BeginChild("settings-content",
+                      {0, -description_height - ImGui::GetFrameHeightWithSpacing() * 2}, true);
+    constexpr std::array pages{"Geral", "Interface", "Gráficos", "Usuário", "Entrada",
+                               "Áudio", "Rede",      "Pastas",   "Log",     "Debug"};
+    if (ImGui::BeginTabBar("settings-pages")) {
+        for (const auto* page : pages) {
+            const bool requested = requested_settings_group == page;
+            if (!ImGui::BeginTabItem(page, nullptr, requested ? ImGuiTabItemFlags_SetSelected : 0))
+                continue;
+            if (requested)
+                requested_settings_group.clear();
+            ImGui::BeginChild("page-options", {0, 0}, false);
+            if (std::string_view(page) == "Gráficos") {
+                ImGui::TextUnformatted("Renderização");
+                ImGui::Separator();
+                const char* backends[] = {"Vulkan / Dozen", "D3D12 nativo"};
+                ImGui::BeginDisabled(!settings_profile.empty());
+                ImGui::Combo("Backend gráfico (global)", &next_graphics_backend, backends, 2);
+                ImGui::EndDisabled();
+                ImGui::Spacing();
+            }
+            if (std::string_view(page) == "Pastas") {
+                ImGui::TextUnformatted("Pastas da biblioteca");
+                ImGui::Separator();
+                ImGui::BeginDisabled(scanning.load() || !settings_profile.empty());
+                if (ImGui::Button("Adicionar pasta…") && choose_folder)
+                    choose_folder(L"library");
+                ImGui::SameLine();
+                if (ImGui::Button("Adicionar PKG…") && choose_folder)
+                    choose_folder(L"pkg");
+                if (library)
+                    for (const auto& root : library->roots) {
+                        ImGui::PushID(root.token.c_str());
+                        bool enabled = root.enabled;
+                        if (ImGui::Checkbox(root.name.c_str(), &enabled))
+                            ChangeRoot(root.token, enabled, false);
+                        ImGui::SameLine();
+                        if (ImGui::Button("Remover"))
+                            ChangeRoot(root.token, enabled, true);
+                        ImGui::PopID();
+                    }
+                ImGui::EndDisabled();
+                ImGui::TextWrapped("Módulos, fontes e DLCs são importados pelo menu "
+                                   "Arquivo > Importar.");
+            }
+            bool any = std::string_view(page) == "Gráficos" || std::string_view(page) == "Pastas";
+            std::vector<std::string> sections;
+            for (const auto& setting : settings) {
+                if (SettingsPage(setting.group, setting.key) != page)
+                    continue;
+                any = true;
+                const auto section = SettingsSection(setting.group, setting.key);
+                if (section != "Avançado" &&
+                    std::find(sections.begin(), sections.end(), section) == sections.end())
+                    sections.push_back(section);
+            }
+            if (std::string_view(page) == "Gráficos")
+                std::stable_sort(sections.begin(), sections.end(),
+                                 [](const auto& a, const auto& b) {
+                                     const auto rank = [](const auto& section) {
+                                         return section == "Dispositivo e cache" ? 0
+                                                : section == "Vídeo"             ? 1
+                                                                                 : 2;
+                                     };
+                                     return rank(a) < rank(b);
+                                 });
+            const int columns =
+                std::max(1, std::min(3, static_cast<int>(ImGui::GetContentRegionAvail().x /
+                                                         (280 * ImGui::GetIO().FontGlobalScale))));
+            if (!sections.empty() &&
+                ImGui::BeginTable("option-sections", columns, ImGuiTableFlags_SizingStretchSame)) {
+                for (const auto& section : sections) {
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(section.c_str());
+                    ImGui::Separator();
+                    for (auto& setting : settings)
+                        if (SettingsPage(setting.group, setting.key) == page &&
+                            SettingsSection(setting.group, setting.key) == section)
+                            DrawSetting(setting);
+                }
+                ImGui::EndTable();
+            }
+            if (std::string_view(page) == "Gráficos" &&
+                ImGui::CollapsingHeader("Opções avançadas de GPU"))
+                for (auto& setting : settings)
+                    if (SettingsPage(setting.group, setting.key) == page &&
+                        SettingsSection(setting.group, setting.key) == "Avançado")
+                        DrawSetting(setting);
 
-  if (ImGui::BeginCombo("Perfil", settings_profile.empty()
-                                      ? "Global"
-                                      : settings_profile.c_str())) {
-    ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(library ? library->profiles.size() + 1 : 1));
-    while (clipper.Step())
-      for (int index = clipper.DisplayStart; index < clipper.DisplayEnd;
-           ++index) {
-        const auto serial =
-            index ? library->profiles[index - 1].second : std::string{};
-        const auto label =
-            index ? library->profiles[index - 1].first + " (" + serial + ")"
-                  : std::string{"Global"};
-        if (ImGui::Selectable(label.c_str(), settings_profile == serial)) {
-          const auto request = ++settings_request;
-          if (Queue(
-                  [this, serial, request] { LoadSettings(serial, request); })) {
-            settings_profile = serial;
-            settings.clear();
-          }
+            if (!any)
+                ImGui::TextWrapped("Nenhuma opção disponível nesta categoria para o "
+                                   "perfil selecionado.");
+            ImGui::EndChild();
+            ImGui::EndTabItem();
         }
-      }
-    ImGui::EndCombo();
-  }
-  ImGui::Text(
-      "%zu opções compatíveis; %zu opções incompatíveis preservadas e ocultas.",
-      settings.size(), excluded);
-  if (ImGui::Button(settings_profile.empty() ? "Restaurar padrões"
-                                             : "Excluir perfil do jogo")) {
-    const auto profile = settings_profile;
-    const auto request = settings_request.load();
-    Queue([this, profile, request] {
-      if (profile.empty() ? reset_settings()
-                          : delete_game_settings(profile.c_str()))
-        throw std::runtime_error(Utf8(core->Error()));
-      LoadSettings(profile, request);
-    });
-  }
-  std::vector<std::string> groups;
-  for (const auto &setting : settings)
-    if (std::find(groups.begin(), groups.end(), setting.group) == groups.end())
-      groups.push_back(setting.group);
-  if (ImGui::BeginTabBar("settings-pages")) {
-    for (const auto &group : groups)
-      if (ImGui::BeginTabItem(group.c_str())) {
-        ImGui::BeginChild(group.c_str(), {0, 0}, false);
-        for (const auto &setting : settings) {
-          if (setting.group != group)
-            continue;
-          ImGui::PushID(setting.key.c_str());
-          ImGui::BeginDisabled(!setting.editable);
-          if (!setting.choices.empty()) {
-            std::string label = setting.value.dump();
-            for (const auto &choice : setting.choices)
-              if (choice.at("value") == setting.value)
-                label = choice.at("label");
-            if (ImGui::BeginCombo(setting.label.c_str(), label.c_str())) {
-              for (const auto &choice : setting.choices)
-                if (ImGui::Selectable(choice.at("label")
-                                          .get_ref<const std::string &>()
-                                          .c_str(),
-                                      choice.at("value") == setting.value))
-                  SaveSetting(setting, choice.at("value"));
-              ImGui::EndCombo();
-            }
-          } else if (setting.value.is_boolean()) {
-            bool value = setting.value;
-            if (ImGui::Checkbox(setting.label.c_str(), &value))
-              SaveSetting(setting, value);
-          } else if (setting.value.is_number_integer()) {
-            int64_t value = setting.value,
-                    minimum = static_cast<int64_t>(setting.minimum),
-                    maximum = static_cast<int64_t>(setting.maximum);
-            if (ImGui::InputScalar(setting.label.c_str(), ImGuiDataType_S64,
-                                   &value, nullptr, nullptr, "%lld",
-                                   ImGuiInputTextFlags_EnterReturnsTrue))
-              SaveSetting(setting, std::clamp(value, minimum, maximum));
-          } else if (setting.value.is_number()) {
-            double value = setting.value;
-            if (ImGui::InputDouble(setting.label.c_str(), &value, 0, 0, "%.3f",
-                                   ImGuiInputTextFlags_EnterReturnsTrue))
-              SaveSetting(setting,
-                          std::clamp(value, setting.minimum, setting.maximum));
-          } else {
-            ImGui::TextWrapped(
-                "%s: %s", setting.label.c_str(),
-                setting.value.get_ref<const std::string &>().c_str());
-            if (ImGui::Button("Editar") && edit_text) {
-              const auto copy = setting;
-              const auto request = settings_request.load();
-              edit_text(
-                  setting.label, setting.value, false,
-                  [self = shared_from_this(), copy,
-                   request](std::string value) {
-                    self->Queue([self, copy, value, request] {
-                      const auto json = nlohmann::json(value).dump();
-                      if (copy.profile.empty()
-                              ? self->set_setting(copy.group.c_str(),
-                                                  copy.key.c_str(),
-                                                  json.c_str())
-                              : self->set_game_setting(
-                                    copy.profile.c_str(), copy.group.c_str(),
-                                    copy.key.c_str(), json.c_str()))
-                        throw std::runtime_error(Utf8(self->core->Error()));
-                      self->LoadSettings(copy.profile, request);
-                    });
-                  });
-            }
-          }
-          ImGui::EndDisabled();
-          if (!setting.editable &&
-              ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Esta opção é global e é herdada pelo perfil.");
-          ImGui::PopID();
-        }
-        ImGui::EndChild();
-        ImGui::EndTabItem();
-      }
-    ImGui::EndTabBar();
-  }
+        ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    if (ImGui::Button(settings_profile.empty() ? "Restaurar padrões" : "Excluir perfil do jogo")) {
+        const auto profile = settings_profile;
+        const auto request = settings_request.load();
+        if (Queue([this, profile, request] {
+                if (profile.empty() ? reset_settings() : delete_game_settings(profile.c_str()))
+                    throw std::runtime_error(Utf8(core->Error()));
+                LoadSettings(profile, request);
+                Complete([this] {
+                    settings_changes.clear();
+                    next_graphics_backend = static_cast<int>(core->GraphicsBackend());
+                });
+            }))
+            status = "Restaurando configurações…";
+    }
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(
+        std::max(ImGui::GetCursorPosX(), ImGui::GetWindowContentRegionMax().x - 240 * scale));
+    if (ImGui::Button("Salvar", {72 * scale, 0}))
+        ApplySettings(true);
+    ImGui::SameLine();
+    if (ImGui::Button("Aplicar", {72 * scale, 0}))
+        ApplySettings(false);
+    ImGui::SameLine();
+    if (ImGui::Button("Fechar", {72 * scale, 0}))
+        settings_open = false;
+    ImGui::BeginChild("settings-description", {0, 0}, true);
+    ImGui::TextWrapped("%s", dirty
+                                 ? "Há alterações não salvas. Salve ou aplique antes de trocar de "
+                                   "perfil."
+                                 : "As configurações são compartilhadas com o núcleo de emulação.");
+    ImGui::EndChild();
 }
+
 void ImGuiFrontend::DrawLogs() {
     if (ImGui::Button("Limpar visualização"))
         logs.clear();

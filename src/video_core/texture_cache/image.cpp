@@ -216,6 +216,11 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     supported_samples = image_format_properties.result == vk::Result::eSuccess
                             ? image_format_properties.value.imageFormatProperties.sampleCounts
                             : vk::SampleCountFlagBits::e1;
+    if ((usage_flags & (vk::ImageUsageFlagBits::eColorAttachment |
+                        vk::ImageUsageFlagBits::eDepthStencilAttachment)) &&
+        !instance.IsMixedDepthSamplesSupported() && !instance.IsMixedAnySamplesSupported()) {
+        supported_samples &= instance.GetColorSampleCounts() & instance.GetDepthSampleCounts();
+    }
 
     const vk::ImageCreateInfo image_ci = {
         .flags = flags,

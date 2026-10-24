@@ -64,6 +64,10 @@ public:
     virtual bool Seek(s64 offset, Common::FS::SeekOrigin origin) = 0;
     virtual u64 Tell() const = 0;
     virtual u64 Size() const = 0;
+    virtual bool SetSize(u64 size) {
+        auto* host = GetHostFile();
+        return !IsReadOnly() && host && host->SetSize(size);
+    }
     virtual bool Flush() = 0;
     virtual bool IsOpen() const = 0;
 

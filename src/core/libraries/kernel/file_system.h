@@ -73,6 +73,8 @@ s64 PS4_SYSV_ABI sceKernelRead(s32 fd, void* buf, u64 nbytes);
 s64 PS4_SYSV_ABI sceKernelPread(s32 fd, void* buf, u64 nbytes, s64 offset);
 s64 PS4_SYSV_ABI sceKernelPwrite(s32 fd, void* buf, u64 nbytes, s64 offset);
 s32 PS4_SYSV_ABI posix_truncate(const char* path, s64 length);
+s32 PS4_SYSV_ABI posix_ftruncate(s32 fd, s64 length);
+s32 PS4_SYSV_ABI sceKernelFtruncate(s32 fd, s64 length);
 s32 PS4_SYSV_ABI sceKernelTruncate(const char* path, s64 length);
 s32 PS4_SYSV_ABI posix_chmod(const char* path, u32 mode);
 s32 PS4_SYSV_ABI sceKernelChmod(const char* path, u32 mode);

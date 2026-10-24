@@ -58,6 +58,7 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 	DebugSettings->EnableFrameRateCounter = false;
 	if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily == "Windows.Xbox")
 	{
+        RequiresPointerMode = ApplicationRequiresPointerMode::WhenRequested;
 		Windows::UI::ViewManagement::ApplicationViewScaling::TrySetDisableLayoutScaling(true);
 		Windows::UI::ViewManagement::ApplicationView::GetForCurrentView()->SetDesiredBoundsMode(
 			Windows::UI::ViewManagement::ApplicationViewBoundsMode::UseCoreWindow);

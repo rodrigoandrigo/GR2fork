@@ -3863,7 +3863,7 @@ emit_load_input_via_intrinsic(struct ntd_context *ctx, nir_intrinsic_instr *intr
          &ctx->mod.inputs[io_index];
       unsigned comp_size = intr->def.bit_size == 64 ? 2 : 1;
       unsigned comp_mask = (1 << (intr->num_components * comp_size)) - 1;
-      comp_mask <<= (var_base_component * comp_size);
+      comp_mask <<= (nir_intrinsic_component(intr) * comp_size);
       if (is_tess_level)
          comp_mask = 1;
       for (unsigned r = 0; r < sig_rec->num_elements; ++r)
@@ -3961,7 +3961,7 @@ emit_load_interpolated_input(struct ntd_context *ctx, nir_intrinsic_instr *intr)
       struct dxil_signature_record *sig_rec = &ctx->mod.inputs[io_index];
       unsigned comp_size = intr->def.bit_size == 64 ? 2 : 1;
       unsigned comp_mask = (1 << (intr->num_components * comp_size)) - 1;
-      comp_mask <<= (var_base_component * comp_size);
+      comp_mask <<= (nir_intrinsic_component(intr) * comp_size);
       for (unsigned r = 0; r < sig_rec->num_elements; ++r)
          sig_rec->elements[r].always_reads_mask |= (comp_mask & sig_rec->elements[r].mask);
 

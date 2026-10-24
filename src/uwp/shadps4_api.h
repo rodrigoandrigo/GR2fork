@@ -99,6 +99,10 @@ SHADPS4_API uint32_t __cdecl shadps4_get_error(char* destination, uint32_t capac
 SHADPS4_API int32_t __cdecl shadps4_mount_storage_folder(const char* mount, void* folder,
                                                          int32_t read_only);
 SHADPS4_API int32_t __cdecl shadps4_unmount_storage_folder(const char* mount);
+SHADPS4_API int32_t __cdecl shadps4_mount_pkg(const char* mount, const char* source,
+                                              int32_t* bootable);
+SHADPS4_API int32_t __cdecl shadps4_mount_pkg_file(const char* mount, void* file,
+                                                   int32_t* bootable);
 SHADPS4_API int32_t __cdecl shadps4_open_storage_file(void* file, uint32_t mode, uint64_t* token);
 SHADPS4_API int32_t __cdecl shadps4_open_random_access_stream(void* stream, uint32_t mode,
                                                               uint64_t* token);

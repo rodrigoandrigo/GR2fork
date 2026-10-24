@@ -1,8 +1,9 @@
 # Renderer D3D12: estado de implementação
 
 Revisão do código local em **21/10/2026**. Este documento separa implementação,
-restrições funcionais, desempenho e validação. O renderer nativo é o padrão do
-host UWP; Vulkan/Dozen continua sendo uma alternativa em [DOZEN-UWP.md](DOZEN-UWP.md).
+restrições funcionais, desempenho e validação. Desde 23/10/2026, Vulkan/Dozen é
+o padrão do host UWP; o renderer D3D12 nativo permanece como opção experimental.
+Detalhes de inicialização e encerramento em [UWP-GRAPHICS-LIFECYCLE.md](UWP-GRAPHICS-LIFECYCLE.md).
 
 **O renderer ainda não está completo. O boot de jogos está implementado e
 habilitado.** O usuário confirmou anteriormente a tela inicial no Xbox Series S;
@@ -542,3 +543,12 @@ originou as adaptações de FSR1, estados de blend/depth/NONE, provoking vertex 
 captura de argumentos indiretos já descritas nas tabelas acima. DMA virtual GPU,
 captura geral de pontos e filas assíncronas da referência não foram portados;
 suas dependências de compilador e ownership não se integram por cópia isolada.
+
+## Inicialização e caminho Dozen em 23/10/2026
+
+As correções de arquivos, memória e inicialização, junto com as correções de
+entrada DXIL, provoking vertex e clip depth do Dozen, estão descritas em
+[UWP-GAME-STARTUP.md](UWP-GAME-STARTUP.md). Os resultados desse caminho não
+encerram pendências do renderer D3D12 nativo. A validação atual é no PC;
+esta revisão ainda não foi executada no Xbox.
+

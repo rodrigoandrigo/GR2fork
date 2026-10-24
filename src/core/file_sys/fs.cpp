@@ -413,6 +413,15 @@ void MntPoints::IterateDirectory(std::string_view guest_directory,
     callback(base_host / ".", false);
     callback(base_host / "..", false);
 
+    if (mount->backends.size() == 1) {
+        if (auto dir = base_backend->OpenDir(rel)) {
+            DirEntry entry;
+            while (dir->Next(entry))
+                callback(base_host / entry.name, !entry.is_directory);
+        }
+        return;
+    }
+
     const auto resolve =
         [&](const std::string& leaf) -> std::optional<std::pair<std::filesystem::path, bool>> {
         const std::string entry_rel = rel.empty() ? leaf : rel + "/" + leaf;
@@ -500,6 +509,9 @@ bool MntPoints::IsDirectory(std::string_view guest_path) {
         return false;
     }
     const auto rel = RelativeToMount(*corrected, *mount);
+    if (mount->backends.size() == 1) {
+        return mount->backends.front()->IsDirectory(rel);
+    }
     for (const auto& backend : mount->backends) {
         if (backend->Exists(rel)) {
             return backend->IsDirectory(rel);

@@ -1,11 +1,15 @@
+#include <unknwn.h>
 #include "uwp/brokered_fs.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <windows.h>
+#include <windowsstoragecom.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.FileProperties.h>
+#include <winrt/Windows.Storage.Search.h>
 #include "uwp/shadps4_api.h"
 
 namespace Core::Uwp {
@@ -64,7 +68,23 @@ public:
         for (const auto& source : {folder, fallback}) {
             if (!source)
                 continue;
-            for (const auto& item : source.GetItemsAsync().get()) {
+            if (ReadNativeDirectory(source))
+                continue;
+            const auto items = [&] {
+                if (const auto queries =
+                        source.try_as<winrt::Windows::Storage::Search::IStorageFolderQueryOperations>()) {
+                    winrt::Windows::Storage::Search::QueryOptions options;
+                    options.IndexerOption(
+                        winrt::Windows::Storage::Search::IndexerOption::DoNotUseIndexer);
+                    options.SetPropertyPrefetch(
+                        winrt::Windows::Storage::FileProperties::PropertyPrefetchOptions::BasicProperties,
+                        {});
+                    if (queries.AreQueryOptionsSupported(options))
+                        return queries.CreateItemQueryWithOptions(options).GetItemsAsync().get();
+                }
+                return source.GetItemsAsync().get();
+            }();
+            for (const auto& item : items) {
                 const auto name = winrt::to_string(item.Name());
                 if (std::ranges::any_of(entries,
                                         [&](const auto& entry) { return entry.name == name; }))
@@ -87,6 +107,49 @@ public:
     }
 
 private:
+    void Append(FileSys::DirEntry entry) {
+        if (std::ranges::none_of(entries,
+                                 [&](const auto& existing) { return existing.name == entry.name; }))
+            entries.push_back(std::move(entry));
+    }
+
+    bool ReadNativeDirectory(const StorageFolder& folder) {
+        const auto access = folder.try_as<IStorageItemHandleAccess>();
+        if (!access)
+            return false;
+        winrt::handle handle;
+        if (FAILED(access->Create(HAO_READ, HSO_SHARE_READ | HSO_SHARE_WRITE | HSO_SHARE_DELETE,
+                                  HO_NONE, nullptr, handle.put())))
+            return false;
+        std::vector<FileSys::DirEntry> found;
+        alignas(FILE_ID_BOTH_DIR_INFO) std::array<u8, 65536> buffer{};
+        auto query = FileIdBothDirectoryRestartInfo;
+        for (;;) {
+            if (!GetFileInformationByHandleEx(handle.get(), query, buffer.data(),
+                                              static_cast<DWORD>(buffer.size()))) {
+                if (GetLastError() != ERROR_NO_MORE_FILES)
+                    return false;
+                for (auto& entry : found)
+                    Append(std::move(entry));
+                return true;
+            }
+            query = FileIdBothDirectoryInfo;
+            const auto* info = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(buffer.data());
+            for (;;) {
+                const std::wstring_view name{info->FileName, info->FileNameLength / sizeof(WCHAR)};
+                if (name != L"." && name != L"..") {
+                    const bool directory = (info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    found.push_back({winrt::to_string(name), directory,
+                                     directory ? 0 : static_cast<u64>(info->EndOfFile.QuadPart)});
+                }
+                if (!info->NextEntryOffset)
+                    break;
+                info = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(
+                    reinterpret_cast<const u8*>(info) + info->NextEntryOffset);
+            }
+        }
+    }
+
     std::vector<FileSys::DirEntry> entries;
     size_t index{};
 };
@@ -175,6 +238,9 @@ s64 BrokeredFile::Transfer(void* data, u64 size, bool write) {
             winrt::throw_hresult(E_INVALIDARG);
         }
     }
+    std::vector<u8> staging;
+    if (!stream)
+        staging.resize(static_cast<size_t>(std::min<u64>(size, 1024 * 1024)));
     u64 total{};
     while (total < size) {
         const auto count = static_cast<uint32_t>(std::min<u64>(size - total, 1024 * 1024));
@@ -195,6 +261,8 @@ s64 BrokeredFile::Transfer(void* data, u64 size, bool write) {
                     winrt::array_view<uint8_t>{bytes, bytes + transferred});
             }
         } else {
+            if (write)
+                std::memcpy(staging.data(), bytes, count);
             OVERLAPPED overlapped{};
             overlapped.Offset = static_cast<DWORD>(position);
             overlapped.OffsetHigh = static_cast<DWORD>(position >> 32);
@@ -203,8 +271,8 @@ s64 BrokeredFile::Transfer(void* data, u64 size, bool write) {
             winrt::check_bool(static_cast<bool>(event));
             overlapped.hEvent = event.get();
             const bool succeeded = write
-                                       ? WriteFile(handle, bytes, count, &transferred, &overlapped)
-                                       : ReadFile(handle, bytes, count, &transferred, &overlapped);
+                                       ? WriteFile(handle, staging.data(), count, &transferred, &overlapped)
+                                       : ReadFile(handle, staging.data(), count, &transferred, &overlapped);
             if (!succeeded) {
                 const auto error = GetLastError();
                 if (!write && error == ERROR_HANDLE_EOF) {
@@ -221,6 +289,8 @@ s64 BrokeredFile::Transfer(void* data, u64 size, bool write) {
                     winrt::throw_hresult(HRESULT_FROM_WIN32(completion_error));
                 }
             }
+            if (!write)
+                std::memcpy(bytes, staging.data(), transferred);
         }
         total += transferred;
         position += transferred;
@@ -273,7 +343,7 @@ u64 BrokeredFile::Size() const {
     winrt::check_bool(GetFileSizeEx(handle, &size));
     return size.QuadPart;
 }
-void BrokeredFile::SetSize(u64 size) {
+bool BrokeredFile::SetSize(u64 size) {
     std::scoped_lock lock{mutex};
     if (IsReadOnly()) {
         winrt::throw_hresult(E_ACCESSDENIED);
@@ -289,6 +359,7 @@ void BrokeredFile::SetSize(u64 size) {
         winrt::check_bool(
             SetFileInformationByHandle(handle, FileEndOfFileInfo, &info, sizeof(info)));
     }
+    return true;
 }
 bool BrokeredFile::Flush() {
     std::scoped_lock lock{mutex};
@@ -351,6 +422,14 @@ std::unique_ptr<BrokeredFile> OpenStorageFile(void* object, uint32_t mode) {
     winrt::Windows::Foundation::IInspectable source{nullptr};
     winrt::copy_from_abi(source, object);
     const auto file = source.as<StorageFile>();
+    if (const auto access = source.try_as<IStorageItemHandleAccess>()) {
+        winrt::handle handle;
+        const auto permissions = mode == SHADPS4_FILE_READ ? HAO_READ : HAO_READ | HAO_WRITE;
+        if (SUCCEEDED(access->Create(permissions,
+                                     HSO_SHARE_READ | HSO_SHARE_WRITE | HSO_SHARE_DELETE,
+                                     HO_OVERLAPPED, nullptr, handle.put())))
+            return std::make_unique<BrokeredFile>(handle.get(), mode);
+    }
     const auto stream =
         file.OpenAsync(mode == SHADPS4_FILE_READ ? FileAccessMode::Read : FileAccessMode::ReadWrite,
                        StorageOpenOptions::AllowReadersAndWriters)
@@ -369,19 +448,11 @@ BrokeredFsBackend::BrokeredFsBackend(void* folder, bool read_only) : read_only{r
 StorageFolder BrokeredFsBackend::Folder(std::string_view relative) const {
     const auto path = RelativePath(relative);
     try {
-        auto folder = root;
-        size_t start{};
-        while (start < path.size()) {
-            const auto slash = path.find('/', start);
-            const auto part = path.substr(start, slash == std::string::npos ? path.size() - start
-                                                                            : slash - start);
-            folder = folder.GetFolderAsync(winrt::to_hstring(part)).get();
-            if (slash == std::string::npos) {
-                break;
-            }
-            start = slash + 1;
-        }
-        return folder;
+        if (path.empty())
+            return root;
+        auto native = path;
+        std::ranges::replace(native, '/', '\\');
+        return root.GetFolderAsync(winrt::to_hstring(native)).get();
     } catch (const winrt::hresult_error& error) {
         if (metadata && Missing(error) && (path == "sce_sys" || path.starts_with("sce_sys/")))
             return metadata->Folder(path == "sce_sys" ? std::string_view{}
@@ -427,9 +498,10 @@ IStorageItem BrokeredFsBackend::Item(std::string_view relative) const {
     if (relative.empty()) {
         return root;
     }
-    const auto [parent, name] = ParentAndName(relative);
+    auto path = RelativePath(relative);
+    std::ranges::replace(path, '/', '\\');
     try {
-        return Folder(parent).GetItemAsync(winrt::to_hstring(name)).get();
+        return root.GetItemAsync(winrt::to_hstring(path)).get();
     } catch (const winrt::hresult_error& error) {
         if (metadata && Missing(error) &&
             (relative == "sce_sys" || relative.starts_with("sce_sys/")))
@@ -465,19 +537,19 @@ std::unique_ptr<FileSys::IFile> BrokeredFsBackend::Open(std::string_view relativ
         winrt::throw_hresult(E_ACCESSDENIED);
     }
     const auto [parent, name] = ParentAndName(relative);
-    const auto folder = Folder(parent);
     StorageFile file{nullptr};
     uint32_t public_mode = writable ? SHADPS4_FILE_READ_WRITE : SHADPS4_FILE_READ;
     if (mode == Common::FS::FileAccessMode::Create) {
         file =
-            folder
+            Folder(parent)
                 .CreateFileAsync(winrt::to_hstring(name), CreationCollisionOption::ReplaceExisting)
                 .get();
         public_mode = SHADPS4_FILE_CREATE;
     } else if (mode == Common::FS::FileAccessMode::Append ||
                mode == Common::FS::FileAccessMode::ReadAppend) {
         file =
-            folder.CreateFileAsync(winrt::to_hstring(name), CreationCollisionOption::OpenIfExists)
+            Folder(parent)
+                .CreateFileAsync(winrt::to_hstring(name), CreationCollisionOption::OpenIfExists)
                 .get();
         public_mode = SHADPS4_FILE_APPEND;
     } else {

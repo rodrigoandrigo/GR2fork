@@ -10,6 +10,7 @@ public:
     void LoadInternalState(Windows::Foundation::Collections::IPropertySet ^ state);
 
 private:
+    void PickPackage();
     void OnLoaded(Platform::Object ^ sender, Windows::UI::Xaml::RoutedEventArgs ^ args);
     void OnUnloaded(Platform::Object ^ sender, Windows::UI::Xaml::RoutedEventArgs ^ args);
     void OnPointer(Platform::Object ^ sender,

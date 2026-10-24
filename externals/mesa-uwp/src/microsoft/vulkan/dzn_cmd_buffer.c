@@ -4244,7 +4244,7 @@ dzn_cmd_buffer_prepare_draw(struct dzn_cmd_buffer *cmdbuf, bool indexed)
       }
       ID3D12GraphicsCommandList1_IASetPrimitiveTopology(cmdbuf->cmdlist,
          rewritten_strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST :
-         dzn_graphics_pipeline_topology(pipeline, cmdbuf->state.pipeline_variant.extended.topology));
+         dzn_graphics_pipeline_topology(pipeline, dzn_cmd_buffer_topology(cmdbuf, pipeline)));
    }
    dzn_cmd_buffer_update_heaps(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS);
    dzn_cmd_buffer_update_sysvals(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS);

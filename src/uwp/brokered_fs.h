@@ -23,7 +23,7 @@ public:
     FileSys::MmapPolicy GetMmapPolicy() const override;
     bool Map(u8* addr, u64 size, u64 offset, u32 prot, const FileSys::FileMapContext& ctx) override;
     void Stat(FileSys::FileStat& out) override;
-    void SetSize(u64 size);
+    bool SetSize(u64 size) override;
 
 private:
     s64 Transfer(void* data, u64 size, bool write);

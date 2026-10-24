@@ -353,7 +353,10 @@ struct AddressSpace::Impl {
                 DWORD previous{};
                 ASSERT_MSG(VirtualProtect(reinterpret_cast<void*>(address), next - address,
                                           protection, &previous),
-                           "Unable to protect lazy memory: {}", Common::GetLastErrorMsg());
+                           "Unable to protect lazy memory at {:#x}, size {:#x}, protection {:#x}, "
+                           "previous {:#x}, allocation {}: {}",
+                           address, next - address, protection, info.Protect,
+                           info.AllocationBase, Common::GetLastErrorMsg());
             }
             address = next;
         }
@@ -534,6 +537,15 @@ struct AddressSpace::Impl {
                 ret = VirtualProtect(ptr, size, prot, &resultvar);
                 ASSERT_MSG(ret, "VirtualProtect failed. {}", Common::GetLastErrorMsg());
             } else {
+#ifdef SHADPS4_UWP
+                if (fd == -1) {
+                    ptr = MapHostView(backing, process, reinterpret_cast<PVOID>(virtual_addr),
+                                      map_offset, size, MEM_REPLACE_PLACEHOLDER,
+                                      PAGE_EXECUTE_READWRITE, nullptr, 0);
+                    ASSERT_MSG(ptr, "MapViewOfFile3 failed. {}", Common::GetLastErrorMsg());
+                    ApplyCommittedProtection(virtual_addr, size, prot);
+                } else
+#endif
                 if (prot == PAGE_NOACCESS) {
                     DWORD resultvar;
                     ptr = MapHostView(backing, process, reinterpret_cast<PVOID>(virtual_addr),

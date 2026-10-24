@@ -35,6 +35,15 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
     frontend = std::make_shared<ImGuiFrontend>(swapChainPanel, gameSwapChainPanel);
     WeakReference weak(this);
     const auto dispatch = Dispatcher;
+    frontend->toggle_fullscreen = [dispatch] {
+        dispatch->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([] {
+            const auto view = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView();
+            if (view->IsFullScreenMode)
+                view->ExitFullScreenMode();
+            else
+                view->TryEnterFullScreenMode();
+        }));
+    };
     frontend->choose_folder = [weak, dispatch](std::wstring purpose) {
         dispatch->RunAsync(CoreDispatcherPriority::Normal,
                            ref new DispatchedHandler([weak, purpose] {
@@ -165,11 +174,14 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
             const auto token = record.at("token").get<std::string>();
             const bool enabled = record.value("enabled", true);
             restored = restored.then([access, token, enabled, roots] {
-                return create_task(access->GetFolderAsync(ref new String(Wide(token).c_str())))
-                    .then([token, enabled, roots](task<StorageFolder ^> result) {
+                return create_task(access->GetItemAsync(ref new String(Wide(token).c_str())))
+                    .then([token, enabled, roots](task<IStorageItem ^> result) {
                         try {
-                            roots->push_back(
-                                {Platform::Agile<StorageFolder>{result.get()}, token, enabled});
+                            auto item = result.get();
+                            if (item->IsOfType(StorageItemTypes::Folder))
+                                roots->push_back({Platform::Agile<StorageFolder>{safe_cast<StorageFolder^>(item)}, token, enabled});
+                            else if (item->IsOfType(StorageItemTypes::File))
+                                roots->push_back({{}, token, enabled, Platform::Agile<StorageFile>{safe_cast<StorageFile^>(item)}});
                         } catch (Exception ^) {
                         }
                     });
@@ -265,6 +277,7 @@ void DirectXPage::OnPanelSizeChanged(Object ^, SizeChangedEventArgs ^) {
         });
 }
 void DirectXPage::PickFolder(std::wstring purpose) {
+    if (purpose == L"pkg") { PickPackage(); return; }
     Capture(true);
     auto picker = ref new FolderPicker();
     picker->SuggestedStartLocation = PickerLocationId::ComputerFolder;
@@ -295,6 +308,27 @@ void DirectXPage::PickFolder(std::wstring purpose) {
                 }
             },
             task_continuation_context::use_current());
+}
+void DirectXPage::PickPackage() {
+    Capture(true);
+    auto picker = ref new FileOpenPicker();
+    picker->SuggestedStartLocation = PickerLocationId::ComputerFolder;
+    picker->FileTypeFilter->Append(L".pkg");
+    WeakReference weak(this);
+    create_task(picker->PickSingleFileAsync()).then([weak](task<StorageFile^> result) {
+        if (auto page = weak.Resolve<DirectXPage>()) {
+            page->Capture(false);
+            try {
+                auto file = result.get();
+                if (!file || !page->frontend) return;
+                const auto token = Windows::Storage::AccessCache::StorageApplicationPermissions::FutureAccessList->Add(file);
+                page->frontend->SetPackage(Platform::Agile<StorageFile>{file}, Utf8(token->Data()));
+            } catch (Exception^ error) {
+                page->statusText->Visibility = Windows::UI::Xaml::Visibility::Visible;
+                page->statusText->Text = error->Message;
+            }
+        }
+    }, task_continuation_context::use_current());
 }
 void DirectXPage::EditText(std::string label, std::string value, bool secret,
                            std::function<void(std::string)> completed) {
