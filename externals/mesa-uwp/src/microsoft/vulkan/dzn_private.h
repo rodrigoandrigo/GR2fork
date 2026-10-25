@@ -169,7 +169,8 @@ struct dzn_meta_blit_key {
    union {
       struct {
          DXGI_FORMAT out_format;
-         uint32_t samples : 6;
+         uint32_t src_samples_log2 : 3;
+         uint32_t dst_samples_log2 : 3;
          uint32_t loc : 4;
          uint32_t out_type : 4;
          uint32_t sampler_dim : 4;
@@ -291,13 +292,31 @@ struct dzn_queue {
    uint64_t fence_point;
 };
 
+struct dzn_feedback_descriptor {
+   uint64_t image_id;
+   VkImageSubresourceRange range;
+   D3D12_SHADER_RESOURCE_VIEW_DESC desc;
+};
+
 struct dzn_descriptor_heap {
+   struct dzn_device *device;
+   struct list_head watches;
+   D3D12_DESCRIPTOR_HEAP_TYPE type;
    uint32_t *format_defaults;
+   struct dzn_feedback_descriptor *feedback;
    ID3D12DescriptorHeap *heap;
    SIZE_T cpu_base;
    uint64_t gpu_base;
    uint32_t desc_count;
    uint32_t desc_sz;
+};
+
+struct dzn_descriptor_watch {
+   struct list_head source_link, command_link;
+   struct dzn_descriptor_heap *source, *destination;
+   uint32_t source_offset, destination_offset, count;
+   ID3D12Resource *metadata;
+   uint64_t metadata_offset;
 };
 
 struct dzn_device_descriptor_heap {
@@ -311,6 +330,7 @@ struct dzn_device_descriptor_heap {
 
 struct dzn_device {
    struct vk_device vk;
+   mtx_t descriptor_update_lock;
    struct vk_device_extension_table enabled_extensions;
    struct vk_device_dispatch_table cmd_dispatch;
    uint64_t memory_report_next_id;
@@ -527,6 +547,19 @@ dzn_descriptor_heap_copy(struct dzn_device *device,
                          const struct dzn_descriptor_heap *src_heap, uint32_t src_heap_offset,
                          uint32_t desc_count, D3D12_DESCRIPTOR_HEAP_TYPE type);
 
+void
+dzn_descriptor_set_copy_snapshots(struct dzn_cmd_buffer *cmdbuf, const struct dzn_descriptor_set *set,
+                        D3D12_DESCRIPTOR_HEAP_TYPE type, struct dzn_descriptor_heap *destination,
+                        uint32_t destination_offset, uint32_t count);
+
+void
+dzn_cmd_buffer_clear_descriptor_watches(struct dzn_cmd_buffer *cmdbuf);
+
+void
+dzn_descriptor_watch_metadata(struct dzn_cmd_buffer *cmdbuf, struct dzn_descriptor_heap *heap,
+                               uint32_t base, uint32_t count, ID3D12Resource *metadata,
+                               uint64_t metadata_offset);
+
 struct dzn_descriptor_heap_pool_entry {
    struct list_head link;
    struct dzn_descriptor_heap heap;
@@ -597,6 +630,7 @@ struct dzn_cmd_buffer_push_constant_state {
 };
 
 struct dzn_rendering_attachment {
+   bool feedback_loop;
    struct dzn_image_view *iview;
    VkImageLayout layout;
    struct {
@@ -789,6 +823,11 @@ struct dzn_cmd_buffer {
 
    /* Push descriptor updates are snapshots and remain alive through execution. */
    struct util_dynarray push_descriptor_pools;
+   struct util_dynarray feedback_images;
+   struct util_dynarray feedback_slots;
+   struct list_head descriptor_watches;
+   struct dzn_feedback_image *mixed_attachments[MAX_RTS];
+   unsigned active_queries;
 
    struct {
       struct hash_table *ht;
@@ -863,12 +902,16 @@ struct dzn_descriptor_pool {
 #define DZN_INLINE_UNIFORM_WINDOW_STRIDE (32 * 1024)
 #define DZN_INLINE_UNIFORM_WINDOW_SIZE (64 * 1024)
 
+#define DZN_IMAGE_MIP_DESCRIPTORS 16
+
 #define MAX_SHADER_VISIBILITIES (D3D12_SHADER_VISIBILITY_PIXEL + 1)
 #define STATIC_SAMPLER_TAG (~0u - 1)
 
 struct dzn_descriptor_set_layout_binding {
+   VkDescriptorBindingFlags flags;
    VkDescriptorType type;
    uint32_t descriptor_count;
+   uint32_t descriptor_stride;
    uint32_t stages;
    D3D12_SHADER_VISIBILITY visibility;
    uint32_t base_shader_register;
@@ -926,11 +969,21 @@ struct dzn_descriptor_set {
    uint32_t heap_offsets[NUM_POOL_TYPES];
    /* The number of descriptors needed for this set */
    uint32_t heap_sizes[NUM_POOL_TYPES];
+   uint32_t pool_desc_count[NUM_POOL_TYPES];
+   uint32_t variable_count;
+   bool private_heaps;
+   struct dzn_descriptor_heap heaps[NUM_POOL_TYPES];
    uint32_t inline_offset;
    uint32_t inline_size;
    /* Layout (and pool) is null for a freed descriptor set */
    const struct dzn_descriptor_set_layout *layout;
 };
+
+static inline struct dzn_descriptor_heap *
+dzn_descriptor_set_heap(const struct dzn_descriptor_set *set, D3D12_DESCRIPTOR_HEAP_TYPE type)
+{
+   return set->private_heaps ? (struct dzn_descriptor_heap *)&set->heaps[type] : &set->pool->heaps[type];
+}
 
 struct dzn_pipeline_layout_set {
    /* The offset from the start of a descriptor table where the set should be copied */
@@ -1103,6 +1156,7 @@ struct dzn_indirect_draw_cmd_sig_key {
 
 struct dzn_graphics_pipeline {
    struct dzn_pipeline base;
+   VkSampleCountFlagBits rasterization_samples;
    uint32_t extended_dynamic;
    bool dynamic_viewport_count, dynamic_scissor_count;
    uint32_t patch_control_points;
@@ -1243,6 +1297,7 @@ dzn_compute_pipeline_get_indirect_cmd_sig(struct dzn_compute_pipeline *pipeline)
 
 struct dzn_image {
    struct vk_image vk;
+   uint64_t feedback_id;
 
    struct {
       uint32_t row_stride;
@@ -1326,7 +1381,11 @@ struct dzn_image_view {
    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc;
    int srv_bindless_slot;
    int uav_bindless_slot;
+   int mip_uav_slots[DZN_IMAGE_MIP_DESCRIPTORS];
 };
+
+bool dzn_image_view_get_mip(const struct dzn_image_view *view, unsigned mip,
+                            struct dzn_image_view *out);
 
 void
 dzn_image_view_init(struct dzn_device *device,
@@ -1453,6 +1512,8 @@ enum dzn_debug_flags {
    DZN_DEBUG_MULTIVIEW = 1 << 13,
    DZN_DEBUG_NO_16BIT = 1 << 14,
    DZN_DEBUG_NO_STENCIL_REF = 1 << 15,
+   DZN_DEBUG_FEEDBACK = 1 << 16,
+   DZN_DEBUG_MIXED_SAMPLES = 1 << 17,
 };
 
 struct dzn_instance {

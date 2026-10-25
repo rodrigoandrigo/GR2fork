@@ -281,6 +281,8 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
       *dxil_spirv_nir_get_spirv_options();
    spirv_opts.amd_trinary_minmax =
       device->vk.enabled_extensions.AMD_shader_trinary_minmax;
+   spirv_opts.amd_shader_explicit_vertex_parameter =
+      device->vk.enabled_extensions.AMD_shader_explicit_vertex_parameter;
    if (dzn_device_lowers_16bit(device)) {
       spirv_opts.mediump_16bit_alu = false;
       spirv_opts.mediump_16bit_derivatives = false;
@@ -291,6 +293,32 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
                                       &spirv_opts, options->nir_opts, NULL, nir);
    if (result != VK_SUCCESS)
       return result;
+
+   bool volume_images = false;
+   bool resized_arrays = false;
+   nir_foreach_variable_with_modes(var, *nir,
+                                  nir_var_uniform | nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo) {
+      if (!device->bindless && glsl_type_is_array(var->type) && !glsl_get_length(var->type) &&
+          var->data.descriptor_set < layout->vk.set_count &&
+          layout->vk.set_layouts[var->data.descriptor_set]) {
+         const struct dzn_descriptor_set_layout *set_layout = container_of(
+            layout->vk.set_layouts[var->data.descriptor_set], struct dzn_descriptor_set_layout, vk);
+         if (var->data.binding < set_layout->binding_count) {
+            var->type = glsl_array_type(glsl_get_array_element(var->type),
+               set_layout->bindings[var->data.binding].descriptor_count,
+               glsl_get_explicit_stride(var->type));
+            resized_arrays = true;
+         }
+      }
+      const struct glsl_type *type = glsl_without_array(var->type);
+      volume_images |= glsl_type_is_image(type) && glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_3D;
+   }
+   if (resized_arrays)
+      NIR_PASS(_, *nir, nir_fixup_deref_types);
+
+   NIR_PASS(_, *nir, dzn_nir_lower_barycentrics, options->force_sample_rate_shading);
+   if (device->vk.enabled_extensions.AMD_shader_image_load_store_lod)
+      NIR_PASS(_, *nir, dzn_nir_lower_image_lod);
 
    if (options->patch_vertices)
       NIR_PASS(_, *nir, dzn_nir_lower_patch_vertices, options->patch_vertices);
@@ -340,8 +368,8 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
          .y_mask = options->y_flip_mask,
          .z_mask = options->z_flip_mask,
       },
-      .declared_read_only_images_as_srvs = !device->bindless,
-      .inferred_read_only_images_as_srvs = !device->bindless,
+      .declared_read_only_images_as_srvs = !device->bindless && !volume_images,
+      .inferred_read_only_images_as_srvs = !device->bindless && !volume_images,
       .force_sample_rate_shading = options->force_sample_rate_shading,
       .lower_view_index = options->lower_view_index,
       .lower_view_index_to_rt_layer = options->lower_view_index_to_rt_layer,
@@ -1803,6 +1831,8 @@ dzn_graphics_pipeline_translate_ms(struct dzn_graphics_pipeline *pipeline,
 
    if (!in_ms)
       return;
+
+   pipeline->rasterization_samples = in_ms->rasterizationSamples;
 
    /* TODO: minSampleShading (use VRS), alphaToOneEnable */
    d3d12_gfx_pipeline_state_stream_new_desc(out, SAMPLE_DESC, DXGI_SAMPLE_DESC, desc);

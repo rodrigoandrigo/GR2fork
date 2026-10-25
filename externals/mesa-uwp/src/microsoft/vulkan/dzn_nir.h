@@ -181,4 +181,7 @@ struct dzn_pipeline_layout;
 bool dzn_nir_lower_robust_images(nir_shader *nir, const struct dzn_pipeline_layout *layout,
                                  bool images, bool buffers);
 
+bool dzn_nir_lower_barycentrics(nir_shader *nir, bool sample_rate);
+bool dzn_nir_lower_image_lod(nir_shader *nir);
+
 #endif

@@ -409,6 +409,8 @@ void ImGuiFrontend::ResolveApi() {
 #define RESOLVE(member, name) member = core->GetApi<decltype(member)>(name)
     RESOLVE(get_settings, "shadps4_get_settings");
     RESOLVE(set_host_state, "shadps4_set_host_state");
+    RESOLVE(get_text_input, "shadps4_get_text_input");
+    RESOLVE(complete_text_input, "shadps4_complete_text_input");
     RESOLVE(set_hdr_output, "shadps4_set_hdr_output");
     RESOLVE(set_setting, "shadps4_set_setting");
     RESOLVE(reset_settings, "shadps4_reset_settings");
@@ -506,12 +508,16 @@ void ImGuiFrontend::Run(std::wstring root) {
                 last_memory_sample = memory_time;
             }
             FrontendInput snapshot;
+            std::deque<std::function<void()>> text_completed;
             {
                 std::lock_guard<std::mutex> lock{input_mutex};
                 snapshot = input;
+                text_completed.swap(text_input_results);
                 input.wheel = 0;
                 input.characters.clear();
             }
+            for (auto& complete : text_completed)
+                complete();
             std::deque<std::function<void()>> updates;
             {
                 std::lock_guard<std::mutex> lock{work_mutex};
@@ -555,6 +561,29 @@ void ImGuiFrontend::Run(std::wstring root) {
                 });
             }
             const bool running = core->State() == SHADPS4_RUNNING;
+            ShadPS4TextInput text_request{};
+            text_request.size = sizeof(text_request);
+            if (get_text_input(&text_request))
+                throw std::runtime_error("Unable to query game text input");
+            if (text_request.id != text_input_id && game_text_input) {
+                text_input_id = text_request.id;
+                const std::weak_ptr<ImGuiFrontend> weak = shared_from_this();
+                game_text_input(text_request, [weak, id = text_request.id](bool confirmed,
+                                                                            std::wstring text) {
+                    if (auto owner = weak.lock()) {
+                        std::lock_guard<std::mutex> lock{owner->input_mutex};
+                        owner->text_input_results.emplace_back([target = owner.get(), id, confirmed,
+                                                     text = std::move(text)] {
+                            if (target->complete_text_input(id, confirmed, text.c_str())) {
+                                ShadPS4TextInput current{};
+                                current.size = sizeof(current);
+                                if (!target->get_text_input(&current) && current.id == id)
+                                    target->text_input_id = 0;
+                            }
+                        });
+                    }
+                });
+            }
             if (running != game_running) {
                 game_running = running;
                 menu_open = !running;

@@ -89,6 +89,23 @@ SHADPS4_API int32_t __cdecl shadps4_run(const wchar_t* executable);
 SHADPS4_API void __cdecl shadps4_request_stop(void);
 SHADPS4_API void __cdecl shadps4_set_paused(int32_t paused);
 SHADPS4_API int32_t __cdecl shadps4_set_host_state(int32_t active, int32_t input_captured);
+enum ShadPS4TextInputFlags {
+    SHADPS4_TEXT_MULTILINE = 1,
+    SHADPS4_TEXT_PASSWORD = 2,
+    SHADPS4_TEXT_NUMBER = 4,
+};
+typedef struct ShadPS4TextInput {
+    uint32_t size;
+    uint32_t flags;
+    uint64_t id;
+    uint32_t max_length;
+    wchar_t title[256];
+    wchar_t placeholder[256];
+    wchar_t text[2049];
+} ShadPS4TextInput;
+SHADPS4_API int32_t __cdecl shadps4_get_text_input(ShadPS4TextInput* request);
+SHADPS4_API int32_t __cdecl shadps4_complete_text_input(uint64_t id, int32_t confirmed,
+                                                       const wchar_t* text);
 SHADPS4_API void __cdecl shadps4_resize(uint32_t width, uint32_t height);
 SHADPS4_API void __cdecl shadps4_resize_surface(uint32_t width, uint32_t height,
                                                float scale_x, float scale_y);

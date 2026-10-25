@@ -31,6 +31,7 @@
 #include "spirv_to_dxil.h"
 #include "nir_to_dxil.h"
 #include "nir_builder.h"
+#include "nir_deref.h"
 #include "nir_builtin_builder.h"
 #include "nir_xfb_info.h"
 #include "util/u_dynarray.h"
@@ -912,7 +913,8 @@ dzn_nir_blit_fs(const struct dzn_nir_blit_info *info)
          tex->coord_components = coord_comps;
 
          tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_ms_index,
-                                           nir_load_sample_id(&b));
+                                           nir_umin(&b, nir_load_sample_id(&b),
+                                                    nir_imm_int(&b, info->src_samples - 1)));
 
          tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod,
                                            nir_imm_int(&b, 0));
@@ -1718,4 +1720,209 @@ bool dzn_nir_lower_robust_images(nir_shader *nir, const struct dzn_pipeline_layo
    struct dzn_robust_image_state state = {layout, images, buffers};
    return nir_shader_instructions_pass(nir, dzn_nir_robust_image_instruction, nir_metadata_none,
                                        &state);
+}
+
+static nir_def *dzn_nir_amd_pixel_inv_w(nir_builder *b, bool sample_rate)
+{
+   nir_def *inv_w = nir_channel(b, nir_load_frag_coord(b), 3);
+   if (sample_rate) {
+      nir_def *offset =
+          nir_fadd_imm(b, nir_load_sample_pos_from_id(b, 32, nir_load_sample_id(b)), -0.5f);
+      inv_w = nir_fsub(b, inv_w,
+                       nir_fadd(b, nir_fmul(b, nir_ddx_fine(b, inv_w), nir_channel(b, offset, 0)),
+                                nir_fmul(b, nir_ddy_fine(b, inv_w), nir_channel(b, offset, 1))));
+   }
+   return inv_w;
+}
+
+static nir_def *dzn_nir_amd_barycentric(nir_builder *b, enum glsl_interp_mode mode, bool centroid,
+                                        bool sample_rate)
+{
+   nir_def *sample =
+       centroid ? nir_imax(b, nir_find_lsb(b, nir_load_sample_mask_in(b)), nir_imm_int(b, 0))
+                : nir_load_sample_id(b);
+   nir_def *offset = nir_fadd_imm(b, nir_load_sample_pos_from_id(b, 32, sample), -0.5f);
+   nir_def *coord = nir_load_barycentric_coord_pixel(b, 32, .interp_mode = mode);
+   if (mode == INTERP_MODE_SMOOTH)
+      coord = nir_fmul(b, coord, dzn_nir_amd_pixel_inv_w(b, sample_rate));
+   coord = nir_fadd(b, coord,
+                    nir_fadd(b, nir_fmul(b, nir_ddx_fine(b, coord), nir_channel(b, offset, 0)),
+                             nir_fmul(b, nir_ddy_fine(b, coord), nir_channel(b, offset, 1))));
+   if (mode == INTERP_MODE_SMOOTH)
+      coord = nir_fdiv(b, coord,
+                       nir_fadd(b, nir_fadd(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1)),
+                                nir_channel(b, coord, 2)));
+   return coord;
+}
+
+static nir_def *dzn_nir_barycentric_offset(nir_builder *b, enum glsl_interp_mode mode,
+                                           nir_def *offset, bool sample_rate)
+{
+   nir_cursor cursor = b->cursor;
+   b->cursor = nir_before_cf_list(&nir_shader_get_entrypoint(b->shader)->body);
+   nir_def *coord = nir_load_barycentric_coord_pixel(b, 32, .interp_mode = mode);
+   if (mode == INTERP_MODE_SMOOTH)
+      coord = nir_fmul(b, coord, dzn_nir_amd_pixel_inv_w(b, sample_rate));
+   nir_def *dx = nir_ddx_fine(b, coord);
+   nir_def *dy = nir_ddy_fine(b, coord);
+   b->cursor = cursor;
+   coord = nir_fadd(b, coord,
+                    nir_fadd(b, nir_fmul(b, dx, nir_channel(b, offset, 0)),
+                             nir_fmul(b, dy, nir_channel(b, offset, 1))));
+   if (mode == INTERP_MODE_SMOOTH)
+      coord = nir_fdiv(b, coord,
+                       nir_fadd(b, nir_fadd(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1)),
+                                nir_channel(b, coord, 2)));
+   return coord;
+}
+
+static bool dzn_nir_lower_barycentric(nir_builder *b, nir_intrinsic_instr *intr,
+                                               void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_deref &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_centroid &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_sample &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_offset)
+      return false;
+   nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+   if (!var || var->data.mode != nir_var_system_value)
+      return false;
+   const bool sample_rate = *(const bool *)data;
+   unsigned location = var->data.location;
+   enum glsl_interp_mode mode;
+   if (location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_COORD ||
+       location == SYSTEM_VALUE_BARYCENTRIC_PERSP_COORD) {
+      mode = location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_COORD ? INTERP_MODE_NOPERSPECTIVE :
+                                                               INTERP_MODE_SMOOTH;
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *offset = NULL;
+      if (intr->intrinsic == nir_intrinsic_interp_deref_at_offset) {
+         offset = intr->src[1].ssa;
+      } else if (intr->intrinsic == nir_intrinsic_interp_deref_at_sample ||
+                 (intr->intrinsic == nir_intrinsic_load_deref && var->data.sample)) {
+         nir_def *sample = intr->intrinsic == nir_intrinsic_interp_deref_at_sample ?
+            intr->src[1].ssa : nir_load_sample_id(b);
+         offset = nir_fadd_imm(b, nir_load_sample_pos_from_id(b, 32, sample), -0.5f);
+      } else if (intr->intrinsic == nir_intrinsic_interp_deref_at_centroid || var->data.centroid) {
+         nir_def *sample = nir_imax(b, nir_find_lsb(b, nir_load_sample_mask_in(b)), nir_imm_int(b, 0));
+         offset = nir_fadd_imm(b, nir_load_sample_pos_from_id(b, 32, sample), -0.5f);
+      }
+      nir_def *coord = offset ? dzn_nir_barycentric_offset(b, mode, offset, sample_rate) :
+         nir_load_barycentric_coord_pixel(b, 32, .interp_mode = mode);
+      nir_def_rewrite_uses(&intr->def, coord);
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   switch (location) {
+   case SYSTEM_VALUE_BARYCENTRIC_LINEAR_PIXEL:
+   case SYSTEM_VALUE_BARYCENTRIC_LINEAR_CENTROID:
+   case SYSTEM_VALUE_BARYCENTRIC_LINEAR_SAMPLE:
+      mode = INTERP_MODE_NOPERSPECTIVE;
+      break;
+   case SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL:
+   case SYSTEM_VALUE_BARYCENTRIC_PERSP_CENTROID:
+   case SYSTEM_VALUE_BARYCENTRIC_PERSP_SAMPLE:
+   case SYSTEM_VALUE_BARYCENTRIC_PULL_MODEL:
+      mode = INTERP_MODE_SMOOTH;
+      break;
+   default:
+      return false;
+   }
+   b->cursor = nir_before_cf_list(&nir_shader_get_entrypoint(b->shader)->body);
+   nir_def *coord;
+   if (location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_CENTROID ||
+       location == SYSTEM_VALUE_BARYCENTRIC_PERSP_CENTROID)
+      coord = dzn_nir_amd_barycentric(b, mode, true, sample_rate);
+   else if (location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_SAMPLE ||
+            location == SYSTEM_VALUE_BARYCENTRIC_PERSP_SAMPLE)
+      coord = dzn_nir_amd_barycentric(b, mode, false, sample_rate);
+   else
+      coord = nir_load_barycentric_coord_pixel(b, 32, .interp_mode = mode);
+   nir_def *result = nir_channels(b, coord, 6);
+   if (location == SYSTEM_VALUE_BARYCENTRIC_PULL_MODEL) {
+      nir_def *inv_w = dzn_nir_amd_pixel_inv_w(b, sample_rate);
+      result = nir_vec3(b, inv_w, nir_fmul(b, nir_channel(b, coord, 1), inv_w),
+                        nir_fmul(b, nir_channel(b, coord, 2), inv_w));
+   }
+   nir_def_rewrite_uses(&intr->def, result);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+bool dzn_nir_lower_barycentrics(nir_shader *nir, bool sample_rate)
+{
+   sample_rate |= nir->info.stage == MESA_SHADER_FRAGMENT && nir->info.fs.uses_sample_shading;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in | nir_var_system_value)
+   {
+      sample_rate |=
+          var->data.sample || (var->data.mode == nir_var_system_value &&
+                               (var->data.location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_SAMPLE ||
+                                var->data.location == SYSTEM_VALUE_BARYCENTRIC_PERSP_SAMPLE ||
+                                var->data.location == SYSTEM_VALUE_SAMPLE_ID ||
+                                var->data.location == SYSTEM_VALUE_SAMPLE_POS));
+   }
+   return nir_shader_intrinsics_pass(nir, dzn_nir_lower_barycentric,
+                                     nir_metadata_control_flow, &sample_rate);
+}
+
+static const struct glsl_type *dzn_image_lod_type(const struct glsl_type *type)
+{
+   if (glsl_type_is_array(type))
+      return glsl_array_type(dzn_image_lod_type(glsl_get_array_element(type)),
+                             glsl_get_length(type), 0);
+   return glsl_array_type(type, DZN_IMAGE_MIP_DESCRIPTORS, 0);
+}
+
+static bool dzn_nir_lower_image_lod_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      break;
+   default:
+      return false;
+   }
+   nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+   if (glsl_get_sampler_dim(glsl_without_array(var->type)) == GLSL_SAMPLER_DIM_BUF)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   int lod_src = intr->intrinsic == nir_intrinsic_image_deref_load    ? 3
+                 : intr->intrinsic == nir_intrinsic_image_deref_store ? 4
+                 : intr->intrinsic == nir_intrinsic_image_deref_size  ? 1
+                                                                      : -1;
+   nir_def *lod = lod_src >= 0 ? intr->src[lod_src].ssa : nir_imm_int(b, 0);
+   if (lod_src >= 0 && !nir_src_is_const(intr->src[lod_src]))
+      nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) | ACCESS_NON_UNIFORM);
+   nir_deref_path path;
+   nir_deref_path_init(&path, nir_src_as_deref(intr->src[0]), NULL);
+   nir_deref_instr *deref = nir_build_deref_var(b, path.path[0]->var);
+   for (unsigned i = 1; path.path[i]; i++)
+      deref = nir_build_deref_array(b, deref, path.path[i]->arr.index.ssa);
+   nir_deref_path_finish(&path);
+   deref = nir_build_deref_array(b, deref,
+                                 nir_umin(b, lod, nir_imm_int(b, DZN_IMAGE_MIP_DESCRIPTORS - 1)));
+   nir_src_rewrite(&intr->src[0], &deref->def);
+   if (lod_src >= 0)
+      nir_src_rewrite(&intr->src[lod_src], nir_imm_int(b, 0));
+   return true;
+}
+
+bool dzn_nir_lower_image_lod(nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_image | nir_var_uniform)
+   {
+      if (glsl_type_is_image(glsl_without_array(var->type)) &&
+          glsl_get_sampler_dim(glsl_without_array(var->type)) != GLSL_SAMPLER_DIM_BUF)
+         var->type = dzn_image_lod_type(var->type);
+   }
+   bool progress = nir_shader_intrinsics_pass(nir, dzn_nir_lower_image_lod_intrinsic,
+                                              nir_metadata_control_flow, NULL);
+   nir_remove_dead_derefs(nir);
+   return progress;
 }

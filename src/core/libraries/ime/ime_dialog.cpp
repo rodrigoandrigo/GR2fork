@@ -13,6 +13,9 @@
 #include "core/libraries/libs.h"
 #include "ime_dialog.h"
 #include "ime_dialog_ui.h"
+#ifdef SHADPS4_UWP
+#include "uwp/text_input.h"
+#endif
 
 static constexpr std::array<float, 2> MAX_X_POSITIONS = {3840.0f, 1920.0f};
 static constexpr std::array<float, 2> MAX_Y_POSITIONS = {2160.0f, 1080.0f};
@@ -58,6 +61,9 @@ struct ImeDialogClientStub {
 static ImeDialogClientStub* g_ime_dlg_client = nullptr;
 
 static void DestroyImeDialogClient() {
+#ifdef SHADPS4_UWP
+    Core::Uwp::ResetTextInput();
+#endif
     if (g_ime_dlg_client) {
         delete g_ime_dlg_client;
         g_ime_dlg_client = nullptr;
@@ -239,6 +245,9 @@ static void CommitDialogResultIfNeeded() {
     const bool restore_original = (g_ime_dlg_result.endstatus != OrbisImeDialogEndStatus::Ok);
     g_ime_dlg_state.CopyTextToOrbisBuffer(restore_original);
     g_ime_dlg_result_committed = true;
+#ifdef SHADPS4_UWP
+    Core::Uwp::ResetTextInput();
+#endif
     LOG_DEBUG(Lib_ImeDialog, "Committed result (restore_original={})", restore_original);
 }
 
@@ -949,6 +958,19 @@ Error PS4_SYSV_ABI sceImeDialogGetResult(OrbisImeDialogResult* result) {
 }
 
 OrbisImeDialogStatus PS4_SYSV_ABI sceImeDialogGetStatus() {
+#ifdef SHADPS4_UWP
+    if (g_ime_dlg_status == OrbisImeDialogStatus::Running) {
+        if (auto completed = Core::Uwp::TakeTextInputResult()) {
+            const bool accepted =
+                completed->confirmed && g_ime_dlg_state.SetHostText(completed->text);
+            g_ime_dlg_result.endstatus =
+                accepted ? OrbisImeDialogEndStatus::Ok : OrbisImeDialogEndStatus::UserCanceled;
+            g_ime_dlg_status = OrbisImeDialogStatus::Finished;
+            g_ime_dlg_ui = ImeDialogUi();
+            LOG_INFO(Lib_ImeDialog, "Host text input finished (confirmed={})", accepted);
+        }
+    }
+#endif
     LOG_TRACE(Lib_ImeDialog, "GetStatus called (status={}, client_state={})",
               static_cast<u32>(g_ime_dlg_status),
               g_ime_dlg_client ? g_ime_dlg_client->dialog_state : -1);
@@ -1038,6 +1060,9 @@ static Error SetupDialogState(OrbisImeDialogParam* param, OrbisImeParamExtended*
         g_ime_dlg_client->dialog_state = 4;
     }
     g_ime_dlg_ui = ImeDialogUi(&g_ime_dlg_state, &g_ime_dlg_status, &g_ime_dlg_result);
+#ifdef SHADPS4_UWP
+    g_ime_dlg_state.RequestHostInput(True(local_param.option & OrbisImeOption::PASSWORD));
+#endif
 
     LOG_INFO(Lib_ImeDialog, "sceImeDialogInit: successful, status now=Running");
     return Error::OK;

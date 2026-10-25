@@ -76,6 +76,14 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
                                    page->EditText(label, value, secret, completed);
                            }));
     };
+    frontend->game_text_input = [weak, dispatch](ShadPS4TextInput request,
+                                                std::function<void(bool, std::wstring)> completed) {
+        dispatch->RunAsync(CoreDispatcherPriority::Normal,
+                          ref new DispatchedHandler([weak, request, completed] {
+            if (auto page = weak.Resolve<DirectXPage>())
+                page->ShowGameTextInput(request, completed);
+        }));
+    };
     frontend->ready = [weak, dispatch] {
         dispatch->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([weak] {
                                if (auto page = weak.Resolve<DirectXPage>())
@@ -222,6 +230,9 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
     }));
 }
 void DirectXPage::OnUnloaded(Object ^, RoutedEventArgs ^) {
+    game_text_request_id = 0;
+    if (game_text_dialog)
+        game_text_dialog->Hide();
     if (display_information) {
         display_information->AdvancedColorInfoChanged -= color_token;
         display_information = nullptr;
@@ -409,6 +420,110 @@ void DirectXPage::EditText(std::string label, std::string value, bool secret,
             },
             task_continuation_context::use_current());
 }
+void DirectXPage::ShowGameTextInput(ShadPS4TextInput request,
+                                    std::function<void(bool, std::wstring)> completed) {
+    game_text_request_id = request.id;
+    if (!request.id) {
+        if (game_text_dialog)
+            game_text_dialog->Hide();
+        return;
+    }
+    if (game_text_dialog) {
+        auto previous = game_text_dialog;
+        game_text_dialog = nullptr;
+        WeakReference weak(this);
+        previous->Closed +=
+            ref new Windows::Foundation::TypedEventHandler < Controls::ContentDialog ^
+            , Controls::ContentDialogClosedEventArgs ^
+                  > ([weak, request, completed](auto, auto) {
+                        if (auto page = weak.Resolve<DirectXPage>()) {
+                            if (page->game_text_request_id == request.id)
+                                page->ShowGameTextInput(request, completed);
+                        }
+                    });
+        previous->Hide();
+        return;
+    }
+    Capture(true);
+    auto dialog = ref new Controls::ContentDialog();
+    game_text_dialog = dialog;
+    dialog->Title = ref new String(request.title[0] ? request.title : L"Entrada de texto");
+    dialog->PrimaryButtonText = L"Confirmar";
+    dialog->CloseButtonText = L"Cancelar";
+    auto text = ref new Controls::TextBox();
+    auto password = ref new Controls::PasswordBox();
+    const bool secret = (request.flags & SHADPS4_TEXT_PASSWORD) != 0;
+    if (secret) {
+        password->MaxLength = request.max_length;
+        password->Password = ref new String(request.text);
+        dialog->Content = password;
+    } else {
+        text->Text = ref new String(request.text);
+        text->MaxLength = request.max_length;
+        text->PlaceholderText = ref new String(request.placeholder);
+        text->AcceptsReturn = (request.flags & SHADPS4_TEXT_MULTILINE) != 0;
+        text->TextWrapping = TextWrapping::Wrap;
+        auto scope = ref new Input::InputScope();
+        auto name = ref new Input::InputScopeName();
+        name->NameValue = (request.flags & SHADPS4_TEXT_NUMBER)
+                              ? Input::InputScopeNameValue::Number
+                              : Input::InputScopeNameValue::Default;
+        scope->Names->Append(name);
+        text->InputScope = scope;
+        if (request.flags & SHADPS4_TEXT_NUMBER) {
+            WeakReference dialog_weak(dialog);
+            text->TextChanged +=
+                ref new Controls::TextChangedEventHandler([dialog_weak](auto sender, auto) {
+                    auto input = safe_cast<Controls::TextBox ^>(sender);
+                    const std::wstring value = input->Text->Data();
+                    if (auto target = dialog_weak.Resolve<Controls::ContentDialog>())
+                        target->IsPrimaryButtonEnabled =
+                            std::all_of(value.begin(), value.end(), [](wchar_t ch) {
+                                return (ch >= L'0' && ch <= L'9') || ch == L',' || ch == L'-' ||
+                                       ch == L'.';
+                            });
+                });
+        }
+        dialog->Content = text;
+    }
+    dialog->Opened += ref new Windows::Foundation::TypedEventHandler < Controls::ContentDialog ^,
+        Controls::ContentDialogOpenedEventArgs ^
+            > ([text, password, secret](auto, auto) {
+                  if (secret)
+                      password->Focus(Windows::UI::Xaml::FocusState::Programmatic);
+                  else {
+                      text->Focus(Windows::UI::Xaml::FocusState::Programmatic);
+                      text->SelectAll();
+                  }
+                  Windows::UI::ViewManagement::InputPane::GetForCurrentView()->TryShow();
+              });
+    WeakReference weak(this);
+    try {
+        create_task(dialog->ShowAsync())
+            .then(
+                [weak, dialog, text, password, secret,
+                 completed](task<Controls::ContentDialogResult> result) {
+                    bool confirmed{};
+                    try {
+                        confirmed = result.get() == Controls::ContentDialogResult::Primary;
+                    } catch (Exception ^) {
+                    }
+                    if (auto page = weak.Resolve<DirectXPage>()) {
+                        if (page->game_text_dialog == dialog) {
+                            page->game_text_dialog = nullptr;
+                            page->Capture(false);
+                        }
+                    }
+                    completed(confirmed, secret ? password->Password->Data() : text->Text->Data());
+                },
+                task_continuation_context::use_current());
+    } catch (Exception ^) {
+        game_text_dialog = nullptr;
+        Capture(false);
+        completed(false, {});
+    }
+}
+
 void DirectXPage::SaveInternalState(Windows::Foundation::Collections::IPropertySet ^) {
     if (frontend)
         frontend->UpdateInput([](FrontendInput& input) {

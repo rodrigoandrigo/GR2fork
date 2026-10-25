@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <memory>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -9,6 +10,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/blit_helper.h"
+#include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image.h"
 
 #include <vk_mem_alloc.h>
@@ -21,6 +23,21 @@ namespace VideoCore {
 using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
+
+#ifdef SHADPS4_UWP
+static bool SupportsStorageView(const Vulkan::Instance& instance, vk::Format format) {
+    const auto supports = [&](vk::Format candidate) {
+        return instance.IsFormatSupported(candidate, vk::FormatFeatureFlagBits2::eStorageImage);
+    };
+    if (supports(format)) {
+        return true;
+    }
+    return std::ranges::any_of(LiverpoolToVK::SurfaceFormats(), [&](const auto& candidate) {
+        return IsVulkanFormatCompatible(format, candidate.vk_format) &&
+               supports(candidate.vk_format);
+    });
+}
+#endif
 
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                            const ImageInfo& info) {
@@ -41,8 +58,7 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
             // supported, where even with ExtendedUsage we may get only one supported sample back.
             if ((info.num_samples == 1 || instance.IsMultisampleStorageImageSupported())
 #ifdef SHADPS4_UWP
-                && instance.IsFormatSupported(info.pixel_format,
-                                              vk::FormatFeatureFlagBits2::eStorageImage)
+                && SupportsStorageView(instance, info.pixel_format)
 #endif
             ) {
                 usage |= vk::ImageUsageFlagBits::eStorage;
@@ -53,8 +69,7 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
         // compressed formats, but may be used for uncompressed views. In order to satisfy this,
         // we will also specify the extended usage bit.
 #ifdef SHADPS4_UWP
-        if (instance.IsFormatSupported(info.pixel_format,
-                                       vk::FormatFeatureFlagBits2::eStorageImage)) {
+        if (SupportsStorageView(instance, info.pixel_format)) {
             usage |= vk::ImageUsageFlagBits::eStorage;
         }
 #else

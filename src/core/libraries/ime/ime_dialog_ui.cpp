@@ -27,6 +27,10 @@
 #include "core/tls.h"
 #include "imgui/imgui_std.h"
 #include "imgui/renderer/imgui_core.h"
+#ifdef SHADPS4_UWP
+#include "common/string_util.h"
+#include "uwp/text_input.h"
+#endif
 
 using namespace ImGui;
 
@@ -244,6 +248,44 @@ ImeDialogState& ImeDialogState::operator=(ImeDialogState&& other) {
     return *this;
 }
 
+#ifdef SHADPS4_UWP
+void ImeDialogState::RequestHostInput(bool password) {
+    ShadPS4TextInput request{};
+    request.max_length = max_text_length;
+    request.flags = (is_multi_line ? SHADPS4_TEXT_MULTILINE : 0) |
+                    (password ? SHADPS4_TEXT_PASSWORD : 0) | (is_numeric ? SHADPS4_TEXT_NUMBER : 0);
+    const auto copy = [this](const char* input, auto& output) {
+        char16_t converted[ORBIS_IME_DIALOG_MAX_TEXT_LENGTH + 1]{};
+        if (!input ||
+            !ConvertUTF8ToOrbis(input, std::strlen(input), converted, std::size(converted))) {
+            return;
+        }
+        size_t length =
+            std::min(std::char_traits<char16_t>::length(converted), std::size(output) - 1);
+        if (length && converted[length - 1] >= 0xd800 && converted[length - 1] <= 0xdbff) {
+            --length;
+        }
+        std::copy_n(converted, length, output);
+    };
+    copy(title.empty() ? nullptr : title.data(), request.title);
+    copy(placeholder.empty() ? nullptr : placeholder.data(), request.placeholder);
+    copy(current_text.begin(), request.text);
+    ::Core::Uwp::BeginTextInput(request);
+}
+
+bool ImeDialogState::SetHostText(std::u16string_view text) {
+    if (text.size() > max_text_length ||
+        !ConvertOrbisToUTF8(text.data(), text.size(), current_text.begin(),
+                            ORBIS_IME_DIALOG_MAX_TEXT_LENGTH * 4 + 1)) {
+        return false;
+    }
+    NormalizeNewlines();
+    ClampCurrentTextToMaxLen();
+    input_changed = true;
+    return true;
+}
+#endif
+
 bool ImeDialogState::CopyTextToOrbisBuffer(bool use_original) {
     if (!text_buffer) {
         LOG_DEBUG(Lib_ImeDialog, "CopyTextToOrbisBuffer: no text_buffer");
@@ -375,8 +417,17 @@ bool ImeDialogState::CallKeyboardFilter(const OrbisImeKeycode* src_keycode, u16*
 bool ImeDialogState::ConvertOrbisToUTF8(const char16_t* orbis_text, std::size_t orbis_text_len,
                                         char* utf8_text, std::size_t utf8_text_len) {
     std::fill(utf8_text, utf8_text + utf8_text_len, '\0');
+#ifdef SHADPS4_UWP
+    const std::wstring wide(orbis_text, orbis_text + orbis_text_len);
+    const auto converted = Common::UTF16ToUTF8(wide);
+    if (converted.size() >= utf8_text_len || (orbis_text_len && converted.empty())) {
+        return false;
+    }
+    std::copy(converted.begin(), converted.end(), utf8_text);
+#else
     const ImWchar* orbis_text_ptr = reinterpret_cast<const ImWchar*>(orbis_text);
     ImTextStrToUtf8(utf8_text, utf8_text_len, orbis_text_ptr, orbis_text_ptr + orbis_text_len);
+#endif
 
     return true;
 }
@@ -384,8 +435,16 @@ bool ImeDialogState::ConvertOrbisToUTF8(const char16_t* orbis_text, std::size_t 
 bool ImeDialogState::ConvertUTF8ToOrbis(const char* utf8_text, std::size_t utf8_text_len,
                                         char16_t* orbis_text, std::size_t orbis_text_len) {
     std::fill(orbis_text, orbis_text + orbis_text_len, u'\0');
+#ifdef SHADPS4_UWP
+    const auto converted = Common::UTF8ToUTF16W(std::string_view{utf8_text, utf8_text_len});
+    if (converted.size() >= orbis_text_len || (utf8_text_len && converted.empty())) {
+        return false;
+    }
+    std::copy(converted.begin(), converted.end(), orbis_text);
+#else
     const char* utf8_end = utf8_text ? (utf8_text + utf8_text_len) : nullptr;
     ImTextStrFromUtf8(reinterpret_cast<ImWchar*>(orbis_text), orbis_text_len, utf8_text, utf8_end);
+#endif
 
     return true;
 }

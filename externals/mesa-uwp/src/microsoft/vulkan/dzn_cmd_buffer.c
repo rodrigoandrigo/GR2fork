@@ -532,6 +532,357 @@ dzn_cmd_buffer_restore_layout(struct dzn_cmd_buffer *cmdbuf,
    }
 }
 
+struct dzn_feedback_image {
+   uint64_t id;
+   bool mixed;
+   uint32_t source_mip, source_layer, source_layer_count;
+   struct dzn_image image;
+   uint32_t subresource_count;
+   uint8_t *copied;
+   uint8_t *initialized;
+};
+
+struct dzn_feedback_slot {
+   uint64_t image_id;
+   D3D12_SHADER_RESOURCE_VIEW_DESC desc;
+   int slot;
+};
+
+static struct dzn_rendering_attachment *
+dzn_feedback_attachment(struct dzn_cmd_buffer *cmdbuf, unsigned index)
+{
+   if (index < MAX_RTS)
+      return index < cmdbuf->state.render.attachments.color_count ?
+         &cmdbuf->state.render.attachments.colors[index] : NULL;
+   return index == MAX_RTS ? &cmdbuf->state.render.attachments.depth :
+                             &cmdbuf->state.render.attachments.stencil;
+}
+
+static VkImageAspectFlagBits
+dzn_feedback_aspect(unsigned index)
+{
+   return index < MAX_RTS ? VK_IMAGE_ASPECT_COLOR_BIT :
+          index == MAX_RTS ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT;
+}
+
+static VkImageSubresourceRange
+dzn_feedback_attachment_range(const struct dzn_image_view *view, VkImageAspectFlags aspect)
+{
+   bool volume = view->vk.image->image_type == VK_IMAGE_TYPE_3D;
+   return (VkImageSubresourceRange) {
+      aspect, view->vk.base_mip_level, view->vk.level_count,
+      volume ? 0 : view->vk.base_array_layer, volume ? 1 : view->vk.layer_count,
+   };
+}
+
+static void
+dzn_feedback_transition(struct dzn_cmd_buffer *cmdbuf, const struct dzn_image *image,
+                        const VkImageSubresourceRange *range, VkImageLayout before,
+                        VkImageLayout after)
+{
+   if (cmdbuf->enhanced_barriers) {
+      D3D12_BARRIER_LAYOUT old_layout = dzn_vk_layout_to_d3d_layout(before, cmdbuf->type, range->aspectMask);
+      D3D12_BARRIER_LAYOUT new_layout = dzn_vk_layout_to_d3d_layout(after, cmdbuf->type, range->aspectMask);
+      if (image->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)
+         old_layout = new_layout = D3D12_BARRIER_LAYOUT_UNDEFINED;
+      dzn_cmd_buffer_image_barrier(cmdbuf, image, D3D12_BARRIER_SYNC_ALL,
+         D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COMMON,
+         old_layout, new_layout, range);
+   } else {
+      dzn_cmd_buffer_queue_image_range_layout_transition(cmdbuf, image, range, before, after,
+                                                         DZN_QUEUE_TRANSITION_FLUSH);
+   }
+}
+
+static void
+dzn_feedback_initialize(struct dzn_cmd_buffer *cmdbuf, const struct dzn_image *image,
+                        const VkImageSubresourceRange *range)
+{
+   if (cmdbuf->type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+       (image->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
+      return;
+   VkImageLayout layout = range->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT ?
+      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+   if (cmdbuf->enhanced_barriers) {
+      dzn_cmd_buffer_image_barrier(cmdbuf, image, D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_ALL,
+         D3D12_BARRIER_ACCESS_NO_ACCESS, D3D12_BARRIER_ACCESS_COMMON,
+         D3D12_BARRIER_LAYOUT_UNDEFINED,
+         dzn_vk_layout_to_d3d_layout(layout, cmdbuf->type, range->aspectMask), range);
+   } else {
+      dzn_feedback_transition(cmdbuf, image, range, VK_IMAGE_LAYOUT_UNDEFINED, layout);
+      dzn_foreach_aspect(aspect, range->aspectMask) {
+         for (unsigned layer = 0; layer < dzn_get_layer_count(image, range); layer++) {
+            D3D12_DISCARD_REGION discard = {
+               .FirstSubresource = dzn_image_range_get_subresource_index(image, range, aspect, 0, layer),
+               .NumSubresources = dzn_get_level_count(image, range),
+            };
+            ID3D12GraphicsCommandList1_DiscardResource(cmdbuf->cmdlist, image->res, &discard);
+         }
+      }
+   }
+   dzn_feedback_transition(cmdbuf, image, range, layout, VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT);
+}
+
+static void
+dzn_feedback_initialize_barriers(struct dzn_cmd_buffer *cmdbuf, const VkDependencyInfo *info)
+{
+   for (unsigned i = 0; i < info->imageMemoryBarrierCount; i++) {
+      const VkImageMemoryBarrier2 *barrier = &info->pImageMemoryBarriers[i];
+      if (barrier->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+          barrier->newLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT) {
+         VK_FROM_HANDLE(dzn_image, image, barrier->image);
+         dzn_feedback_initialize(cmdbuf, image, &barrier->subresourceRange);
+      }
+   }
+}
+
+static void
+dzn_cmd_buffer_feedback_attachments(struct dzn_cmd_buffer *cmdbuf, bool prepare)
+{
+   for (unsigned i = 0; i < MAX_RTS + 2; i++) {
+      struct dzn_rendering_attachment *att = dzn_feedback_attachment(cmdbuf, i);
+      if (!att || !att->iview || !att->feedback_loop)
+         continue;
+      VkImageLayout layout = prepare ? (i < MAX_RTS ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL :
+                                          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) :
+                                       VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+      if (att->layout == layout)
+         continue;
+      struct dzn_image *image = container_of(att->iview->vk.image, struct dzn_image, vk);
+      VkImageSubresourceRange range = dzn_feedback_attachment_range(att->iview, dzn_feedback_aspect(i));
+      dzn_feedback_transition(cmdbuf, image, &range, att->layout, layout);
+      att->layout = layout;
+   }
+}
+
+static void
+dzn_cmd_buffer_finish_feedback(struct dzn_cmd_buffer *cmdbuf)
+{
+   util_dynarray_foreach(&cmdbuf->feedback_images, struct dzn_feedback_image *, ptr) {
+      struct dzn_feedback_image *entry = *ptr;
+      const struct dzn_image *image = &entry->image;
+      unsigned layers = image->vk.image_type == VK_IMAGE_TYPE_3D ? 1 : image->vk.array_layers;
+      if (entry->mixed) {
+         VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+         dzn_feedback_transition(cmdbuf, image, &range,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PREINITIALIZED);
+         continue;
+      }
+      dzn_foreach_aspect(aspect, image->vk.aspects) {
+         for (unsigned layer = 0; layer < layers; layer++) {
+            for (unsigned mip = 0; mip < image->vk.mip_levels; mip++) {
+               VkImageSubresourceRange range = {aspect, mip, 1, layer, 1};
+               unsigned subres = dzn_image_range_get_subresource_index(image, &range, aspect, 0, 0);
+               if (entry->initialized[subres])
+                  dzn_feedback_transition(cmdbuf, image, &range,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_PREINITIALIZED);
+            }
+         }
+      }
+   }
+}
+
+static void
+dzn_cmd_buffer_clear_feedback(struct dzn_cmd_buffer *cmdbuf)
+{
+   struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
+   util_dynarray_foreach(&cmdbuf->feedback_images, struct dzn_feedback_image *, entry) {
+      ID3D12Resource_Release((*entry)->image.res);
+      free((*entry)->copied);
+      free(*entry);
+   }
+   util_dynarray_foreach(&cmdbuf->feedback_slots, struct dzn_feedback_slot, entry)
+      dzn_device_descriptor_heap_free_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, entry->slot);
+   util_dynarray_clear(&cmdbuf->feedback_images);
+   util_dynarray_clear(&cmdbuf->feedback_slots);
+}
+
+static struct dzn_feedback_image *
+dzn_cmd_buffer_feedback_image(struct dzn_cmd_buffer *cmdbuf, const struct dzn_image *image)
+{
+   util_dynarray_foreach(&cmdbuf->feedback_images, struct dzn_feedback_image *, entry) {
+      if (!(*entry)->mixed && (*entry)->id == image->feedback_id)
+         return *entry;
+   }
+   struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
+   struct dzn_feedback_image *entry = calloc(1, sizeof(*entry));
+   if (!entry)
+      goto fail;
+   entry->id = image->feedback_id;
+   entry->image = *image;
+   entry->image.res = NULL;
+   entry->image.desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+   unsigned layers = image->vk.image_type == VK_IMAGE_TYPE_3D ? 1 : image->vk.array_layers;
+   entry->subresource_count = image->vk.mip_levels * layers * util_bitcount(image->vk.aspects);
+   entry->copied = calloc(entry->subresource_count, 2);
+   if (!entry->copied)
+      goto fail;
+   entry->initialized = entry->copied + entry->subresource_count;
+   D3D12_HEAP_PROPERTIES heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
+   HRESULT hr;
+   if (device->dev10 && image->castable_format_count) {
+      const D3D12_RESOURCE_DESC *desc = &entry->image.desc;
+      D3D12_RESOURCE_DESC1 desc1 = {
+         .Dimension = desc->Dimension, .Alignment = desc->Alignment,
+         .Width = desc->Width, .Height = desc->Height,
+         .DepthOrArraySize = desc->DepthOrArraySize, .MipLevels = desc->MipLevels,
+         .Format = desc->Format, .SampleDesc = desc->SampleDesc,
+         .Layout = desc->Layout, .Flags = desc->Flags,
+      };
+      hr = ID3D12Device10_CreateCommittedResource3(device->dev10, &heap, D3D12_HEAP_FLAG_NONE,
+         &desc1, D3D12_BARRIER_LAYOUT_COMMON, NULL, NULL, image->castable_format_count,
+         image->castable_formats, &IID_ID3D12Resource, (void **)&entry->image.res);
+   } else {
+      hr = ID3D12Device1_CreateCommittedResource(device->dev, &heap, D3D12_HEAP_FLAG_NONE,
+         &entry->image.desc, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource,
+         (void **)&entry->image.res);
+   }
+   if (FAILED(hr))
+      goto fail;
+   struct dzn_feedback_image **slot = util_dynarray_grow(&cmdbuf->feedback_images,
+                                                        struct dzn_feedback_image *, 1);
+   if (!slot) {
+      ID3D12Resource_Release(entry->image.res);
+      goto fail;
+   }
+   *slot = entry;
+   return entry;
+fail:
+   if (entry) {
+      free(entry->copied);
+      free(entry);
+   }
+   vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   return NULL;
+}
+
+static VkImageLayout
+dzn_feedback_source_layout(struct dzn_cmd_buffer *cmdbuf, const struct dzn_image *image,
+                            VkImageAspectFlagBits aspect, unsigned mip, unsigned layer)
+{
+   for (unsigned i = 0; i < MAX_RTS + 2; i++) {
+      struct dzn_rendering_attachment *att = dzn_feedback_attachment(cmdbuf, i);
+      if (!att || !att->iview || !att->feedback_loop || dzn_feedback_aspect(i) != aspect ||
+          att->iview->vk.image != &image->vk)
+         continue;
+      VkImageSubresourceRange r = dzn_feedback_attachment_range(att->iview, aspect);
+      if (mip >= r.baseMipLevel && mip < r.baseMipLevel + r.levelCount &&
+          layer >= r.baseArrayLayer && layer < r.baseArrayLayer + r.layerCount)
+         return att->layout;
+   }
+   return VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+}
+
+static struct dzn_image *
+dzn_feedback_source(struct dzn_cmd_buffer *cmdbuf, const struct dzn_feedback_descriptor *desc)
+{
+   if (!desc->image_id)
+      return NULL;
+   for (unsigned i = 0; i < MAX_RTS + 2; i++) {
+      struct dzn_rendering_attachment *att = dzn_feedback_attachment(cmdbuf, i);
+      if (!att || !att->iview || !att->feedback_loop)
+         continue;
+      struct dzn_image *image = container_of(att->iview->vk.image, struct dzn_image, vk);
+      if (image->feedback_id != desc->image_id || !(desc->range.aspectMask & dzn_feedback_aspect(i)))
+         continue;
+      VkImageSubresourceRange r = dzn_feedback_attachment_range(att->iview, dzn_feedback_aspect(i));
+      if (r.baseMipLevel < desc->range.baseMipLevel + desc->range.levelCount &&
+          desc->range.baseMipLevel < r.baseMipLevel + r.levelCount &&
+          r.baseArrayLayer < desc->range.baseArrayLayer + desc->range.layerCount &&
+          desc->range.baseArrayLayer < r.baseArrayLayer + r.layerCount)
+         return image;
+   }
+   return NULL;
+}
+
+static struct dzn_feedback_image *
+dzn_cmd_buffer_copy_feedback(struct dzn_cmd_buffer *cmdbuf, const struct dzn_feedback_descriptor *desc)
+{
+   struct dzn_image *image = dzn_feedback_source(cmdbuf, desc);
+   if (!image)
+      return NULL;
+   struct dzn_feedback_image *entry = dzn_cmd_buffer_feedback_image(cmdbuf, image);
+   if (!entry)
+      return NULL;
+   dzn_foreach_aspect(aspect, desc->range.aspectMask) {
+      for (unsigned mip = desc->range.baseMipLevel; mip < desc->range.baseMipLevel + desc->range.levelCount; mip++) {
+         for (unsigned layer = desc->range.baseArrayLayer; layer < desc->range.baseArrayLayer + desc->range.layerCount; layer++) {
+            VkImageSubresourceRange range = {aspect, mip, 1, layer, 1};
+            unsigned subres = dzn_image_range_get_subresource_index(image, &range, aspect, 0, 0);
+            if (entry->copied[subres])
+               continue;
+            VkImageLayout before = dzn_feedback_source_layout(cmdbuf, image, aspect, mip, layer);
+            dzn_feedback_transition(cmdbuf, image, &range, before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            dzn_feedback_transition(cmdbuf, &entry->image, &range,
+               entry->initialized[subres] ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_PREINITIALIZED,
+               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            D3D12_TEXTURE_COPY_LOCATION src = {.pResource = image->res,
+               .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = subres};
+            D3D12_TEXTURE_COPY_LOCATION dst = src;
+            dst.pResource = entry->image.res;
+            ID3D12GraphicsCommandList1_CopyTextureRegion(cmdbuf->cmdlist, &dst, 0, 0, 0, &src, NULL);
+            dzn_feedback_transition(cmdbuf, image, &range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, before);
+            dzn_feedback_transition(cmdbuf, &entry->image, &range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            entry->copied[subres] = entry->initialized[subres] = 1;
+         }
+      }
+   }
+   return entry;
+}
+
+static int
+dzn_cmd_buffer_feedback_slot(struct dzn_cmd_buffer *cmdbuf, const struct dzn_feedback_descriptor *desc,
+                              const struct dzn_feedback_image *image)
+{
+   util_dynarray_foreach(&cmdbuf->feedback_slots, struct dzn_feedback_slot, entry) {
+      if (entry->image_id == desc->image_id && !memcmp(&entry->desc, &desc->desc, sizeof(desc->desc)))
+         return entry->slot;
+   }
+   struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
+   int slot = dzn_device_descriptor_heap_alloc_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+   if (slot < 0) {
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return -1;
+   }
+   struct dzn_feedback_slot *entry = util_dynarray_grow(&cmdbuf->feedback_slots, struct dzn_feedback_slot, 1);
+   if (!entry) {
+      dzn_device_descriptor_heap_free_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slot);
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return -1;
+   }
+   *entry = (struct dzn_feedback_slot){desc->image_id, desc->desc, slot};
+   memset(&device->device_heaps[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].heap.feedback[slot],
+          0, sizeof(struct dzn_feedback_descriptor));
+   ID3D12Device1_CreateShaderResourceView(device->dev, image->image.res, &desc->desc,
+      dzn_descriptor_heap_get_cpu_handle(&device->device_heaps[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].heap, slot));
+   return slot;
+}
+
+static bool
+dzn_cmd_buffer_has_feedback(struct dzn_cmd_buffer *cmdbuf)
+{
+   bool active = false;
+   for (unsigned i = 0; i < MAX_RTS + 2; i++) {
+      struct dzn_rendering_attachment *att = dzn_feedback_attachment(cmdbuf, i);
+      active |= att && att->iview && att->feedback_loop;
+   }
+   return active;
+}
+
+static void
+dzn_cmd_buffer_prepare_feedback(struct dzn_cmd_buffer *cmdbuf)
+{
+   if (!dzn_cmd_buffer_has_feedback(cmdbuf))
+      return;
+   dzn_cmd_buffer_feedback_attachments(cmdbuf, true);
+   util_dynarray_foreach(&cmdbuf->feedback_images, struct dzn_feedback_image *, entry)
+      if (!(*entry)->mixed)
+         memset((*entry)->copied, 0, (*entry)->subresource_count);
+   for (unsigned i = 0; i < MAX_SETS; i++)
+      cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_GRAPHICS].dirty |= DZN_CMD_BINDPOINT_DIRTY_DESC_SET0 << i;
+}
+
 static void
 dzn_cmd_buffer_clear_push_descriptor_pools(struct dzn_cmd_buffer *cmdbuf)
 {
@@ -575,6 +926,8 @@ dzn_cmd_buffer_destroy(struct vk_command_buffer *cbuf)
 
    struct dzn_cmd_buffer *cmdbuf = container_of(cbuf, struct dzn_cmd_buffer, vk);
 
+   dzn_cmd_buffer_clear_descriptor_watches(cmdbuf);
+
    if (cmdbuf->cmdlist2)
       ID3D12GraphicsCommandList2_Release(cmdbuf->cmdlist2);
 
@@ -603,8 +956,11 @@ dzn_cmd_buffer_destroy(struct vk_command_buffer *cbuf)
    dzn_descriptor_heap_pool_finish(&cmdbuf->rtvs.pool);
    dzn_descriptor_heap_pool_finish(&cmdbuf->dsvs.pool);
    dzn_cmd_buffer_release_descriptor_layouts(cmdbuf);
+   dzn_cmd_buffer_clear_feedback(cmdbuf);
    dzn_cmd_buffer_clear_push_descriptor_pools(cmdbuf);
    util_dynarray_fini(&cmdbuf->push_descriptor_pools);
+   util_dynarray_fini(&cmdbuf->feedback_images);
+   util_dynarray_fini(&cmdbuf->feedback_slots);
    util_dynarray_fini(&cmdbuf->events.signal);
    util_dynarray_fini(&cmdbuf->queries.reset);
    util_dynarray_fini(&cmdbuf->queries.signal);
@@ -650,13 +1006,18 @@ static void
 dzn_cmd_buffer_reset(struct vk_command_buffer *cbuf, VkCommandBufferResetFlags flags)
 {
    struct dzn_cmd_buffer *cmdbuf = container_of(cbuf, struct dzn_cmd_buffer, vk);
+   dzn_cmd_buffer_clear_descriptor_watches(cmdbuf);
 
    dzn_cmd_buffer_release_descriptor_layouts(cmdbuf);
+   dzn_cmd_buffer_clear_feedback(cmdbuf);
    dzn_cmd_buffer_clear_push_descriptor_pools(cmdbuf);
 
    /* Reset the state */
    memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
+   cmdbuf->active_queries = 0;
+   memset(cmdbuf->mixed_attachments, 0, sizeof(cmdbuf->mixed_attachments));
    cmdbuf->vk.dynamic_graphics_state.vi = &cmdbuf->dynamic_vi;
+   list_inithead(&cmdbuf->descriptor_watches);
    cmdbuf->state.pipeline_variant.color_write_enables = BITFIELD_MASK(MAX_RTS);
    cmdbuf->state.multiview.num_views = 1;
    cmdbuf->state.multiview.view_mask = 1;
@@ -814,10 +1175,13 @@ dzn_cmd_buffer_create(const VkCommandBufferAllocateInfo *info,
    cmdbuf->state.multiview.view_mask = 1;
    for (uint32_t bucket = 0; bucket < DZN_INTERNAL_BUF_BUCKET_COUNT; ++bucket)
       list_inithead(&cmdbuf->internal_bufs[bucket]);
+   list_inithead(&cmdbuf->descriptor_watches);
    cmdbuf->events.signal = UTIL_DYNARRAY_INIT;
    cmdbuf->queries.reset = UTIL_DYNARRAY_INIT;
    cmdbuf->queries.signal = UTIL_DYNARRAY_INIT;
    cmdbuf->push_descriptor_pools = UTIL_DYNARRAY_INIT;
+   cmdbuf->feedback_images = UTIL_DYNARRAY_INIT;
+   cmdbuf->feedback_slots = UTIL_DYNARRAY_INIT;
    dzn_descriptor_heap_pool_init(&cmdbuf->rtvs.pool, device,
                                  D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                                  false, &pool->alloc);
@@ -1280,6 +1644,7 @@ dzn_EndCommandBuffer(VkCommandBuffer commandBuffer)
    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
 
    if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+      dzn_cmd_buffer_finish_feedback(cmdbuf);
       dzn_cmd_buffer_gather_events(cmdbuf);
       dzn_cmd_buffer_gather_queries(cmdbuf);
       HRESULT hres = ID3D12GraphicsCommandList1_Close(cmdbuf->cmdlist);
@@ -1315,6 +1680,8 @@ dzn_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                         const VkDependencyInfo *info)
 {
    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
+
+   dzn_cmd_buffer_feedback_attachments(cmdbuf, false);
 
    bool execution_barrier =
       !info->memoryBarrierCount &&
@@ -1426,6 +1793,7 @@ dzn_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                                                          new_layout,
                                                          DZN_QUEUE_TRANSITION_FLUSH);
    }
+   dzn_feedback_initialize_barriers(cmdbuf, info);
 }
 
 /* A straightforward translation of the Vulkan sync flags to D3D sync flags */
@@ -1730,6 +2098,7 @@ dzn_CmdPipelineBarrier2_enhanced(VkCommandBuffer commandBuffer,
                                  const VkDependencyInfo *info)
 {
    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
+   dzn_cmd_buffer_feedback_attachments(cmdbuf, false);
    const bool ownership_all_stages = info->dependencyFlags &
       VK_DEPENDENCY_QUEUE_FAMILY_OWNERSHIP_TRANSFER_USE_ALL_STAGES_BIT_KHR;
 
@@ -2014,6 +2383,7 @@ dzn_CmdPipelineBarrier2_enhanced(VkCommandBuffer commandBuffer,
    assert(tbar == num_image_barriers);
 
    ID3D12GraphicsCommandList8_Barrier(cmdbuf->cmdlist8, num_barrier_groups, groups);
+   dzn_feedback_initialize_barriers(cmdbuf, info);
 
    vk_free(&cmdbuf->vk.pool->alloc, global_barriers);
 }
@@ -3193,7 +3563,8 @@ dzn_cmd_buffer_blit_set_pipeline(struct dzn_cmd_buffer *cmdbuf,
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
    struct dzn_meta_blit_key ctx_key = {
       .out_format = dzn_image_get_dxgi_format(pdev, out_format, usage, aspect),
-      .samples = (uint32_t)src->vk.samples,
+      .src_samples_log2 = util_logbase2(src->vk.samples),
+      .dst_samples_log2 = resolve_mode == dzn_blit_resolve_none ? util_logbase2(dst->vk.samples) : 0,
       .loc = (uint32_t)(aspect == VK_IMAGE_ASPECT_DEPTH_BIT ?
                         FRAG_RESULT_DEPTH :
                         aspect == VK_IMAGE_ASPECT_STENCIL_BIT ?
@@ -3732,9 +4103,8 @@ dzn_cmd_buffer_update_heaps(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint)
             uint32_t set_heap_offset = pipeline->sets[s].heap_offsets[type];
             uint32_t set_desc_count = MIN2(pipeline->sets[s].range_desc_count[type], set->heap_sizes[type]);
             if (set_desc_count) {
-               dzn_descriptor_heap_copy(device, dst_heap, dst_heap_offset + set_heap_offset,
-                                        &set->pool->heaps[type], set->heap_offsets[type],
-                                        set_desc_count, type);
+               dzn_descriptor_set_copy_snapshots(cmdbuf, set, type, dst_heap,
+                                       dst_heap_offset + set_heap_offset, set_desc_count);
             }
 
             if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
@@ -3760,6 +4130,17 @@ dzn_cmd_buffer_update_heaps(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint)
             }
          }
 
+         if (bindpoint == VK_PIPELINE_BIND_POINT_GRAPHICS && dst_heap->feedback &&
+             dzn_cmd_buffer_has_feedback(cmdbuf)) {
+            for (unsigned i = 0; i < desc_count; i++) {
+               const struct dzn_feedback_descriptor *desc = &dst_heap->feedback[dst_heap_offset + i];
+               struct dzn_feedback_image *image = dzn_cmd_buffer_copy_feedback(cmdbuf, desc);
+               if (image)
+                  ID3D12Device1_CreateShaderResourceView(device->dev, image->image.res, &desc->desc,
+                     dzn_descriptor_heap_get_cpu_handle(dst_heap, dst_heap_offset + i));
+            }
+         }
+
          if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
              pipeline->image_metadata_offset != ~0u) {
             uint32_t elements = MAX2(pipeline->image_metadata_offset, 1);
@@ -3771,18 +4152,7 @@ dzn_cmd_buffer_update_heaps(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint)
                 &upload, &offset);
             if (result != VK_SUCCESS)
                return;
-            void *mapped;
-            D3D12_RANGE read_range = {0, 0};
-            if (FAILED(ID3D12Resource_Map(upload, 0, &read_range, &mapped))) {
-               vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_MEMORY_MAP_FAILED);
-               return;
-            }
-            if (pipeline->image_metadata_offset)
-               memcpy((char *)mapped + offset, dst_heap->format_defaults + dst_heap_offset, bytes);
-            else
-               memset((char *)mapped + offset, 0, bytes);
-            D3D12_RANGE written = {offset, offset + bytes};
-            ID3D12Resource_Unmap(upload, 0, &written);
+            dzn_descriptor_watch_metadata(cmdbuf, dst_heap, dst_heap_offset, elements, upload, offset);
             D3D12_SHADER_RESOURCE_VIEW_DESC desc = {
                 .Format = DXGI_FORMAT_R32_TYPELESS,
                 .ViewDimension = D3D12_SRV_DIMENSION_BUFFER,
@@ -3841,6 +4211,43 @@ dzn_cmd_buffer_update_heaps(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint)
          uint32_t dirty_bit = DZN_CMD_BINDPOINT_DIRTY_DESC_SET0 << s;
          if (cmdbuf->state.bindpoint[bindpoint].dirty & dirty_bit) {
             uint64_t gpuva = set->pool->bindless.gpuva + (set->heap_offsets[0] * sizeof(struct dxil_spirv_bindless_entry));
+            if (bindpoint == VK_PIPELINE_BIND_POINT_GRAPHICS &&
+                device->vk.enabled_features.attachmentFeedbackLoopLayout &&
+                dzn_cmd_buffer_has_feedback(cmdbuf)) {
+               unsigned count = set->heap_sizes[0];
+               struct dxil_spirv_bindless_entry *entries = NULL;
+               ID3D12Resource *upload;
+               uint64_t offset;
+               VkResult result = dzn_cmd_buffer_alloc_internal_buf(cmdbuf,
+                  MAX2(count * sizeof(*entries), 16), DZN_INTERNAL_BUF_UPLOAD,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, 16, &upload, &offset);
+               if (result != VK_SUCCESS)
+                  return;
+               void *mapped;
+               if (FAILED(ID3D12Resource_Map(upload, 0, NULL, &mapped))) {
+                  vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_MEMORY_MAP_FAILED);
+                  return;
+               }
+               entries = (void *)((char *)mapped + offset);
+               memcpy(entries, (const void *)(set->pool->bindless.map + set->heap_offsets[0]),
+                      count * sizeof(*entries));
+               struct dzn_descriptor_heap *heap = &device->device_heaps[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].heap;
+               for (unsigned i = 0; i < count; i++) {
+                  unsigned index = entries[i].texture_idx;
+                  if (index >= heap->desc_count)
+                     continue;
+                  const struct dzn_feedback_descriptor *desc = &heap->feedback[index];
+                  struct dzn_feedback_image *image = dzn_cmd_buffer_copy_feedback(cmdbuf, desc);
+                  if (image) {
+                     int slot = dzn_cmd_buffer_feedback_slot(cmdbuf, desc, image);
+                     if (slot >= 0)
+                        entries[i].texture_idx = slot;
+                  }
+               }
+               ID3D12Resource_Unmap(upload, 0, NULL);
+               gpuva = ID3D12Resource_GetGPUVirtualAddress(upload) + offset;
+            }
+
             if (bindpoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
                ID3D12GraphicsCommandList1_SetGraphicsRootShaderResourceView(cmdbuf->cmdlist, s, gpuva);
             else
@@ -4225,9 +4632,209 @@ dzn_cmd_buffer_triangle_fan_rewrite_index(struct dzn_cmd_buffer *cmdbuf,
    return VK_SUCCESS;
 }
 
+static struct dzn_feedback_image *
+dzn_cmd_buffer_mixed_image(struct dzn_cmd_buffer *cmdbuf, const struct dzn_image_view *view,
+                            VkSampleCountFlagBits samples)
+{
+   const struct dzn_image *source = container_of(view->vk.image, struct dzn_image, vk);
+   util_dynarray_foreach(&cmdbuf->feedback_images, struct dzn_feedback_image *, ptr) {
+      struct dzn_feedback_image *entry = *ptr;
+      if (entry->mixed && entry->id == source->feedback_id && entry->image.vk.samples == samples &&
+          entry->source_mip == view->vk.base_mip_level &&
+          entry->source_layer == view->vk.base_array_layer &&
+          entry->source_layer_count == view->vk.layer_count)
+         return entry;
+   }
+   if (source->vk.image_type != VK_IMAGE_TYPE_2D) {
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return NULL;
+   }
+   struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
+   struct dzn_feedback_image *entry = calloc(1, sizeof(*entry));
+   if (!entry)
+      goto fail;
+   entry->id = source->feedback_id;
+   entry->mixed = true;
+   entry->source_mip = view->vk.base_mip_level;
+   entry->source_layer = view->vk.base_array_layer;
+   entry->source_layer_count = view->vk.layer_count;
+   entry->image = *source;
+   struct dzn_image *image = &entry->image;
+   image->res = NULL;
+   image->vk.extent.width = u_minify(source->vk.extent.width, view->vk.base_mip_level);
+   image->vk.extent.height = u_minify(source->vk.extent.height, view->vk.base_mip_level);
+   image->vk.mip_levels = 1;
+   image->vk.array_layers = view->vk.layer_count;
+   image->vk.samples = samples;
+   image->desc.Width = image->vk.extent.width;
+   image->desc.Height = image->vk.extent.height;
+   image->desc.DepthOrArraySize = image->vk.array_layers;
+   image->desc.MipLevels = 1;
+   image->desc.Alignment = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+   image->desc.SampleDesc.Count = samples;
+   image->desc.SampleDesc.Quality = 0;
+   image->desc.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                          D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                          D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+   image->desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+   D3D12_HEAP_PROPERTIES heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
+   HRESULT hr;
+   if (device->dev10 && source->castable_format_count) {
+      const D3D12_RESOURCE_DESC *desc = &image->desc;
+      D3D12_RESOURCE_DESC1 desc1 = {
+         .Dimension = desc->Dimension, .Alignment = desc->Alignment,
+         .Width = desc->Width, .Height = desc->Height,
+         .DepthOrArraySize = desc->DepthOrArraySize, .MipLevels = desc->MipLevels,
+         .Format = desc->Format, .SampleDesc = desc->SampleDesc,
+         .Layout = desc->Layout, .Flags = desc->Flags,
+      };
+      hr = ID3D12Device10_CreateCommittedResource3(device->dev10, &heap, D3D12_HEAP_FLAG_NONE,
+         &desc1, D3D12_BARRIER_LAYOUT_COMMON, NULL, NULL, source->castable_format_count,
+         source->castable_formats, &IID_ID3D12Resource, (void **)&image->res);
+   } else {
+      hr = ID3D12Device1_CreateCommittedResource(device->dev, &heap, D3D12_HEAP_FLAG_NONE,
+         &image->desc, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&image->res);
+   }
+   if (FAILED(hr))
+      goto fail;
+   struct dzn_feedback_image **slot = util_dynarray_grow(&cmdbuf->feedback_images,
+                                                        struct dzn_feedback_image *, 1);
+   if (!slot) {
+      ID3D12Resource_Release(image->res);
+      goto fail;
+   }
+   *slot = entry;
+   VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, image->vk.array_layers};
+   if (cmdbuf->enhanced_barriers) {
+      dzn_cmd_buffer_image_barrier(cmdbuf, image, D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_ALL,
+         D3D12_BARRIER_ACCESS_NO_ACCESS, D3D12_BARRIER_ACCESS_COMMON,
+         D3D12_BARRIER_LAYOUT_UNDEFINED, D3D12_BARRIER_LAYOUT_RENDER_TARGET, &range);
+   } else {
+      dzn_feedback_transition(cmdbuf, image, &range, VK_IMAGE_LAYOUT_PREINITIALIZED,
+                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+      ID3D12GraphicsCommandList1_DiscardResource(cmdbuf->cmdlist, image->res, NULL);
+   }
+   return entry;
+fail:
+   free(entry);
+   vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   return NULL;
+}
+
+static void
+dzn_cmd_buffer_mixed_blit(struct dzn_cmd_buffer *cmdbuf, struct dzn_rendering_attachment *att,
+                           struct dzn_feedback_image *entry, bool write_back)
+{
+   struct dzn_image *original = container_of(att->iview->vk.image, struct dzn_image, vk);
+   VkImageBlit2 region = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, entry->source_mip,
+                        entry->source_layer, entry->source_layer_count},
+      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, entry->source_layer_count},
+      .srcOffsets = {{0, 0, 0}, {entry->image.vk.extent.width, entry->image.vk.extent.height, 1}},
+      .dstOffsets = {{0, 0, 0}, {entry->image.vk.extent.width, entry->image.vk.extent.height, 1}},
+   };
+   VkBlitImageInfo2 info = {
+      .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+      .srcImage = dzn_image_to_handle(original),
+      .srcImageLayout = att->layout,
+      .dstImage = dzn_image_to_handle(&entry->image),
+      .dstImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .regionCount = 1, .pRegions = &region, .filter = VK_FILTER_NEAREST,
+   };
+   if (write_back) {
+      SWAP(info.srcImage, info.dstImage);
+      SWAP(info.srcImageLayout, info.dstImageLayout);
+      SWAP(region.srcSubresource, region.dstSubresource);
+   }
+   dzn_cmd_buffer_blit_image(cmdbuf, &info, false);
+}
+
+static void
+dzn_cmd_buffer_mixed_targets(struct dzn_cmd_buffer *cmdbuf, bool original)
+{
+   D3D12_CPU_DESCRIPTOR_HANDLE handles[MAX_RTS], depth = {0};
+   unsigned count = cmdbuf->state.render.attachments.color_count;
+   for (unsigned i = 0; i < count; i++) {
+      struct dzn_image_view *view = cmdbuf->state.render.attachments.colors[i].iview;
+      struct dzn_feedback_image *entry = cmdbuf->mixed_attachments[i];
+      if (!view) {
+         handles[i] = dzn_cmd_buffer_get_null_rtv(cmdbuf);
+      } else if (!original && entry) {
+         D3D12_RENDER_TARGET_VIEW_DESC desc = {
+            .Format = view->rtv_desc.Format,
+            .ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY,
+            .Texture2DMSArray = {.FirstArraySlice = 0, .ArraySize = entry->image.vk.array_layers},
+         };
+         handles[i] = dzn_cmd_buffer_get_rtv(cmdbuf, &entry->image, &desc);
+      } else {
+         struct dzn_image *image = container_of(view->vk.image, struct dzn_image, vk);
+         handles[i] = dzn_cmd_buffer_get_rtv(cmdbuf, image, &view->rtv_desc);
+      }
+   }
+   struct dzn_image_view *view = cmdbuf->state.render.attachments.depth.iview;
+   if (!view)
+      view = cmdbuf->state.render.attachments.stencil.iview;
+   if (view) {
+      struct dzn_image *image = container_of(view->vk.image, struct dzn_image, vk);
+      depth = dzn_cmd_buffer_get_dsv(cmdbuf, image, &view->dsv_desc);
+   }
+   ID3D12GraphicsCommandList1_OMSetRenderTargets(cmdbuf->cmdlist, count, handles, false,
+                                                depth.ptr ? &depth : NULL);
+}
+
+static void
+dzn_cmd_buffer_prepare_mixed_samples(struct dzn_cmd_buffer *cmdbuf)
+{
+   memset(cmdbuf->mixed_attachments, 0, sizeof(cmdbuf->mixed_attachments));
+   struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
+   if (!device->vk.enabled_extensions.AMD_mixed_attachment_samples)
+      return;
+   const struct dzn_graphics_pipeline *pipeline = (const struct dzn_graphics_pipeline *)
+      cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_GRAPHICS].pipeline;
+   VkSampleCountFlagBits samples = pipeline->extended_dynamic & DZN_DYNAMIC_SAMPLES ?
+      cmdbuf->state.pipeline_variant.extended.samples : pipeline->rasterization_samples;
+   bool mixed = false;
+   for (unsigned i = 0; i < cmdbuf->state.render.attachments.color_count; i++) {
+      struct dzn_rendering_attachment *att = &cmdbuf->state.render.attachments.colors[i];
+      if (!att->iview || att->iview->vk.image->samples >= samples)
+         continue;
+      if (cmdbuf->active_queries)
+         vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      struct dzn_feedback_image *entry = dzn_cmd_buffer_mixed_image(cmdbuf, att->iview, samples);
+      if (!entry)
+         return;
+      cmdbuf->mixed_attachments[i] = entry;
+      dzn_cmd_buffer_mixed_blit(cmdbuf, att, entry, false);
+      mixed = true;
+   }
+   if (mixed)
+      dzn_cmd_buffer_mixed_targets(cmdbuf, false);
+}
+
+static void
+dzn_cmd_buffer_finish_mixed_samples(struct dzn_cmd_buffer *cmdbuf)
+{
+   bool mixed = false;
+   for (unsigned i = 0; i < cmdbuf->state.render.attachments.color_count; i++) {
+      struct dzn_feedback_image *entry = cmdbuf->mixed_attachments[i];
+      if (!entry)
+         continue;
+      dzn_cmd_buffer_mixed_blit(cmdbuf, &cmdbuf->state.render.attachments.colors[i], entry, true);
+      mixed = true;
+   }
+   if (mixed) {
+      dzn_cmd_buffer_mixed_targets(cmdbuf, false);
+      dzn_cmd_buffer_set_conditional(cmdbuf, false);
+   }
+}
+
 static void
 dzn_cmd_buffer_prepare_draw(struct dzn_cmd_buffer *cmdbuf, bool indexed)
 {
+   dzn_cmd_buffer_prepare_feedback(cmdbuf);
+   dzn_cmd_buffer_prepare_mixed_samples(cmdbuf);
+
    if (indexed)
       dzn_cmd_buffer_update_ibview(cmdbuf);
 
@@ -4697,6 +5304,7 @@ dzn_cmd_buffer_indirect_draw(struct dzn_cmd_buffer *cmdbuf,
                                                  draw_buf, draw_buf_offset,
                                                  count_buf, count_buf_offset);
       dzn_cmd_buffer_set_conditional(cmdbuf, false);
+      dzn_cmd_buffer_finish_mixed_samples(cmdbuf);
    }
 
    /* Restore the old IB view if we modified it during the triangle fan lowering */
@@ -4777,6 +5385,23 @@ dzn_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
                           const VkCopyImageToBufferInfo2 *info)
 {
    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(dzn_buffer, dst_buffer, info->dstBuffer);
+   D3D12_RESOURCE_BARRIER barrier = {
+      .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+      .Transition = {
+         .pResource = dst_buffer->res,
+         .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+         .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+         .StateAfter = D3D12_RESOURCE_STATE_COPY_DEST,
+      },
+   };
+   if (cmdbuf->enhanced_barriers) {
+      dzn_cmd_buffer_buffer_barrier(cmdbuf, dst_buffer->res,
+                                   D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_COPY,
+                                   D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST);
+   } else {
+      ID3D12GraphicsCommandList1_ResourceBarrier(cmdbuf->cmdlist, 1, &barrier);
+   }
 
    for (int i = 0; i < info->regionCount; i++) {
       const VkBufferImageCopy2 *region = info->pRegions + i;
@@ -4785,6 +5410,15 @@ dzn_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
          for (uint32_t l = 0; l < region->imageSubresource.layerCount; l++)
             dzn_cmd_buffer_copy_img2buf_region(cmdbuf, info, i, aspect, l);
       }
+   }
+   if (cmdbuf->enhanced_barriers) {
+      dzn_cmd_buffer_buffer_barrier(cmdbuf, dst_buffer->res,
+                                   D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_ALL,
+                                   D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_COMMON);
+   } else {
+      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+      ID3D12GraphicsCommandList1_ResourceBarrier(cmdbuf->cmdlist, 1, &barrier);
    }
 }
 
@@ -5166,7 +5800,8 @@ dzn_cmd_buffer_clear_msaa_integer(struct dzn_cmd_buffer *cmdbuf,
    struct dzn_meta_blit_key key = {
       .out_format = dzn_image_get_dxgi_format(pdev, image->vk.format,
          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT),
-      .samples = image->vk.samples,
+      .src_samples_log2 = util_logbase2(image->vk.samples),
+      .dst_samples_log2 = util_logbase2(image->vk.samples),
       .loc = FRAG_RESULT_DATA0,
       .out_type = util_format_is_pure_sint(pfmt) ? GLSL_TYPE_INT : GLSL_TYPE_UINT,
       .sampler_dim = GLSL_SAMPLER_DIM_MS,
@@ -5686,6 +6321,12 @@ dzn_rendering_attachment_initial_transition(struct dzn_cmd_buffer *cmdbuf,
       range.layerCount = 1;
    }
 
+   if (initial_layout->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+       att->imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT) {
+      dzn_feedback_initialize(cmdbuf, image, &range);
+      return;
+   }
+
    if (cmdbuf->enhanced_barriers) {
       D3D12_BARRIER_SYNC sync_before = D3D12_BARRIER_SYNC_ALL;
       D3D12_BARRIER_ACCESS access_before = D3D12_BARRIER_ACCESS_COMMON;
@@ -5763,6 +6404,8 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
       cmdbuf->state.render.attachments.colors[i].iview = iview;
       cmdbuf->state.render.attachments.colors[i].layout = att->imageLayout;
+      cmdbuf->state.render.attachments.colors[i].feedback_loop =
+         att->imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
       cmdbuf->state.render.attachments.colors[i].resolve.mode = att->resolveMode;
       cmdbuf->state.render.attachments.colors[i].resolve.iview =
          dzn_image_view_from_handle(att->resolveImageView);
@@ -5792,6 +6435,8 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
       cmdbuf->state.render.attachments.depth.iview =
          dzn_image_view_from_handle(att->imageView);
       cmdbuf->state.render.attachments.depth.layout = att->imageLayout;
+      cmdbuf->state.render.attachments.depth.feedback_loop =
+         att->imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
       cmdbuf->state.render.attachments.depth.resolve.mode = att->resolveMode;
       cmdbuf->state.render.attachments.depth.resolve.iview =
          dzn_image_view_from_handle(att->resolveImageView);
@@ -5808,6 +6453,8 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
       cmdbuf->state.render.attachments.stencil.iview =
          dzn_image_view_from_handle(att->imageView);
       cmdbuf->state.render.attachments.stencil.layout = att->imageLayout;
+      cmdbuf->state.render.attachments.stencil.feedback_loop =
+         att->imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
       cmdbuf->state.render.attachments.stencil.resolve.mode = att->resolveMode;
       cmdbuf->state.render.attachments.stencil.resolve.iview =
          dzn_image_view_from_handle(att->resolveImageView);
@@ -5840,9 +6487,18 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
    uint32_t rt_count = pRenderingInfo->colorAttachmentCount;
    while (rt_count && !pRenderingInfo->pColorAttachments[rt_count - 1].imageView)
       rt_count--;
-   ID3D12GraphicsCommandList1_OMSetRenderTargets(cmdbuf->cmdlist, rt_count,
-                                                 rt_count ? rt_handles : NULL,
-                                                 false, zs_handle.ptr ? &zs_handle : NULL);
+   uint32_t samples = 0;
+   bool mixed_samples = false;
+   for (unsigned i = 0; i < MAX_RTS + 2; i++) {
+      const struct dzn_rendering_attachment *att = dzn_feedback_attachment(cmdbuf, i);
+      if (!att || !att->iview)
+         continue;
+      mixed_samples |= samples && samples != att->iview->vk.image->samples;
+      samples = att->iview->vk.image->samples;
+   }
+   ID3D12GraphicsCommandList1_OMSetRenderTargets(cmdbuf->cmdlist, mixed_samples ? 0 : rt_count,
+                                                 !mixed_samples && rt_count ? rt_handles : NULL,
+                                                 false, !mixed_samples && zs_handle.ptr ? &zs_handle : NULL);
 
    /* Attachments are bound directly, rather than through D3D12 BeginRenderPass.
     * LOAD preserves the backing resource, CLEAR is explicit, and DONT_CARE/NONE
@@ -5976,6 +6632,7 @@ dzn_CmdEndRendering(VkCommandBuffer commandBuffer)
                                                   separate_stencil_resolve);
    }
 
+   dzn_cmd_buffer_feedback_attachments(cmdbuf, false);
    memset(&cmdbuf->state.render, 0, sizeof(cmdbuf->state.render));
 }
 
@@ -6445,6 +7102,53 @@ dzn_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
 }
 
 VKAPI_ATTR void VKAPI_CALL
+dzn_CmdBindDescriptorSets2KHR(VkCommandBuffer commandBuffer,
+                              const VkBindDescriptorSetsInfoKHR *info)
+{
+   if (info->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
+      dzn_CmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                info->layout, info->firstSet, info->descriptorSetCount,
+                                info->pDescriptorSets, info->dynamicOffsetCount,
+                                info->pDynamicOffsets);
+   if (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+      dzn_CmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                info->layout, info->firstSet, info->descriptorSetCount,
+                                info->pDescriptorSets, info->dynamicOffsetCount,
+                                info->pDynamicOffsets);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+dzn_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
+                         const VkPushConstantsInfoKHR *info)
+{
+   dzn_CmdPushConstants(commandBuffer, info->layout, info->stageFlags,
+                        info->offset, info->size, info->pValues);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+dzn_CmdPushDescriptorSet2KHR(VkCommandBuffer commandBuffer,
+                             const VkPushDescriptorSetInfoKHR *info)
+{
+   if (info->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
+      dzn_CmdPushDescriptorSetKHR(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  info->layout, info->set, info->descriptorWriteCount,
+                                  info->pDescriptorWrites);
+   if (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+      dzn_CmdPushDescriptorSetKHR(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  info->layout, info->set, info->descriptorWriteCount,
+                                  info->pDescriptorWrites);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+dzn_CmdPushDescriptorSetWithTemplate2KHR(
+   VkCommandBuffer commandBuffer,
+   const VkPushDescriptorSetWithTemplateInfoKHR *info)
+{
+   dzn_CmdPushDescriptorSetWithTemplateKHR(commandBuffer, info->descriptorUpdateTemplate,
+                                          info->layout, info->set, info->pData);
+}
+
+VKAPI_ATTR void VKAPI_CALL
 dzn_CmdDraw(VkCommandBuffer commandBuffer,
             uint32_t vertexCount,
             uint32_t instanceCount,
@@ -6480,6 +7184,7 @@ dzn_CmdDraw(VkCommandBuffer commandBuffer,
          ID3D12GraphicsCommandList1_DrawIndexedInstanced(cmdbuf->cmdlist, vertexCount, instanceCount, 0,
                                                 firstVertex, firstInstance);
          dzn_cmd_buffer_set_conditional(cmdbuf, false);
+         dzn_cmd_buffer_finish_mixed_samples(cmdbuf);
       }
 
       /* Restore the IB view if we modified it when lowering triangle fans. */
@@ -6498,6 +7203,7 @@ dzn_CmdDraw(VkCommandBuffer commandBuffer,
          ID3D12GraphicsCommandList1_DrawInstanced(cmdbuf->cmdlist, vertexCount, instanceCount,
                                           firstVertex, firstInstance);
          dzn_cmd_buffer_set_conditional(cmdbuf, false);
+         dzn_cmd_buffer_finish_mixed_samples(cmdbuf);
       }
    }
 }
@@ -6583,6 +7289,7 @@ dzn_CmdDrawIndexed(VkCommandBuffer commandBuffer,
       ID3D12GraphicsCommandList1_DrawIndexedInstanced(cmdbuf->cmdlist, indexCount, instanceCount, firstIndex,
                                             vertexOffset, firstInstance);
       dzn_cmd_buffer_set_conditional(cmdbuf, false);
+      dzn_cmd_buffer_finish_mixed_samples(cmdbuf);
    }
 
    /* Restore the IB view if we modified it when lowering triangle fans. */
@@ -6727,11 +7434,11 @@ dzn_CmdBindIndexBuffer(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
    VK_FROM_HANDLE(dzn_buffer, buf, buffer);
 
-   cmdbuf->state.ib.view.BufferLocation = buf->gpuva + offset;
-   cmdbuf->state.ib.view.SizeInBytes = buf->size - offset;
+   cmdbuf->state.ib.view.BufferLocation = buf ? buf->gpuva + offset : 0;
+   cmdbuf->state.ib.view.SizeInBytes = buf ? buf->size - offset : 0;
    cmdbuf->state.ib.uint8_buffer = indexType == VK_INDEX_TYPE_UINT8_EXT ? buf : NULL;
    cmdbuf->state.ib.uint8_offset = offset;
-   cmdbuf->state.ib.uint8_size = buf->size - offset;
+   cmdbuf->state.ib.uint8_size = buf ? buf->size - offset : 0;
    switch (indexType) {
    case VK_INDEX_TYPE_UINT8_EXT:
       cmdbuf->state.ib.view.Format = DXGI_FORMAT_R32_UINT;
@@ -6767,8 +7474,8 @@ dzn_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(dzn_buffer, buf, buffer);
    dzn_CmdBindIndexBuffer(commandBuffer, buffer, offset, indexType);
    cmdbuf->state.ib.view.SizeInBytes =
-      size == VK_WHOLE_SIZE ? buf->size - offset : size;
-   cmdbuf->state.ib.uint8_size = size == VK_WHOLE_SIZE ? buf->size - offset : size;
+      buf ? (size == VK_WHOLE_SIZE ? buf->size - offset : size) : 0;
+   cmdbuf->state.ib.uint8_size = buf ? (size == VK_WHOLE_SIZE ? buf->size - offset : size) : 0;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -6874,6 +7581,7 @@ dzn_CmdBeginQuery(VkCommandBuffer commandBuffer,
       qpool->queries[query + i].type = dzn_query_pool_get_query_type(qpool, flags);
 
    ID3D12GraphicsCommandList1_BeginQuery(cmdbuf->cmdlist, qpool->heap, qpool->queries[query].type, query);
+   cmdbuf->active_queries++;
 
    dzn_cmd_buffer_dynbitset_clear_range(cmdbuf, &state->collect, query, cmdbuf->state.multiview.num_views);
    dzn_cmd_buffer_dynbitset_clear_range(cmdbuf, &state->zero, query, cmdbuf->state.multiview.num_views);
@@ -6893,6 +7601,9 @@ dzn_CmdEndQuery(VkCommandBuffer commandBuffer,
       return;
 
    ID3D12GraphicsCommandList1_EndQuery(cmdbuf->cmdlist, qpool->heap, qpool->queries[query].type, query);
+
+   assert(cmdbuf->active_queries);
+   cmdbuf->active_queries--;
 
    dzn_cmd_buffer_dynbitset_set(cmdbuf, &state->collect, query);
    if (cmdbuf->state.multiview.num_views > 1)

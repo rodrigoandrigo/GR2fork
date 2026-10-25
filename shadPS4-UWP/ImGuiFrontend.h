@@ -71,6 +71,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     void ImportFolder(Platform::Agile<Windows::Storage::StorageFolder> folder, std::wstring target);
     std::function<void(std::wstring)> choose_folder;
     std::function<void(std::string, std::string, bool, std::function<void(std::string)>)> edit_text;
+    std::function<void(ShadPS4TextInput, std::function<void(bool, std::wstring)>)> game_text_input;
     std::function<void(std::wstring)> failure;
     std::function<void()> ready;
     std::function<void()> toggle_fullscreen;
@@ -128,6 +129,8 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     std::shared_ptr<ShadPS4Host> core;
     bool game_surface{}, game_running{}, menu_open{true}, menu_pressed{};
     bool session_pending{}, session_paused{};
+    uint64_t text_input_id{};
+    std::deque<std::function<void()>> text_input_results;
     bool pointer_visible{true};
     Platform::Agile<Windows::UI::Xaml::Controls::SwapChainPanel> panel;
     Platform::Agile<Windows::UI::Core::CoreDispatcher> dispatcher;
@@ -185,6 +188,8 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     decltype(&shadps4_get_settings) get_settings{};
     decltype(&shadps4_set_hdr_output) set_hdr_output{};
     decltype(&shadps4_set_host_state) set_host_state{};
+    decltype(&shadps4_get_text_input) get_text_input{};
+    decltype(&shadps4_complete_text_input) complete_text_input{};
     decltype(&shadps4_set_setting) set_setting{};
     decltype(&shadps4_reset_settings) reset_settings{};
     decltype(&shadps4_mount_storage_folder) mount{};

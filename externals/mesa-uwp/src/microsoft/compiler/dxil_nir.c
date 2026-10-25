@@ -2581,18 +2581,22 @@ dxil_nir_guess_image_formats(nir_shader *s)
 }
 
 static void
-set_binding_variables_coherent(nir_shader *s, nir_binding binding, nir_variable_mode modes)
+set_binding_variables_coherent(nir_shader *s, nir_binding binding, nir_variable_mode modes,
+                               bool atomic)
 {
    nir_foreach_variable_with_modes(var, s, modes) {
-      if (var->data.binding == binding.binding &&
-          var->data.descriptor_set == binding.desc_set) {
+      if (!binding.success ||
+          (var->data.binding == binding.binding &&
+           var->data.descriptor_set == binding.desc_set)) {
          var->data.access |= ACCESS_COHERENT;
+         if (atomic)
+            var->data.access &= ~ACCESS_NON_WRITEABLE;
       }
    }
 }
 
 static void
-set_deref_variables_coherent(nir_shader *s, nir_deref_instr *deref)
+set_deref_variables_coherent(nir_shader *s, nir_deref_instr *deref, bool atomic)
 {
    while (deref->deref_type != nir_deref_type_var &&
           deref->deref_type != nir_deref_type_cast) {
@@ -2600,6 +2604,8 @@ set_deref_variables_coherent(nir_shader *s, nir_deref_instr *deref)
    }
    if (deref->deref_type == nir_deref_type_var) {
       deref->var->data.access |= ACCESS_COHERENT;
+      if (atomic)
+         deref->var->data.access &= ~ACCESS_NON_WRITEABLE;
       return;
    }
 
@@ -2608,7 +2614,28 @@ set_deref_variables_coherent(nir_shader *s, nir_deref_instr *deref)
    if (!cast_src || cast_src->intrinsic != nir_intrinsic_load_vulkan_descriptor)
       return;
    nir_binding binding = nir_chase_binding(cast_src->src[0]);
-   set_binding_variables_coherent(s, binding, nir_var_mem_ssbo);
+   set_binding_variables_coherent(s, binding, nir_var_mem_ssbo, atomic);
+}
+
+static void
+set_load_store_variables_coherent(nir_shader *s, nir_intrinsic_instr *intr, bool atomic)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_deref:
+   case nir_intrinsic_store_deref:
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_store:
+      set_deref_variables_coherent(s, nir_src_as_deref(intr->src[0]), atomic);
+      break;
+   default: {
+      const bool ssbo = intr->intrinsic == nir_intrinsic_load_ssbo ||
+                        intr->intrinsic == nir_intrinsic_store_ssbo;
+      const unsigned resource_idx = intr->intrinsic == nir_intrinsic_store_ssbo ? 1 : 0;
+      set_binding_variables_coherent(s, nir_chase_binding(intr->src[resource_idx]),
+                                    ssbo ? nir_var_mem_ssbo : nir_var_image, atomic);
+      break;
+   }
+   }
 }
 
 static nir_def *
@@ -2651,15 +2678,7 @@ lower_coherent_load_store(nir_builder *b, nir_intrinsic_instr *intr, void *conte
    case nir_intrinsic_image_deref_load:
    case nir_intrinsic_image_load: {
       if (intr->def.bit_size != 32 || intr->def.num_components > 1) {
-         if (intr->intrinsic == nir_intrinsic_load_deref)
-            set_deref_variables_coherent(b->shader, nir_src_as_deref(intr->src[0]));
-         else {
-            nir_binding binding = {0};
-            if (nir_src_is_const(intr->src[0]))
-               binding.binding = nir_src_as_uint(intr->src[0]);
-            set_binding_variables_coherent(b->shader, binding,
-                                           intr->intrinsic == nir_intrinsic_load_ssbo ? nir_var_mem_ssbo : nir_var_image);
-         }
+         set_load_store_variables_coherent(b->shader, intr, false);
          return false;
       }
 
@@ -2671,21 +2690,12 @@ lower_coherent_load_store(nir_builder *b, nir_intrinsic_instr *intr, void *conte
    case nir_intrinsic_store_ssbo:
    case nir_intrinsic_image_deref_store:
    case nir_intrinsic_image_store: {
-      int resource_idx = intr->intrinsic == nir_intrinsic_store_ssbo ? 1 : 0;
       int value_idx = intr->intrinsic == nir_intrinsic_store_ssbo ? 0 :
          intr->intrinsic == nir_intrinsic_store_deref ? 1 : 3;
       unsigned num_components = nir_intrinsic_has_write_mask(intr) ?
          util_bitcount(nir_intrinsic_write_mask(intr)) : intr->src[value_idx].ssa->num_components;
       if (intr->src[value_idx].ssa->bit_size != 32 || num_components > 1) {
-         if (intr->intrinsic == nir_intrinsic_store_deref)
-            set_deref_variables_coherent(b->shader, nir_src_as_deref(intr->src[resource_idx]));
-         else {
-            nir_binding binding = {0};
-            if (nir_src_is_const(intr->src[resource_idx]))
-               binding.binding = nir_src_as_uint(intr->src[resource_idx]);
-            set_binding_variables_coherent(b->shader, binding,
-                                           intr->intrinsic == nir_intrinsic_store_ssbo ? nir_var_mem_ssbo : nir_var_image);
-         }
+         set_load_store_variables_coherent(b->shader, intr, false);
          return false;
       }
 
@@ -2697,7 +2707,8 @@ lower_coherent_load_store(nir_builder *b, nir_intrinsic_instr *intr, void *conte
    }
 
    nir_intrinsic_instr *atomic = nir_def_as_intrinsic(atomic_def);
-   nir_intrinsic_set_access(atomic, nir_intrinsic_access(intr));
+   set_load_store_variables_coherent(b->shader, intr, true);
+   nir_intrinsic_set_access(atomic, nir_intrinsic_access(intr) & ~ACCESS_NON_WRITEABLE);
    if (nir_intrinsic_has_image_dim(intr))
       nir_intrinsic_set_image_dim(atomic, nir_intrinsic_image_dim(intr));
    if (nir_intrinsic_has_image_array(intr))

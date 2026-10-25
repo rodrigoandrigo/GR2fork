@@ -1,5 +1,47 @@
 # Inicialização e encerramento gráfico UWP
 
+## Segunda abertura: criação do dispositivo — 24/10/2026
+
+Os novos `frontend-d3d12.log` e `shadps4.log` mostram falha antes da execução
+de qualquer jogo: `ID3D12DeviceFactory::CreateDevice failed`, seguida de
+`Dozen adapter enumeration failed: ErrorInitializationFailed`. O log anterior
+não registrava o HRESULT, portanto não distingue a razão interna dessa falha
+de criação no Xbox.
+
+O build UWP do Dozen agora usa `D3D12CreateDevice` do runtime do sistema, como
+o frontend e o renderer nativo, sem selecionar a factory de configuração/Agility
+da implementação desktop. A cada instância Vulkan, o driver também deixa de
+reativar a camada de debug ou mudar a configuração de validação: no host UWP,
+os diagnósticos D3D12 já são configurados uma vez antes de criar dispositivos.
+O caminho desktop da factory permanece disponível nos builds desktop.
+
+A criação verifica `GetDeviceRemovedReason` antes de aceitar o dispositivo.
+Falhas tanto da factory quanto da chamada direta passam a registrar o HRESULT
+completo; um dispositivo já removido é liberado e recusado.
+
+Validação desta atualização no PC:
+
+- Oito ciclos de inicialização, falha de attachment com rollback, nova tentativa,
+  apresentação, resize e shutdown, mantendo um dispositivo D3D12 do frontend
+  ativo. Cada ciclo teve `FRONTEND_DEVICE_HEALTH=0x00000000`,
+  `ENVIRONMENT_DURING_PRESENTATION=PASS`, `SURFACE_DETACHED=PASS` e `SHUTDOWN=0`.
+- Bloodborne iniciou e encerrou normalmente com o driver atualizado,
+  `D3D_INFO_QUEUE_MESSAGES=0` e `BOOT_RESULT=0`.
+- Após encerrar o processo do jogo, outro processo passou por mais oito ciclos
+  completos, novamente com dispositivo do frontend válido e superfícies liberadas
+  (`Build/xbox-second-open-fresh-process-after-game.log`).
+- Mesa/Dozen e host Release x64 recompilados; bundle assinado com
+  `CMS_SIGNATURE=PASS` e payloads verificados contra as saídas locais.
+
+Registros: `Build/xbox-second-open-existing-device-after.log`,
+`Build/xbox-second-open-bloodborne-regression.log`,
+`Build/xbox-second-open-dozen-build.log`, `Build/xbox-second-open-host-build.log`,
+`Build/xbox-second-open-package-sign.log` e `Build/xbox-second-open-package-verify.log`.
+
+A versão anterior também passou pelos ciclos no PC. O erro específico do Xbox
+não foi reproduzido nessa máquina, e a confirmação de segunda abertura no console
+continua dependendo de executar o pacote atualizado no Series S.
+
 Atualização de 23/10/2026, após relato de falha ao iniciar novamente no Xbox Series S.
 
 ## Padrão de renderização

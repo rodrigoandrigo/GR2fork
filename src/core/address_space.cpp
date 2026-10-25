@@ -277,7 +277,6 @@ struct AddressSpace::Impl {
     }
 
 #ifdef SHADPS4_UWP
-    static constexpr u64 AppMemoryBudget = 5120_MB;
     static constexpr u64 HostMemoryReserve = 256_MB;
     static constexpr u64 BackingViewSize = 16_MB;
     static constexpr u64 CommitSize = 64_KB;
@@ -373,8 +372,7 @@ struct AddressSpace::Impl {
         if (info.State == MEM_COMMIT)
             return;
         try {
-            const u64 limit = std::min<u64>(
-                AppMemoryBudget, winrt::Windows::System::MemoryManager::AppMemoryUsageLimit());
+            const u64 limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
             const u64 usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
             if (limit && (usage >= limit || size > limit - usage ||
                           HostMemoryReserve > limit - usage - size))

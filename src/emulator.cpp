@@ -41,6 +41,9 @@
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
+#ifdef SHADPS4_UWP
+#include "core/libraries/ime/ime_dialog.h"
+#endif
 #include "core/libraries/music/music_player_service.h"
 #include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_auth/np_auth.h"
@@ -858,6 +861,7 @@ void Emulator::StopGuest() {
         linker->Stop();
     }
     Libraries::GnmDriver::StopGpuCommandProcessor();
+    Libraries::ImeDialog::sceImeDialogForceClose();
     Libraries::VideoOut::ShutdownVideoOut();
     Libraries::AudioOut::ShutdownAudioOut();
     Libraries::MusicPlayerService::Shutdown();

@@ -11,6 +11,10 @@ public:
 
 private:
     void PickPackage();
+    void ShowGameTextInput(ShadPS4TextInput request,
+                          std::function<void(bool, std::wstring)> completed);
+    Windows::UI::Xaml::Controls::ContentDialog ^ game_text_dialog;
+    uint64_t game_text_request_id{};
     void OnLoaded(Platform::Object ^ sender, Windows::UI::Xaml::RoutedEventArgs ^ args);
     void OnUnloaded(Platform::Object ^ sender, Windows::UI::Xaml::RoutedEventArgs ^ args);
     void OnPointer(Platform::Object ^ sender,

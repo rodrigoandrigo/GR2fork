@@ -680,8 +680,7 @@ dzn_meta_blit_create(struct dzn_device *device, const struct dzn_meta_blit_key *
    };
    uint32_t num_root_params = 2;
 
-   uint32_t samples = key->resolve_mode == dzn_blit_resolve_none ?
-      key->samples : 1;
+   uint32_t samples = 1u << key->dst_samples_log2;
    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {
       .SampleMask = (1ULL << samples) - 1,
       .RasterizerState = {
@@ -698,7 +697,7 @@ dzn_meta_blit_create(struct dzn_device *device, const struct dzn_meta_blit_key *
    };
 
    struct dzn_nir_blit_info blit_fs_info = {
-      .src_samples = key->samples,
+      .src_samples = 1u << key->src_samples_log2,
       .loc = key->loc,
       .out_type = key->out_type,
       .sampler_dim = key->sampler_dim,

@@ -75,6 +75,10 @@ public:
     bool CallTextFilter();
     bool NormalizeNewlines();
     bool ClampCurrentTextToMaxLen();
+#ifdef SHADPS4_UWP
+    void RequestHostInput(bool password);
+    bool SetHostText(std::u16string_view text);
+#endif
 
 private:
     bool CallKeyboardFilter(const OrbisImeKeycode* src_keycode, u16* out_keycode, u32* out_status);

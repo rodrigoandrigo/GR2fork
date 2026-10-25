@@ -3746,7 +3746,8 @@ static bool
 emit_load_input_via_intrinsic(struct ntd_context *ctx, nir_intrinsic_instr *intr)
 {
    bool is_fragment_per_vertex_input =
-      intr->intrinsic == nir_intrinsic_load_per_vertex_input &&
+      (intr->intrinsic == nir_intrinsic_load_per_vertex_input ||
+       intr->intrinsic == nir_intrinsic_load_input_vertex) &&
       ctx->mod.shader_kind == DXIL_PIXEL_SHADER;
    bool attr_at_vertex = is_fragment_per_vertex_input;
    if (ctx->mod.shader_kind == DXIL_PIXEL_SHADER &&
@@ -3797,9 +3798,11 @@ emit_load_input_via_intrinsic(struct ntd_context *ctx, nir_intrinsic_instr *intr
 
    bool is_per_vertex =
       intr->intrinsic == nir_intrinsic_load_per_vertex_input ||
+      intr->intrinsic == nir_intrinsic_load_input_vertex ||
       intr->intrinsic == nir_intrinsic_load_per_vertex_output;
    int row_index = is_per_vertex ? 1 : 0;
    const struct dxil_value *vertex_id = NULL;
+   const struct dxil_value *dynamic_vertex_id = NULL;
    if (!is_patch_constant) {
       if (is_per_vertex) {
          vertex_id = get_src(ctx, &intr->src[0], 0, nir_type_int);
@@ -3808,12 +3811,15 @@ emit_load_input_via_intrinsic(struct ntd_context *ctx, nir_intrinsic_instr *intr
              * geometry-shader inputs. PerVertexKHR in a pixel shader maps to
              * AttributeAtVertex, whose vertex index is an i8 in [0, 2].
              */
-            const struct dxil_type *vertex_index_type =
-               dxil_module_get_int_type(&ctx->mod, 8);
-            if (!vertex_id || !vertex_index_type)
+            if (!vertex_id)
                return false;
-            vertex_id = dxil_emit_cast(&ctx->mod, DXIL_CAST_TRUNC,
-                                       vertex_index_type, vertex_id);
+            if (nir_src_is_const(intr->src[0])) {
+               vertex_id = dxil_module_get_int8_const(&ctx->mod,
+                                                      nir_src_as_uint(intr->src[0]));
+            } else {
+               dynamic_vertex_id = vertex_id;
+               vertex_id = dxil_module_get_int8_const(&ctx->mod, 0);
+            }
          }
       } else if (attr_at_vertex) {
          vertex_id = dxil_module_get_int8_const(&ctx->mod, ctx->opts->provoking_vertex);
@@ -3894,6 +3900,20 @@ emit_load_input_via_intrinsic(struct ntd_context *ctx, nir_intrinsic_instr *intr
       const struct dxil_value *retval = dxil_emit_call(&ctx->mod, func, args, num_args);
       if (!retval)
          return false;
+      if (dynamic_vertex_id) {
+         for (unsigned vertex = 1; vertex < 3; vertex++) {
+            args[4] = dxil_module_get_int8_const(&ctx->mod, vertex);
+            const struct dxil_value *value = dxil_emit_call(&ctx->mod, func, args, num_args);
+            const struct dxil_value *selected = dxil_emit_cmp(
+               &ctx->mod, DXIL_ICMP_EQ, dynamic_vertex_id,
+               dxil_module_get_int32_const(&ctx->mod, vertex));
+            if (!value || !selected)
+               return false;
+            retval = dxil_emit_select(&ctx->mod, selected, value, retval);
+            if (!retval)
+               return false;
+         }
+      }
       store_def(ctx, &intr->def, i, retval);
    }
    return true;
@@ -3991,11 +4011,17 @@ emit_load_barycentric_coords(struct ntd_context *ctx, nir_intrinsic_instr *intr)
    unsigned num_args;
    switch (intr->intrinsic) {
    case nir_intrinsic_load_barycentric_model:
-   case nir_intrinsic_load_barycentric_coord_pixel:
       opcode_val = DXIL_INTR_EVAL_SNAPPED;
       func_name = "dx.op.evalSnapped";
       num_args = 6;
       args[4] = args[5] = dxil_module_get_int32_const(&ctx->mod, 0);
+      break;
+   case nir_intrinsic_load_barycentric_coord_pixel:
+      opcode_val = DXIL_INTR_LOAD_INPUT;
+      func_name = "dx.op.loadInput";
+      num_args = 5;
+      args[4] = dxil_module_get_undef(&ctx->mod,
+                                     dxil_module_get_int_type(&ctx->mod, 32));
       break;
    case nir_intrinsic_load_barycentric_coord_centroid:
       opcode_val = DXIL_INTR_EVAL_CENTROID;
@@ -4027,7 +4053,14 @@ emit_load_barycentric_coords(struct ntd_context *ctx, nir_intrinsic_instr *intr)
       UNREACHABLE("Unsupported barycentric coordinate intrinsic");
    }
 
-   uint8_t io_index = ctx->mod.input_mappings[nir_intrinsic_base(intr)];
+   unsigned location = nir_intrinsic_interp_mode(intr) == INTERP_MODE_NOPERSPECTIVE ?
+      SYSTEM_VALUE_BARYCENTRIC_LINEAR_COORD : SYSTEM_VALUE_BARYCENTRIC_PERSP_COORD;
+   nir_variable *var = nir_find_variable_with_location(ctx->shader,
+                                                       nir_var_system_value,
+                                                       location);
+   if (!var)
+      return false;
+   uint8_t io_index = ctx->mod.input_mappings[var->data.driver_location];
    args[0] = dxil_module_get_int32_const(&ctx->mod, opcode_val);
    args[1] = dxil_module_get_int32_const(&ctx->mod, io_index);
    args[2] = dxil_module_get_int32_const(&ctx->mod, 0);
@@ -4044,7 +4077,7 @@ emit_load_barycentric_coords(struct ntd_context *ctx, nir_intrinsic_instr *intr)
          sig_rec->elements[r].always_reads_mask |= 0x7;
    }
 
-   for (unsigned i = 0; i < intr->num_components; i++) {
+   for (unsigned i = 0; i < intr->def.num_components; i++) {
       args[3] = dxil_module_get_int8_const(&ctx->mod, i);
       if (!args[3] || (num_args > 4 && !args[4]) ||
           (num_args > 5 && !args[5]))
@@ -4710,7 +4743,8 @@ emit_load_vulkan_descriptor(struct ntd_context *ctx, nir_intrinsic_instr *intr)
       if (!index_value)
          return false;
 
-      handle = emit_createhandle_call_dynamic(ctx, resource_class, space, binding, index_value, false);
+      handle = emit_createhandle_call_dynamic(ctx, resource_class, space, binding, index_value,
+                                              !nir_src_is_const(intr->src[0]));
    } else {
       const struct dxil_value *heap_index_value = get_src(ctx, &intr->src[0], 0, nir_type_uint32);
       if (!heap_index_value)
@@ -5118,6 +5152,7 @@ emit_intrinsic(struct ntd_context *ctx, nir_intrinsic_instr *intr)
       return emit_get_ssbo_size(ctx, intr);
    case nir_intrinsic_load_input:
    case nir_intrinsic_load_per_vertex_input:
+   case nir_intrinsic_load_input_vertex:
    case nir_intrinsic_load_output:
    case nir_intrinsic_load_per_vertex_output:
       return emit_load_input_via_intrinsic(ctx, intr);
@@ -5319,8 +5354,12 @@ emit_deref(struct ntd_context* ctx, nir_deref_instr* instr)
    
    unsigned descriptor_set = ctx->opts->environment == DXIL_ENVIRONMENT_VULKAN ?
       var->data.descriptor_set : (glsl_type_is_image(type) ? 1 : 0);
+   bool non_uniform = false;
+   for (nir_deref_instr *deref = instr; deref; deref = nir_deref_instr_parent(deref))
+      non_uniform |= deref->deref_type == nir_deref_type_array &&
+                     !nir_src_is_const(deref->arr.index);
    const struct dxil_value *handle = emit_createhandle_call_dynamic(ctx, res_class,
-      descriptor_set, binding_val, binding, false);
+      descriptor_set, binding_val, binding, non_uniform);
    if (!handle)
       return false;
 
@@ -6884,7 +6923,6 @@ lower_barycentric_coord_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
       state->inputs[semantic_index] = var;
    }
 
-   nir_intrinsic_set_base(intr, var->data.driver_location);
    if (intr->intrinsic == nir_intrinsic_load_barycentric_coord_sample) {
       /* The coordinate builtin is at the current sample. DXIL expresses that
        * using evalSampleIndex on the single SV_Barycentrics input.
@@ -6894,9 +6932,6 @@ lower_barycentric_coord_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
       nir_def *sample_id = nir_load_sample_id(b);
       nir_def *coord = nir_load_barycentric_coord_at_sample(
          b, 32, sample_id, .interp_mode = interp_mode);
-      nir_intrinsic_instr *replacement =
-         nir_def_as_intrinsic(coord);
-      nir_intrinsic_set_base(replacement, var->data.driver_location);
       nir_def_rewrite_uses(&intr->def, coord);
       nir_instr_remove(&intr->instr);
    }

@@ -25,6 +25,7 @@
 #include "uwp/dozen_host.h"
 #include "uwp/native_host.h"
 #include "uwp/gamepad_input.h"
+#include "uwp/text_input.h"
 #include "uwp/xaudio2_output.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
 
@@ -469,6 +470,7 @@ int32_t shadps4_get_native_temporal_jitter(ShadPS4TemporalJitterSample* sample,
 }
 
 void shadps4_request_stop() {
+    Core::Uwp::ResetTextInput();
     stop_requested.store(true);
     Core::Uwp::StopGuestWorkers();
     if (state.load() == SHADPS4_RUNNING) {

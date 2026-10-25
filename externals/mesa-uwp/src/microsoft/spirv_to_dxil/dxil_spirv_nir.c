@@ -38,6 +38,7 @@
 static const struct spirv_capabilities
 spirv_caps = {
    .Shader = true,
+   .StencilExportEXT = true,
    .Geometry = true,
    .TransformFeedback = true,
    /* Vulkan 1.2 feature-gated system-value outputs. */
@@ -87,6 +88,8 @@ spirv_caps = {
    .StorageImageReadWithoutFormat = true,
    .StorageImageWriteWithoutFormat = true,
    .ImageQuery = true,
+   .ImageReadWriteLodAMD = true,
+   .InterpolationFunction = true,
    .Int64 = true,
    .Int64Atomics = true,
    .Int64ImageEXT = true,
