@@ -317,6 +317,7 @@ struct dzn_descriptor_watch {
    uint32_t source_offset, destination_offset, count;
    ID3D12Resource *metadata;
    uint64_t metadata_offset;
+   const struct dzn_feedback_scope *feedback_scope;
 };
 
 struct dzn_device_descriptor_heap {
@@ -344,6 +345,7 @@ struct dzn_device {
 
    struct dzn_meta_indirect_draw indirect_draws[DZN_NUM_INDIRECT_DRAW_TYPES];
    struct dzn_meta_large_point_draw_args large_point_draw_args;
+   struct dzn_meta_large_point_draw_args query_reduce;
    struct dzn_meta_triangle_fan_rewrite_index triangle_fan[DZN_NUM_INDEX_TYPE];
    struct dzn_meta_blits blits;
 
@@ -448,6 +450,7 @@ enum dzn_cmd_dirty {
    DZN_CMD_DIRTY_DEPTH_BIAS = 1 << 8,
 };
 
+#define MAX_RTS D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
 #define MAX_VBS D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT
 #define MAX_VP D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
 #define MAX_SCISSOR D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
@@ -465,6 +468,18 @@ enum dzn_cmd_dirty {
    for (D3D12_DESCRIPTOR_HEAP_TYPE type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; \
         type <= D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER; \
         type = (D3D12_DESCRIPTOR_HEAP_TYPE)(type + 1))
+
+struct dzn_feedback_binding {
+   uint64_t image_id;
+   VkImageSubresourceRange range;
+   ID3D12Resource *resource;
+};
+
+struct dzn_feedback_scope {
+   struct list_head link;
+   unsigned count;
+   struct dzn_feedback_binding bindings[MAX_RTS + 2];
+};
 
 struct dzn_cmd_event_signal {
    struct dzn_event *event;
@@ -550,7 +565,8 @@ dzn_descriptor_heap_copy(struct dzn_device *device,
 void
 dzn_descriptor_set_copy_snapshots(struct dzn_cmd_buffer *cmdbuf, const struct dzn_descriptor_set *set,
                         D3D12_DESCRIPTOR_HEAP_TYPE type, struct dzn_descriptor_heap *destination,
-                        uint32_t destination_offset, uint32_t count);
+                        uint32_t destination_offset, uint32_t count,
+                        const struct dzn_feedback_scope *feedback_scope);
 
 void
 dzn_cmd_buffer_clear_descriptor_watches(struct dzn_cmd_buffer *cmdbuf);
@@ -631,6 +647,7 @@ struct dzn_cmd_buffer_push_constant_state {
 
 struct dzn_rendering_attachment {
    bool feedback_loop;
+   VkImageLayout feedback_layout;
    struct dzn_image_view *iview;
    VkImageLayout layout;
    struct {
@@ -714,8 +731,6 @@ struct dzn_graphics_pipeline_variant {
    struct dzn_graphics_pipeline_variant_key key;
    ID3D12PipelineState *state;
 };
-
-#define MAX_RTS D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
 
 struct dzn_cmd_buffer_state {
    const struct dzn_pipeline *pipeline;
@@ -824,10 +839,13 @@ struct dzn_cmd_buffer {
    /* Push descriptor updates are snapshots and remain alive through execution. */
    struct util_dynarray push_descriptor_pools;
    struct util_dynarray feedback_images;
-   struct util_dynarray feedback_slots;
    struct list_head descriptor_watches;
+   struct list_head feedback_scopes;
+   struct dzn_feedback_scope *feedback_scope;
    struct dzn_feedback_image *mixed_attachments[MAX_RTS];
    unsigned active_queries;
+   struct util_dynarray active_query_list;
+   struct util_dynarray query_exclusions;
 
    struct {
       struct hash_table *ht;
@@ -1024,6 +1042,7 @@ struct dzn_pipeline_layout {
       uint32_t sysval_cbv_param_idx;
       uint32_t viewport_cbv_param_idx;
       uint32_t push_constant_cbv_param_idx;
+      uint32_t push_constant_size;
       uint32_t dynamic_buffer_bindless_param_idx;
       D3D12_DESCRIPTOR_HEAP_TYPE type[MAX_SHADER_VISIBILITIES];
       ID3D12RootSignature *sig;
@@ -1123,6 +1142,7 @@ struct dzn_pipeline {
       uint32_t sysval_cbv_param_idx;
       uint32_t viewport_cbv_param_idx;
       uint32_t push_constant_cbv_param_idx;
+      uint32_t push_constant_size;
       uint32_t dynamic_buffer_bindless_param_idx;
       D3D12_DESCRIPTOR_HEAP_TYPE type[MAX_SHADER_VISIBILITIES];
       ID3D12RootSignature *sig;
@@ -1512,8 +1532,6 @@ enum dzn_debug_flags {
    DZN_DEBUG_MULTIVIEW = 1 << 13,
    DZN_DEBUG_NO_16BIT = 1 << 14,
    DZN_DEBUG_NO_STENCIL_REF = 1 << 15,
-   DZN_DEBUG_FEEDBACK = 1 << 16,
-   DZN_DEBUG_MIXED_SAMPLES = 1 << 17,
 };
 
 struct dzn_instance {

@@ -253,12 +253,11 @@ static const struct vk_instance_extension_table instance_extensions = {
 static void
 dzn_physical_device_get_extensions(struct dzn_physical_device *pdev)
 {
-   const struct dzn_instance *instance = container_of(pdev->vk.instance, struct dzn_instance, vk);
    pdev->vk.supported_extensions = (struct vk_device_extension_table) {
       .AMD_buffer_marker                    = dzn_buffer_marker_supported(pdev),
       .AMD_shader_trinary_minmax            = true,
-      .AMD_mixed_attachment_samples         =
-         (instance->debug_flags & DZN_DEBUG_MIXED_SAMPLES) != 0,
+      .AMD_gcn_shader                      = true,
+      .AMD_mixed_attachment_samples         = true,
       .EXT_4444_formats                     = true,
       /* Legacy D3D12 cannot represent arbitrary independent front/back
        * stencil state. Never advertise a dynamic-state contract it cannot
@@ -351,8 +350,7 @@ dzn_physical_device_get_extensions(struct dzn_physical_device *pdev)
       .KHR_maintenance5                     = true,
       .KHR_maintenance6                     = true,
       .KHR_maintenance8                     = dzn_advanced_texture_ops_supported(pdev),
-      .EXT_attachment_feedback_loop_layout  =
-         (instance->debug_flags & DZN_DEBUG_FEEDBACK) != 0,
+      .EXT_attachment_feedback_loop_layout  = true,
       .KHR_line_rasterization               = true,
       .KHR_shader_float_controls             = true,
       /* Mesa SPIR-V/NIR consumes FloatControls2 fast-math defaults and modes. */
@@ -524,7 +522,6 @@ static const struct debug_control dzn_debug_options[] = {
    { "multiview", DZN_DEBUG_MULTIVIEW },
    { "no16bit", DZN_DEBUG_NO_16BIT },
    { "nostencilref", DZN_DEBUG_NO_STENCIL_REF },
-   { "feedback", DZN_DEBUG_FEEDBACK },
    { NULL, 0 }
 };
 
@@ -704,7 +701,7 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &pdev->shader_model,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
                      offsetof(struct dzn_physical_device, shader_model));
-   const uint32_t runtime_layout_version = 11;
+   const uint32_t runtime_layout_version = 15;
    _mesa_blake3_update(&blake3_ctx, &runtime_layout_version, sizeof(runtime_layout_version));
    _mesa_blake3_final(&blake3_ctx, blake3);
    memcpy(pdev->pipeline_cache_uuid, blake3, VK_UUID_SIZE);
@@ -2540,13 +2537,6 @@ dzn_instance_create(const VkInstanceCreateInfo *pCreateInfo,
    instance->debug_flags =
       parse_debug_string(os_get_option("DZN_DEBUG"), dzn_debug_options);
 
-   const char *feedback = getenv("DZN_ATTACHMENT_FEEDBACK");
-   if (feedback && !strcmp(feedback, "1"))
-      instance->debug_flags |= DZN_DEBUG_FEEDBACK;
-   const char *mixed_samples = getenv("DZN_MIXED_ATTACHMENT_SAMPLES");
-   if (mixed_samples && !strcmp(mixed_samples, "1"))
-      instance->debug_flags |= DZN_DEBUG_MIXED_SAMPLES;
-
    const char *max_shader_model = os_get_option("DZN_MAX_SHADER_MODEL");
    unsigned sm_major, sm_minor;
    instance->max_shader_model =
@@ -3407,6 +3397,7 @@ dzn_device_create(struct dzn_physical_device *pdev,
                       !device->vk.enabled_features.nullDescriptor &&
                       !device->vk.enabled_features.robustBufferAccess2 &&
                       !device->vk.enabled_features.pipelineRobustness &&
+                      !device->vk.enabled_features.attachmentFeedbackLoopLayout &&
                       ((instance->debug_flags & DZN_DEBUG_BINDLESS) != 0 ||
                        device->vk.enabled_features.descriptorIndexing ||
                        device->vk.enabled_extensions.EXT_descriptor_indexing ||

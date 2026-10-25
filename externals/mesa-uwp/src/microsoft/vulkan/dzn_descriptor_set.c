@@ -1035,6 +1035,7 @@ dzn_pipeline_layout_create(struct dzn_device *device,
       push_constant_flags |= range->stageFlags;
    }
 
+   layout->root.push_constant_size = push_constant_size;
    if (push_constant_size > 0) {
       layout->root.push_constant_cbv_param_idx = layout->root.param_count;
       D3D12_ROOT_PARAMETER1 *root_param = &root_params[layout->root.param_count++];
@@ -1108,6 +1109,34 @@ dzn_descriptor_heap_copy_raw(struct dzn_device *device, struct dzn_descriptor_he
                               uint32_t src_offset, uint32_t count, D3D12_DESCRIPTOR_HEAP_TYPE type);
 
 static void
+dzn_descriptor_heap_apply_feedback(struct dzn_device *device, const struct dzn_feedback_scope *scope,
+                                    struct dzn_descriptor_heap *destination, uint32_t dst_offset,
+                                    const struct dzn_descriptor_heap *source, uint32_t src_offset,
+                                    uint32_t count)
+{
+   if (!scope || !source->feedback)
+      return;
+   for (unsigned d = 0; d < count; d++) {
+      const struct dzn_feedback_descriptor *desc = &source->feedback[src_offset + d];
+      if (!desc->image_id)
+         continue;
+      for (unsigned i = 0; i < scope->count; i++) {
+         const struct dzn_feedback_binding *binding = &scope->bindings[i];
+         const VkImageSubresourceRange *a = &binding->range, *v = &desc->range;
+         if (binding->image_id != desc->image_id || !(a->aspectMask & v->aspectMask) ||
+             a->baseMipLevel >= v->baseMipLevel + v->levelCount ||
+             v->baseMipLevel >= a->baseMipLevel + a->levelCount ||
+             a->baseArrayLayer >= v->baseArrayLayer + v->layerCount ||
+             v->baseArrayLayer >= a->baseArrayLayer + a->layerCount)
+            continue;
+         ID3D12Device1_CreateShaderResourceView(device->dev, binding->resource, &desc->desc,
+            dzn_descriptor_heap_get_cpu_handle(destination, dst_offset + d));
+         break;
+      }
+   }
+}
+
+static void
 dzn_descriptor_heap_notify(struct dzn_descriptor_heap *heap, uint32_t offset, uint32_t count)
 {
    if (!heap->device || !count)
@@ -1122,6 +1151,8 @@ dzn_descriptor_heap_notify(struct dzn_descriptor_heap *heap, uint32_t offset, ui
       uint32_t delta = first - watch->source_offset;
       dzn_descriptor_heap_copy_raw(device, watch->destination, watch->destination_offset + delta,
                                     heap, first, end - first, heap->type);
+      dzn_descriptor_heap_apply_feedback(device, watch->feedback_scope, watch->destination,
+         watch->destination_offset + delta, heap, first, end - first);
       if (watch->metadata) {
          void *mapped;
          D3D12_RANGE read = {0, 0};
@@ -1158,13 +1189,16 @@ dzn_cmd_buffer_clear_descriptor_watches(struct dzn_cmd_buffer *cmdbuf)
 void
 dzn_descriptor_set_copy_snapshots(struct dzn_cmd_buffer *cmdbuf, const struct dzn_descriptor_set *set,
                         D3D12_DESCRIPTOR_HEAP_TYPE type, struct dzn_descriptor_heap *destination,
-                        uint32_t destination_offset, uint32_t count)
+                        uint32_t destination_offset, uint32_t count,
+                        const struct dzn_feedback_scope *feedback_scope)
 {
    struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
    struct dzn_descriptor_heap *source = dzn_descriptor_set_heap(set, type);
    mtx_lock(&device->descriptor_update_lock);
    dzn_descriptor_heap_copy_raw(device, destination, destination_offset, source,
                                  set->heap_offsets[type], count, type);
+   dzn_descriptor_heap_apply_feedback(device, feedback_scope, destination, destination_offset,
+      source, set->heap_offsets[type], count);
    for (unsigned b = 0; b < set->layout->binding_count; b++) {
       const struct dzn_descriptor_set_layout_binding *binding = &set->layout->bindings[b];
       if (!binding->descriptor_count ||
@@ -1191,6 +1225,7 @@ dzn_descriptor_set_copy_snapshots(struct dzn_cmd_buffer *cmdbuf, const struct dz
          }
          watch->source = source;
          watch->destination = destination;
+         watch->feedback_scope = feedback_scope;
          watch->source_offset = set->heap_offsets[type] + start;
          watch->destination_offset = destination_offset + start;
          watch->count = MIN2(range->NumDescriptors, count - start);
@@ -1391,16 +1426,18 @@ static uint32_t dzn_format_defaults(VkFormat format, uint32_t mapping)
 {
    const struct util_format_description *desc =
        util_format_description(vk_format_to_pipe_format(format));
-   uint32_t ones = 0, mapped = 0;
+   uint32_t ones = 0, mapped = 0, present = 0;
    for (unsigned c = 0; c < 4; c++)
       ones |= (desc->swizzle[c] == PIPE_SWIZZLE_1) << c;
    for (unsigned c = 0; c < 4; c++) {
       unsigned source = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(c, mapping);
+      if (source < 4 && desc->swizzle[source] < PIPE_SWIZZLE_0)
+         present |= BITFIELD_BIT(c);
       if (source == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1 ||
           (source < 4 && (ones & BITFIELD_BIT(source))))
          mapped |= BITFIELD_BIT(c);
    }
-   return mapped;
+   return mapped | (present << 4);
 }
 
 void

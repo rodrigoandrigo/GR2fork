@@ -412,9 +412,11 @@ dzn_image_layers_get_subresource_index(const struct dzn_image *image,
    int planeSlice =
       aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : 0;
 
+   unsigned array_layer = image->vk.image_type == VK_IMAGE_TYPE_3D ? 0 : subres->baseArrayLayer + layer;
+   unsigned array_size = image->vk.image_type == VK_IMAGE_TYPE_3D ? 1 : image->desc.DepthOrArraySize;
    return subres->mipLevel +
-          ((subres->baseArrayLayer + layer) * image->desc.MipLevels) +
-          (planeSlice * image->desc.MipLevels * image->desc.DepthOrArraySize);
+          (array_layer * image->desc.MipLevels) +
+          (planeSlice * image->desc.MipLevels * array_size);
 }
 
 uint32_t
@@ -426,9 +428,11 @@ dzn_image_range_get_subresource_index(const struct dzn_image *image,
    int planeSlice =
       aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : 0;
 
+   unsigned array_layer = image->vk.image_type == VK_IMAGE_TYPE_3D ? 0 : subres->baseArrayLayer + layer;
+   unsigned array_size = image->vk.image_type == VK_IMAGE_TYPE_3D ? 1 : image->desc.DepthOrArraySize;
    return subres->baseMipLevel + level +
-          ((subres->baseArrayLayer + layer) * image->desc.MipLevels) +
-          (planeSlice * image->desc.MipLevels * image->desc.DepthOrArraySize);
+          (array_layer * image->desc.MipLevels) +
+          (planeSlice * image->desc.MipLevels * array_size);
 }
 
 static uint32_t

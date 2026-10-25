@@ -5027,7 +5027,7 @@ static bool
 emit_shader_clock(struct ntd_context *ctx, nir_intrinsic_instr *intr)
 {
    const struct dxil_func *func =
-      dxil_get_function(&ctx->mod, "dx.op.cycleCounterLegacy", DXIL_I64);
+      dxil_get_function(&ctx->mod, "dx.op.cycleCounterLegacy", DXIL_NONE);
    const struct dxil_value *opcode =
       dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_CYCLE_COUNTER_LEGACY);
    if (!func || !opcode)
@@ -5037,14 +5037,9 @@ emit_shader_clock(struct ntd_context *ctx, nir_intrinsic_instr *intr)
    if (!counter)
       return false;
 
-   const struct dxil_value *low =
-      dxil_emit_cast(&ctx->mod, DXIL_CAST_TRUNC, ctx->mod.int32_type, counter);
-   const struct dxil_value *shift = dxil_module_get_int64_const(&ctx->mod, 32);
-   const struct dxil_value *high64 =
-      dxil_emit_binop(&ctx->mod, DXIL_BINOP_LSHR, counter, shift, 0);
-   const struct dxil_value *high =
-      dxil_emit_cast(&ctx->mod, DXIL_CAST_TRUNC, ctx->mod.int32_type, high64);
-   if (!low || !shift || !high64 || !high)
+   const struct dxil_value *low = dxil_emit_extractval(&ctx->mod, counter, 0);
+   const struct dxil_value *high = dxil_emit_extractval(&ctx->mod, counter, 1);
+   if (!low || !high)
       return false;
 
    store_def(ctx, &intr->def, 0, low);

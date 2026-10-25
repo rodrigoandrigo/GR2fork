@@ -110,6 +110,8 @@ spirv_to_nir_options = {
    .min_ubo_alignment = 256, /* D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT */
    .min_ssbo_alignment = 16, /* D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT */
 
+   .amd_gcn_shader = true,
+   .lower_amd_gcn_shader_clock = true,
    .mediump_16bit_alu = true,
    .mediump_16bit_derivatives = true,
 };
@@ -130,6 +132,7 @@ dxil_spirv_nir_get_spirv_options(void)
 void
 dxil_spirv_nir_prep(nir_shader *nir)
 {
+   NIR_PASS(_, nir, dxil_nir_lower_amd_cube);
    /* We have to lower away local constant initializers right before we
    * inline functions.  That way they get properly initialized at the top
    * of the function and not at the top of its caller.
@@ -1150,6 +1153,7 @@ dxil_spirv_nir_passes(nir_shader *nir,
                       const struct dxil_spirv_runtime_conf *conf,
                       struct dxil_spirv_metadata *metadata)
 {
+   NIR_PASS(_, nir, dxil_nir_lower_amd_clock);
    glsl_type_singleton_init_or_ref();
 
    NIR_PASS(_, nir, nir_opt_vectorize_io_vars,

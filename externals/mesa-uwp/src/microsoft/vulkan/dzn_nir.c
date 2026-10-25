@@ -298,6 +298,46 @@ dzn_nir_indirect_draw_shader(struct dzn_indirect_draw_type type)
 }
 
 nir_shader *
+dzn_nir_query_reduce_shader(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      dxil_get_base_nir_compiler_options(), "dzn_query_reduce");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   nir_def *params = dzn_nir_create_bo_desc(&b, nir_var_mem_ubo, 0, 0, "params", 0);
+   nir_def *src = dzn_nir_create_bo_desc(&b, nir_var_mem_ssbo, 0, 1, "src", ACCESS_NON_WRITEABLE);
+   nir_def *dst = dzn_nir_create_bo_desc(&b, nir_var_mem_ssbo, 0, 2, "dst", ACCESS_NON_READABLE);
+   nir_def *counts = nir_load_ubo(&b, 2, 32, params, nir_imm_int(&b, 0),
+      .align_mul = 4, .range_base = 0, .range = 8);
+   nir_def *offset = nir_imul_imm(&b, nir_channel(&b, nir_load_workgroup_id(&b), 0), 8);
+   nir_def *total = nir_load_ssbo(&b, 2, 32, src, offset,
+      .align_mul = 8, .access = ACCESS_NON_WRITEABLE);
+   nir_variable *value = nir_local_variable_create(b.impl, glsl_uvec_type(2), "value");
+   nir_variable *cursor = nir_local_variable_create(b.impl, glsl_uint_type(), "cursor");
+   nir_store_var(&b, value, total, 3);
+   nir_store_var(&b, cursor, nir_imm_int(&b, 0), 1);
+   nir_push_loop(&b);
+   nir_def *i = nir_load_var(&b, cursor);
+   nir_break_if(&b, nir_uge(&b, i, nir_channel(&b, counts, 1)));
+   nir_def *part_offset = nir_iadd(&b, offset,
+      nir_imul(&b, nir_iadd_imm(&b, i, 1), nir_channel(&b, counts, 0)));
+   nir_def *part = nir_load_ssbo(&b, 2, 32, src, part_offset,
+      .align_mul = 8, .access = ACCESS_NON_WRITEABLE);
+   nir_def *old = nir_load_var(&b, value);
+   nir_def *lo = nir_isub(&b, nir_channel(&b, old, 0), nir_channel(&b, part, 0));
+   nir_def *borrow = nir_b2i32(&b, nir_ult(&b, nir_channel(&b, old, 0), nir_channel(&b, part, 0)));
+   nir_def *hi = nir_isub(&b, nir_isub(&b, nir_channel(&b, old, 1), nir_channel(&b, part, 1)), borrow);
+   nir_store_var(&b, value, nir_vec2(&b, lo, hi), 3);
+   nir_store_var(&b, cursor, nir_iadd_imm(&b, i, 1), 1);
+   nir_pop_loop(&b, NULL);
+   nir_store_ssbo(&b, nir_load_var(&b, value), dst, offset,
+      .write_mask = 3, .access = ACCESS_NON_READABLE, .align_mul = 8);
+   nir_lower_vars_to_ssa(b.shader);
+   return b.shader;
+}
+
+nir_shader *
 dzn_nir_large_point_draw_args_shader(void)
 {
    nir_builder b =
@@ -1538,8 +1578,7 @@ static nir_def *dzn_nir_image_metadata_descriptor(nir_builder *b)
        0);
 }
 
-static nir_def *dzn_nir_image_defaults(nir_builder *b, nir_deref_instr *deref, unsigned components,
-                                       nir_alu_type type, unsigned bit_size,
+static nir_def *dzn_nir_image_metadata(nir_builder *b, nir_deref_instr *deref,
                                        const struct dzn_pipeline_layout *layout)
 {
    nir_variable *var = nir_deref_instr_get_variable(deref);
@@ -1556,8 +1595,15 @@ static nir_def *dzn_nir_image_defaults(nir_builder *b, nir_deref_instr *deref, u
       }
    }
    nir_def *descriptor = dzn_nir_image_metadata_descriptor(b);
-   nir_def *mask = nir_load_ssbo(b, 1, 32, descriptor, nir_imul_imm(b, index, 4), .align_mul = 4,
+   return nir_load_ssbo(b, 1, 32, descriptor, nir_imul_imm(b, index, 4), .align_mul = 4,
                                  .access = ACCESS_NON_WRITEABLE);
+}
+
+static nir_def *dzn_nir_image_defaults(nir_builder *b, nir_deref_instr *deref, unsigned components,
+                                       nir_alu_type type, unsigned bit_size,
+                                       const struct dzn_pipeline_layout *layout)
+{
+   nir_def *mask = dzn_nir_image_metadata(b, deref, layout);
    nir_def *zero = nir_imm_zero(b, 1, bit_size);
    nir_def *one = nir_alu_type_get_base_type(type) == nir_type_float
                       ? nir_imm_floatN_t(b, 1, bit_size)
@@ -1567,6 +1613,35 @@ static nir_def *dzn_nir_image_defaults(nir_builder *b, nir_deref_instr *deref, u
       values[c] =
           nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, mask, BITFIELD_BIT(c)), 0), one, zero);
    return nir_vec(b, values, components);
+}
+
+static bool
+dzn_nir_unformatted_image_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_image_deref_load)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (var->data.image.format != PIPE_FORMAT_NONE)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   const struct dzn_pipeline_layout *layout = data;
+   nir_def *mask = dzn_nir_image_metadata(b, deref, layout);
+   nir_def *defaults = dzn_nir_image_defaults(b, deref, intr->def.num_components,
+      nir_intrinsic_dest_type(intr), intr->def.bit_size, layout);
+   nir_def *components[4];
+   for (unsigned c = 0; c < intr->def.num_components; c++)
+      components[c] = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, mask, BITFIELD_BIT(c + 4)), 0),
+         nir_channel(b, &intr->def, c), nir_channel(b, defaults, c));
+   nir_def *result = nir_vec(b, components, intr->def.num_components);
+   nir_def_rewrite_uses_after(&intr->def, result);
+   return true;
+}
+
+bool
+dzn_nir_lower_unformatted_image_loads(nir_shader *nir, const struct dzn_pipeline_layout *layout)
+{
+   return nir_shader_intrinsics_pass(nir, dzn_nir_unformatted_image_load, nir_metadata_none, (void *)layout);
 }
 
 static void dzn_nir_predicate_image(nir_builder *b, nir_instr *instr, nir_def *valid,

@@ -31,6 +31,92 @@
 #include "util/u_math.h"
 #include "vulkan/vulkan_core.h"
 
+struct amd_clock_state {
+   nir_variable *low, *high;
+};
+
+static bool
+lower_amd_clock(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_shader_clock ||
+       nir_intrinsic_memory_scope(intr) != SCOPE_INVOCATION)
+      return false;
+   struct amd_clock_state *state = data;
+   nir_intrinsic_set_memory_scope(intr, SCOPE_SUBGROUP);
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *low = nir_channel(b, &intr->def, 0);
+   nir_def *carry = nir_b2i32(b, nir_ult(b, low, nir_load_var(b, state->low)));
+   nir_def *high = nir_iadd(b, nir_load_var(b, state->high), carry);
+   nir_store_var(b, state->low, low, 1);
+   nir_store_var(b, state->high, high, 1);
+   nir_def_rewrite_uses_after(&intr->def, nir_vec2(b, low, high));
+   return true;
+}
+
+bool
+dxil_nir_lower_amd_clock(nir_shader *shader)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, shader) {
+      bool found = false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               found |= intr->intrinsic == nir_intrinsic_shader_clock &&
+                  nir_intrinsic_memory_scope(intr) == SCOPE_INVOCATION;
+            }
+         }
+      }
+      if (!found)
+         continue;
+      nir_builder b = nir_builder_at(nir_before_impl(impl));
+      struct amd_clock_state state = {
+         nir_local_variable_create(impl, glsl_uint_type(), "amd_clock_low"),
+         nir_local_variable_create(impl, glsl_uint_type(), "amd_clock_high"),
+      };
+      nir_store_var(&b, state.low, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, state.high, nir_imm_int(&b, 0), 1);
+      progress |= nir_function_intrinsics_pass(impl, lower_amd_clock, nir_metadata_none, &state);
+   }
+   if (progress)
+      nir_lower_vars_to_ssa(shader);
+   return progress;
+}
+
+static bool
+is_amd_cube(const nir_instr *instr, const void *data)
+{
+   return instr->type == nir_instr_type_alu && nir_instr_as_alu(instr)->op == nir_op_cube_amd;
+}
+
+static nir_def *
+lower_amd_cube(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_def *coord = nir_ssa_for_alu_src(b, nir_instr_as_alu(instr), 0);
+   nir_def *x = nir_channel(b, coord, 0), *y = nir_channel(b, coord, 1), *z = nir_channel(b, coord, 2);
+   nir_def *ax = nir_fabs(b, x), *ay = nir_fabs(b, y), *az = nir_fabs(b, z);
+   nir_def *major_z = nir_iand(b, nir_fge(b, az, ax), nir_fge(b, az, ay));
+   nir_def *major_y = nir_fge(b, ay, ax);
+   nir_def *negative_x = nir_flt_imm(b, x, 0), *negative_y = nir_flt_imm(b, y, 0);
+   nir_def *negative_z = nir_flt_imm(b, z, 0);
+   nir_def *s = nir_bcsel(b, major_z, nir_bcsel(b, negative_z, nir_fneg(b, x), x),
+      nir_bcsel(b, major_y, x, nir_bcsel(b, negative_x, z, nir_fneg(b, z))));
+   nir_def *t = nir_bcsel(b, major_z, nir_fneg(b, y),
+      nir_bcsel(b, major_y, nir_bcsel(b, negative_y, nir_fneg(b, z), z), nir_fneg(b, y)));
+   nir_def *major = nir_bcsel(b, major_z, az, nir_bcsel(b, major_y, ay, ax));
+   nir_def *face = nir_bcsel(b, major_z, nir_bcsel(b, negative_z, nir_imm_float(b, 5), nir_imm_float(b, 4)),
+      nir_bcsel(b, major_y, nir_bcsel(b, negative_y, nir_imm_float(b, 3), nir_imm_float(b, 2)),
+         nir_bcsel(b, negative_x, nir_imm_float(b, 1), nir_imm_float(b, 0))));
+   return nir_vec4(b, t, s, nir_fmul_imm(b, major, 2), face);
+}
+
+bool
+dxil_nir_lower_amd_cube(nir_shader *shader)
+{
+   return nir_shader_lower_instructions(shader, is_amd_cube, lower_amd_cube, NULL);
+}
+
 static void
 cl_type_size_align(const struct glsl_type *type, unsigned *size,
                    unsigned *align)

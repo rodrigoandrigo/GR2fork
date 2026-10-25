@@ -279,6 +279,7 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
       container_of(device->vk.physical, struct dzn_physical_device, vk);
    struct spirv_to_nir_options spirv_opts =
       *dxil_spirv_nir_get_spirv_options();
+   spirv_opts.amd_gcn_shader = device->vk.enabled_extensions.AMD_gcn_shader;
    spirv_opts.amd_trinary_minmax =
       device->vk.enabled_extensions.AMD_shader_trinary_minmax;
    spirv_opts.amd_shader_explicit_vertex_parameter =
@@ -294,7 +295,9 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
    if (result != VK_SUCCESS)
       return result;
 
+   NIR_PASS(_, *nir, dxil_nir_lower_amd_cube);
    bool volume_images = false;
+   bool unformatted_images = false;
    bool resized_arrays = false;
    nir_foreach_variable_with_modes(var, *nir,
                                   nir_var_uniform | nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo) {
@@ -312,6 +315,7 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
       }
       const struct glsl_type *type = glsl_without_array(var->type);
       volume_images |= glsl_type_is_image(type) && glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_3D;
+      unformatted_images |= glsl_type_is_image(type) && var->data.image.format == PIPE_FORMAT_NONE;
    }
    if (resized_arrays)
       NIR_PASS(_, *nir, nir_fixup_deref_types);
@@ -336,6 +340,9 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
       NIR_PASS(_, *nir, nir_lower_var_copies);
       NIR_PASS(_, *nir, nir_lower_clip_halfz);
    }
+
+   if (!device->bindless && unformatted_images)
+      NIR_PASS(_, *nir, dzn_nir_lower_unformatted_image_loads, layout);
 
    bool robust_images = options->robustness.images ==
                             VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT ||
@@ -368,8 +375,8 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
          .y_mask = options->y_flip_mask,
          .z_mask = options->z_flip_mask,
       },
-      .declared_read_only_images_as_srvs = !device->bindless && !volume_images,
-      .inferred_read_only_images_as_srvs = !device->bindless && !volume_images,
+      .declared_read_only_images_as_srvs = !device->bindless && !volume_images && !unformatted_images,
+      .inferred_read_only_images_as_srvs = !device->bindless && !volume_images && !unformatted_images,
       .force_sample_rate_shading = options->force_sample_rate_shading,
       .lower_view_index = options->lower_view_index,
       .lower_view_index_to_rt_layer = options->lower_view_index_to_rt_layer,
@@ -2256,6 +2263,7 @@ dzn_pipeline_init(struct dzn_pipeline *pipeline,
    pipeline->root.sysval_cbv_param_idx = layout->root.sysval_cbv_param_idx;
    pipeline->root.viewport_cbv_param_idx = layout->root.viewport_cbv_param_idx;
    pipeline->root.push_constant_cbv_param_idx = layout->root.push_constant_cbv_param_idx;
+   pipeline->root.push_constant_size = layout->root.push_constant_size;
    pipeline->root.dynamic_buffer_bindless_param_idx = layout->root.dynamic_buffer_bindless_param_idx;
    STATIC_ASSERT(sizeof(pipeline->root.type) == sizeof(layout->root.type));
    memcpy(pipeline->root.type, layout->root.type, sizeof(pipeline->root.type));
