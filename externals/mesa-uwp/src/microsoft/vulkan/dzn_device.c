@@ -701,7 +701,7 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &pdev->shader_model,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
                      offsetof(struct dzn_physical_device, shader_model));
-   const uint32_t runtime_layout_version = 15;
+   const uint32_t runtime_layout_version = 16;
    _mesa_blake3_update(&blake3_ctx, &runtime_layout_version, sizeof(runtime_layout_version));
    _mesa_blake3_final(&blake3_ctx, blake3);
    memcpy(pdev->pipeline_cache_uuid, blake3, VK_UUID_SIZE);
@@ -1853,6 +1853,9 @@ dzn_physical_device_get_format_support(struct dzn_physical_device *pdev,
    if (aspects == 0 && dfmt_info.Format != DXGI_FORMAT_UNKNOWN &&
        (create_flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)) {
       DXGI_FORMAT cast_format = dzn_get_most_capable_format_for_casting(format, create_flags);
+      if (!pdev->options12.RelaxedFormatCastingSupported &&
+          dzn_get_typeless_dxgi_format(dfmt_info.Format) != dzn_get_typeless_dxgi_format(cast_format))
+         cast_format = dzn_pipe_to_dxgi_format(util_format_linear(vk_format_to_pipe_format(format)));
       if (pdev->options12.RelaxedFormatCastingSupported ||
           dzn_get_typeless_dxgi_format(dfmt_info.Format) ==
           dzn_get_typeless_dxgi_format(cast_format))

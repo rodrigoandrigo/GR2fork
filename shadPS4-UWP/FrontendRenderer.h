@@ -24,7 +24,7 @@ public:
                     IUnknown* adapter = nullptr);
     void Resize(uint32_t width, uint32_t height, float scale_x = 1.0f, float scale_y = 1.0f);
     void BeginFrame(float delta);
-    void EndFrame();
+    bool EndFrame();
     void SetTransparent(bool value) { transparent = value; }
     bool Upload(const ThumbnailPixels& pixels);
     uintptr_t Image(const std::string& key);
@@ -33,6 +33,7 @@ public:
 
 private:
     bool transparent{};
+    bool empty_presented{};
     struct Frame {
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
         Microsoft::WRL::ComPtr<ID3D12Resource> target;

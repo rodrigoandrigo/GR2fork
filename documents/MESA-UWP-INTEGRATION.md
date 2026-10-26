@@ -681,3 +681,202 @@ O bundle Release foi recompilado e assinado, com `CMS_SIGNATURE=PASS`,
 `vulkan_dzn.dll`: `da662e0b68376f17160ef775a68fead5b28ae6d8919518040f7ddf8787625e5d`.
 A captura `Build/gcn-unformatted/pacman-regression.png` foi conferida.
 O pacote não foi instalado; a validação ocorreu no PC, sem execução no Xbox.
+
+## Menu do Xbox e inicializações repetidas (2026-10-25)
+
+A perda de foco ou visibilidade da interface passou a interceptar o controle
+sem pausar as threads do jogo. A suspensão real do aplicativo continua
+acionando a pausa e a suspensão do áudio. Isso evita executar SuspendThread
+e ResumeThread a cada abertura do menu do sistema. A interface deixa de
+renderizar enquanto está oculta ou sem foco, mantendo a apresentação do core.
+
+O AccurateTimer limita o atraso acumulado a um intervalo. Após uma interrupção
+longa do host, o temporizador não dispara uma sequência de vblanks rápidos
+para compensar todo o tempo perdido.
+
+A inicialização com superfície usa a criação efetiva do backend para validar
+o dispositivo. A sonda de ambiente continua disponível pela API e permanece
+na inicialização sem superfície, evitando criar e destruir um dispositivo
+adicional em cada abertura normal. Em Release, a camada de debug e o DRED
+forçado são opt-in por `GAME_D3D_DEBUG=1`; Debug mantém os diagnósticos.
+
+Validação no PC: oito ciclos de inicialização, apresentação, redimensionamento
+e encerramento passaram, incluindo limpeza após falha simulada de attach.
+Três processos consecutivos executaram PAC-MAN por 20 segundos cada, com três
+ciclos de captura de controle e três de suspensão/retomada por processo.
+Os presents continuaram avançando, com `D3D_INFO_QUEUE_MESSAGES=0`,
+`BOOT_RESULT=0`, `SHUTDOWN=0` e saída zero nas três execuções.
+Os registros estão em `Build/xbox-guide-relaunch/`.
+
+O bundle Release foi recompilado e assinado: `CMS_SIGNATURE=PASS`,
+`PAYLOAD_HASHES=PASS` e `SOURCE_WHITESPACE=PASS`. O core incluído tem SHA-256
+`d2b386c33f7b998d61a3d957fefa25383e10ceb1d1f490678ac11da6e65f79e9`.
+Esses resultados usam o harness no PC; não reproduzem a interface do sistema
+Xbox nem confirmam a terceira abertura no console. O pacote não foi instalado.
+
+## Uso opcional de imagens packed no Xbox (2026-10-25)
+
+O log `shad_log (1).txt` registra uma textura B4G4R4A4 de 640x539 no
+PAC-MAN 256. A consulta de formato rejeitava a combinação de amostragem,
+transferência, armazenamento e attachment, mas o código prosseguia até
+uma falha de alocação reportada como ErrorOutOfDeviceMemory. Os valores
+registrados de orçamento e uso não indicavam esgotamento do limite do app.
+
+A criação de imagens agora tenta uma combinação reduzida apenas quando a
+consulta original retorna ErrorFormatNotSupported. São retirados os usos
+opcionais de storage e color attachment que o formato não suporta; o uso
+de feedback acompanha a remoção do attachment. A combinação reduzida também
+precisa passar pela consulta antes de ser adotada. As flags e features da
+imagem usadas na criação das views acompanham o resultado. Quando ExtendedUsage
+já permite a combinação original, ela é preservada. Não há regra por jogo.
+
+Uma DLL de diagnóstico em `Build/packed-image-fix/` restringe as capacidades
+de casting e de RT/UAV do formato para exercitar o contrato observado no log.
+A sonda Vulkan retornou `ORIGINAL_USAGE_RESULT=-11` para a combinação original
+e `PACKED_IMAGE_640x539=PASS SDK_ERRORS=0` para criação, alocação e binding
+com amostragem/transferência. Essa DLL não foi incluída no pacote.
+
+O PAC-MAN passou por 25 segundos com o driver de produção, com
+`D3D_INFO_QUEUE_MESSAGES=0`, `BOOT_RESULT=0`, `SHUTDOWN=0` e saída zero.
+A tela inicial no PC, inclusive com a versão anterior sob a fixture, não
+reproduziu a alocação específica registrada no Xbox; a sonda acima valida
+separadamente a combinação incompatível. A confirmação do cenário completo
+no console continua pendente.
+
+O bundle Release foi recompilado e assinado: `CMS_SIGNATURE=PASS`,
+`PAYLOAD_HASHES=PASS`, `SOURCE_WHITESPACE=PASS`. O SHA-256 do core incluído é
+`2d76d9dbea0e0b9ea87bef0313f3e1cc4fc937772be65518fbb193d449daf6b9`.
+
+## Apresentação da interface durante gameplay (2026-10-25)
+
+O launcher mantinha uma segunda swapchain apresentando frames transparentes
+com VSync durante o jogo. Abrir o menu do Xbox interrompia esse loop por perda
+de foco, enquanto a apresentação do core continuava. Isso explicava uma
+diferença concreta entre os dois estados relatados no console.
+
+Quando o ImGui está vazio e a interface está transparente, o renderer agora
+apresenta a limpeza uma vez e deixa de submeter comandos e chamar Present nos
+frames vazios seguintes. O loop continua processando entrada e comandos,
+com espera de 8 ms enquanto não apresenta. Uploads de miniaturas aguardam a
+interface voltar a ser exibida. Uploads já gravados não são descartados.
+A reabertura do menu interno, o retorno ao launcher e o redimensionamento
+retomam a apresentação necessária.
+
+A sonda GPU do renderer passou no PC: 120 frames vazios sem novas apresentações,
+limpeza com alpha zero, redimensionamento, reabertura do menu e upload pendente.
+`D3D12_MESSAGES=0`. Os fontes e registros da sonda estão em
+`Build/overlay-pacing/`. O host Release foi recompilado; o efeito sobre o
+frame pacing durante gameplay ainda requer confirmação no Xbox Series S.
+
+## Perda do dispositivo ao iniciar Bloodborne (2026-10-25)
+
+Os arquivos `frontend-d3d12.log` e `shad_log (2).txt` registraram o dispositivo
+invalidado com 0x887a0001 e, depois, falha de criação de PSO compute com
+0x887a0005 / ErrorDeviceLost. A sequência foi reproduzida no PC com uma DLL
+de diagnóstico limitada a Shader Model 6.0, sem operações nativas de 16 bits,
+barreiras aprimoradas e casting relaxado. A validação D3D12 revelou problemas
+no contrato de descritores e nos estados legados, anteriores à falha de PSO.
+
+Correções no Dozen, sem seleção por título ou shader:
+
+- Mips inexistentes usam descritores nulos com a dimensão e o formato da
+  view original, incluindo volumes 3D; não usam indiscriminadamente Texture2D.
+- Ranges das tabelas clássicas são declarados voláteis. Isso permite bindings
+  não utilizados pelo shader permanecerem não inicializados, como permitido
+  pelo Vulkan, sem exigir a inicialização estática de toda a tabela D3D12.
+- A consulta ExtendedUsage no caminho sem casting relaxado considera o formato
+  linear da mesma família typeless. Uma imagem sRGB mutável pode assim manter
+  storage para sua view UNORM, sem perder o UAV durante a criação da imagem.
+- Cópias entre regiões do mesmo recurso passam por um buffer temporário no
+  caminho legado. As cópias são divididas em blocos de até 64 KiB, com transições
+  explícitas entre origem e destino. FillBuffer e UpdateBuffer também restauram
+  o estado após escrever. Barreiras de buffers consideram leituras promovidas
+  implicitamente, em vez de presumirem que ainda estão em COMMON.
+- Texturas legadas de uma amostra sem depth/stencil usam simultaneous access,
+  permitindo promoção/decay compatíveis com o tratamento de GENERAL no backend.
+  Imagens lineares representadas por buffers não recebem essa flag.
+- O identificador de cache do driver passou à revisão 16.
+
+A reprodução limitada que antes falhava passou por 35 segundos até a tela
+inicial do Bloodborne, com 656 presents, `D3D_INFO_QUEUE_MESSAGES=0`,
+`BOOT_RESULT=0`, `SHUTDOWN=0` e saída zero. A captura
+`Build/bloodborne-device-loss/bloodborne-sm60.png` foi conferida visualmente.
+As mesmas operações de shader registradas no log original foram ultrapassadas.
+Esse resultado valida a inicialização; não comprova gameplay com personagem.
+
+Com a DLL de produção, Bloodborne passou por 35 segundos e PAC-MAN por 25,
+também com zero mensagens D3D12 e encerramento normal. Passaram as regressões
+de LOD de imagens, UPDATE_AFTER_BIND em buffers e texel buffers, ciclo de vida
+e robustness2. O LOD clássico também passou na DLL limitada a SM 6.0.
+Fontes das sondas e logs: `Build/bloodborne-device-loss/`.
+
+O bundle Release foi recompilado, assinado e verificado:
+`CMS_SIGNATURE=PASS`, `PAYLOAD_HASHES=PASS`, `SOURCE_WHITESPACE=PASS`.
+SHA-256 do Dozen incluído:
+`57da7fd09c9c8202f2ec9c5e42efb8e8522c0a6934d8b82870f836ddcea31f02`.
+A DLL de diagnóstico não foi empacotada. O pacote não foi instalado; o Xbox
+Series S continua sendo uma etapa de confirmação separada.
+
+Referência para promoção e decay de recursos:
+[documentação D3D12](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12).
+
+## Compromisso de RAM sob demanda (2026-10-25)
+
+O novo `shad_log.txt` ultrapassa a criação de pipelines que falhava antes e
+termina em CommitPhysical, no offset físico 0x1f6fa0000, ao comprometer 64 KiB.
+A mensagem do Windows não foi traduzida e o código numérico original não
+ficou registrado; o log sozinho não distingue falta de compromisso disponível
+de outros erros da API.
+
+O backend UWP agora usa a página informada por GetSystemInfo como compromisso
+mínimo, em vez de comprometer sempre 64 KiB. No PC validado são 4 KiB.
+Acessos esparsos continuam pequenos; acessos sequenciais de cada thread crescem primeiro para
+16 KiB e depois para até 64 KiB, reduzindo o custo de faltas em leituras
+contínuas. Cada janela respeita a faixa ainda reservada, o fim da seção de
+16 MiB e o tamanho do backing. Sob falha de compromisso por memória, uma
+janela ampliada é tentada novamente com apenas a página necessária.
+
+As seções SEC_RESERVE, aliases compartilhados e proteções continuam sendo
+usados. O erro de compromisso passa a registrar imediatamente o código Win32,
+offset, tamanho, total comprometido e uso/limite de memória do app quando a
+consulta WinRT está disponível. NativeErrorToString também conserva o número
+quando FormatMessageA não encontra a mensagem.
+
+Validação com objetos de produção do core, em `Build/demand-page-fix/`:
+
+- Proteções parciais de 4 KiB, upgrade de view dividida somente leitura e
+  aliases concorrentes numa faixa de 1 GiB passaram.
+- Passaram acessos acima de 4/7 GiB e no offset 0x1f6fa0000 registrado no log.
+- A sonda de acessos esparsos numa faixa de 1 GiB comprometeu 67.387.392 bytes
+  (cerca de 64,3 MiB), com página host de 4 KiB. O antigo compromisso fixo de
+  64 KiB por acesso esparso ocuparia 1 GiB nesse padrão.
+- Passou a preservação do código numérico para erro sem mensagem traduzível.
+- Bloodborne permaneceu por 75 segundos no harness do PC e chegou à tela
+  inicial, com `D3D_INFO_QUEUE_MESSAGES=0`, `BOOT_RESULT=0`, `SHUTDOWN=0` e
+  saída zero. Esse teste não reproduz o limite físico de RAM do Xbox.
+
+O bundle Release foi recompilado, assinado e verificado:
+`CMS_SIGNATURE=PASS`, `PAYLOAD_HASHES=PASS`, `SOURCE_WHITESPACE=PASS`.
+SHA-256 do core incluído:
+`18d67087b47ab115fcb44cd1eb32c78f77452fa5206787858c4c175cba41d4e1`.
+Não houve instalação; a confirmação da falha original no Xbox continua pendente.
+
+## Configurações, Cheats / Patches, FPS e swap (2026-10-25)
+
+- A API UWP mantém uma fonte única para as configurações globais e os perfis por jogo. Tamanho/modo da janela ficam sob controle do host; controles sem efeito foram ocultados. Readbacks e cache adaptativo agora têm opções enumeradas; resolução interna, RCAS e opções numéricas de cache/threads têm limites explícitos.
+- O menu **Cheats / Patches** abre o gerenciador do jogo selecionado: repositórios shadPS4/GoldHEN, download de JSON/XML, versões, créditos, notas, exclusão e seleção persistida em `isEnabled`. Downloads preservam seleções anteriores e geram `files.json` após gravar os XMLs. O carregador considera todos os arquivos associados ao serial em cada repositório.
+- Cheats são aplicados apenas ao jogo e executável correspondentes em execução. As escritas passam pelo backing compartilhado e pela sincronização de acesso à memória do núcleo; desativar aplica o campo `off`. Arquivos de outras versões não são habilitados na interface.
+- O contador no canto superior esquerdo usa flips reais do VideoOut, compartilhados pelos dois backends. O texto XAML é atualizado a cada 500 ms. A interface ImGui continua sem apresentar frames vazios durante a gameplay.
+- `General.memory_swap_enabled` é global, com padrão `true` em `Windows.Xbox` e `false` no PC. Uma escolha salva é preservada. O swap usa seções de RAM de 16 MiB apoiadas em arquivos privados `cache/swap`, com vistas compartilhadas e paginação administrada pelo sistema operacional. A criação das seções é sincronizada; arquivos usam exclusão ao fechar e não são reaproveitados entre sessões. O caminho sem swap conserva o compromisso anônimo adaptativo anterior.
+
+Validações no PC:
+
+- Auditoria nativa da API: 132 opções disponíveis aceitas, 37 entradas indisponíveis/internas excluídas da interface e sete rejeições esperadas de tipos, enumerações ou limites inválidos.
+- Downloads reais de cheats e patches dos dois repositórios passaram. Listagem, ativação/desativação persistida de XML, incompatibilidade de versão e confinamento de nomes de arquivo passaram.
+- Readback da janela de cheats com as funções de desenho de produção passou; a janela foi inspecionada visualmente.
+- RAM com e sem swap: aliases concorrentes em 1 GiB, endereços físicos acima de 4/7 GiB, proteções de 4 KiB e limpeza passaram. Com swap, execução de código por alias e leitura após redução do working set passaram. Sem swap, o padrão esparso comprometeu 67.387.392 bytes em um intervalo de 1 GiB.
+- Host diagnóstico com PAC-MAN por 30 segundos: 1.435 apresentações, contador de flips igual ao contador de apresentações, escrita e restauração de bytes de cheat em uma região de memória reservada pelo próprio probe, `D3D_INFO_QUEUE_MESSAGES=0` e encerramento normal.
+- DLL de produção com PAC-MAN por 25 segundos, swap explicitamente ativado: `BOOT_RESULT=0`, `SHUTDOWN=0`, `D3D_INFO_QUEUE_MESSAGES=0` e saída zero.
+- Núcleo e frontend Release recompilados. Pacote assinado e payload verificado. SHA-256 do núcleo: `533d21b8b84e9b9a6c2a9bb43d5d6969d8ff0f135015d5eac0f641216e5b97a1`.
+
+Os probes usam um host nativo no PC. Não houve instalação do pacote, validação visual do contador dentro de uma instância UWP instalada nem execução no Xbox nesta etapa; o orçamento de RAM e a paginação reais do Xbox ainda precisam de confirmação no console.

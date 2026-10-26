@@ -7,6 +7,11 @@
         <TextBlock x:Name="statusText" Text="Inicializando shadPS4…" Foreground="White" TextWrapping="Wrap" VerticalAlignment="Top" Padding="16" />
       </Grid>
     </Page>
-  </Grid>
+      <Border x:Name="fpsOverlay" HorizontalAlignment="Left" VerticalAlignment="Top"
+            Margin="12" Padding="8,4" Background="#A0000000" CornerRadius="3"
+            IsHitTestVisible="False" Visibility="Collapsed">
+        <TextBlock x:Name="fpsText" Foreground="White" FontSize="18" FontWeight="SemiBold"/>
+    </Border>
+</Grid>
 </Page>
 

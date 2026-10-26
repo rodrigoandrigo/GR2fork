@@ -190,6 +190,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GameInstallDir, path, enabled)
 // -------------------------------
 // General settings
 // -------------------------------
+bool DefaultMemorySwapEnabled();
+
 struct GeneralSettings {
     Setting<std::vector<GameInstallDir>> install_dirs;
     Setting<std::filesystem::path> addon_install_dir;
@@ -207,7 +209,12 @@ struct GeneralSettings {
     Setting<std::string> trophy_notification_side{"right"};
     Setting<bool> show_splash{false};
     Setting<bool> discord_rpc_enabled{false};
+#ifdef SHADPS4_UWP
+    Setting<bool> show_fps_counter{true};
+#else
     Setting<bool> show_fps_counter{false};
+#endif
+    Setting<bool> memory_swap_enabled{DefaultMemorySwapEnabled()};
     Setting<int> console_language{1};
     Setting<int> big_picture_scale{1000};
     Setting<int> big_picture_folder_depth{2};
@@ -238,7 +245,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    sys_modules_dir, font_dir, volume_slider, neo_mode, dev_kit_mode,
                                    extra_dmem_in_mbytes, extra_fmem_in_mbytes,
                                    trophy_popup_disabled, trophy_notification_duration, show_splash,
-                                   trophy_notification_side, discord_rpc_enabled, show_fps_counter,
+                                   trophy_notification_side, discord_rpc_enabled, show_fps_counter, memory_swap_enabled,
                                    console_language, big_picture_scale, big_picture_folder_depth,
                                    redzone_patches)
 
@@ -1139,6 +1146,7 @@ public:
     SETTING_FORWARD_BOOL(m_general, ShowSplash, show_splash)
     SETTING_FORWARD_BOOL(m_general, DiscordRPCEnabled, discord_rpc_enabled)
     SETTING_FORWARD_BOOL(m_general, ShowFpsCounter, show_fps_counter)
+    SETTING_FORWARD_BOOL(m_general, MemorySwapEnabled, memory_swap_enabled)
     SETTING_FORWARD(m_general, ConsoleLanguage, console_language)
     SETTING_FORWARD(m_general, BigPictureScale, big_picture_scale)
     SETTING_FORWARD(m_general, BigPictureFolderDepth, big_picture_folder_depth)

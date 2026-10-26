@@ -263,6 +263,7 @@ void AccurateTimer::End() {
     auto now = std::chrono::high_resolution_clock::now();
     total_wait +=
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
+    total_wait = std::max(total_wait, -target_interval);
 }
 
 std::string GetCurrentThreadName() {

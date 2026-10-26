@@ -76,6 +76,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     std::function<void()> ready;
     std::function<void()> toggle_fullscreen;
     std::function<void(bool)> set_pointer_mode;
+    std::function<void(bool, float)> set_game_fps;
 
   private:
     struct Setting {
@@ -175,7 +176,16 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     bool settings_saving{};
     size_t selection{};
     float ui_scale{1.0f};
-    bool show_fps{};
+    bool show_fps{true};
+    decltype(&shadps4_get_game_frame_count) get_game_frame_count{};
+    decltype(&shadps4_cheats_request) cheats_request{};
+    bool cheats_open{}, cheats_busy{};
+    std::string cheats_serial, cheats_version, cheats_title, cheats_error;
+    nlohmann::json cheats_data;
+    int cheats_repository{};
+    void OpenCheats();
+    void CheatsCommand(nlohmann::json request);
+    void DrawCheats();
     std::string settings_profile;
     std::atomic<uint64_t> settings_request{};
     char search[256]{};

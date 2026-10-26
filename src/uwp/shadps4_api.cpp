@@ -1,5 +1,6 @@
 #include "uwp/session.h"
 #include "uwp/shadps4_api.h"
+#include "uwp/game_metrics.h"
 
 #include <algorithm>
 #include <atomic>
@@ -303,7 +304,7 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
         UserSettings.Load();
         D3D12::NativeTemporalJitter().Configure({});
         D3D12::NativeTemporalJitter().Reset();
-        if (shadps4_check_environment() != 0) {
+        if (!config->panel && shadps4_check_environment() != 0) {
             return -1;
         }
         if (config->panel) {
@@ -543,6 +544,10 @@ int32_t shadps4_render_host_frame() {
     } catch (const std::exception& exception) {
         return Fail(exception.what());
     }
+}
+
+uint64_t shadps4_get_game_frame_count() {
+    return Core::Uwp::game_frame_count.load(std::memory_order_relaxed);
 }
 
 uint32_t shadps4_get_state() {

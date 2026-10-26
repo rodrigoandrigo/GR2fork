@@ -507,16 +507,8 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
          range->RangeType = desc_type_to_range_type(range_type, true);
          range->NumDescriptors = desc_count * binfos[binding].descriptor_stride;
          range->BaseShaderRegister = binfos[binding].base_shader_register;
-         range->Flags = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ?
-            D3D12_DESCRIPTOR_RANGE_FLAG_NONE :
-            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS;
-         if (binfos[binding].flags &
-             (VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
-              VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
-              VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT |
-              VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT))
-            range->Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
-               (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 0 : D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+         range->Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+            (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 0 : D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
          if (is_dynamic) {
             range->OffsetInDescriptorsFromTableStart =
                set_layout->dynamic_buffers.range_offset +
@@ -1445,14 +1437,14 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
                                           struct dzn_descriptor_heap *heap,
                                           uint32_t desc_offset,
                                           bool writeable, bool cube_as_2darray,
-                                          const struct dzn_image_view *iview)
+                                          const struct dzn_image_view *iview, bool null_resource)
 {
    mtx_lock(&device->descriptor_update_lock);
    if (heap->feedback)
       memset(&heap->feedback[desc_offset], 0, sizeof(*heap->feedback));
 
    heap->format_defaults[desc_offset] =
-       iview ? dzn_format_defaults(iview->vk.format, writeable
+       iview && !null_resource ? dzn_format_defaults(iview->vk.format, writeable
                                                          ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
                                                          : iview->srv_desc.Shader4ComponentMapping)
              : 0;
@@ -1466,7 +1458,7 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
       dzn_descriptor_heap_get_cpu_handle(heap, desc_offset);
    struct dzn_image *image = container_of(iview->vk.image, struct dzn_image, vk);
 
-   if (!writeable && heap->feedback &&
+   if (!null_resource && !writeable && heap->feedback &&
        (image->vk.usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) {
       heap->feedback[desc_offset] = (struct dzn_feedback_descriptor) {
          .image_id = image->feedback_id,
@@ -1480,7 +1472,7 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
       if (iview->uav_desc.ViewDimension == D3D12_UAV_DIMENSION_UNKNOWN)
          _debug_printf("Dozen storage image view lacks UAV: format=%u view_usage=0x%x image_usage=0x%x type=%u\n",
                        iview->vk.format, iview->vk.usage, image->vk.usage, iview->vk.view_type);
-      ID3D12Device1_CreateUnorderedAccessView(device->dev, image->res, NULL, &iview->uav_desc, view_handle);
+      ID3D12Device1_CreateUnorderedAccessView(device->dev, null_resource ? NULL : image->res, NULL, &iview->uav_desc, view_handle);
    } else if (cube_as_2darray &&
               (iview->srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY ||
                iview->srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE)) {
@@ -1508,9 +1500,9 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
 
       if (heap->feedback)
          heap->feedback[desc_offset].desc = srv_desc;
-      ID3D12Device1_CreateShaderResourceView(device->dev, image->res, &srv_desc, view_handle);
+      ID3D12Device1_CreateShaderResourceView(device->dev, null_resource ? NULL : image->res, &srv_desc, view_handle);
    } else {
-      ID3D12Device1_CreateShaderResourceView(device->dev, image->res, &iview->srv_desc, view_handle);
+      ID3D12Device1_CreateShaderResourceView(device->dev, null_resource ? NULL : image->res, &iview->srv_desc, view_handle);
    }
    dzn_descriptor_heap_notify(heap, desc_offset, 1);
    mtx_unlock(&device->descriptor_update_lock);
@@ -2058,14 +2050,14 @@ dzn_descriptor_set_write_image_view_desc(struct dzn_device *device,
                iview ? iview->mip_uav_slots[mip] : 0;
          } else {
             struct dzn_image_view mip_view;
-            const struct dzn_image_view *view =
-               dzn_image_view_get_mip(iview, mip, &mip_view) ? &mip_view : NULL;
+            bool valid = dzn_image_view_get_mip(iview, mip, &mip_view);
+            const struct dzn_image_view *view = valid ? &mip_view : iview;
             dzn_descriptor_heap_write_image_view_desc(device, dzn_descriptor_set_heap(set, type),
-               set->heap_offsets[type] + heap_offset + mip, true, true, view);
+               set->heap_offsets[type] + heap_offset + mip, true, true, view, !valid);
             if (alt_heap_offset != ~0)
                dzn_descriptor_heap_write_image_view_desc(device, dzn_descriptor_set_heap(set, type),
-                  set->heap_offsets[type] + alt_heap_offset + mip, false, true, view);
-            if (!view && iview) {
+                  set->heap_offsets[type] + alt_heap_offset + mip, false, true, view, !valid);
+            if (!valid && iview) {
                mtx_lock(&device->descriptor_update_lock);
                dzn_descriptor_set_heap(set, type)->format_defaults[set->heap_offsets[type] + heap_offset + mip] =
                   dzn_format_defaults(iview->vk.format, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
@@ -2096,7 +2088,7 @@ dzn_descriptor_set_write_image_view_desc(struct dzn_device *device,
                                              dzn_descriptor_set_heap(set, type),
                                              set->heap_offsets[type] + heap_offset,
                                              primary_writable, cube_as_2darray,
-                                             iview);
+                                             iview, false);
 
    if (alt_heap_offset != ~0) {
       assert(primary_writable);
@@ -2104,7 +2096,7 @@ dzn_descriptor_set_write_image_view_desc(struct dzn_device *device,
                                                 dzn_descriptor_set_heap(set, type),
                                                 set->heap_offsets[type] + alt_heap_offset,
                                                 false, cube_as_2darray,
-                                                iview);
+                                                iview, false);
    }
 }
 

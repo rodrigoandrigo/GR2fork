@@ -16,6 +16,21 @@
 
 #include <SDL3/SDL_messagebox.h>
 
+#ifdef SHADPS4_UWP
+#include <winrt/Windows.System.Profile.h>
+#endif
+
+bool DefaultMemorySwapEnabled() {
+#ifdef SHADPS4_UWP
+    try {
+        return winrt::Windows::System::Profile::AnalyticsInfo::VersionInfo().DeviceFamily() ==
+               L"Windows.Xbox";
+    } catch (const winrt::hresult_error&) {
+    }
+#endif
+    return false;
+}
+
 using json = nlohmann::json;
 
 // ── Singleton storage ─────────────────────────────────────────────────

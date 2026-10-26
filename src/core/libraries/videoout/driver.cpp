@@ -1,3 +1,6 @@
+#ifdef SHADPS4_UWP
+#include "uwp/game_metrics.h"
+#endif
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -285,6 +288,9 @@ void VideoOutDriver::Flip(const Request& req) {
 
     // Present the frame.
     req.sink->Present(req.frame);
+#ifdef SHADPS4_UWP
+    Core::Uwp::game_frame_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 
     // Update flip status.
     auto* port = req.port;

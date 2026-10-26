@@ -534,7 +534,7 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
                                           uint32_t heap_offset,
                                           bool writeable,
                                           bool cube_as_2darray,
-                                          const struct dzn_image_view *iview);
+                                          const struct dzn_image_view *iview, bool null_resource);
 
 void
 dzn_descriptor_heap_write_buffer_view_desc(struct dzn_device *device,

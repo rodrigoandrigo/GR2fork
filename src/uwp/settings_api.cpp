@@ -17,6 +17,9 @@ constexpr std::array groups{"General", "Network", "Log", "Debug",
                             "Input",   "Audio",   "GPU", "Vulkan"};
 
 std::string Unsupported(std::string_view group, std::string_view key, const json& value) {
+    if (group == "GPU" && (key == "window_width" || key == "window_height" ||
+                           key == "full_screen" || key == "full_screen_mode"))
+        return "O tamanho e o modo da janela são controlados pelo host UWP; use Exibir/Tela cheia.";
     if (group == "GPU" && key == "present_mode")
         return "O host apresenta todos os frames em FIFO, sem descarte.";
     if (group == "Vulkan" && (key.starts_with("vkvalidation") || key.starts_with("vkcrash") ||
@@ -69,7 +72,16 @@ json Choices(std::string_view key) {
     const auto add = [&](json value, const char* label) {
         result.push_back({{"value", value}, {"label", label}});
     };
-    if (key == "audio_backend") {
+    if (key == "readbacks_mode") {
+        add(0, "Desativado");
+        add(1, "Relaxado");
+        add(2, "Preciso");
+    } else if (key == "adaptive_skipcaches_mode") {
+        add(0, "Desativado");
+        add(1, "Adaptativo");
+        add(2, "Forçado");
+        add(3, "Somente validação");
+    } else if (key == "audio_backend") {
         add(0, "SDL3");
         add(1, "OpenAL");
         add(2, "XAudio2");
@@ -137,6 +149,22 @@ json Choices(std::string_view key) {
 }
 
 std::pair<double, double> Bounds(std::string_view key, const json& value) {
+    if (key == "internal_screen_width" || key == "internal_screen_height")
+        return {64, 16384};
+    if (key == "rcas_attenuation")
+        return {0, 1000};
+    if (key == "gpu_id")
+        return {-1, 15};
+    if (key == "stream_copy_workers" || key == "stream_copy_lane_threads")
+        return {1, 16};
+    if (key == "findimg_memo_ways")
+        return {1, 8};
+    if (key == "findimg_memo_entries" || key == "shader_params_memo_entries")
+        return {0, 65536};
+    if (key == "spec_key_fast" || key == "spec_fp_canonical" || key == "bind_write_plan")
+        return {0, 2};
+    if (key == "draw_glue_memo")
+        return {0, 3};
     if (key == "volume_slider")
         return {0, 500};
     if (key == "extra_dmem_in_mbytes" || key == "extra_fmem_in_mbytes")

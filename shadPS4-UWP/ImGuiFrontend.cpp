@@ -55,6 +55,7 @@ std::string Label(std::string text) {
     static const std::unordered_map<std::string, std::string> labels{
         {"big_picture_scale", "Escala da interface (1000 = 100%)"},
         {"big_picture_folder_depth", "Profundidade de busca de jogos"},
+        {"memory_swap_enabled", "Swap de memória (padrão no Xbox)"},
         {"show_fps_counter", "Exibir contador de FPS"},
         {"console_language", "Idioma do console"},
         {"volume_slider", "Volume (%)"},
@@ -408,6 +409,8 @@ HRESULT ImGuiFrontend::Attach(IDXGISwapChain* chain) {
 void ImGuiFrontend::ResolveApi() {
 #define RESOLVE(member, name) member = core->GetApi<decltype(member)>(name)
     RESOLVE(get_settings, "shadps4_get_settings");
+    RESOLVE(get_game_frame_count, "shadps4_get_game_frame_count");
+    RESOLVE(cheats_request, "shadps4_cheats_request");
     RESOLVE(set_host_state, "shadps4_set_host_state");
     RESOLVE(get_text_input, "shadps4_get_text_input");
     RESOLVE(complete_text_input, "shadps4_complete_text_input");
@@ -610,8 +613,8 @@ void ImGuiFrontend::Run(std::wstring root) {
                     set_pointer_mode(show_pointer);
             }
             if (set_host_state(
-                    !snapshot.suspended && snapshot.active && snapshot.visible,
-                    snapshot.captured || snapshot.system_pointer ||
+                    !snapshot.suspended,
+                    !snapshot.active || !snapshot.visible || snapshot.captured || snapshot.system_pointer ||
                         (game_running ? menu_open : io.NavActive || io.WantCaptureKeyboard)))
                 throw std::runtime_error(Utf8(core->Error()));
             if (snapshot.suspended || !snapshot.active || !snapshot.visible) {
@@ -624,6 +627,17 @@ void ImGuiFrontend::Run(std::wstring root) {
                 core->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
             renderer->SetTransparent(game_running);
             const auto now = std::chrono::steady_clock::now();
+            static auto fps_time = now;
+            static uint64_t fps_count = get_game_frame_count();
+            if (now - fps_time >= std::chrono::milliseconds(500)) {
+                const auto count = get_game_frame_count();
+                const auto seconds = std::chrono::duration<float>(now - fps_time).count();
+                if (set_game_fps)
+                    set_game_fps(game_running && show_fps,
+                                 (count >= fps_count ? count - fps_count : 0) / seconds);
+                fps_count = count;
+                fps_time = now;
+            }
             const auto delta = std::chrono::duration<float>(now - last).count();
             last = now;
             SubmitInput(snapshot);
@@ -632,7 +646,7 @@ void ImGuiFrontend::Run(std::wstring root) {
                            0.75f, 3.0f);
             renderer->BeginFrame(delta);
             unsigned uploads{};
-            while (!decoded.empty() && uploads < 2) {
+            while ((!game_running || menu_open) && !decoded.empty() && uploads < 2) {
                 if (!renderer->Upload(decoded.front()))
                     break;
                 pending_images.erase(decoded.front().key);
@@ -640,7 +654,8 @@ void ImGuiFrontend::Run(std::wstring root) {
                 ++uploads;
             }
             Draw();
-            renderer->EndFrame();
+            if (!renderer->EndFrame())
+                std::this_thread::sleep_for(std::chrono::milliseconds(8));
         }
     } catch (const winrt::hresult_error& error) {
         try {
@@ -665,6 +680,8 @@ void ImGuiFrontend::Run(std::wstring root) {
         } catch (...) {
         }
     }
+    if (set_game_fps)
+        set_game_fps(false, 0);
     stopping.store(true);
     work_ready.notify_all();
     if (worker.joinable())
@@ -1329,6 +1346,12 @@ void ImGuiFrontend::Draw() {
                 open_settings("Pastas");
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Cheats / Patches")) {
+            if (ImGui::MenuItem("Gerenciar jogo selecionado…", nullptr, false,
+                                library && selection < library->games.size() && !session_pending))
+                OpenCheats();
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Ajuda")) {
             if (ImGui::MenuItem("Sobre o ShadPS4-UWP"))
                 about_open = true;
@@ -1429,10 +1452,7 @@ void ImGuiFrontend::Draw() {
         ImGui::Text("Examinando pastas: %u", scanned.load());
     else
         ImGui::TextUnformatted(status.c_str());
-    if (show_fps) {
-        ImGui::SameLine();
-        ImGui::Text("| %.1f FPS", ImGui::GetIO().Framerate);
-    }
+
 
     const auto layout = nlohmann::json{
         {"game_list", show_game_list},
@@ -1451,6 +1471,7 @@ void ImGuiFrontend::Draw() {
         }
     }
     ImGui::End();
+    DrawCheats();
     if (settings_open) {
         ImGui::SetNextWindowSize(
             {std::min(1000 * scale, display.x - 24), std::min(740 * scale, display.y - 24)},
@@ -1929,4 +1950,174 @@ void ImGuiFrontend::DrawLogs() {
         for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index)
             ImGui::TextUnformatted(logs[index].c_str());
     ImGui::EndChild();
+}
+
+void ImGuiFrontend::OpenCheats() {
+    if (!library || selection >= library->games.size() || cheats_busy)
+        return;
+    const auto& game = library->games[selection];
+    cheats_serial = game.serial;
+    cheats_version = game.version;
+    cheats_title = game.title;
+    cheats_open = true;
+    cheats_data = nlohmann::json::object();
+    CheatsCommand({{"operation", "list"}});
+}
+
+void ImGuiFrontend::CheatsCommand(nlohmann::json request) {
+    if (cheats_busy)
+        return;
+    request["serial"] = cheats_serial;
+    request["version"] = cheats_version;
+    if (!request.contains("repository"))
+        request["repository"] = cheats_repository == 0 ? "shadPS4" : "GoldHEN";
+    cheats_busy = true;
+    cheats_error.clear();
+    if (!Queue([this, request] {
+            try {
+                std::vector<char> buffer(2 * 1024 * 1024);
+                const auto code = cheats_request(request.dump().c_str(), buffer.data(),
+                                                 static_cast<uint32_t>(buffer.size()));
+                auto data = nlohmann::json::parse(buffer.data());
+                Complete([this, data = std::move(data), code] {
+                    cheats_busy = false;
+                    if (code)
+                        cheats_error = data.value("error", "Falha em cheats/patches.");
+                    else
+                        cheats_data = data;
+                });
+            } catch (const std::exception& error) {
+                const std::string message = error.what();
+                Complete([this, message] {
+                    cheats_busy = false;
+                    cheats_error = message;
+                });
+            }
+        })) {
+        cheats_busy = false;
+        cheats_error = "A fila de tarefas está ocupada.";
+    }
+}
+
+void ImGuiFrontend::DrawCheats() {
+    if (!cheats_open)
+        return;
+    const auto display = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowSize({std::min(900.0f, display.x - 24), std::min(650.0f, display.y - 24)},
+                             ImGuiCond_Appearing);
+    if (ImGui::Begin("Cheats / Patches", &cheats_open, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::TextWrapped("%s | %s | %s", cheats_title.c_str(), cheats_serial.c_str(),
+                           cheats_version.c_str());
+        if (!cheats_error.empty())
+            ImGui::TextWrapped("%s", cheats_error.c_str());
+        if (cheats_busy)
+            ImGui::TextUnformatted("Processando…");
+        ImGui::BeginDisabled(cheats_busy);
+        const char* repositories[]{"shadPS4", "GoldHEN"};
+        ImGui::Combo("Repositório", &cheats_repository, repositories, 2);
+        if (ImGui::Button("Atualizar lista local"))
+            CheatsCommand({{"operation", "list"}});
+        if (ImGui::BeginTabBar("cheats-patches-tabs")) {
+            if (ImGui::BeginTabItem("Cheats")) {
+                if (ImGui::Button("Baixar / atualizar cheats deste jogo"))
+                    CheatsCommand({{"operation", "download_cheats"}});
+                ImGui::TextWrapped("Cheats são aplicados durante a execução e podem "
+                                   "ser desativados na mesma sessão.");
+                const bool matching_game = game_running && active_game_path.size() && library &&
+                                           std::any_of(library->games.begin(), library->games.end(),
+                                                       [this](const auto& game) {
+                                                           return game.path == active_game_path &&
+                                                                  game.serial == cheats_serial;
+                                                       });
+                if (!matching_game)
+                    ImGui::TextWrapped("Inicie este jogo para aplicar os cheats compatíveis.");
+                if (!cheats_data.contains("cheats") || cheats_data["cheats"].empty())
+                    ImGui::TextUnformatted("Nenhum arquivo de cheats local para este jogo.");
+                for (const auto& file : cheats_data.value("cheats", nlohmann::json::array())) {
+                    const auto filename = file.at("file").get<std::string>();
+                    ImGui::PushID(filename.c_str());
+                    if (ImGui::TreeNodeEx(filename.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+                        if (file.contains("error")) {
+                            ImGui::TextWrapped("%s", file.at("error").get<std::string>().c_str());
+                        } else {
+                            const bool compatible = file.at("compatible").get<bool>();
+                            ImGui::Text("Versão: %s%s",
+                                        file.at("version").get<std::string>().c_str(),
+                                        compatible ? "" : " (incompatível)");
+                            ImGui::TextWrapped("Créditos: %s", file.at("credits").dump().c_str());
+                            ImGui::BeginDisabled(!matching_game || !compatible || cheats_busy);
+                            for (const auto& mod : file.at("mods")) {
+                                ImGui::PushID(mod.at("index").get<int>());
+                                const auto name = mod.at("name").get<std::string>();
+                                bool enabled = mod.at("enabled").get<bool>();
+                                const bool button = mod.at("type") == "button";
+                                const bool changed = button
+                                                         ? ImGui::Button(name.c_str())
+                                                         : ImGui::Checkbox(name.c_str(), &enabled);
+                                if (changed)
+                                    CheatsCommand({{"operation", "apply"},
+                                                   {"file", filename},
+                                                   {"index", mod.at("index")},
+                                                   {"enabled", button || enabled}});
+                                if (!mod.at("hint").is_null())
+                                    ImGui::TextWrapped("%s", mod.at("hint").dump().c_str());
+                                ImGui::PopID();
+                            }
+                            ImGui::EndDisabled();
+                        }
+                        ImGui::BeginDisabled(game_running || cheats_busy);
+                        if (ImGui::Button("Excluir arquivo de cheats"))
+                            CheatsCommand({{"operation", "delete_cheats"}, {"file", filename}});
+                        ImGui::EndDisabled();
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Patches")) {
+                if (ImGui::Button("Baixar / atualizar patches deste jogo"))
+                    CheatsCommand({{"operation", "download_patches"}});
+                ImGui::TextWrapped("As seleções são salvas automaticamente e aplicadas "
+                                   "na próxima inicialização do jogo.");
+                if (!cheats_data.contains("patches") || cheats_data["patches"].empty())
+                    ImGui::TextUnformatted("Nenhum patch local para este jogo.");
+                for (const auto& patch : cheats_data.value("patches", nlohmann::json::array())) {
+                    const auto repo = patch.at("repository").get<std::string>();
+                    const auto filename = patch.at("file").get<std::string>();
+                    ImGui::PushID((repo + "/" + filename).c_str());
+                    ImGui::PushID(patch.at("index").get<int>());
+                    bool enabled = patch.at("enabled").get<bool>();
+                    ImGui::BeginDisabled((!patch.at("compatible").get<bool>() && !enabled) ||
+                                         cheats_busy);
+                    if (ImGui::Checkbox(patch.at("name").get<std::string>().c_str(), &enabled))
+                        CheatsCommand({{"operation", "patch"},
+                                       {"repository", repo},
+                                       {"file", filename},
+                                       {"index", patch.at("index")},
+                                       {"enabled", enabled}});
+                    ImGui::EndDisabled();
+                    ImGui::TextWrapped("%s | Versão %s | %s", repo.c_str(),
+                                       patch.at("version").get<std::string>().c_str(),
+                                       patch.at("author").get<std::string>().c_str());
+                    if (ImGui::TreeNode("Notas e arquivo")) {
+                        ImGui::TextWrapped("%s", patch.at("note").get<std::string>().c_str());
+                        ImGui::TextWrapped("%s", filename.c_str());
+                        if (ImGui::Button("Excluir arquivo de patches"))
+                            CheatsCommand({{"operation", "delete_patches"},
+                                           {"repository", repo},
+                                           {"file", filename}});
+                        ImGui::TreePop();
+                    }
+                    ImGui::Separator();
+                    ImGui::PopID();
+                    ImGui::PopID();
+                }
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        ImGui::EndDisabled();
+    }
+    ImGui::End();
 }

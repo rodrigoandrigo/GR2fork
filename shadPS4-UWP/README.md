@@ -133,3 +133,11 @@ Para builds de depuração, os diretórios do núcleo e do runtime utilizam `Deb
 - [scripts/build-uwp.ps1](../scripts/build-uwp.ps1): build completo.
 - [scripts/build-dozen.ps1](../scripts/build-dozen.ps1): build das bibliotecas Mesa.
 - [scripts/sign-uwp.ps1](../scripts/sign-uwp.ps1): assinatura e verificação do pacote.
+
+## Cheats, patches e informações durante o jogo
+
+Selecione um jogo e abra **Cheats / Patches > Gerenciar jogo selecionado…**. As abas permitem baixar arquivos dos repositórios shadPS4 e GoldHEN, consultar versões, créditos e notas, excluir arquivos e selecionar os patches. As seleções são salvas automaticamente e aplicadas na próxima inicialização. Atualizar os arquivos preserva os patches já selecionados. Durante a execução, abra o menu do emulador e use as caixas ou botões de cheats para o jogo em execução; desmarcar uma caixa aplica os bytes de desativação do arquivo.
+
+**Configurações > Exibir contador de FPS** controla o contador no canto superior esquerdo da imagem. Ele mede os flips efetivos do jogo, com atualização a cada meio segundo, sem manter o swapchain da interface apresentando frames durante a gameplay.
+
+O **swap de memória** fica ativado por padrão no Xbox e desativado por padrão no PC. A configuração global `General.memory_swap_enabled` preserva uma escolha explícita. O backing da RAM guest usa arquivos temporários em `cache/swap`, compartilhados pelas suas diferentes vistas de memória e removidos ao liberar os mapeamentos ou encerrar o processo. O sistema operacional administra a paginação desses arquivos.

@@ -260,15 +260,12 @@ void OnGameLoaded() {
                 continue;
             }
 
-            std::filesystem::path game_patch_file;
             for (auto const& [filename, serials] : available_patches.items()) {
-                if (std::find(serials.begin(), serials.end(), g_game_serial) != serials.end()) {
-                    game_patch_file = repo.path() / filename;
-                    break;
-                }
-            }
-            if (std::filesystem::exists(game_patch_file)) {
-                ApplyPatchesFromXML(game_patch_file);
+                if (std::find(serials.begin(), serials.end(), g_game_serial) == serials.end())
+                    continue;
+                const auto game_patch_file = repo.path() / filename;
+                if (std::filesystem::is_regular_file(game_patch_file))
+                    ApplyPatchesFromXML(game_patch_file);
             }
         }
     }

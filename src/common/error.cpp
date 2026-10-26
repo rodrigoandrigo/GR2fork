@@ -23,7 +23,7 @@ std::string NativeErrorToString(int e) {
                                nullptr, e, MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
                                reinterpret_cast<LPSTR>(&err_str), 1, nullptr);
     if (!res) {
-        return "(FormatMessageA failed to format error)";
+        return "Win32 error " + std::to_string(e);
     }
     std::string ret(err_str);
     LocalFree(err_str);

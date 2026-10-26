@@ -15,6 +15,7 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #endif
 #include "common/scope_exit.h"
+#include "common/path_util.h"
 #include "core/address_space.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
@@ -148,6 +149,9 @@ struct AddressSpace::Impl {
         // Determine the system's page alignment
         SYSTEM_INFO sys_info{};
         GetSystemInfo(&sys_info);
+#ifdef SHADPS4_UWP
+        commit_size = sys_info.dwPageSize;
+#endif
         u64 alignment = sys_info.dwAllocationGranularity;
 
         // Older Windows builds have a severe performance issue with VirtualAlloc2.
@@ -258,6 +262,11 @@ struct AddressSpace::Impl {
 #ifdef SHADPS4_UWP
         backing_views.resize((BackingSize + BackingViewSize - 1) / BackingViewSize);
         ram_pages.resize(backing_views.size());
+        swap_enabled = EmulatorSettings.IsMemorySwapEnabled();
+        if (swap_enabled) {
+            swap_directory = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "swap";
+            std::filesystem::create_directories(swap_directory);
+        }
         for (u64 offset = 0; offset + BackingViewSize < BackingSize; offset += BackingViewSize) {
             ASSERT_MSG(VirtualFreeEx(process, backing_base + offset, BackingViewSize,
                                      MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
@@ -266,8 +275,8 @@ struct AddressSpace::Impl {
         }
         active_backing.store(this);
         rollback.Cancel();
-        LOG_INFO(Core, "UWP memory: {} MiB reserved, 64 KiB demand commitment, swap disabled",
-                 BackingSize / 1_MB);
+        LOG_INFO(Core, "UWP memory: {} MiB reserved, {} KiB minimum demand commitment, swap {}",
+                 BackingSize / 1_MB, commit_size / 1_KB, swap_enabled ? "enabled" : "disabled");
 #else
         void* const ret =
             MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
@@ -279,12 +288,20 @@ struct AddressSpace::Impl {
 #ifdef SHADPS4_UWP
     static constexpr u64 HostMemoryReserve = 256_MB;
     static constexpr u64 BackingViewSize = 16_MB;
-    static constexpr u64 CommitSize = 64_KB;
+    u64 commit_size{};
     inline static std::atomic<Impl*> active_backing{};
     std::mutex backing_mutex;
     std::vector<bool> backing_views;
     std::vector<HANDLE> ram_pages;
+    std::mutex ram_pages_mutex;
+    bool swap_enabled{};
+    std::filesystem::path swap_directory;
     u64 committed_bytes{};
+    struct CommitSequence {
+        u64 end{~u64{0}};
+        u32 length{};
+    };
+    std::map<DWORD, CommitSequence> commit_sequences;
 
     bool MapBackingView(void* address) {
         const auto offset =
@@ -362,8 +379,7 @@ struct AddressSpace::Impl {
     }
 
     void CommitPhysical(u64 offset) {
-        const auto begin = Common::AlignDown(offset, CommitSize);
-        const auto size = std::min(CommitSize, BackingSize - begin);
+        const auto begin = Common::AlignDown(offset, commit_size);
         auto* address = backing_base + begin;
         ASSERT_MSG(MapBackingView(address), "Unable to map lazy physical memory");
         MEMORY_BASIC_INFORMATION info{};
@@ -371,6 +387,14 @@ struct AddressSpace::Impl {
                    "Unable to query lazy physical memory");
         if (info.State == MEM_COMMIT)
             return;
+        auto& sequence = commit_sequences[GetCurrentThreadId()];
+        const bool sequential = begin == sequence.end;
+        const u64 window = sequential ? std::max(commit_size, sequence.length ? 64_KB : 16_KB)
+                                     : commit_size;
+        u64 size = std::min({window, BackingSize - begin,
+                             BackingViewSize - begin % BackingViewSize,
+                             reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize -
+                                 reinterpret_cast<u64>(address)});
         try {
             const u64 limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
             const u64 usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
@@ -382,10 +406,32 @@ struct AddressSpace::Impl {
                     usage / 1_MB, limit / 1_MB, size / 1_MB));
         } catch (const winrt::hresult_error&) {
         }
-        ASSERT_MSG(VirtualAllocFromApp(address, size, MEM_COMMIT, PAGE_READWRITE) == address,
-                   "Unable to commit physical memory at {:#x}, size {:#x}: {}", begin, size,
-                   Common::GetLastErrorMsg());
+        auto* committed = VirtualAllocFromApp(address, size, MEM_COMMIT, PAGE_READWRITE);
+        if (committed != address && size > commit_size) {
+            const auto error = GetLastError();
+            if (error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY ||
+                error == ERROR_COMMITMENT_LIMIT) {
+                size = commit_size;
+                committed = VirtualAllocFromApp(address, size, MEM_COMMIT, PAGE_READWRITE);
+            }
+        }
+        if (committed != address) {
+            const auto error = GetLastError();
+            u64 usage{}, limit{};
+            try {
+                usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
+                limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+            } catch (const winrt::hresult_error&) {
+            }
+            throw std::runtime_error(fmt::format(
+                "Unable to commit physical memory at {:#x}, size {:#x}: Win32 {}; "
+                "committed {} MiB, app usage {} MiB, limit {} MiB: {}",
+                begin, size, error, committed_bytes / 1_MB, usage / 1_MB, limit / 1_MB,
+                Common::NativeErrorToString(error)));
+        }
         committed_bytes += size;
+        sequence.end = begin + size;
+        sequence.length = sequential ? std::min(sequence.length + 1, 2u) : 0;
         for (auto& [base, region] : regions) {
             if (!region.is_resident || region.fd != -1 || region.phys_base == PAddr(-1))
                 continue;
@@ -410,12 +456,32 @@ struct AddressSpace::Impl {
     }
 
     HANDLE GetRamPage(u64 index) {
+        std::scoped_lock lock{ram_pages_mutex};
         if (ram_pages[index])
             return ram_pages[index];
         const u64 size = std::min(BackingViewSize, BackingSize - index * BackingViewSize);
+        HANDLE file = INVALID_HANDLE_VALUE;
+        if (swap_enabled) {
+            const auto path =
+                swap_directory / fmt::format("{}-{}-{}.swap", GetCurrentProcessId(),
+                                             reinterpret_cast<uintptr_t>(this), index);
+            CREATEFILE2_EXTENDED_PARAMETERS parameters{sizeof(parameters)};
+            parameters.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+            parameters.dwFileFlags = FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_RANDOM_ACCESS;
+            file = CreateFile2FromAppW(
+                path.c_str(), GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, CREATE_ALWAYS, &parameters);
+            if (file == INVALID_HANDLE_VALUE)
+                throw std::runtime_error("Unable to create memory swap: " +
+                                         Common::GetLastErrorMsg());
+        }
+        SCOPE_EXIT {
+            if (file != INVALID_HANDLE_VALUE)
+                CloseHandle(file);
+        };
         ram_pages[index] =
-            CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
-                               PAGE_EXECUTE_READWRITE, SEC_RESERVE, size, nullptr, nullptr, 0);
+            CreateFileMapping2(file, nullptr, FILE_MAP_ALL_ACCESS, PAGE_EXECUTE_READWRITE,
+                               swap_enabled ? SEC_COMMIT : SEC_RESERVE, size, nullptr, nullptr, 0);
         ASSERT_MSG(ram_pages[index], "Unable to allocate RAM page at {:#x}, size {:#x}: {}",
                    index * BackingViewSize, size, Common::GetLastErrorMsg());
         return ram_pages[index];
@@ -424,8 +490,8 @@ struct AddressSpace::Impl {
 
     ~Impl() {
 #ifdef SHADPS4_UWP
-        LOG_INFO(Core, "UWP demand memory: {} KiB committed, swap disabled",
-                 committed_bytes / 1_KB);
+        LOG_INFO(Core, "UWP demand memory: {} KiB committed, swap {}",
+                 committed_bytes / 1_KB, swap_enabled ? "enabled" : "disabled");
         for (const auto& [address, region] : regions) {
             if (region.is_mapped && region.is_resident) {
                 if ((region.fd != -1 && region.prot != PAGE_READONLY) ||

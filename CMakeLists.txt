@@ -1409,7 +1409,8 @@ if(SHADPS4_UWP)
     target_sources(shadps4 PRIVATE src/uwp/brokered_fs.cpp src/uwp/brokered_fs.h src/uwp/brokered_api.cpp
         src/core/file_sys/backends/pkg_reader.cpp src/core/file_sys/backends/pkg_reader.h
         src/core/file_sys/backends/pkg_fs.cpp src/core/file_sys/backends/pkg_fs.h)
-    target_sources(shadps4 PRIVATE src/uwp/settings_api.cpp)
+    target_sources(shadps4 PRIVATE src/uwp/settings_api.cpp src/uwp/cheats_api.cpp)
+    target_sources(shadps4 PRIVATE src/uwp/text_input.cpp)
     set(SHADPS4_DXC_RUNTIME_DIR "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64" CACHE PATH "DXC runtime directory")
     target_sources(shadps4 PRIVATE src/uwp/xaudio2_output.cpp
                                   src/core/libraries/audio/xaudio2_audio_out.cpp

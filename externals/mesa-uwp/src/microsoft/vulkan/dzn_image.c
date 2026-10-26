@@ -281,7 +281,9 @@ dzn_image_create(struct dzn_device *device,
       }
    }
 
-   if (pCreateInfo->sharingMode == VK_SHARING_MODE_CONCURRENT &&
+   if ((pCreateInfo->sharingMode == VK_SHARING_MODE_CONCURRENT ||
+        !pdev->options12.EnhancedBarriersSupported) &&
+       image->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
        !(image->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
        image->desc.SampleDesc.Count == 1)
       image->desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
@@ -1650,7 +1652,7 @@ dzn_image_view_create(struct dzn_device *device,
                                                    &device->device_heaps[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].heap,
                                                    iview->srv_bindless_slot,
                                                    false, false,
-                                                   iview);
+                                                   iview, false);
       }
       if (iview->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
          iview->uav_bindless_slot = dzn_device_descriptor_heap_alloc_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1663,7 +1665,7 @@ dzn_image_view_create(struct dzn_device *device,
                                                    &device->device_heaps[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].heap,
                                                    iview->uav_bindless_slot,
                                                    true, true,
-                                                   iview);
+                                                   iview, false);
       }
    }
 
@@ -1678,9 +1680,10 @@ dzn_image_view_create(struct dzn_device *device,
          }
          iview->mip_uav_slots[mip] = slot;
          struct dzn_image_view mip_view;
+         bool valid = dzn_image_view_get_mip(iview, mip, &mip_view);
          dzn_descriptor_heap_write_image_view_desc(device,
             &device->device_heaps[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].heap,
-            slot, true, true, dzn_image_view_get_mip(iview, mip, &mip_view) ? &mip_view : NULL);
+            slot, true, true, valid ? &mip_view : iview, !valid);
       }
    }
 

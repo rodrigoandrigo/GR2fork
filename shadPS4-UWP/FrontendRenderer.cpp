@@ -158,6 +158,7 @@ void FrontendRenderer::Resize(uint32_t new_width, uint32_t new_height, float sca
     }
     width = new_width;
     height = new_height;
+    empty_presented = false;
     if (swapchain)
         Check(
             swapchain->ResizeBuffers(frames.size(), width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0));
@@ -269,9 +270,14 @@ size_t FrontendRenderer::ImageCount() const {
     return images.size();
 }
 
-void FrontendRenderer::EndFrame() {
+bool FrontendRenderer::EndFrame() {
     ImGui::Render();
     auto& frame = frames[frame_index];
+    const bool empty = transparent && ImGui::GetDrawData()->TotalVtxCount == 0;
+    if (empty && empty_presented && frame.uploads.empty()) {
+        Check(commands->Close(), L"Frontend command list Close");
+        return false;
+    }
     Transition(commands.Get(), frame.target.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_RENDER_TARGET);
     auto target = rtv->GetCPUDescriptorHandleForHeapStart();
@@ -293,6 +299,8 @@ void FrontendRenderer::EndFrame() {
             image.ticket = frame.ticket;
     if (swapchain)
         Check(swapchain->Present(1, 0), L"Frontend swapchain Present");
+    empty_presented = empty;
+    return true;
 }
 
 std::vector<uint8_t> FrontendRenderer::Readback() {

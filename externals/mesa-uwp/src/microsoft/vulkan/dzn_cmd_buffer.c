@@ -3651,7 +3651,7 @@ dzn_cmd_buffer_blit_prepare_src_view(struct dzn_cmd_buffer *cmdbuf,
 
    struct dzn_image_view iview;
    dzn_image_view_init(device, &iview, &iview_info);
-   dzn_descriptor_heap_write_image_view_desc(device, heap, heap_slot, false, false, &iview);
+   dzn_descriptor_heap_write_image_view_desc(device, heap, heap_slot, false, false, &iview, false);
    dzn_image_view_finish(&iview);
 
    D3D12_GPU_DESCRIPTOR_HANDLE handle =
@@ -5463,13 +5463,48 @@ dzn_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
    VK_FROM_HANDLE(dzn_buffer, src_buffer, info->srcBuffer);
    VK_FROM_HANDLE(dzn_buffer, dst_buffer, info->dstBuffer);
+   if (!cmdbuf->enhanced_barriers && src_buffer->res == dst_buffer->res && info->regionCount) {
+      uint32_t size = 0;
+      for (uint32_t i = 0; i < info->regionCount; i++)
+         size = MAX2(size, MIN2(info->pRegions[i].size, 65536));
+      if (!size)
+         return;
+      ID3D12Resource *temporary;
+      uint64_t offset;
+      if (dzn_cmd_buffer_alloc_internal_buf(cmdbuf, size, DZN_INTERNAL_BUF_DEFAULT,
+            D3D12_RESOURCE_STATE_COPY_DEST, 4, &temporary, &offset) != VK_SUCCESS)
+         return;
+      dzn_cmd_buffer_query_buffer_barrier(cmdbuf, src_buffer->res,
+         D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      for (uint32_t i = 0; i < info->regionCount; i++) {
+         const VkBufferCopy2 *region = &info->pRegions[i];
+         for (uint64_t copied = 0; copied < region->size; copied += size) {
+            uint64_t count = MIN2(region->size - copied, size);
+            ID3D12GraphicsCommandList1_CopyBufferRegion(cmdbuf->cmdlist, temporary, offset,
+               src_buffer->res, region->srcOffset + copied, count);
+            dzn_cmd_buffer_query_buffer_barrier(cmdbuf, temporary,
+               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            dzn_cmd_buffer_query_buffer_barrier(cmdbuf, dst_buffer->res,
+               D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            ID3D12GraphicsCommandList1_CopyBufferRegion(cmdbuf->cmdlist, dst_buffer->res,
+               region->dstOffset + copied, temporary, offset, count);
+            dzn_cmd_buffer_query_buffer_barrier(cmdbuf, dst_buffer->res,
+               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            dzn_cmd_buffer_query_buffer_barrier(cmdbuf, temporary,
+               D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+         }
+      }
+      dzn_cmd_buffer_query_buffer_barrier(cmdbuf, dst_buffer->res,
+         D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+      return;
+   }
 
    D3D12_RESOURCE_BARRIER barrier = {
       .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
       .Transition = {
          .pResource = dst_buffer->res,
          .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-         .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+         .StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ,
          .StateAfter = D3D12_RESOURCE_STATE_COPY_DEST,
       },
    };
@@ -6112,7 +6147,13 @@ dzn_CmdFillBuffer(VkCommandBuffer commandBuffer,
 
    ID3D12Resource_Unmap(src_res, 0, NULL);
 
+   if (!cmdbuf->enhanced_barriers)
+      dzn_cmd_buffer_query_buffer_barrier(cmdbuf, buf->res,
+         D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COPY_DEST);
    ID3D12GraphicsCommandList1_CopyBufferRegion(cmdbuf->cmdlist, buf->res, dstOffset, src_res, src_offset, size);
+   if (!cmdbuf->enhanced_barriers)
+      dzn_cmd_buffer_query_buffer_barrier(cmdbuf, buf->res,
+         D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -6152,7 +6193,13 @@ dzn_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
    memcpy((uint8_t *)cpu_ptr + src_offset, data, size),
    ID3D12Resource_Unmap(src_res, 0, NULL);
 
+   if (!cmdbuf->enhanced_barriers)
+      dzn_cmd_buffer_query_buffer_barrier(cmdbuf, buf->res,
+         D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COPY_DEST);
    ID3D12GraphicsCommandList1_CopyBufferRegion(cmdbuf->cmdlist, buf->res, dstOffset, src_res, src_offset, size);
+   if (!cmdbuf->enhanced_barriers)
+      dzn_cmd_buffer_query_buffer_barrier(cmdbuf, buf->res,
+         D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
 }
 
 VKAPI_ATTR void VKAPI_CALL
