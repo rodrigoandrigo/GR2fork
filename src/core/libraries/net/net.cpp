@@ -23,6 +23,9 @@
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
+#ifdef SHADPS4_UWP
+#include "core/address_space.h"
+#endif
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/threads.h"
@@ -1962,6 +1965,9 @@ s32 PS4_SYSV_ABI sceNetRecv(OrbisNetId s, void* buf, u64 len, s32 flags) {
 
 static s32 sceNetRecvfromImpl(OrbisNetId s, void* buf, u64 len, s32 flags, OrbisNetSockaddr* addr,
                               u32* paddrlen) {
+#ifdef SHADPS4_UWP
+    const auto residency = Core::AddressSpace::AcquireHostAccess(buf, len);
+#endif
     const auto msg = ToHostMsgFlags(flags);
     if (msg.peeklen && buf == nullptr) {
         // MSG_PEEKLEN with no buffer: peek into our own and return the size waiting.
@@ -2244,6 +2250,9 @@ s32 PS4_SYSV_ABI sceNetSendmsg(OrbisNetId s, const OrbisNetMsghdr* msg, s32 flag
 
 static s32 sceNetSendtoImpl(OrbisNetId s, const void* buf, u64 len, s32 flags,
                             const OrbisNetSockaddr* addr, u32 addrlen) {
+#ifdef SHADPS4_UWP
+    const auto residency = Core::AddressSpace::AcquireHostAccess(buf, len);
+#endif
     if (buf == nullptr && len != 0) {
         return SetErrno(ORBIS_NET_EFAULT);
     }

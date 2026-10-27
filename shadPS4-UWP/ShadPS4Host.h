@@ -38,6 +38,7 @@ public:
 
 private:
     void PresentationLoop();
+    void DetachSDL();
     static void __cdecl Log(void* context, uint32_t level, const char* message);
     static void __cdecl ReportError(void* context, const char* message);
     static long __cdecl AttachSwapChain(void* context, void* swapchain);

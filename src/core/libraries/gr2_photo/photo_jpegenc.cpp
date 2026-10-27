@@ -7,6 +7,7 @@
 #include <stb_image_write.h>
 #include "common/alignment.h"
 #include "common/logging/log.h"
+#include "common/scope_exit.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/gr2_photo/photo_gallery.h"
 #include "core/libraries/gr2_photo/photo_jpegenc.h"
@@ -187,6 +188,22 @@ static int PackImage(const OrbisJpegEncEncodeParam* param, std::vector<u8>& pack
     return 3;
 }
 
+// The game draws the photo between creating the encoder and encoding the photo. A draw skipped
+// for a pipeline still compiling would leave the photo black, so those compiles are waited for.
+s32 PS4_SYSV_ABI sceJpegEncCreate(const OrbisJpegEncCreateParam* param, void* memory,
+                                  u32 memory_size, OrbisJpegEncHandle* handle) {
+    const s32 result = Libraries::JpegEnc::sceJpegEncCreate(param, memory, memory_size, handle);
+    if (result == ORBIS_OK) {
+        VideoCore::PhotoReadback::SetCapturing(true);
+    }
+    return result;
+}
+
+s32 PS4_SYSV_ABI sceJpegEncDelete(OrbisJpegEncHandle handle) {
+    VideoCore::PhotoReadback::SetCapturing(false);
+    return Libraries::JpegEnc::sceJpegEncDelete(handle);
+}
+
 s32 PS4_SYSV_ABI sceJpegEncEncode(OrbisJpegEncHandle handle, const OrbisJpegEncEncodeParam* param,
                                   OrbisJpegEncOutputInfo* output_info) {
     if (auto handle_ret = ValidateJpecEngHandle(handle); handle_ret != ORBIS_OK) {
@@ -200,6 +217,11 @@ s32 PS4_SYSV_ABI sceJpegEncEncode(OrbisJpegEncHandle handle, const OrbisJpegEncE
 
     const bool is_photo =
         VideoCore::PhotoReadback::IsArmed(param->image_width, param->image_height);
+    SCOPE_EXIT {
+        if (is_photo) {
+            VideoCore::PhotoReadback::SetCapturing(false);
+        }
+    };
     if (is_photo) {
         ReadPhotoTarget(param);
     }
@@ -245,10 +267,8 @@ s32 PS4_SYSV_ABI sceJpegEncEncode(OrbisJpegEncHandle handle, const OrbisJpegEncE
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    LIB_FUNCTION("K+rocojkr-I", "libSceJpegEnc", 1, "libSceJpegEnc",
-                 Libraries::JpegEnc::sceJpegEncCreate);
-    LIB_FUNCTION("j1LyMdaM+C0", "libSceJpegEnc", 1, "libSceJpegEnc",
-                 Libraries::JpegEnc::sceJpegEncDelete);
+    LIB_FUNCTION("K+rocojkr-I", "libSceJpegEnc", 1, "libSceJpegEnc", sceJpegEncCreate);
+    LIB_FUNCTION("j1LyMdaM+C0", "libSceJpegEnc", 1, "libSceJpegEnc", sceJpegEncDelete);
     LIB_FUNCTION("QbrU0cUghEM", "libSceJpegEnc", 1, "libSceJpegEnc", sceJpegEncEncode);
     LIB_FUNCTION("o6ZgXfFdWXQ", "libSceJpegEnc", 1, "libSceJpegEnc",
                  Libraries::JpegEnc::sceJpegEncQueryMemorySize);

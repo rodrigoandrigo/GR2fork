@@ -168,7 +168,10 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
         const u64 offset_in_page = virtual_addr % GUEST_PAGE_SIZE;
         const u64 copy_size = std::min<u64>(GUEST_PAGE_SIZE - offset_in_page, size);
         if (auto* entry = backing_pages.find(page); entry && *entry) {
-            std::memcpy(dest, *entry + offset_in_page, copy_size);
+#ifdef SHADPS4_UWP
+            if (!AddressSpace::CopyBacking(dest, *entry + offset_in_page, copy_size))
+#endif
+                std::memcpy(dest, *entry + offset_in_page, copy_size);
         } else {
             std::memset(dest, 0, copy_size);
         }
@@ -332,8 +335,8 @@ bool MemoryManager::BackingRangesOverlap(VAddr first, u64 first_size, VAddr seco
             for (; physical != area.phys_areas.end() && physical->first < limit; ++physical) {
                 const auto start = std::max(begin, u64{physical->first});
                 const auto stop = std::min(limit, physical->first + physical->second.size);
-                if (start < stop && overlaps(physical->second.base + start - physical->first,
-                                              stop - start))
+                if (start < stop &&
+                    overlaps(physical->second.base + start - physical->first, stop - start))
                     return true;
             }
         }
@@ -347,10 +350,11 @@ bool MemoryManager::BackingRangesOverlap(VAddr first, u64 first_size, VAddr seco
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
-    const auto image_access = gpu_image_tracking.load(std::memory_order_acquire) &&
-                                      gpu_access_memory != this && rasterizer
-                                  ? rasterizer->AcquireCpuAccess(reinterpret_cast<VAddr>(address), size, true)
-                                  : nullptr;
+    const auto image_access =
+        gpu_image_tracking.load(std::memory_order_acquire) && gpu_access_memory != this &&
+                rasterizer
+            ? rasterizer->AcquireCpuAccess(reinterpret_cast<VAddr>(address), size, true)
+            : nullptr;
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     // Shared lock unless a GuestCopyScope already holds it (see GuestCopyScope).
     std::shared_lock lk{mutex, std::defer_lock};
@@ -373,7 +377,10 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 virtual_addr + size <= e.end) {
                 ++memo.hits;
                 memo.hit_bytes += size;
-                std::memcpy(e.backing + (virtual_addr - e.base), data, size);
+#ifdef SHADPS4_UWP
+                if (!AddressSpace::CopyBacking(e.backing + (virtual_addr - e.base), data, size))
+#endif
+                    std::memcpy(e.backing + (virtual_addr - e.base), data, size);
                 return true;
             }
         }
@@ -417,7 +424,10 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                     ++memo.multi;
                 }
             }
-            memcpy(backing, data, copy_size);
+#ifdef SHADPS4_UWP
+            if (!AddressSpace::CopyBacking(backing, data, copy_size))
+#endif
+                memcpy(backing, data, copy_size);
             data = static_cast<const u8*>(data) + copy_size;
             size -= copy_size;
         }
@@ -1255,8 +1265,8 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
                         end = std::min(end, mapped ? alias->second : alias->first);
                     ASSERT(end > current);
                     const auto carved = CarvePhysArea(dmem_map, current, end - current);
-                    carved->second.dma_type = mapped ? PhysicalMemoryType::Mapped
-                                                   : PhysicalMemoryType::Allocated;
+                    carved->second.dma_type =
+                        mapped ? PhysicalMemoryType::Mapped : PhysicalMemoryType::Allocated;
                     MergeAdjacent(dmem_map, carved);
                     current = end;
                 }

@@ -592,7 +592,10 @@ std::optional<u64> BufferCache::StreamViaLane(VAddr device_addr, u32 size) {
             queued = lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size));
         }
         if (!queued) {
-            std::memcpy(dst, spans[i].ptr, spans[i].size);
+#ifdef SHADPS4_UWP
+            if (!Core::AddressSpace::CopyBacking(dst, spans[i].ptr, spans[i].size))
+#endif
+                std::memcpy(dst, spans[i].ptr, spans[i].size);
         }
         dst += spans[i].size;
     }

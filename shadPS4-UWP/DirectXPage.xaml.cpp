@@ -39,6 +39,7 @@ DirectXPage::DirectXPage() {
     }
 }
 void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
+    UwpDiagnostics::UiStage("page_loaded", reinterpret_cast<IInspectable*>(this));
     UwpDiagnostics::Record("main_page_loaded");
     if (frontend)
         return;
@@ -241,6 +242,7 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
     }));
 }
 void DirectXPage::OnUnloaded(Object ^, RoutedEventArgs ^) {
+    UwpDiagnostics::UiStage("page_unloaded_begin", reinterpret_cast<IInspectable*>(this));
     game_text_request_id = 0;
     if (game_text_dialog)
         game_text_dialog->Hide();
@@ -275,20 +277,35 @@ void DirectXPage::Capture(bool captured) {
         SetPointerMode(pointer_visible);
 }
 void DirectXPage::SetPointerMode(bool visible) {
+    UwpDiagnostics::UiStage("pointer_mode_begin", reinterpret_cast<IInspectable*>(this), visible,
+                            dialog_open);
     pointer_visible = visible;
     if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily != "Windows.Xbox")
         return;
+    UwpDiagnostics::UiStage("pointer_hit_test_begin", reinterpret_cast<IInspectable*>(this),
+                            reinterpret_cast<uintptr_t>(reinterpret_cast<IInspectable*>(interfacePage)),
+                            visible);
     interfacePage->IsHitTestVisible = visible;
+    UwpDiagnostics::UiStage("pointer_tab_stop_begin", reinterpret_cast<IInspectable*>(this), visible);
     interfacePage->IsTabStop = visible;
+    UwpDiagnostics::UiStage("pointer_enable_begin", reinterpret_cast<IInspectable*>(this), visible);
     interfacePage->IsEnabled = visible;
-    if (dialog_open)
+    if (dialog_open) {
+        UwpDiagnostics::UiStage("pointer_mode_deferred_dialog", reinterpret_cast<IInspectable*>(this));
         return;
+    }
     bool focused = false;
     try {
+        UwpDiagnostics::UiStage("pointer_focus_begin", reinterpret_cast<IInspectable*>(this), visible,
+                                Dispatcher->HasThreadAccess);
         focused = visible ? interfacePage->Focus(Windows::UI::Xaml::FocusState::Programmatic)
                           : Focus(Windows::UI::Xaml::FocusState::Programmatic);
         UwpDiagnostics::Record("xbox_pointer_page visible/focused", visible, focused);
+        UwpDiagnostics::UiStage("pointer_focus_end", reinterpret_cast<IInspectable*>(this), visible,
+                                focused);
     } catch (Exception^ error) {
+        UwpDiagnostics::UiStage("pointer_focus_failed", reinterpret_cast<IInspectable*>(this),
+                                static_cast<uint32_t>(error->HResult));
         UwpDiagnostics::Record("xbox_pointer_page_failed hresult", static_cast<uint32_t>(error->HResult));
         UwpDiagnostics::Text(UwpDiagnostics::session_file, "xbox_pointer_page_message", error->Message->Data());
     }

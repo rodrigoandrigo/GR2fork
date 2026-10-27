@@ -111,6 +111,7 @@ enum class BufferType : u8 {
     SamplerTable,
     BufferAddressTable,
     Strmout,
+    StrmoutCounter,
 };
 
 struct BufferResource {

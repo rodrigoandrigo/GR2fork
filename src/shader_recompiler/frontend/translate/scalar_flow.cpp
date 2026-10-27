@@ -83,12 +83,22 @@ void Translator::S_SENDMSG(const GcnInst& inst) {
         case SendMsgSimm::GsOp::Emit:
             ir.EmitVertex();
             break;
+        case SendMsgSimm::GsOp::EmitCut:
+            ir.EmitVertex();
+            ir.EmitPrimitive();
+            break;
         default:
             UNREACHABLE();
         }
         break;
     }
     case SendMsgSimm::Message::GsDone: {
+        if (simm.op == SendMsgSimm::GsOp::Emit || simm.op == SendMsgSimm::GsOp::EmitCut) {
+            ir.EmitVertex();
+        }
+        if (simm.op == SendMsgSimm::GsOp::Cut || simm.op == SendMsgSimm::GsOp::EmitCut) {
+            ir.EmitPrimitive();
+        }
         break;
     }
     default:

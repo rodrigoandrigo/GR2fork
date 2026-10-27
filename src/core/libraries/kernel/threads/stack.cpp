@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#ifdef SHADPS4_UWP
+#include "common/scope_exit.h"
+#endif
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/threads/thread_state.h"
 #include "core/memory.h"
@@ -16,6 +19,12 @@ static constexpr size_t RoundUp(size_t size) {
 }
 
 int ThreadState::CreateStack(PthreadAttr* attr) {
+#ifdef SHADPS4_UWP
+    SCOPE_EXIT {
+        Core::Memory::Instance()->GetAddressSpace().PinMappings(
+            reinterpret_cast<VAddr>(attr->stackaddr_attr), attr->stacksize_attr, true);
+    };
+#endif
     if ((attr->stackaddr_attr) != nullptr) {
         attr->guardsize_attr = 0;
         attr->flags |= PthreadAttrFlags::StackUser;
@@ -120,6 +129,11 @@ int ThreadState::CreateStack(PthreadAttr* attr) {
 }
 
 void ThreadState::FreeStack(PthreadAttr* attr) {
+#ifdef SHADPS4_UWP
+    if (attr)
+        Core::Memory::Instance()->GetAddressSpace().PinMappings(
+            reinterpret_cast<VAddr>(attr->stackaddr_attr), attr->stacksize_attr, false);
+#endif
     if (!attr || True(attr->flags & PthreadAttrFlags::StackUser) || !attr->stackaddr_attr) {
         return;
     }

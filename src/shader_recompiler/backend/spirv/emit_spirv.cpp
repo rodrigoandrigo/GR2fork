@@ -244,17 +244,12 @@ spv::ExecutionMode ExecutionMode(AmdGpu::TessellationType primitive) {
 spv::ExecutionMode ExecutionMode(AmdGpu::TessellationPartitioning spacing) {
     switch (spacing) {
     case AmdGpu::TessellationPartitioning::Integer:
+    case AmdGpu::TessellationPartitioning::Pow2:
         return spv::ExecutionMode::SpacingEqual;
     case AmdGpu::TessellationPartitioning::FracOdd:
         return spv::ExecutionMode::SpacingFractionalOdd;
     case AmdGpu::TessellationPartitioning::FracEven:
         return spv::ExecutionMode::SpacingFractionalEven;
-    case AmdGpu::TessellationPartitioning::Pow2:
-        // Pow2 rounds tessellation factors to the nearest power of 2, which has no
-        // direct Vulkan equivalent. SpacingEqual (integer) is the closest match.
-        LOG_WARNING(Render_Vulkan, "Tessellation partitioning Pow2 has no Vulkan equivalent, "
-                                   "falling back to SpacingEqual");
-        return spv::ExecutionMode::SpacingEqual;
     default:
         break;
     }

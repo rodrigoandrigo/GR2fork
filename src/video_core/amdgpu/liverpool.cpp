@@ -1099,10 +1099,21 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                       magic_enum::enum_name(event->event_type.Value()),
                       magic_enum::enum_name(event->event_index.Value()));
-            if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
-                // TODO: handle proper synchronization, for now signal that update is done
-                // immediately
-                regs.cp_strmout_cntl.offset_update_done = 1;
+            if (event->event_type.Value() == EventType::SoVgtStreamoutFlush ||
+                event->event_type.Value() == EventType::VgtStreamoutSync ||
+                event->event_type.Value() == EventType::VgtStreamoutReset) {
+                VideoCore::StreamCopyLane::Instance().DrainProducer();
+                if (rasterizer) {
+                    rasterizer->Finish();
+                }
+                if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
+                    regs.cp_strmout_cntl.offset_update_done = 1;
+                } else if (event->event_type.Value() == EventType::VgtStreamoutReset) {
+                    for (u32 buffer = 0; buffer < std::size(regs.vgt_strmout_buffers); ++buffer) {
+                        regs.vgt_strmout_buffer_filled_size[buffer] =
+                            regs.vgt_strmout_buffers[buffer].offset;
+                    }
+                }
             } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                 if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                     ++packet_stats.occlusion_events;
@@ -1240,48 +1251,57 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
             const u32 buffer = strmout->buffer_select.Value();
             if (buffer >= std::size(regs.vgt_strmout_buffers)) {
-                LOG_WARNING(Render_Vulkan, "STRMOUT_BUFFER_UPDATE with invalid buffer {}",
-                            buffer);
+                LOG_WARNING(Render_Vulkan, "STRMOUT_BUFFER_UPDATE with invalid buffer {}", buffer);
                 break;
             }
             auto& buffers = regs.vgt_strmout_buffers[buffer];
-            if (strmout->update_memory.Value() == 0) {
-                buffers.offset = strmout->buffer_offset;
-                break;
+            VideoCore::StreamCopyLane::Instance().DrainProducer();
+            if (rasterizer) {
+                rasterizer->Finish();
             }
-            u32 value = 0;
+            const u32 filled = regs.vgt_strmout_buffer_filled_size[buffer];
+            const auto swap = [](u32 value, u32 mode) {
+                switch (mode) {
+                case 1:
+                    return ((value & 0x00FF00FFU) << 8) | ((value >> 8) & 0x00FF00FFU);
+                case 2:
+                    return std::byteswap(value);
+                case 3:
+                    return (value << 16) | (value >> 16);
+                default:
+                    return value;
+                }
+            };
+            u32 offset{};
             switch (strmout->source_select.Value()) {
             case SourceSelect::BufferOffset:
-                value = buffers.offset;
+                offset = strmout->buffer_offset;
                 break;
             case SourceSelect::VgtStrmoutBufferFilledSize:
-                value = regs.vgt_strmout_buffer_filled_size[buffer];
+                offset = filled;
                 break;
             case SourceSelect::SrcAddress:
-                value = *reinterpret_cast<const u32*>(strmout->SrcAddress());
+                std::memcpy(&offset, reinterpret_cast<const void*>(strmout->SrcAddress()),
+                            sizeof(offset));
+                offset = swap(offset, strmout->swap_src.Value());
                 break;
             case SourceSelect::None:
-                LOG_WARNING(Render_Vulkan, "STRMOUT_BUFFER_UPDATE with no source");
                 break;
             }
-            if (strmout->source_select.Value() == SourceSelect::None) {
-                break;
+            if (strmout->source_select.Value() != SourceSelect::None) {
+                if (strmout->offset_in_bytes.Value() &&
+                    strmout->source_select.Value() != SourceSelect::VgtStrmoutBufferFilledSize) {
+                    offset >>= 2;
+                }
+                buffers.offset = offset;
+                regs.vgt_strmout_buffer_filled_size[buffer] = offset;
             }
-            switch (strmout->swap_dst.Value()) {
-            case 1:
-                value = ((value & 0x00FF00FFU) << 8) | ((value >> 8) & 0x00FF00FFU);
-                break;
-            case 2:
-                value = std::byteswap(value);
-                break;
-            case 3:
-                LOG_WARNING(Render_Vulkan, "STRMOUT_BUFFER_UPDATE reserved swap mode");
-                break;
-            default:
-                break;
+            if (strmout->update_memory.Value()) {
+                const u32 value = swap(strmout->offset_in_bytes.Value() ? filled << 2 : filled,
+                                       strmout->swap_dst.Value());
+                CpWriteOrCopy(rasterizer, reinterpret_cast<void*>(strmout->DstAddress()), &value,
+                              sizeof(value));
             }
-            CpWriteOrCopy(rasterizer, reinterpret_cast<void*>(strmout->DstAddress()), &value,
-                          sizeof(value));
             break;
         }
         case PM4ItOpcode::GetLodStats: {

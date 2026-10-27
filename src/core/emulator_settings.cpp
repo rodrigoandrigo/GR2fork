@@ -472,6 +472,9 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 mergeGroup(m_input, "Input");
                 mergeGroup(m_audio, "Audio");
                 mergeGroup(m_gpu, "GPU");
+                if (gj.contains("GPU") && !gj["GPU"].contains("pipeline_sync_budget_ms")) {
+                    m_gpu.readback_offload.value = true;
+                }
                 mergeGroup(m_vulkan, "Vulkan");
 
                 if (const json launcher = TranslateLauncherGyroKeys(gj); !launcher.empty()) {
@@ -479,6 +482,8 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                     current.update(launcher);
                     m_input = current.get<InputSettings>();
                 }
+                if (gj.contains("GPU") && !gj["GPU"].contains("pipeline_sync_budget_ms") && !Save())
+                    return false;
             } else {
                 if (std::filesystem::exists(Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
                                             "config.toml")) {

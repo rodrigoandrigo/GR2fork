@@ -129,6 +129,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     HRESULT Attach(IDXGISwapChain* chain);
     std::shared_ptr<ShadPS4Host> core;
     bool game_surface{}, game_running{}, menu_open{true}, menu_pressed{};
+    bool overlay_visible{true};
     bool session_pending{}, session_paused{};
     uint64_t text_input_id{};
     std::deque<std::function<void()>> text_input_results;

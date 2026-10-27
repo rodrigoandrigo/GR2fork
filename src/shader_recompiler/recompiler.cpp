@@ -122,6 +122,12 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
             buffer.is_written = true;
             program.info.buffers.push_back(buffer);
         }
+        Shader::BufferResource counter;
+        counter.used_types = IR::Type::U32;
+        counter.buffer_type = Shader::BufferType::StrmoutCounter;
+        counter.is_written = true;
+        counter.is_coherent = true;
+        program.info.buffers.push_back(counter);
     }
     Shader::Optimization::PhiSimplificationPass(program);
     Shader::Optimization::InverseBallotEliminationPass(program);

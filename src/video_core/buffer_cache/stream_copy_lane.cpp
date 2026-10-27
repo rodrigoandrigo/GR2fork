@@ -10,6 +10,9 @@
 #endif
 #include "common/cpu_pause.h"
 #include "common/thread.h"
+#ifdef SHADPS4_UWP
+#include "core/address_space.h"
+#endif
 #include "video_core/buffer_cache/stream_copy_lane.h"
 
 namespace VideoCore {
@@ -143,7 +146,10 @@ bool StreamCopyLane::ClaimAndCopy() {
     // lap later, and the payload bytes are ordered by the caller's completion
     // store, which every drain waiter reads with acquire.
     slot->seq.store(pos + kRingSlots, std::memory_order_release);
-    std::memcpy(job.dst, job.src, job.size);
+#ifdef SHADPS4_UWP
+    if (!Core::AddressSpace::CopyBacking(job.dst, job.src, job.size))
+#endif
+        std::memcpy(job.dst, job.src, job.size);
     // dst is the write-combined staging ring. The tail of the copy can sit in
     // this core's WC buffer past the completion store below (a plain mov that
     // flushes nothing), and an idle worker then pause-spins with no fence or

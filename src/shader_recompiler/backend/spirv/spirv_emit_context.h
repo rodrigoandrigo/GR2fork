@@ -355,6 +355,7 @@ public:
     boost::container::small_vector<BufferDefinition, 16> buffers;
     boost::container::small_vector<u32, 4> strmout_buffers;
     Id strmout_vertex{};
+    u32 strmout_counter{UINT32_MAX};
     boost::container::small_vector<TextureDefinition, 8> images;
     boost::container::small_vector<Id, 4> samplers;
     std::unordered_map<u32, Id> first_to_last_label_map;

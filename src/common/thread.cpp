@@ -269,7 +269,11 @@ void AccurateTimer::End() {
 std::string GetCurrentThreadName() {
     using namespace Libraries::Kernel;
     if (g_curthread && !g_curthread->name.empty()) {
-        if (g_curthread->tcb->tcb_fiber) {
+#ifdef SHADPS4_UWP
+        if (g_curthread->critical_count.load(std::memory_order_relaxed) != 0)
+            return g_curthread->name;
+#endif
+        if (g_curthread->tcb && g_curthread->tcb->tcb_fiber) {
             return fmt::format("{}@@{}", g_curthread->name,
                                g_curthread->tcb->tcb_fiber->current_fiber->name);
         }

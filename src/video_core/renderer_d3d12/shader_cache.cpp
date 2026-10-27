@@ -357,47 +357,6 @@ void ApplySampleMasks(std::string& source, bool sample_shading) {
         source += "ShadMsaaOutput output;\n";
     source += "output." + coverage + "\nreturn output;\n}\n";
 }
-void ApplyDepthBounds(std::string& source) {
-    auto entry = source.find(" main(");
-    if (entry == std::string::npos)
-        throw std::runtime_error("Missing HLSL fragment entry point");
-    const auto close = source.find(')', entry);
-    if (close == std::string::npos)
-        throw std::runtime_error("Invalid HLSL fragment entry point");
-    std::string position;
-    if (source.find("struct SPIRV_Cross_Input") != std::string::npos) {
-        const auto member = SemanticMember(source, "SPIRV_Cross_Input", "SV_Position");
-        if (!member.empty())
-            position = "input." + member;
-    }
-    if (position.empty()) {
-        const auto semantic = source.find(": SV_Position", entry);
-        if (semantic != std::string::npos && semantic < close) {
-            size_t last = semantic;
-            while (last > entry && std::isspace(static_cast<unsigned char>(source[last - 1])))
-                --last;
-            size_t first = last;
-            while (first > entry && (std::isalnum(static_cast<unsigned char>(source[first - 1])) ||
-                                     source[first - 1] == '_'))
-                --first;
-            if (first != last)
-                position = source.substr(first, last - first);
-        }
-    }
-    if (position.empty()) {
-        position = "shadDepthPosition";
-        source.insert(close, "float4 shadDepthPosition : SV_Position");
-    }
-    const auto bol = source.rfind('\n', entry);
-    source.insert(bol == std::string::npos ? 0 : bol + 1,
-                  "cbuffer ShadDepthBounds : register(b4, space0) { float2 shadDepthBounds; };\n");
-    const auto reopened = source.find(" main(");
-    const auto body = source.find('{', source.find(')', reopened));
-    if (body == std::string::npos)
-        throw std::runtime_error("Invalid HLSL fragment entry point");
-    source.insert(body + 1, "\nif (" + position + ".z < shadDepthBounds.x || " + position +
-                                ".z > shadDepthBounds.y) discard;\n");
-}
 const wchar_t* Target(Shader::SwStage stage, D3D_SHADER_MODEL model) {
     switch (stage) {
     case Shader::SwStage::Vertex:
@@ -486,6 +445,19 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     profile.supports_image_sample_min_lod = true;
     profile.needs_unified_buffer_types = true;
     profile.needs_buffer_offsets = true;
+}
+void TessellationLink::ValidateNativeTopology() const {
+    if (u32(type) > u32(AmdGpu::TessellationType::Quad))
+        throw std::runtime_error("Invalid native tessellation domain");
+    if (u32(topology) > u32(AmdGpu::TessellationTopology::TriangleCcw))
+        throw std::runtime_error("Invalid native tessellation output topology");
+    if ((type == AmdGpu::TessellationType::Isoline &&
+         topology != AmdGpu::TessellationTopology::Line &&
+         topology != AmdGpu::TessellationTopology::Point) ||
+        (type != AmdGpu::TessellationType::Isoline &&
+         topology == AmdGpu::TessellationTopology::Line))
+        throw std::runtime_error(
+            "Guest tessellation domain/topology pair has no defined D3D12 connectivity lowering");
 }
 CompiledShader ShaderCache::Compile(Shader::ShaderParams params, Shader::RuntimeInfo runtime,
                                     Shader::Backend::Bindings bindings, bool flip_y,
@@ -684,6 +656,10 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     bool depth_bounds, bool flip_x) {
     if (words.size() < 5 || words.size() > 4 * 1024 * 1024 || words[0] != spv::MagicNumber)
         throw std::runtime_error("Invalid guest SPIR-V module");
+    if (depth_bounds)
+        throw std::runtime_error("Depth bounds requires output-merger state");
+    if (tessellation_link)
+        tessellation_link->ValidateNativeTopology();
     bool subgroup{};
     bool quad_only = true;
     for (size_t offset = 5; offset < words.size();) {
@@ -851,11 +827,6 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
         if (stage != Shader::SwStage::Fragment)
             throw std::runtime_error("Sample masks require a fragment shader");
         ApplySampleMasks(result->hlsl, sample_shading);
-    }
-    if (depth_bounds) {
-        if (stage != Shader::SwStage::Fragment)
-            throw std::runtime_error("Depth bounds require a fragment shader");
-        ApplyDepthBounds(result->hlsl);
     }
     if (stage == Shader::SwStage::Compute && shader_model >= D3D_SHADER_MODEL_6_6) {
         const auto entry = result->hlsl.find("[numthreads(");
@@ -1412,6 +1383,7 @@ void ShaderCache::CompileNativeSpirv(std::span<const u32> words, ShaderBinary& b
         }
         switch (link->partitioning) {
         case AmdGpu::TessellationPartitioning::Integer:
+        case AmdGpu::TessellationPartitioning::Pow2:
             config.tessellation_spacing = 1;
             break;
         case AmdGpu::TessellationPartitioning::FracOdd:
@@ -1421,18 +1393,12 @@ void ShaderCache::CompileNativeSpirv(std::span<const u32> words, ShaderBinary& b
             config.tessellation_spacing = 3;
             break;
         default:
-            throw std::runtime_error("Native tessellation partitioning requires factor emulation");
+            throw std::runtime_error("Invalid native tessellation partitioning");
         }
         config.tessellation_input_control_points = link->input_control_points;
         config.tessellation_output_control_points = link->output_control_points;
         config.tessellation_ccw = link->topology == AmdGpu::TessellationTopology::TriangleCcw;
         config.tessellation_point_mode = link->topology == AmdGpu::TessellationTopology::Point;
-        if ((link->type == AmdGpu::TessellationType::Isoline &&
-             link->topology != AmdGpu::TessellationTopology::Line &&
-             !config.tessellation_point_mode) ||
-            (link->type != AmdGpu::TessellationType::Isoline &&
-             link->topology == AmdGpu::TessellationTopology::Line))
-            throw std::runtime_error("Native tessellation topology requires geometry expansion");
     }
     config.yz_flip.mode = flip_y ? DXIL_SPIRV_Y_FLIP_UNCONDITIONAL : DXIL_SPIRV_YZ_FLIP_NONE;
     if (flip_x)

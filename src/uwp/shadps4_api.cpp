@@ -16,6 +16,7 @@
 #include <winrt/base.h>
 #include "common/key_manager.h"
 #include "common/logging/log.h"
+#include "core/address_space.h"
 #include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
@@ -206,6 +207,7 @@ int32_t shadps4_shutdown() {
     }
     try {
         stop_requested.store(true);
+        Core::AddressSpace::StopPager();
         Core::Uwp::StopGamepadInput();
         std::scoped_lock lock{presentation_mutex};
         if (native_presentation)

@@ -1,5 +1,6 @@
 #include <unknwn.h>
 #include "uwp/brokered_fs.h"
+#include "core/address_space.h"
 
 #include <algorithm>
 #include <array>
@@ -245,6 +246,7 @@ s64 BrokeredFile::Transfer(void* data, u64 size, bool write) {
     while (total < size) {
         const auto count = static_cast<uint32_t>(std::min<u64>(size - total, 1024 * 1024));
         auto* bytes = static_cast<uint8_t*>(data) + total;
+        const auto residency = AddressSpace::AcquireHostAccess(bytes, count);
         DWORD transferred{};
         if (stream) {
             if (write) {

@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <cstring>
 #include "common/types.h"
+#ifdef SHADPS4_UWP
+#include "core/address_space.h"
+#endif
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -16,6 +19,10 @@ namespace Common {
 /// Copies from write-combined memory, such as a host mapping of video memory, with streaming
 /// loads that fetch whole cache lines; plain memcpy where the build has no AVX2.
 inline void StreamCopy(void* dst, const void* src, size_t size) {
+#ifdef SHADPS4_UWP
+    if (Core::AddressSpace::CopyBacking(dst, src, size))
+        return;
+#endif
 #if defined(__AVX2__)
     auto* d = static_cast<u8*>(dst);
     const auto* s = static_cast<const u8*>(src);

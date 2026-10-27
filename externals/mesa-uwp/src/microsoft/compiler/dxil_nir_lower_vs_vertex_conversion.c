@@ -71,7 +71,7 @@ from_10_10_10_2_snorm(nir_builder *b, nir_def *src, nir_def *lshift)
                                          1.0f / 0x1ff,
                                          1.0f / 0x1ff,
                                          1.0f);
-   return nir_fmul(b, split, scale_rgb);
+   return nir_fmax(b, nir_fmul(b, split, scale_rgb), nir_imm_float(b, -1.0f));
 }
 
 static nir_def *
@@ -118,6 +118,15 @@ lower_vs_vertex_conversion_impl(nir_builder *b, nir_instr *instr, void *options)
       nir_def *src = nir_channel(b, &intr->def, 0);
 
       switch (fmt) {
+      case PIPE_FORMAT_R10G10B10A2_SINT:
+         return nir_ishr(b, nir_ishl(b, src, lshift_rgba(b)),
+                         nir_imm_ivec4(b, 22, 22, 22, 30));
+      case PIPE_FORMAT_B10G10R10A2_SINT:
+         return nir_ishr(b, nir_ishl(b, src, lshift_bgra(b)),
+                         nir_imm_ivec4(b, 22, 22, 22, 30));
+      case PIPE_FORMAT_B10G10R10A2_UINT:
+         return nir_ushr(b, nir_ishl(b, src, lshift_bgra(b)),
+                         nir_imm_ivec4(b, 22, 22, 22, 30));
       case PIPE_FORMAT_R10G10B10A2_SNORM:
          return from_10_10_10_2_snorm(b, src, lshift_rgba(b));
       case PIPE_FORMAT_B10G10R10A2_SNORM:

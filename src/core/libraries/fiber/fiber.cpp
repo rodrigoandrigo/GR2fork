@@ -8,6 +8,9 @@
 #include "core/libraries/fiber/fiber_error.h"
 #include "core/libraries/libs.h"
 #include "core/tls.h"
+#ifdef SHADPS4_UWP
+#include "core/memory.h"
+#endif
 
 namespace Libraries::Fiber {
 
@@ -57,6 +60,10 @@ s32 PS4_SYSV_ABI _sceFiberAttachContext(OrbisFiber* fiber, void* addr_context, u
         return ORBIS_FIBER_ERROR_INVALID;
     }
 
+#ifdef SHADPS4_UWP
+    Core::Memory::Instance()->GetAddressSpace().PinMappings(reinterpret_cast<VAddr>(addr_context),
+                                                            size_context, true);
+#endif
     fiber->addr_context = addr_context;
     fiber->size_context = size_context;
     fiber->context_start = addr_context;
@@ -184,6 +191,11 @@ s32 PS4_SYSV_ABI sceFiberInitializeImpl(OrbisFiber* fiber, const char* name, Orb
         user_flags |= FiberFlags::ContextSizeCheck;
     }
 
+#ifdef SHADPS4_UWP
+    auto& space = Core::Memory::Instance()->GetAddressSpace();
+    space.PinMappings(reinterpret_cast<VAddr>(fiber), sizeof(*fiber), true);
+    space.PinMappings(reinterpret_cast<VAddr>(addr_context), size_context, true);
+#endif
     strncpy(fiber->name, name, ORBIS_FIBER_MAX_NAME_LENGTH);
 
     fiber->entry = entry;
@@ -253,6 +265,12 @@ s32 PS4_SYSV_ABI sceFiberFinalize(OrbisFiber* fiber) {
     if (!fiber->state.compare_exchange_strong(expected, FiberState::Terminated)) {
         return ORBIS_FIBER_ERROR_STATE;
     }
+
+#ifdef SHADPS4_UWP
+    auto& space = Core::Memory::Instance()->GetAddressSpace();
+    space.PinMappings(reinterpret_cast<VAddr>(fiber->addr_context), fiber->size_context, false);
+    space.PinMappings(reinterpret_cast<VAddr>(fiber), sizeof(*fiber), false);
+#endif
 
     return ORBIS_OK;
 }

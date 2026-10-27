@@ -680,6 +680,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     // Initialize components
     memory = Core::Memory::Instance();
+#ifdef SHADPS4_UWP
+    AddressSpace::StartPager();
+#endif
     controllers = Common::Singleton<Input::GameControllers>::Instance();
     linker = Common::Singleton<Core::Linker>::Instance();
 
@@ -852,6 +855,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
 #ifdef SHADPS4_UWP
 void Emulator::StopGuest() {
+    AddressSpace::StopPager();
     Uwp::SetGuestReady(false);
     Uwp::StopGuestWorkers();
     Libraries::Np::NpAuth::Shutdown();

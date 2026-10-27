@@ -39,6 +39,7 @@ struct CompiledShader {
     std::map<u32, std::vector<u32>> image_address_tables{};
 };
 struct TessellationLink {
+    void ValidateNativeTopology() const;
     AmdGpu::TessellationType type;
     AmdGpu::TessellationPartitioning partitioning;
     AmdGpu::TessellationTopology topology;

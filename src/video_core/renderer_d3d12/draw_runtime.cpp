@@ -22,8 +22,85 @@
 namespace D3D12 {
 namespace {
 Profile profile;
-std::vector<u8> PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3DBlob* root) {
-    std::vector<u8> key{1};
+template <typename T, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type>
+struct alignas(void*) PipelinePart {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type{Type};
+    T value;
+    PipelinePart(const T& data) : value{data} {}
+};
+HRESULT CreateGraphicsPipeline(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                               bool depth_bounds, ID3D12PipelineState** state) {
+    if (!depth_bounds)
+        return device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(state));
+    Microsoft::WRL::ComPtr<ID3D12Device2> extended;
+    const HRESULT result = device->QueryInterface(IID_PPV_ARGS(&extended));
+    if (FAILED(result))
+        return result;
+    const auto& original = desc.DepthStencilState;
+    const D3D12_DEPTH_STENCIL_DESC1 depth{
+        original.DepthEnable,   original.DepthWriteMask,  original.DepthFunc,
+        original.StencilEnable, original.StencilReadMask, original.StencilWriteMask,
+        original.FrontFace,     original.BackFace,        TRUE};
+    D3D12_RT_FORMAT_ARRAY formats{};
+    formats.NumRenderTargets = desc.NumRenderTargets;
+    std::copy_n(desc.RTVFormats, 8, formats.RTFormats);
+    struct {
+        PipelinePart<ID3D12RootSignature*, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE> root;
+        PipelinePart<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS> vs;
+        PipelinePart<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS> ps;
+        PipelinePart<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS> ds;
+        PipelinePart<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS> hs;
+        PipelinePart<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS> gs;
+        PipelinePart<D3D12_STREAM_OUTPUT_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT>
+            so;
+        PipelinePart<D3D12_BLEND_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND> blend;
+        PipelinePart<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK> mask;
+        PipelinePart<D3D12_RASTERIZER_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER> raster;
+        PipelinePart<D3D12_DEPTH_STENCIL_DESC1, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1>
+            depth;
+        PipelinePart<D3D12_INPUT_LAYOUT_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT>
+            inputs;
+        PipelinePart<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
+                     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE>
+            cut;
+        PipelinePart<D3D12_PRIMITIVE_TOPOLOGY_TYPE,
+                     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY>
+            topology;
+        PipelinePart<D3D12_RT_FORMAT_ARRAY,
+                     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS>
+            formats;
+        PipelinePart<DXGI_FORMAT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT> dsv;
+        PipelinePart<DXGI_SAMPLE_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC> samples;
+        PipelinePart<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK> node;
+        PipelinePart<D3D12_CACHED_PIPELINE_STATE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO>
+            cache;
+        PipelinePart<D3D12_PIPELINE_STATE_FLAGS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS> flags;
+    } stream{desc.pRootSignature,
+             desc.VS,
+             desc.PS,
+             desc.DS,
+             desc.HS,
+             desc.GS,
+             desc.StreamOutput,
+             desc.BlendState,
+             desc.SampleMask,
+             desc.RasterizerState,
+             depth,
+             desc.InputLayout,
+             desc.IBStripCutValue,
+             desc.PrimitiveTopologyType,
+             formats,
+             desc.DSVFormat,
+             desc.SampleDesc,
+             desc.NodeMask,
+             desc.CachedPSO,
+             desc.Flags};
+    const D3D12_PIPELINE_STATE_STREAM_DESC description{sizeof(stream), &stream};
+    return extended->CreatePipelineState(&description, IID_PPV_ARGS(state));
+}
+std::vector<u8> PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3DBlob* root,
+                            bool depth_bounds = false) {
+    std::vector<u8> key{2, u8(depth_bounds)};
     const auto integer = [&](u64 value) {
         for (u32 i = 0; i < 8; ++i)
             key.push_back(static_cast<u8>(value >> (i * 8)));
@@ -149,7 +226,166 @@ u64 CommandRuntime::GsInvocations(D3D_PRIMITIVE_TOPOLOGY topology, u64 count) {
 void CommandRuntime::Draw(const DrawRequest& request) {
     ProfileSample(profile, "runtime_draw", 128, [&] { DrawImpl(request); });
 }
+void CommandRuntime::DrawDepthGated(const DrawRequest& request) {
+    std::scoped_lock lock{mutex};
+    if (!request.count || !request.instances)
+        return;
+    if (request.geometry || request.hull || request.indirect || request.expansion ||
+        request.point_fill || request.line_expand ||
+        std::ranges::any_of(request.strmout, [](const auto& slot) { return slot.size != 0; }))
+        throw std::runtime_error(
+            "Ordered depth-result color gating requires unexpanded primitives");
+    if ((request.index_address || request.index_buffer_bound) && request.converted_indices.empty())
+        throw std::runtime_error("Ordered depth-result color gating requires decoded indices");
+    if (request.count > 4 * 1024 * 1024 ||
+        (!request.converted_indices.empty() && request.count != request.converted_indices.size()))
+        throw std::runtime_error("Invalid ordered depth-result primitive range");
+    const auto writes_memory = [](const Shader::Info& info) {
+        return info.uses_dma || info.has_storage_images ||
+               std::ranges::any_of(info.buffers,
+                                   [](const auto& buffer) { return buffer.is_written; }) ||
+               std::ranges::any_of(info.images, [](const auto& image) {
+                   return image.is_written || image.is_atomic;
+               });
+    };
+    const auto vertex = shaders.Translate(request.vertex, request.vertex_runtime);
+    if (writes_memory(vertex->shader.info))
+        throw std::runtime_error("Depth-result gating needs capture of vertex side effects");
+    const auto fragment = request.fragment.code.empty()
+                              ? nullptr
+                              : shaders.Translate(request.fragment, request.fragment_runtime);
+    const bool storage = fragment && writes_memory(fragment->shader.info);
+    if (storage) {
+        const auto& info = fragment->shader.info;
+        if (request.samples != 1 || request.alpha_to_coverage || request.depth_bounds ||
+            info.has_discard || info.stores.Get(Shader::IR::Attribute::Depth) ||
+            info.stores.Get(Shader::IR::Attribute::SampleMask) ||
+            info.stores.Get(Shader::IR::Attribute::StencilRef))
+            throw std::runtime_error(
+                "Depth-result gating needs capture of fragment coverage/depth");
+        const auto ranges = GetShaderResourceRanges(info);
+        for (const auto& range : ranges) {
+            const auto aliases = [&](VAddr address, u64 size) {
+                return resources.Aliases(address, size, range.address, range.size);
+            };
+            if (request.depth_image &&
+                (aliases(request.depth_image->guest_address, request.depth_image->guest_size) ||
+                 aliases(request.depth_image->stencil_addr, request.depth_image->stencil_size) ||
+                 aliases(request.depth_read_address, request.depth_image->guest_size) ||
+                 aliases(request.stencil_read_address, request.depth_image->stencil_size)))
+                throw std::runtime_error(
+                    "Depth-result gating needs ordered depth/stencil feedback");
+            if (range.written && request.index_address &&
+                aliases(request.index_address,
+                        u64(request.count) *
+                            (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)))
+                throw std::runtime_error("Depth-result gating needs coherent index capture");
+        }
+    }
+    AmdGpu::PrimitiveType primitive;
+    u32 vertices;
+    switch (request.topology) {
+    case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+        primitive = AmdGpu::PrimitiveType::PointList;
+        vertices = 1;
+        break;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+        primitive = request.topology == D3D_PRIMITIVE_TOPOLOGY_LINELIST
+                        ? AmdGpu::PrimitiveType::LineList
+                        : AmdGpu::PrimitiveType::LineStrip;
+        vertices = 2;
+        break;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+        primitive = request.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+                        ? AmdGpu::PrimitiveType::TriangleList
+                        : AmdGpu::PrimitiveType::TriangleStrip;
+        vertices = 3;
+        break;
+    default:
+        throw std::runtime_error("Unsupported ordered depth-result primitive topology");
+    }
+    std::vector<u32> source = request.converted_indices;
+    if (source.empty()) {
+        source.resize(request.count);
+        for (u32 index = 0; index < request.count; ++index)
+            source[index] = request.first_vertex + index;
+    }
+    const auto restart = request.strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF
+                             ? std::optional<u32>{0xffff}
+                         : request.strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
+                             ? std::optional<u32>{UINT32_MAX}
+                             : std::nullopt;
+    const auto indices =
+        ConvertPrimitiveIndices(primitive, source, restart, request.provoking_last);
+    const auto inverse = [](D3D12_COMPARISON_FUNC value) {
+        if (value < D3D12_COMPARISON_FUNC_NEVER || value > D3D12_COMPARISON_FUNC_ALWAYS)
+            throw std::runtime_error("Invalid guest comparison function");
+        return D3D12_COMPARISON_FUNC(9 - u32(value));
+    };
+    const auto keep_stencil = [](D3D12_DEPTH_STENCILOP_DESC& face) {
+        face.StencilFailOp = face.StencilDepthFailOp = face.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    };
+    bool first = true;
+    const auto run = [&](DrawRequest pass) {
+        if (!first) {
+            pass.clear_depth = pass.clear_stencil = false;
+            pass.color_clear_buffers.clear();
+        }
+        DrawImpl(pass);
+        first = false;
+    };
+    for (u32 instance = 0; instance < request.instances; ++instance) {
+        for (size_t index = 0; index < indices.size(); index += vertices) {
+            auto pass = request;
+            pass.depth_gated = false;
+            pass.instances = 1;
+            pass.first_instance += instance;
+            pass.count = vertices;
+            pass.converted_indices.assign(indices.begin() + index,
+                                          indices.begin() + index + vertices);
+            if (request.converted_indices.empty())
+                pass.base_vertex = 0;
+            pass.index_address = 0;
+            pass.index_buffer_bound = false;
+            pass.index_capacity = pass.index_read_count = UINT32_MAX;
+            pass.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+            pass.topology = vertices == 1   ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST
+                            : vertices == 2 ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
+                                            : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+            if (storage)
+                pass.fragment_runtime.hw.fs.depth_before_shader = true;
+            auto fail = pass;
+            fail.depth.DepthFunc = inverse(fail.depth.DepthFunc);
+            fail.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            keep_stencil(fail.depth.FrontFace);
+            keep_stencil(fail.depth.BackFace);
+            for (u32 target = 0; target < 8; ++target)
+                fail.blend.RenderTarget[target].RenderTargetWriteMask =
+                    request.depth_fail_masks[target];
+            if (storage && request.depth.StencilEnable &&
+                !request.fragment_runtime.hw.fs.depth_before_shader) {
+                auto stencil_fail = fail;
+                stencil_fail.depth.DepthEnable = FALSE;
+                stencil_fail.depth.FrontFace.StencilFunc =
+                    inverse(stencil_fail.depth.FrontFace.StencilFunc);
+                stencil_fail.depth.BackFace.StencilFunc =
+                    inverse(stencil_fail.depth.BackFace.StencilFunc);
+                for (auto& blend : stencil_fail.blend.RenderTarget)
+                    blend.RenderTargetWriteMask = 0;
+                run(std::move(stencil_fail));
+            }
+            run(std::move(fail));
+            run(std::move(pass));
+        }
+    }
+}
 void CommandRuntime::DrawImpl(const DrawRequest& request) {
+    if (request.depth_gated) {
+        DrawDepthGated(request);
+        return;
+    }
     const u32 sample_iterations = request.sample_iterations ? request.sample_iterations
                                   : request.sample_shading  ? request.samples
                                                             : 1u;
@@ -226,6 +462,9 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                  u64(index_read_count) * (request.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4)});
         for (const auto& color : request.colors)
             writes.push_back({color.guest_address, color.guest_size});
+        for (const auto& slot : request.strmout)
+            if (slot.address && slot.size)
+                writes.push_back({slot.address, slot.size});
         if (request.depth_image) {
             const auto& depth = *request.depth_image;
             writes.push_back({depth.guest_address, depth.guest_size});
@@ -251,15 +490,25 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     if (!std::has_single_bit(request.samples) || request.samples > 16 ||
         request.colors.size() > 8 || request.color_slots.size() != request.colors.size() ||
         request.color_base_slice.size() != request.colors.size() ||
-        ((request.depth.DepthEnable || request.depth.StencilEnable) && !request.depth_image) ||
-        (!request.depth.DepthEnable && !request.depth.StencilEnable && request.depth_image) ||
+        ((request.depth.DepthEnable || request.depth.StencilEnable || request.depth_bounds) &&
+         !request.depth_image) ||
+        (!request.depth.DepthEnable && !request.depth.StencilEnable && !request.depth_bounds &&
+         request.depth_image) ||
         request.vertex_runtime.sw_stage != Shader::SwStage::Vertex ||
         request.fragment_runtime.sw_stage != Shader::SwStage::Fragment ||
         (request.geometry && request.geometry_runtime.sw_stage != Shader::SwStage::Geometry) ||
         (!request.converted_indices.empty() && request.count != request.converted_indices.size()) ||
-        request.hull.has_value() != request.domain.has_value() ||
-        (request.depth_bounds && request.fragment.code.empty()))
+        request.hull.has_value() != request.domain.has_value())
         throw std::runtime_error("Invalid or unsupported D3D12 guest graphics state");
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> depth_bounds_commands;
+    if (request.depth_bounds) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS2 options{};
+        if (FAILED(device.Device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &options,
+                                                        sizeof(options))) ||
+            !options.DepthBoundsTestSupported)
+            throw std::runtime_error("Guest depth bounds requires native stored-depth testing");
+        winrt::check_hresult(commands.As(&depth_bounds_commands));
+    }
     Shader::Backend::Bindings next_bindings{};
     auto vertex_runtime = request.vertex_runtime;
     auto domain_runtime = request.domain_runtime;
@@ -270,12 +519,14 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     if (request.hull) {
         if (request.hull_runtime.sw_stage != Shader::SwStage::TessellationControl ||
             domain_runtime.sw_stage != Shader::SwStage::TessellationEval ||
+            request.hull_runtime.sw.tcs.tess_type != domain_runtime.sw.tes.tess_type ||
             vertex_runtime.hw_stage != Shader::HwStage::Local)
             throw std::runtime_error("Invalid native tessellation stage configuration");
         tessellation_link.emplace(TessellationLink{
             domain_runtime.sw.tes.tess_type, domain_runtime.sw.tes.tess_partitioning,
             domain_runtime.sw.tes.tess_topology,
             request.hull_runtime.sw.tcs.num_input_control_points, 0});
+        tessellation_link->ValidateNativeTopology();
         translated_hull = shaders.Translate(*request.hull, request.hull_runtime);
         Shader::TessellationDataConstantBuffer constants{};
         translated_hull->shader.info.ReadTessConstantBuffer(constants);
@@ -433,27 +684,9 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             request.line_pattern_msb, request.line_pattern_scale, request.line_viewport_dims,
             request.line_cull, capture_geometry);
     }
-    if (request.geometry) {
-        const bool strmout_active = std::any_of(request.strmout.begin(), request.strmout.end(),
-                                                [](const auto& slot) { return slot.address != 0; });
-        if (strmout_active) {
-            if (!geometry->info.gs_emit_vertices)
-                throw std::runtime_error("D3D12 stream-out capture requires vertex emissions");
-            const u64 partitions = GsInvocations(request.topology, request.count);
-            if (!partitions)
-                throw std::runtime_error("Guest stream-out draw has no geometry partitions");
-            const auto& gs_info = request.geometry_runtime.hw.gs;
-            const u64 written =
-                partitions * u64(request.instances) * u64(gs_info.num_invocations) *
-                std::min(u64(geometry->info.gs_emit_vertices), u64(gs_info.output_vertices));
-            strmout_filled = u32(std::min<u64>(written, request.strmout[0].size /
-                                                            (u64(gs_info.strmout_stride) * 4)));
-        }
-    }
     if (!request.fragment.code.empty()) {
         fragment.emplace(compile_stage(std::move(translated_fragment), end_bindings, false,
-                                       request.samples > 1, sample_iterations > 1,
-                                       request.depth_bounds, false));
+                                       request.samples > 1, sample_iterations > 1, false, false));
         if (std::any_of(logic_formats.begin(), logic_formats.end(),
                         [](auto format) { return format != DXGI_FORMAT_UNKNOWN; }))
             fragment->binary =
@@ -461,27 +694,6 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         stages.push_back(&*fragment);
     } else if (!request.colors.empty())
         throw std::runtime_error("D3D12 color rendering requires a fragment shader");
-    if (request.depth_gated) {
-        const auto writes_memory = [](const CompiledShader& shader) {
-            const auto& info = shader.info;
-            return info.uses_dma || info.has_storage_images ||
-                   info.uses_buffer_atomic_float_min_max || info.uses_image_atomic_float_min_max ||
-                   std::any_of(info.buffers.begin(), info.buffers.end(),
-                               [](const auto& buffer) {
-                                   // Stream-out capture only writes in the final pass; the
-                                   // depth-fail pass binds a null UAV for it.
-                                   return buffer.is_written &&
-                                          buffer.buffer_type != Shader::BufferType::Strmout;
-                               }) ||
-                   std::any_of(info.images.begin(), info.images.end(), [](const auto& image) {
-                       return image.is_written || image.is_atomic;
-                   });
-        };
-        if (std::any_of(stages.begin(), stages.end(),
-                        [&](const CompiledShader* shader) { return writes_memory(*shader); }))
-            throw std::runtime_error(
-                "Guest depth-result color write gating requires side-effect-free shaders");
-    }
     PrepareContext(stages);
     if (request.indirect &&
         (request.geometry || request.hull || request.rectangles || request.clear_depth ||
@@ -813,14 +1025,6 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         masks.Constants = {3, 0, 4};
         parameters.push_back(masks);
     }
-    u32 bounds_slot = UINT32_MAX;
-    if (request.depth_bounds) {
-        D3D12_ROOT_PARAMETER bounds{};
-        bounds.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        bounds.Constants = {4, 0, 2};
-        bounds_slot = u32(parameters.size());
-        parameters.push_back(bounds);
-    }
     const auto add_table = [&](const auto& ranges) {
         const u32 slot = parameters.size();
         if (!ranges.empty()) {
@@ -1058,13 +1262,12 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     if (first_pipeline)
         LOG_INFO(Core, "[UWP stage] first graphics pipeline creation begin");
     auto& cached = GetPipeline(
-        PipelineKey(desc, blob.Get()), blob.Get(),
+        PipelineKey(desc, blob.Get(), request.depth_bounds), blob.Get(),
         [&](auto* root, auto** state, D3D12_CACHED_PIPELINE_STATE cached) {
             desc.pRootSignature = root;
             desc.CachedPSO = cached;
             const HRESULT created = ProfileSample(profile, "pso_create", 128, [&] {
-                return device.Device()->CreateGraphicsPipelineState(
-                    &desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(state));
+                return CreateGraphicsPipeline(device.Device(), desc, request.depth_bounds, state);
             });
             return created;
         });
@@ -1215,11 +1418,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     if (request.samples > 1)
         commands->SetGraphicsRoot32BitConstants(2, request.sample_masks.size(),
                                                 request.sample_masks.data(), 0);
-    if (request.depth_bounds) {
-        const std::array<u32, 2> bounds{std::bit_cast<u32>(request.bounds_min),
-                                        std::bit_cast<u32>(request.bounds_max)};
-        commands->SetGraphicsRoot32BitConstants(bounds_slot, bounds.size(), bounds.data(), 0);
-    }
+    if (depth_bounds_commands)
+        depth_bounds_commands->OMSetDepthBounds(request.bounds_min, request.bounds_max);
     bindings.Bind(commands.Get(), true, resource_slot, sampler_slot);
     commands->IASetPrimitiveTopology(request.topology);
     commands->IASetVertexBuffers(0, vertices.size(), vertices.data());
@@ -1292,7 +1492,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         submission_lease = std::make_shared<CaptureLease>(
             CaptureLease{memory_access, pipeline, capture_pipeline, root, capture_root});
     }
-    FinishRecording(std::move(submission_lease), bindings.GdsBuffer(), bindings.CpuRanges(0, true));
+    FinishRecording(std::move(submission_lease), bindings.GdsBuffer(), bindings.CpuRanges(0, true),
+                    bindings.StreamOutCounter());
     recording.completed = true;
 }
 } // namespace D3D12

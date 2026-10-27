@@ -12,6 +12,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/gravity_rush.h"
 #include "common/rdtsc.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
@@ -51,7 +52,11 @@ constexpr u8 ViewKeyOf(const TextureCache::ImageDesc& desc) {
 
 static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
     static constexpr std::array<u8, Core::GUEST_PAGE_SIZE> zeros{};
+#ifdef SHADPS4_UWP
+    std::array<u8, Core::GUEST_PAGE_SIZE> snapshot;
+#endif
     auto* state = XXH3_createState();
+    auto release_state = ::detail::MakeScopeGuard([&] { XXH3_freeState(state); });
     const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
     XXH3_64bits_reset(state);
     while (size) {
@@ -59,7 +64,13 @@ static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
         const u64 offset_in_page = virtual_addr & (Core::GUEST_PAGE_SIZE - 1);
         const u64 hash_size = std::min<u64>(Core::GUEST_PAGE_SIZE - offset_in_page, size);
         if (auto* entry = backing_pages.find(page); entry && *entry) {
-            XXH3_64bits_update(state, *entry + offset_in_page, hash_size);
+#ifdef SHADPS4_UWP
+            if (Core::AddressSpace::CopyBacking(snapshot.data(), *entry + offset_in_page,
+                                                hash_size))
+                XXH3_64bits_update(state, snapshot.data(), hash_size);
+            else
+#endif
+                XXH3_64bits_update(state, *entry + offset_in_page, hash_size);
         } else {
             XXH3_64bits_update(state, zeros.data(), hash_size);
         }
@@ -67,18 +78,25 @@ static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
         virtual_addr += hash_size;
     }
     const u64 hash = XXH3_64bits_digest(state);
-    XXH3_freeState(state);
     return hash;
 }
 
 static bool BackingMemoryDiffers(VAddr virtual_addr, const u8* data, u64 size) {
+#ifdef SHADPS4_UWP
+    std::array<u8, Core::GUEST_PAGE_SIZE> snapshot;
+#endif
     const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
     while (size) {
         const u64 page = virtual_addr >> Core::GUEST_PAGE_BITS;
         const u64 offset_in_page = virtual_addr & (Core::GUEST_PAGE_SIZE - 1);
         const u64 compare_size = std::min<u64>(Core::GUEST_PAGE_SIZE - offset_in_page, size);
         if (auto* entry = backing_pages.find(page); entry && *entry) {
-            if (std::memcmp(*entry + offset_in_page, data, compare_size) != 0) {
+            const auto* backing = *entry + offset_in_page;
+#ifdef SHADPS4_UWP
+            if (Core::AddressSpace::CopyBacking(snapshot.data(), backing, compare_size))
+                backing = snapshot.data();
+#endif
+            if (std::memcmp(backing, data, compare_size) != 0) {
                 return true;
             }
         }
@@ -98,9 +116,12 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       slot_image_views{MAX_IMAGE_VIEWS}, slot_samplers{MAX_SAMPLERS},
       blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
-      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
-      readback_linear_images_async{readback_linear_images &&
-                                   EmulatorSettings.IsReadbackLinearImagesAsync()},
+      readback_linear_images{
+          (EmulatorSettings.IsReadbackLinearImagesEnabled() || Common::IsGravityRushRemastered()) &&
+          !Common::IsGravityRush2()},
+      readback_linear_images_async{
+          readback_linear_images &&
+          (EmulatorSettings.IsReadbackLinearImagesAsync() || Common::IsGravityRushRemastered())},
       image_fast_state{EmulatorSettings.IsImageFastState()},
       view_memo{EmulatorSettings.IsTextureViewMemo()},
       findimg_trust_gen{EmulatorSettings.IsFindimgTrustGen()},

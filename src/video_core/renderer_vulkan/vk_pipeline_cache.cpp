@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/texture_cache/photo_readback.h"
 #include "video_core/skipcache/skipcache.h"
 
 namespace Vulkan {
@@ -1116,6 +1117,7 @@ PipelineCache::~PipelineCache() {
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    ReapPendingPipelines();
     ++graphics_lookups;
     // The indirect draw's SGPR offsets reach the vertex runtime info without
     // passing through a register, so the register stamp does not cover them.
@@ -1146,12 +1148,34 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         ++key_refresh_same;
         return last_graphics_pipeline;
     }
+    if (abandoned_graphics_pipelines.contains(graphics_key)) {
+        ++async_skipped_draws;
+        return nullptr;
+    }
+    if (auto pending_it = pending_graphics_pipelines.find(graphics_key);
+        pending_it != pending_graphics_pipelines.end()) {
+        auto& pending = *pending_it->second;
+        if (!pending.photo_waited && DrawsPhoto()) {
+            pending.photo_waited = true;
+            if (pre_compile_hook_)
+                pre_compile_hook_(pre_compile_user_);
+            pending.future.wait_for(SyncBudget(true));
+            ReapPendingPipelines();
+        }
+        if (!graphics_pipelines.contains(graphics_key)) {
+            ++async_skipped_draws;
+            return nullptr;
+        }
+    }
+    if (!graphics_pipelines.contains(graphics_key) && pending_graphics_pipelines.size() >= 4) {
+        ++async_skipped_draws;
+        return nullptr;
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
-        GraphicsPipeline::SerializationSupport sdata{};
         if (pre_compile_hook_) {
             pre_compile_hook_(pre_compile_user_);
         }
@@ -1173,40 +1197,164 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                             vs_info->pgm_hash, fetch_shader ? fetch_shader->attributes.size() : 0);
             }
         }
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
-            graphics_key, *pipeline_cache, infos, runtime_infos, fetch_shader, modules, sdata,
-            false);
-        constexpr auto full_mask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-                                   vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
-        for (u32 cb = 0; cb < graphics_key.num_color_attachments; ++cb) {
-            if (graphics_key.write_masks[cb] != full_mask) {
-                ++nonfull_mask_pipelines;
-                break;
-            }
+        auto pending = StartGraphicsPipeline(pipeline_hash, fetch_shader);
+        const bool photo = DrawsPhoto();
+        pending->photo_waited = photo;
+        const bool ready = pending->future.wait_for(SyncBudget(photo)) == std::future_status::ready;
+        graphics_pipelines.erase(it);
+        pending_graphics_pipelines.emplace(graphics_key, std::move(pending));
+        if (!ready) {
+            ++async_skipped_draws;
+            return nullptr;
         }
-
-        RegisterPipelineData(graphics_key, pipeline_hash, sdata);
-        ++num_new_pipelines;
-        if (num_new_pipelines % 64 == 1)
-            SaveDriverCache();
-
-        if (EmulatorSettings.IsShaderCollect()) {
-            for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-                if (infos[stage]) {
-                    auto& m = modules[stage];
-                    module_related_pipelines[m].emplace_back(graphics_key);
-                }
-            }
-        }
+        ReapPendingPipelines();
     }
     // memcpy keeps the padding bytes deterministic for the memcmp-based compare.
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
-    last_graphics_pipeline = it->second.get();
+    last_graphics_pipeline = graphics_pipelines.at(graphics_key).get();
     last_graphics_pipe_gen = pipe_gen;
     last_key_stamp = liverpool->GetGfxStateStamp();
     key_is_last = true;
     return last_graphics_pipeline;
+}
+
+std::unique_ptr<PipelineCache::PendingGraphicsPipeline> PipelineCache::StartGraphicsPipeline(
+    u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader) {
+    auto pending = std::make_unique<PendingGraphicsPipeline>();
+    pending->start = std::chrono::steady_clock::now();
+    pending->hash = hash;
+    pending->live_infos = infos;
+    // The next lookups republish infos, runtime_infos and modules, and the next draws rewrite the
+    // user data the infos read their sharps from, so the worker builds from copies of all of them.
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        const Shader::Info* live = infos[i];
+        if (!live) {
+            continue;
+        }
+        auto& info = pending->info_copies[i].emplace(*live);
+        auto& user_data = pending->user_data[i];
+        ASSERT(live->user_data.size() <= user_data.size());
+        std::ranges::copy(live->user_data, user_data.begin());
+        info.user_data = std::span<const u32>{user_data.data(), live->user_data.size()};
+        info.flat_ud = live->flat_ud == live->user_data.data() ? user_data.data()
+                                                               : info.flattened_ud_buf.data();
+        pending->copied_infos[i] = &info;
+    }
+    pending->runtime_infos = runtime_infos;
+    pending->modules = modules;
+    if (fetch_shader) {
+        pending->fetch_shader = *fetch_shader;
+        // Without dynamic vertex input the pipeline bakes in the vertex buffer formats, which
+        // come from guest memory the guest may rewrite once this draw is done.
+        const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
+        if (!instance.IsVertexInputDynamicState() && vs_info) {
+            for (const auto& attrib : fetch_shader->attributes) {
+                pending->vertex_sharps.push_back(attrib.GetSharp(*vs_info));
+            }
+        }
+    }
+    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    if (cache_result != vk::Result::eSuccess)
+        throw std::runtime_error("Unable to create asynchronous compiler cache");
+    pending->driver_cache = std::move(cache);
+    PendingGraphicsPipeline* job = pending.get();
+    pending->future = std::async(std::launch::async, [this, job, key = graphics_key] {
+        auto pipeline = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile, key,
+            *job->driver_cache, job->copied_infos, job->runtime_infos,
+            job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules, job->sdata, false,
+            std::span<const AmdGpu::Buffer>{job->vertex_sharps.data(), job->vertex_sharps.size()});
+        return pipeline;
+    });
+    return pending;
+}
+
+void PipelineCache::InstallGraphicsPipeline(const GraphicsPipelineKey& key,
+                                            PendingGraphicsPipeline& pending) {
+    auto pipeline = pending.future.get();
+    ++async_completed_pipelines;
+    pipeline->SetStages(pending.live_infos);
+    const auto cache = *pending.driver_cache;
+    const auto merged = instance.GetDevice().mergePipelineCaches(*pipeline_cache, cache);
+    if (merged != vk::Result::eSuccess)
+        LOG_WARNING(Render_Vulkan, "Unable to merge asynchronous pipeline cache: {}",
+                    vk::to_string(merged));
+    graphics_pipelines[key] = std::move(pipeline);
+    RegisterPipelineData(key, pending.hash, pending.sdata);
+    ++num_new_pipelines;
+    constexpr auto full_mask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                               vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    for (u32 cb = 0; cb < key.num_color_attachments; ++cb) {
+        if (key.write_masks[cb] != full_mask) {
+            ++nonfull_mask_pipelines;
+            break;
+        }
+    }
+    if (EmulatorSettings.IsShaderCollect()) {
+        for (u32 stage = 0; stage < MaxShaderStages; ++stage)
+            if (pending.live_infos[stage])
+                module_related_pipelines[pending.modules[stage]].emplace_back(key);
+    }
+}
+
+void PipelineCache::ReapPendingPipelines(bool drain) {
+    std::exception_ptr failure;
+    for (auto it = pending_graphics_pipelines.begin(); it != pending_graphics_pipelines.end();) {
+        auto& pending = *it->second;
+        if (drain && pre_compile_hook_)
+            pre_compile_hook_(pre_compile_user_);
+        if (drain)
+            pending.future.wait();
+        if (pending.future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+            if (!pending.abandoned &&
+                std::chrono::steady_clock::now() - pending.start >= std::chrono::seconds(30)) {
+                pending.abandoned = true;
+                abandoned_graphics_pipelines.insert(it->first);
+                LOG_ERROR(Render_Vulkan,
+                          "Abandoning graphics pipeline {:#x} after 30 seconds; compilation "
+                          "resources remain alive",
+                          pending.hash);
+            }
+            ++it;
+            continue;
+        }
+        try {
+            if (pending.abandoned) {
+                auto discarded = pending.future.get();
+            } else {
+                InstallGraphicsPipeline(it->first, pending);
+            }
+        } catch (...) {
+            abandoned_graphics_pipelines.insert(it->first);
+            failure = std::current_exception();
+        }
+        it = pending_graphics_pipelines.erase(it);
+    }
+    if (failure)
+        std::rethrow_exception(failure);
+}
+
+std::chrono::milliseconds PipelineCache::SyncBudget(bool photo) const {
+    const int budget = std::clamp(EmulatorSettings.GetPipelineSyncBudgetMs(), 0, 50000);
+    return std::chrono::milliseconds(photo ? std::max(budget, 700) : budget);
+}
+
+bool PipelineCache::DrawsPhoto() const {
+    if (VideoCore::PhotoReadback::IsCapturing()) {
+        return true;
+    }
+    const auto& regs = liverpool->regs;
+    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable) {
+        return false;
+    }
+    for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& col_buf = regs.color_buffers[cb];
+        if (col_buf && regs.color_target_mask.GetMask(cb) && !col_buf.IsTiled() &&
+            VideoCore::PhotoReadback::IsArmed(col_buf.Pitch(), col_buf.Height())) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // The stamp covers every register the key reads (context, SH and uconfig), so
@@ -1419,6 +1567,9 @@ void PipelineCache::DumpProgramIdentityStats() {
 }
 
 void PipelineCache::DumpKeyReuseStats() {
+    LOG_INFO(Render_Skipcache, "[AsyncPipeline] completed={} skipped_draws={} pending={} abandoned={}",
+             async_completed_pipelines, async_skipped_draws, pending_graphics_pipelines.size(),
+             abandoned_graphics_pipelines.size());
     if (!key_stamp_reuse) {
         return;
     }
@@ -2324,6 +2475,7 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
+    ReapPendingPipelines(true);
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <array>
-#include <string_view>
-#include "common/elf_info.h"
+#include "common/gravity_rush.h"
 #include "common/logging/log.h"
 #include "core/libraries/gr2_photo/gr2_photo.h"
 #include "core/libraries/gr2_photo/photo_content.h"
@@ -15,15 +12,11 @@
 
 namespace Libraries::Gr2Photo {
 
-constexpr std::array<std::string_view, 7> Serials = {
-    "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547", "PCJS50010", "PCAS00079", "CUSA04935",
-};
-
 // The game renders a photo into a target of this size before it encodes it.
 constexpr u32 PhotoSize = 1024;
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    if (!std::ranges::contains(Serials, Common::ElfInfo::Instance().GameSerial())) {
+    if (!Common::IsGravityRush2()) {
         return;
     }
     // The linker asks the HLE table before the exports of a loaded module and takes the first

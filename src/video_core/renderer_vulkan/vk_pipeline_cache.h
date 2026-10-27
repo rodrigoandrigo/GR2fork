@@ -4,6 +4,9 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#include <future>
+#include <unordered_set>
 #include <memory>
 #include <variant>
 #include <tsl/robin_map.h>
@@ -237,6 +240,32 @@ public:
     void DumpSharpReadStats();
 
 private:
+    struct PendingGraphicsPipeline {
+        std::chrono::steady_clock::time_point start;
+        u64 hash{};
+        vk::UniquePipelineCache driver_cache;
+        GraphicsPipeline::SerializationSupport sdata{};
+        std::array<std::optional<Shader::Info>, MaxShaderStages> info_copies;
+        std::array<std::array<u32, Shader::NUM_USER_DATA_REGS>, MaxShaderStages> user_data{};
+        std::array<const Shader::Info*, MaxShaderStages> copied_infos{};
+        std::array<const Shader::Info*, MaxShaderStages> live_infos{};
+        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
+        VertexInputs<AmdGpu::Buffer> vertex_sharps;
+        bool photo_waited{};
+        bool abandoned{};
+        std::future<std::unique_ptr<GraphicsPipeline>> future;
+    };
+    std::unique_ptr<PendingGraphicsPipeline> StartGraphicsPipeline(
+        u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
+    void InstallGraphicsPipeline(const GraphicsPipelineKey& key, PendingGraphicsPipeline& pending);
+    void ReapPendingPipelines(bool drain = false);
+    bool DrawsPhoto() const;
+    std::chrono::milliseconds SyncBudget(bool photo) const;
+    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>>
+        pending_graphics_pipelines;
+    std::unordered_set<GraphicsPipelineKey> abandoned_graphics_pipelines;
     void LoadDriverCache();
     void SaveDriverCache();
     bool RefreshGraphicsKey();
@@ -300,6 +329,8 @@ private:
     u64 key_reuse_diff_decisions{};
     u64 nonfull_mask_pipelines{};
     u64 graphics_lookups{};
+    u64 async_skipped_draws{};
+    u64 async_completed_pipelines{};
     bool key_stamp_reuse{};
     bool key_reuse_validate{}; // ValidateOnly mode: every reuse is rebuilt and compared
     u64 key_reuse_hits{};

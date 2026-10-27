@@ -105,6 +105,7 @@ private:
 #ifdef SHADPS4_UWP
     void PresentEmbedded(Frame* frame, bool is_reusing_frame, bool is_game_frame);
     std::mutex embedded_present_mutex;
+    u64 embedded_present_count{};
 #endif
     Frame* GetRenderFrame();
 

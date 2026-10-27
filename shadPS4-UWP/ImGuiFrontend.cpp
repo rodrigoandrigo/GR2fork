@@ -55,6 +55,8 @@ std::string Label(std::string text) {
     static const std::unordered_map<std::string, std::string> labels{
         {"big_picture_scale", "Escala da interface (1000 = 100%)"},
         {"big_picture_folder_depth", "Profundidade de busca de jogos"},
+        {"pipeline_sync_budget_ms", "Orçamento síncrono de pipeline (ms)"},
+        {"readback_offload", "Readback em fila de cópia"},
         {"memory_swap_enabled", "Swap de memória (padrão no Xbox)"},
         {"show_fps_counter", "Exibir contador de FPS"},
         {"console_language", "Idioma do console"},
@@ -626,6 +628,17 @@ void ImGuiFrontend::Run(std::wstring root) {
             if (game_surface)
                 core->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
             renderer->SetTransparent(game_running);
+            const bool show_overlay = !game_surface || !game_running || menu_open;
+            if (show_overlay != overlay_visible) {
+                overlay_visible = show_overlay;
+                auto target = panel;
+                dispatcher->RunAsync(CoreDispatcherPriority::Normal,
+                                     ref new DispatchedHandler([target, show_overlay] {
+                                         target->Opacity = show_overlay ? 1.0 : 0.0;
+                                         UwpDiagnostics::Record("frontend_overlay_visible",
+                                                                show_overlay);
+                                     }));
+            }
             const auto now = std::chrono::steady_clock::now();
             static auto fps_time = now;
             static uint64_t fps_count = get_game_frame_count();

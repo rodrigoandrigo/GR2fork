@@ -5,6 +5,9 @@
 #include <system_error>
 
 #include "common/string_util.h"
+#ifdef SHADPS4_UWP
+#include "core/address_space.h"
+#endif
 #include "core/file_sys/backends/host_fs.h"
 #include "core/file_sys/fs.h"
 
@@ -39,6 +42,9 @@ HostFile::HostFile(std::filesystem::path host_path, Common::FS::FileAccessMode m
 }
 
 s64 HostFile::Read(void* dst, u64 size) {
+#ifdef SHADPS4_UWP
+    const auto residency = AddressSpace::AcquireHostAccess(dst, size);
+#endif
     if (!m_file.IsOpen()) {
         return -1;
     }
@@ -46,6 +52,9 @@ s64 HostFile::Read(void* dst, u64 size) {
 }
 
 s64 HostFile::Write(const void* src, u64 size) {
+#ifdef SHADPS4_UWP
+    const auto residency = AddressSpace::AcquireHostAccess(src, size);
+#endif
     if (!m_file.IsOpen() || m_read_only) {
         return -1;
     }

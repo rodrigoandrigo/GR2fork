@@ -58,7 +58,9 @@ void CommandRuntime::MaintainMemory(bool force) {
     }
     struct Scope {
         bool& active;
-        ~Scope() { active = false; }
+        ~Scope() {
+            active = false;
+        }
     } scope{trimming_memory};
     trimming_memory = true;
     DrainContexts();
@@ -227,9 +229,14 @@ void CommandRuntime::PrepareContext(std::span<CompiledShader*> stages) {
     }
 }
 void CommandRuntime::FinishRecording(std::shared_ptr<void> lease, ResourceCache::Buffer* gds_buffer,
-                                     std::vector<ResourceCache::Range> cpu_ranges) {
-    const auto commit = [this, lease, gds_buffer, cpu_ranges = std::move(cpu_ranges)] {
+                                     std::vector<ResourceCache::Range> cpu_ranges,
+                                     ResourceCache::Buffer* strmout_counter) {
+    const auto commit = [this, lease, gds_buffer, strmout_counter,
+                         cpu_ranges = std::move(cpu_ranges)] {
         resources.CommitDownloads(bool(lease));
+        if (strmout_counter) {
+            std::memcpy(&strmout_filled, strmout_counter->host_data.data(), sizeof(strmout_filled));
+        }
         if (gds_buffer) {
             std::memcpy(gds.data(), gds_buffer->host_data.data(), gds.size());
             if (coordinator)
@@ -294,8 +301,7 @@ void CommandRuntime::CompleteContext() {
         coordinator->SubmitReady();
     if (!pending_fence)
         throw std::runtime_error("Native submission has no completion fence");
-    ProfileSample(runtime_profile, "context_fence_wait", 128,
-                  [&] { device.Wait(pending_fence); });
+    ProfileSample(runtime_profile, "context_fence_wait", 128, [&] { device.Wait(pending_fence); });
     completing = true;
     try {
         completion();

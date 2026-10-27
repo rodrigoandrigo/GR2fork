@@ -37,8 +37,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
     const auto* signals = Signals::Instance();
 #ifdef SHADPS4_UWP
-    if (pExp && pExp->ExceptionRecord &&
-        pExp->ExceptionRecord->ExceptionCode == 0xe06d7363)
+    if (pExp && pExp->ExceptionRecord && pExp->ExceptionRecord->ExceptionCode == 0xe06d7363)
         return EXCEPTION_CONTINUE_SEARCH;
 #endif
 
@@ -64,10 +63,14 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     bool static_protection_exception = false; // Windows static guest red-zone protection
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION: {
+        guest_info._si_addr =
+            reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]);
+        guest_context.uc_mcontext.mc_addr = reinterpret_cast<u64>(guest_info._si_addr);
 #ifdef SHADPS4_UWP
+        bool mapping_failed{};
         if (AddressSpace::HandleBackingFault(
                 reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]),
-                pExp->ExceptionRecord->ExceptionInformation[0]))
+                pExp->ExceptionRecord->ExceptionInformation[0], &mapping_failed))
             return EXCEPTION_CONTINUE_EXECUTION;
 #endif
         guest_info._si_signo = POSIX_SIGSEGV;
@@ -80,8 +83,11 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         Sigset old_mask{};
         posix_sigfillset(&all_signals);
         posix_pthread_sigmask(POSIX_SIG_SETMASK, &all_signals, &old_mask);
-        handled = signals->DispatchAccessViolation(
-            pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));
+#ifdef SHADPS4_UWP
+        if (!mapping_failed)
+#endif
+            handled = signals->DispatchAccessViolation(
+                pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));
         posix_pthread_sigmask(POSIX_SIG_SETMASK, &old_mask, nullptr);
         break;
     }
@@ -160,6 +166,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     if (guest_info._si_signo != 0) {
         if (g_curthread &&
             g_curthread->DispatchSignal(guest_info._si_signo, &guest_info, &guest_context)) {
+            guest_context.SyncHostFromGuest(pExp->ContextRecord);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -168,9 +175,21 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
+            const auto& regs = *pExp->ContextRecord;
+            LOG_CRITICAL(Debug,
+                         "Fault address {:#x}, access {}, RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x} "
+                         "RSI={:#x} RDI={:#x} RBP={:#x} RSP={:#x} R8={:#x} R9={:#x} R10={:#x} "
+                         "R11={:#x} R12={:#x} R13={:#x} R14={:#x} R15={:#x}",
+                         pExp->ExceptionRecord->ExceptionInformation[1],
+                         pExp->ExceptionRecord->ExceptionInformation[0], regs.Rax, regs.Rbx,
+                         regs.Rcx, regs.Rdx, regs.Rsi, regs.Rdi, regs.Rbp, regs.Rsp, regs.R8,
+                         regs.R9, regs.R10, regs.R11, regs.R12, regs.R13, regs.R14, regs.R15);
+        }
 #ifdef SHADPS4_UWP
         if (g_curthread && guest_info._si_signo != 0) {
-            Uwp::FailGuestSession(fmt::format("Unhandled guest exception {:#x} at {}", code, address));
+            Uwp::FailGuestSession(
+                fmt::format("Unhandled guest exception {:#x} at {}", code, address));
             posix_pthread_exit(nullptr);
         }
 #else
@@ -310,6 +329,7 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
             sigaddset(&guest_signal, SIGUSR1);
             pthread_sigmask(SIG_UNBLOCK, &guest_signal, nullptr);
             if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
+                context.SyncHostFromGuest(raw_context);
                 return;
             }
             UNREACHABLE_MSG("Unhandled access violation at code address {}: {} address {}",
@@ -330,6 +350,7 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     case SIGABRT:
     case SIGSYS: {
         if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
+            context.SyncHostFromGuest(raw_context);
             return;
         }
 
@@ -351,8 +372,8 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
         break;
     }
     case SIGUSR1:
-        if (thread) {
-            thread->DispatchPendingSignals(info_p, context_p);
+        if (thread && thread->DispatchPendingSignals(info_p, context_p)) {
+            context.SyncHostFromGuest(raw_context);
         }
         break;
     default:

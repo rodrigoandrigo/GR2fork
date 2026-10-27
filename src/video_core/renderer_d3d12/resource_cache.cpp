@@ -1,6 +1,9 @@
 #include "video_core/renderer_d3d12/resource_cache.h"
 
 #include <algorithm>
+#ifdef SHADPS4_UWP
+#include "core/address_space.h"
+#endif
 #include <array>
 #include <cstring>
 #include <limits>
@@ -588,8 +591,8 @@ void ResourceCache::EnsureStaging(Buffer& buffer, bool download) {
     if (resource.Get())
         return;
     const u64 size = (buffer.size + 3) & ~u64{3};
-    resource = transfer_pool->Acquire(
-        size, download ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD);
+    resource =
+        transfer_pool->Acquire(size, download ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD);
 }
 void ResourceCache::Barrier(Buffer& buffer, ID3D12GraphicsCommandList* commands,
                             D3D12_RESOURCE_STATES state) {
@@ -641,7 +644,11 @@ void ResourceCache::Upload(Buffer& buffer, ID3D12GraphicsCommandList* commands) 
             }
         }
     } else if (buffer.physical) {
-        std::memcpy(data.data(), reinterpret_cast<const void*>(buffer.address), data.size());
+#ifdef SHADPS4_UWP
+        if (!Core::AddressSpace::CopyBacking(
+                data.data(), reinterpret_cast<const void*>(buffer.address), data.size()))
+#endif
+            std::memcpy(data.data(), reinterpret_cast<const void*>(buffer.address), data.size());
         upload_statistics.cpu_bytes += data.size();
     } else {
         read(buffer.address, data);

@@ -138,7 +138,7 @@ struct Ucontext {
 #else
     explicit Ucontext(PCONTEXT context);
 #endif
-    void SyncHostFromGuest();
+    void SyncHostFromGuest(void* host_context) const;
 };
 static_assert(sizeof(Ucontext) == 0x500, "Ucontext size must match PS4 ABI (0x500 bytes)");
 

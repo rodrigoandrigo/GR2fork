@@ -409,6 +409,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    ReapPendingPipelines(true);
     SaveDriverCache();
     Storage::DataBase::Instance().Close();
 }

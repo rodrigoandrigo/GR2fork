@@ -92,6 +92,12 @@ void EmitDiscardCond(EmitContext& ctx, Id condition) {
 }
 
 static void EmitStreamOutCapture(EmitContext& ctx) {
+    const auto& count = ctx.buffers[ctx.strmout_counter].Alias(EmitContext::PointerType::U32);
+    const Id count_ptr =
+        ctx.OpAccessChain(count.pointer_type, count.id, ctx.u32_zero_value, ctx.u32_zero_value);
+    ctx.OpAtomicIAdd(ctx.U32[1], count_ptr, ctx.ConstU32(std::to_underlying(spv::Scope::Device)),
+                     ctx.ConstU32(std::to_underlying(spv::MemorySemanticsMask::MaskNone)),
+                     ctx.u32_one_value);
     const auto& gs = ctx.runtime_info.hw.gs;
     const Id position{ctx.OpLoad(ctx.F32[4], ctx.output_position)};
     std::array<Id, 4> positions;
@@ -101,16 +107,20 @@ static void EmitStreamOutCapture(EmitContext& ctx) {
     }
     const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
     const u32 window = std::min(gs.out_vertex_data_size, 4u + ctx.info.gs_copy_data.num_attrs * 4u);
+    u32 mask = gs.strmout_buffer_mask;
     for (u32 slot = 0; slot < ctx.strmout_buffers.size(); ++slot) {
+        const u32 buffer_index = std::countr_zero(mask);
+        mask &= mask - 1;
+        const u32 stride = gs.strmout_strides[buffer_index];
         const auto& buffer = ctx.buffers[ctx.strmout_buffers[slot]];
         const auto& buffer_alias = buffer.Alias(EmitContext::PointerType::U32);
         Id base_address = ctx.OpLoad(ctx.U32[1], ctx.strmout_vertex);
-        base_address = ctx.OpIMul(ctx.U32[1], base_address, ctx.ConstU32(gs.strmout_stride));
+        base_address = ctx.OpIMul(ctx.U32[1], base_address, ctx.ConstU32(stride));
         if (const Id offset = buffer.Offset(EmitContext::PointerSize::B32);
             Sirit::ValidId(offset)) {
             base_address = ctx.OpIAdd(ctx.U32[1], base_address, offset);
         }
-        for (u32 dword = 0; dword < window; ++dword) {
+        for (u32 dword = 0; dword < std::min(window, stride); ++dword) {
             Id value = ctx.u32_zero_value;
             if (dword < 4) {
                 value = positions[dword];

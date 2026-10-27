@@ -204,6 +204,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 }
 
 Rasterizer::~Rasterizer() {
+    try {
+        pipeline_cache.Sync();
+    } catch (const std::exception& error) {
+        LOG_ERROR(Render_Vulkan, "Unable to finish asynchronous pipelines: {}", error.what());
+    }
+    pipeline_cache.SetPreCompileHook(nullptr, nullptr);
     VideoCore::StreamCopyLane::Instance().Shutdown();
 }
 

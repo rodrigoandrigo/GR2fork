@@ -165,6 +165,8 @@ std::pair<double, double> Bounds(std::string_view key, const json& value) {
         return {0, 2};
     if (key == "draw_glue_memo")
         return {0, 3};
+    if (key == "pipeline_sync_budget_ms")
+        return {0, 50000};
     if (key == "volume_slider")
         return {0, 500};
     if (key == "extra_dmem_in_mbytes" || key == "extra_fmem_in_mbytes")

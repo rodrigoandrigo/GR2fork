@@ -465,10 +465,14 @@ std::array<VAddr, 4> ResolveStreamOutBases(
     });
     std::array<VAddr, 4> bases{};
     u32 assigned{};
+    u32 remaining = buffer_mask;
     for (const auto& candidate : candidates) {
         if (assigned == slots)
             break;
-        bases[assigned++] = candidate.sharp.base_address;
+        const u32 buffer = std::countr_zero(remaining);
+        remaining &= remaining - 1;
+        bases[buffer] = candidate.sharp.base_address;
+        ++assigned;
     }
     if (assigned != slots)
         throw std::runtime_error(fmt::format(
@@ -481,8 +485,9 @@ std::array<VAddr, 4> ResolveStreamOutBases(
         buffer_mask, vtx_stride,
         [&] {
             std::string words;
-            for (u32 i = 0; i < assigned; ++i)
-                words += fmt::format(" {}: {:#x}", i, bases[i]);
+            for (u32 i = 0; i < bases.size(); ++i)
+                if (buffer_mask & (1u << i))
+                    words += fmt::format(" {}: {:#x}", i, bases[i]);
             return words;
         }(),
         dump_user_data(), dump_candidates());
@@ -718,9 +723,11 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         if (config.streamout_1_en || config.streamout_2_en || config.streamout_3_en ||
             config.rast_stream != 0 || (config.use_rast_stream_mask && config.rast_stream_mask))
             throw std::runtime_error("Guest stream-out beyond stream 0 exceeds D3D12 support");
-        const u32 buffer_mask = regs.vgt_strmout_buffer_config.stream_0_buf_en;
-        if (!regs.vgt_strmout_buffers[0].vtx_stride)
-            throw std::runtime_error("Guest stream-out buffers require a vertex stride");
+        const u32 buffer_mask =
+            config.streamout_0_en ? regs.vgt_strmout_buffer_config.stream_0_buf_en : 0;
+        for (u32 buffer = 0; buffer < 4; ++buffer)
+            if ((buffer_mask & (1u << buffer)) && !regs.vgt_strmout_buffers[buffer].vtx_stride)
+                throw std::runtime_error("Guest stream-out buffers require a vertex stride");
         strmout_buffer_mask = buffer_mask;
     }
     std::array<VAddr, 4> strmout_bases{};
@@ -836,10 +843,12 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         geometry.vs_copy = copy.code;
         geometry.vs_copy_hash = copy.hash;
         geometry.strmout_buffer_mask = strmout_buffer_mask;
-        geometry.strmout_stride = regs.vgt_strmout_buffers[0].vtx_stride;
+        for (u32 buffer = 0; buffer < 4; ++buffer)
+            geometry.strmout_strides[buffer] = regs.vgt_strmout_buffers[buffer].vtx_stride;
         if (strmout_buffer_mask) {
-            strmout_bases = ResolveStreamOutBases(draw.geometry->user_data, strmout_buffer_mask,
-                                                  regs.vgt_strmout_buffers[0].vtx_stride);
+            strmout_bases = ResolveStreamOutBases(
+                draw.geometry->user_data, strmout_buffer_mask,
+                regs.vgt_strmout_buffers[std::countr_zero(strmout_buffer_mask)].vtx_stride);
         }
     } else if (!tessellation) {
         draw.vertex_runtime.hw.vs.user_clip_plane_mask =
@@ -1189,7 +1198,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         pass.depth.StencilWriteMask = static_cast<UINT8>(face_front ? front_write : back_write);
         pass.stencil_ref = face_front ? front_ref_value : back_ref_value;
     };
-    if (draw.depth.DepthEnable || stencil_test_enable)
+    if (draw.depth.DepthEnable || stencil_test_enable || depth_bounds)
         draw.depth_image.emplace(regs.depth_buffer, regs.depth_view.NumSlices(),
                                  VAddr(regs.depth_htile_data_base.address) << 8,
                                  liverpool.last_db_extent, true);
@@ -1494,7 +1503,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                          regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
                          regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip || point_cpu ||
                          contour || provoking_lines || (remap_provoking && polygonal) ||
-                         wire_expand_conv ||
+                         wire_expand_conv || (depth_gated && !has_geometry && !tessellation) ||
                          (indexed && regs.enable_primitive_restart &&
                           regs.primitive_type != AmdGpu::PrimitiveType::AdjLineStrip &&
                           regs.primitive_type != AmdGpu::PrimitiveType::AdjTriangleStrip);
@@ -1615,7 +1624,8 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             draw.base_vertex = draw.first_vertex;
         }
         if (indexed)
-            std::fill(indices.begin() + draw.index_capacity, indices.end(), 0);
+            std::fill(indices.begin() + std::min(draw.index_capacity, draw.count), indices.end(),
+                      0);
         const auto restart = indexed && regs.enable_primitive_restart
                                  ? std::optional<u32>{regs.primitive_restart_index}
                                  : std::nullopt;
@@ -1658,25 +1668,41 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         }
     }
     draw.depth_gated = depth_gated;
-    const u64 stride_bytes = u64(draw.geometry_runtime.hw.gs.strmout_stride) * 4;
+    if (depth_gated && on_depth_fail)
+        for (u32 target = 0; target < 8; ++target)
+            draw.depth_fail_masks[target] = regs.color_target_mask.GetMask(target);
+    std::array<u32, 4> strmout_offsets{};
+    std::array<u64, 4> strmout_capacities{};
     if (strmout_buffer_mask) {
         const auto partitions = CommandRuntime::GsInvocations(draw.topology, draw.count);
         if (!partitions)
             throw std::runtime_error("Guest stream-out draw has no geometry partitions");
         const auto& gs_info = draw.geometry_runtime.hw.gs;
-        const u64 worst_vertices = partitions * u64(draw.instances) * u64(gs_info.num_invocations) *
-                                   u64(gs_info.output_vertices);
+        u64 worst_vertices = partitions;
+        for (const u32 factor :
+             {draw.instances, gs_info.num_invocations, gs_info.output_vertices}) {
+            if (factor && worst_vertices > UINT32_MAX / factor)
+                throw std::runtime_error("Guest stream-out emission count exceeds counter range");
+            worst_vertices *= factor;
+        }
         u32 ordinal{};
         u32 mask = strmout_buffer_mask;
         while (mask) {
             const u32 buffer = std::countr_zero(mask);
             mask &= mask - 1;
             const u64 capacity_bytes = u64(regs.vgt_strmout_buffers[buffer].size) * 4;
-            const u64 start_bytes = u64(regs.vgt_strmout_buffers[buffer].offset) * 4;
+            const u64 stride_bytes = u64(regs.vgt_strmout_buffers[buffer].vtx_stride) * 4;
+            strmout_offsets[buffer] = std::max(regs.vgt_strmout_buffers[buffer].offset,
+                                               regs.vgt_strmout_buffer_filled_size[buffer]);
+            const u64 start_bytes = u64(strmout_offsets[buffer]) * 4;
             if (start_bytes < capacity_bytes) {
-                const u64 window = std::min({capacity_bytes - start_bytes,
-                                             worst_vertices * stride_bytes, u64(16) * 1024 * 1024});
-                draw.strmout[ordinal] = {strmout_bases[buffer] + start_bytes, window};
+                const u64 vertices =
+                    std::min({(capacity_bytes - start_bytes) / stride_bytes, worst_vertices,
+                              (u64(16) * 1024 * 1024) / stride_bytes});
+                strmout_capacities[buffer] = vertices;
+                if (vertices)
+                    draw.strmout[ordinal] = {strmout_bases[buffer] + start_bytes,
+                                             vertices * stride_bytes};
             }
             ++ordinal;
         }
@@ -1700,23 +1726,6 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             pass.line_expand = true;
             if (pass.depth.StencilEnable)
                 pass.depth.BackFace = pass.depth.FrontFace;
-        }
-        if (depth_gated) {
-            CommandRuntime::DrawRequest fail_pass{pass};
-            fail_pass.strmout = {};
-            fail_pass.depth.DepthFunc = InvertedDepthFunc(fail_pass.depth.DepthFunc);
-            fail_pass.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-            fail_pass.depth.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
-                                         D3D12_STENCIL_OP_KEEP,
-                                         fail_pass.depth.FrontFace.StencilFunc};
-            fail_pass.depth.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
-                                        D3D12_STENCIL_OP_KEEP,
-                                        fail_pass.depth.BackFace.StencilFunc};
-            for (u32 i = 0; i < 8; ++i) {
-                fail_pass.blend.RenderTarget[i].RenderTargetWriteMask =
-                    regs.color_target_mask.GetMask(i);
-            }
-            runtime.Draw(fail_pass);
         }
         runtime.Draw(pass);
     };
@@ -1765,10 +1774,11 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         while (mask) {
             const u32 buffer = std::countr_zero(mask);
             mask &= mask - 1;
-            const u64 capacity_vertices = u64(regs.vgt_strmout_buffers[buffer].size) /
-                                          draw.geometry_runtime.hw.gs.strmout_stride;
+            const auto& state = regs.vgt_strmout_buffers[buffer];
             auto& filled = liverpool.regs.vgt_strmout_buffer_filled_size[buffer];
-            filled = u32(std::min(u64(filled) + written, capacity_vertices));
+            const u64 start = u64(strmout_offsets[buffer]);
+            filled =
+                u32(start + std::min(u64(written), strmout_capacities[buffer]) * state.vtx_stride);
         }
     }
 }

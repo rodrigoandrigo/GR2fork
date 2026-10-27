@@ -7,6 +7,9 @@
 #include "core/libraries/libs.h"
 #include "core/linker.h"
 #include "core/tls.h"
+#ifdef SHADPS4_UWP
+#include "core/memory.h"
+#endif
 
 namespace Libraries::Kernel {
 
@@ -25,6 +28,10 @@ Core::Tcb* TcbCtor(Pthread* thread, int initial) {
     // Initialize allocated memory and allocate DTV table.
     const u32 num_dtvs = linker->MaxTlsIndex();
     const auto static_tls_size = linker->StaticTlsSize();
+#ifdef SHADPS4_UWP
+    Core::Memory::Instance()->GetAddressSpace().PinMappings(
+        reinterpret_cast<VAddr>(addr_out), static_tls_size + sizeof(Core::Tcb), true);
+#endif
     auto* dtv_table = new Core::DtvEntry[num_dtvs + 2]{};
 
     // Initialize thread control block
@@ -80,6 +87,10 @@ void TcbDtor(Core::Tcb* oldtls) {
     }
     delete[] dtv_table;
 
+#ifdef SHADPS4_UWP
+    Core::Memory::Instance()->GetAddressSpace().PinMappings(
+        reinterpret_cast<VAddr>(tls_base), static_tls_size + sizeof(Core::Tcb), false);
+#endif
     linker->FreeTlsForNonPrimaryThread(tls_base);
 }
 

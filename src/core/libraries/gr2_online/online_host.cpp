@@ -13,6 +13,7 @@
 #include <type_traits>
 #include <nlohmann/json.hpp>
 #include "common/elf_info.h"
+#include "common/gravity_rush.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/gr2_online/online_host.h"
@@ -34,10 +35,6 @@ static_assert(std::is_same_v<decltype(&Np::NpHandler::SyncTrophies),
                                                      std::function<void(const TrophyList&)>)>);
 
 namespace {
-
-constexpr std::array<std::string_view, 7> Serials = {
-    "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547", "PCJS50010", "PCAS00079", "CUSA04935",
-};
 
 // The port the server of the game listens on unless it is told otherwise.
 constexpr int DefaultPort = 8443;
@@ -184,7 +181,7 @@ Server LoadServer() {
 } // Anonymous namespace
 
 bool IsGravityRush2() {
-    return std::ranges::contains(Serials, Serial());
+    return Common::IsGravityRush2();
 }
 
 std::string_view Serial() {

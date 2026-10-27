@@ -21,12 +21,19 @@ public:
                 const ResourceCache::Read& read, std::span<const u8, 65536> gds,
                 std::span<const u8> shared_memory = {});
     void PrepareImages();
-    std::span<const ResourceCache::Range> GuestRanges() const { return guest_ranges; }
+    std::span<const ResourceCache::Range> GuestRanges() const {
+        return guest_ranges;
+    }
     std::vector<ResourceCache::Range> ImageRanges() const;
     std::vector<ResourceCache::Range> CpuRanges(VAddr border_colors,
                                                 bool written_only = false) const;
     void CommitGds(std::span<u8, 65536> gds);
-    ResourceCache::Buffer* GdsBuffer() const { return gds_buffer; }
+    ResourceCache::Buffer* GdsBuffer() const {
+        return gds_buffer;
+    }
+    ResourceCache::Buffer* StreamOutCounter() const {
+        return strmout_counter;
+    }
     const std::vector<D3D12_DESCRIPTOR_RANGE>& ResourceRanges() const {
         return resource_ranges;
     }
@@ -56,5 +63,6 @@ private:
     D3D12DescriptorArena& resources;
     D3D12DescriptorArena& samplers;
     ResourceCache::Buffer* gds_buffer{};
+    ResourceCache::Buffer* strmout_counter{};
 };
 } // namespace D3D12

@@ -148,6 +148,7 @@ ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& b
                                resource.buffer_type != Shader::BufferType::ImageAddressTable &&
                                resource.buffer_type != Shader::BufferType::BufferAddressTable &&
                                resource.buffer_type != Shader::BufferType::SamplerTable &&
+                               resource.buffer_type != Shader::BufferType::StrmoutCounter &&
                                resource.buffer_type != Shader::BufferType::SharedMemory)
                         throw std::runtime_error(
                             "D3D12 shader special buffer requires additional execution state");
@@ -419,6 +420,11 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
             else if (resource.buffer_type == Shader::BufferType::GdsBuffer) {
                 gds_buffer = &buffers.GetHostBuffer(0xfffc000000000000ULL, gds);
                 view = {gds_buffer, 0, gds.size_bytes()};
+            } else if (resource.buffer_type == Shader::BufferType::StrmoutCounter) {
+                const std::array<u8, 16> zero{};
+                strmout_counter = &buffers.GetHostBuffer(0xfff8000000000000ULL, zero);
+                strmout_counter->snapshot.clear();
+                view = {strmout_counter, 0, zero.size()};
             } else if (resource.buffer_type == Shader::BufferType::SharedMemory) {
                 if (shared_memory.empty())
                     throw std::runtime_error("Missing D3D12 shared memory backing");

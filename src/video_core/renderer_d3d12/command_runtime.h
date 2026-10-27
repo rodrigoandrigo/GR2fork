@@ -75,6 +75,7 @@ public:
         bool clear_depth{};
         bool clear_stencil{};
         bool depth_gated{};
+        std::array<u8, 8> depth_fail_masks{};
         bool depth_bounds{};
         float bounds_min{0.f}, bounds_max{1.f};
         Shader::PushData push{};
@@ -125,6 +126,7 @@ public:
                   std::array<u32, 3> groups, VAddr border_colors = 0, VAddr indirect_address = 0);
     void Draw(const DrawRequest& request);
     void DrawImpl(const DrawRequest& request);
+    void DrawDepthGated(const DrawRequest& request);
     static u64 GsInvocations(D3D_PRIMITIVE_TOPOLOGY topology, u64 count);
     void Resolve(const VideoCore::ImageInfo& source, const VideoCore::ImageInfo& destination,
                  u32 source_layer = 0, u32 destination_layer = 0, u32 layers = 0);
@@ -134,9 +136,7 @@ public:
     ResourceCache& Resources() {
         return resources;
     }
-    u32 StrmoutFilledSize() const {
-        return last_context ? last_context->strmout_filled : strmout_filled;
-    }
+    u32 StrmoutFilledSize();
     std::span<u8, 65536> Gds();
     const TransferPool& Transfers() const {
         return *transfer_pool;
@@ -222,7 +222,8 @@ private:
     void CompleteContext();
     void PrepareContext(std::span<CompiledShader*> stages);
     void FinishRecording(std::shared_ptr<void> lease, ResourceCache::Buffer* gds_buffer,
-                         std::vector<ResourceCache::Range> cpu_ranges);
+                         std::vector<ResourceCache::Range> cpu_ranges,
+                         ResourceCache::Buffer* strmout_counter = nullptr);
     CommandRuntime* coordinator{};
     CommandRuntime* last_context{};
     std::vector<std::unique_ptr<CommandRuntime>> contexts;

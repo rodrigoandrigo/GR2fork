@@ -28,6 +28,9 @@ ThreadState::ThreadState() {
                                       Core::MemoryProt::CpuReadWrite, Core::MemoryMapFlags::NoFlags,
                                       Core::VMAType::File, "ThrHeap");
     ASSERT_MSG(ret == 0, "Unable to allocate thread heap memory {}", ret);
+#ifdef SHADPS4_UWP
+    impl.PinMappings(reinterpret_cast<VAddr>(heap_addr), ThrHeapSize, true);
+#endif
     thread_heap.Initialize(heap_addr, ThrHeapSize);
 }
 
@@ -47,6 +50,11 @@ void ThreadState::Collect(Pthread* curthread) {
                 ++it;
                 continue;
             }
+#ifdef SHADPS4_UWP
+            if (!(td->sigaltstack.ss_flags & POSIX_SS_DISABLE))
+                Core::Memory::Instance()->GetAddressSpace().PinMappings(
+                    reinterpret_cast<VAddr>(td->sigaltstack.ss_sp), td->sigaltstack.ss_size, false);
+#endif
             FreeStack(&td->attr);
             work_list.push_back(td);
             it = gc_list.erase(it);

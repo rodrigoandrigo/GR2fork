@@ -1693,6 +1693,16 @@ if(SHADPS4_UWP)
     target_link_libraries(shadps4 PRIVATE shadps4_native_spirv_cross dxcompiler)
 endif()
 
+foreach(stack_target IN ITEMS shadps4 shadps4_native_d3d12)
+    if(TARGET ${stack_target})
+        if(MSVC)
+            target_compile_options(${stack_target} PRIVATE /GS-)
+        else()
+            target_compile_options(${stack_target} PRIVATE -fno-stack-protector)
+        endif()
+    endif()
+endforeach()
+
 # Install rules
 install(TARGETS shadps4 BUNDLE DESTINATION .)
 

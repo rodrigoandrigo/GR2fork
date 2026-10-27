@@ -25,6 +25,7 @@ using namespace Windows::UI::Core;
 ShadPS4Host::ShadPS4Host(Windows::UI::Xaml::Controls::SwapChainPanel ^ target) : panel{target} {}
 
 ShadPS4Host::~ShadPS4Host() {
+    UwpDiagnostics::CoreStage("core_destructor_enter", this, reinterpret_cast<uintptr_t>(module));
     const HRESULT apartment = RoInitialize(RO_INIT_MULTITHREADED);
     Stop();
     Wait();
@@ -36,7 +37,16 @@ ShadPS4Host::~ShadPS4Host() {
     if (presentation_thread.joinable()) {
         presentation_thread.join();
     }
-    const bool released = !shutdown || shutdown() == 0;
+    bool released = !shutdown || shutdown() == 0;
+    if (released) {
+        try {
+            DetachSDL();
+        } catch (Platform::Exception^ error) {
+            released = false;
+            UwpDiagnostics::Record("sdl_detach_failed_retaining_core", static_cast<uint32_t>(error->HResult));
+        }
+    }
+    UwpDiagnostics::CoreStage("core_destructor_shutdown_end", this, released);
     if (set_log_callback) {
         set_log_callback(nullptr, nullptr);
     }
@@ -48,6 +58,7 @@ ShadPS4Host::~ShadPS4Host() {
     }
     if (SUCCEEDED(apartment))
         RoUninitialize();
+    UwpDiagnostics::CoreStage("core_destructor_end", this);
 }
 
 void ShadPS4Host::SetLogConsumer(std::function<void(std::string)> consumer) {
@@ -56,7 +67,7 @@ void ShadPS4Host::SetLogConsumer(std::function<void(std::string)> consumer) {
 }
 
 void ShadPS4Host::Log(void* context, uint32_t level, const char* message) {
-    if (level >= 5 || std::strstr(message, "[UWP stage]"))
+    if (level >= 5 || std::strstr(message, "[UWP stage]") || std::strstr(message, "[MemDiag]"))
         UwpDiagnostics::Record(message);
 
     if (context) {
@@ -77,6 +88,7 @@ void ShadPS4Host::ReportError(void*, const char* message) {
 
 void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width, uint32_t height,
                              bool frontend, bool game_surface) {
+    UwpDiagnostics::CoreStage("core_initialize_enter", this, frontend, game_surface);
     UwpDiagnostics::Memory("core_load_begin bytes/limit");
     module = LoadPackagedLibrary(L"shadPS4.dll", 0);
     if (!module) {
@@ -135,10 +147,14 @@ void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width,
     config.attach_swapchain = !frontend || game_surface ? AttachSwapChain : nullptr;
     config.attach_context = this;
     UwpDiagnostics::Memory("core_initialize_begin bytes/limit");
+    UwpDiagnostics::CoreStage("core_initialize_api_begin", this,
+                              reinterpret_cast<uintptr_t>(module),
+                              reinterpret_cast<uintptr_t>(initialize));
     if (initialize(&config)) {
         throw ref new Platform::FailureException(ref new Platform::String(Error().c_str()));
     }
     UwpDiagnostics::Memory("core_ready bytes/limit");
+    UwpDiagnostics::CoreStage("core_initialize_api_end", this);
     if (!frontend)
         presentation_thread = std::thread([this] { PresentationLoop(); });
 }
@@ -173,21 +189,28 @@ void ShadPS4Host::PresentationLoop() {
 
 void ShadPS4Host::Reload(const std::wstring &user_directory, uint32_t width,
                          uint32_t height, bool frontend, bool game_surface) {
+  UwpDiagnostics::CoreStage("core_reload_enter", this, reinterpret_cast<uintptr_t>(module));
   std::scoped_lock lock{module_mutex};
   stop_pending.store(false);
   Wait();
+  UwpDiagnostics::CoreStage("core_reload_guest_joined", this);
+  UwpDiagnostics::CoreStage("core_shutdown_api_begin", this);
   if (shutdown && shutdown())
     throw ref new Platform::FailureException(
         ref new Platform::String(Error().c_str()));
+  UwpDiagnostics::CoreStage("core_shutdown_api_end", this);
+  DetachSDL();
   if (set_log_callback)
     set_log_callback(nullptr, nullptr);
   if (set_error_callback)
     set_error_callback(nullptr, nullptr);
   if (module) {
+    UwpDiagnostics::CoreStage("core_free_library_begin", this, reinterpret_cast<uintptr_t>(module));
     if (!FreeLibrary(module))
       throw ref new Platform::FailureException(
           L"Não foi possível descarregar o núcleo.");
     module = nullptr;
+    UwpDiagnostics::CoreStage("core_free_library_end", this);
     if (GetModuleHandleExW(0, L"shadPS4.dll", &module))
       throw ref new Platform::FailureException(
           L"O núcleo ainda possui tarefas ativas; não é seguro iniciar outra "
@@ -205,6 +228,7 @@ void ShadPS4Host::Reload(const std::wstring &user_directory, uint32_t width,
   set_log_callback = nullptr;
   set_error_callback = nullptr;
   Initialize(user_directory, width, height, frontend, game_surface);
+  UwpDiagnostics::CoreStage("core_reload_end", this);
   if (stop_pending.load())
     stop();
 }
@@ -334,8 +358,51 @@ bool ShadPS4Host::Render() {
     return true;
 }
 
+void ShadPS4Host::DetachSDL() {
+    struct Completion {
+        HANDLE event = CreateEventExW(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS);
+        HRESULT result{E_FAIL};
+        ~Completion() {
+            if (event)
+                CloseHandle(event);
+        }
+    };
+    auto completion = std::make_shared<Completion>();
+    if (!completion->event)
+        throw Platform::Exception::CreateException(HRESULT_FROM_WIN32(GetLastError()));
+    const auto detach = [completion] {
+        UwpDiagnostics::UiStage("sdl_panel_detach_begin", completion.get());
+        const auto sdl = LoadPackagedLibrary(L"SDL3.dll", 0);
+        if (sdl) {
+            using DetachPanel = bool(__cdecl*)();
+            const auto detach_panel = reinterpret_cast<DetachPanel>(
+                GetProcAddress(sdl, "SDL_WinRTDetachXAMLPanel"));
+            completion->result = !detach_panel ? HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND)
+                                 : detach_panel() ? S_OK : E_FAIL;
+            FreeLibrary(sdl);
+        } else {
+            completion->result = HRESULT_FROM_WIN32(GetLastError());
+        }
+        UwpDiagnostics::UiStage("sdl_panel_detach_end", completion.get(),
+                                static_cast<uint32_t>(completion->result));
+        SetEvent(completion->event);
+    };
+    auto target = panel.Get();
+    if (target->Dispatcher->HasThreadAccess)
+        detach();
+    else {
+        target->Dispatcher->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler(detach));
+        if (WaitForSingleObjectEx(completion->event, 10000, FALSE) != WAIT_OBJECT_0)
+            throw Platform::Exception::CreateException(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    }
+    if (FAILED(completion->result))
+        throw Platform::Exception::CreateException(completion->result);
+}
+
 long ShadPS4Host::AttachSwapChain(void* context, void* swapchain) {
     auto* self = static_cast<ShadPS4Host*>(context);
+    UwpDiagnostics::CoreStage("swapchain_attach_requested", self,
+                              reinterpret_cast<uintptr_t>(swapchain));
     struct Attachment {
         HANDLE event =
             CreateEventExW(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS);
@@ -354,11 +421,17 @@ long ShadPS4Host::AttachSwapChain(void* context, void* swapchain) {
     attachment->chain = static_cast<IDXGISwapChain*>(swapchain);
     auto target = self->panel;
     const auto attach = [self, target, attachment] {
+        UwpDiagnostics::UiStage("swapchain_ui_attach_begin", self,
+                                reinterpret_cast<uintptr_t>(attachment->chain.Get()));
         ComPtr<ISwapChainPanelNative> native;
         attachment->result =
             reinterpret_cast<IInspectable*>(target.Get())->QueryInterface(IID_PPV_ARGS(&native));
         if (SUCCEEDED(attachment->result)) {
+            UwpDiagnostics::UiStage("swapchain_set_begin", self,
+                                    reinterpret_cast<uintptr_t>(native.Get()));
             attachment->result = native->SetSwapChain(attachment->chain.Get());
+            UwpDiagnostics::UiStage("swapchain_set_end", self,
+                                    static_cast<uint32_t>(attachment->result));
             if (SUCCEEDED(attachment->result)) {
                 std::scoped_lock lock{self->chain_mutex};
                 self->composition_chain.Reset();
@@ -382,13 +455,19 @@ long ShadPS4Host::AttachSwapChain(void* context, void* swapchain) {
                 using AttachPanel = bool(__cdecl*)(void*);
                 const auto attach_panel =
                     reinterpret_cast<AttachPanel>(GetProcAddress(sdl, "SDL_WinRTAttachXAMLPanel"));
+                if (attach_panel)
+                    UwpDiagnostics::UiStage("sdl_panel_attach_begin", self);
                 attachment->result = !attach_panel ? HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND)
                                      : attach_panel(reinterpret_cast<IInspectable*>(target.Get()))
                                          ? S_OK
                                          : E_FAIL;
+                UwpDiagnostics::UiStage("sdl_panel_attach_end", self,
+                                        static_cast<uint32_t>(attachment->result));
                 FreeLibrary(sdl);
             }
         }
+        UwpDiagnostics::UiStage("swapchain_ui_attach_end", self,
+                                static_cast<uint32_t>(attachment->result));
         SetEvent(attachment->event);
     };
     if (target->Dispatcher->HasThreadAccess) {

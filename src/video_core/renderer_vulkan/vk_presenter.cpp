@@ -1270,8 +1270,14 @@ void Presenter::PresentEmbedded(Frame* frame, bool is_reusing_frame, bool is_gam
         std::scoped_lock free_lock{free_mutex};
         free_queue.push(frame);
         free_cv.notify_one();
-        if (is_game_frame)
+        if (is_game_frame) {
             DebugState.IncFlipFrameNum();
+            const auto count = ++embedded_present_count;
+            if (count == 1 || count % 300 == 0)
+                LOG_INFO(Render_Vulkan, "[UWP present] game_frames={} source={}x{} output={}x{}",
+                         count, frame->width, frame->height, swapchain.GetWidth(),
+                         swapchain.GetHeight());
+        }
     }
 }
 #endif

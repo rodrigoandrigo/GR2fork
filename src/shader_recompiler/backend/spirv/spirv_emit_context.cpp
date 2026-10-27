@@ -873,10 +873,16 @@ void EmitContext::DefineBuffers() {
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
-        if (desc.buffer_type == BufferType::Strmout) {
+        if (desc.buffer_type == BufferType::Strmout ||
+            desc.buffer_type == BufferType::StrmoutCounter) {
             if (True(desc.used_types & IR::Type::U32)) {
                 spv_buffer.Alias(PointerType::U32) =
                     DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
+            }
+            if (desc.buffer_type == BufferType::StrmoutCounter) {
+                strmout_counter = u32(buffers.size() - 1);
+                ++binding.unified;
+                continue;
             }
             strmout_buffers.push_back(u32(buffers.size() - 1));
             if (!Sirit::ValidId(strmout_vertex)) {

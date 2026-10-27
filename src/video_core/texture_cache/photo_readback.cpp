@@ -17,6 +17,8 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace VideoCore {
 
 void PhotoReadback::Arm(u32 width, u32 height) noexcept {
+    capturing.store(false, std::memory_order_relaxed);
+    tracked_index.store(ImageId::INVALID_INDEX, std::memory_order_relaxed);
     armed_extent.store(PackExtent(width, height), std::memory_order_relaxed);
 }
 

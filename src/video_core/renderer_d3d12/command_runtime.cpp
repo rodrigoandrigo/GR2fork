@@ -163,6 +163,14 @@ std::shared_ptr<VideoCore::ResidentFrame> CommandRuntime::CapturePresentation(
     recording.completed = true;
     return frame;
 }
+u32 CommandRuntime::StrmoutFilledSize() {
+    std::scoped_lock lock{mutex};
+    if (last_context) {
+        last_context->CompleteContext();
+        return last_context->strmout_filled;
+    }
+    return strmout_filled;
+}
 u64 CommandRuntime::Flush() {
     auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
                               [&] { return std::unique_lock{mutex}; });

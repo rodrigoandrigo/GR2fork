@@ -30,7 +30,13 @@ public:
     explicit AddressSpace();
     ~AddressSpace();
 #ifdef SHADPS4_UWP
-    static bool HandleBackingFault(void* address, u64 access_type);
+    static bool HandleBackingFault(void* address, u64 access_type, bool* mapping_failed = nullptr);
+    void PinMappings(VAddr address, u64 size, bool protect);
+    static std::shared_ptr<void> AcquireHostAccess(const void* address, u64 size,
+                                                   bool populate = true);
+    static bool CopyBacking(void* destination, const void* source, u64 size);
+    static void StartPager();
+    static void StopPager();
 #endif
 
     struct Traits {

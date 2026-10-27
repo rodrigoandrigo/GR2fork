@@ -152,7 +152,7 @@ struct HwGeometryRuntimeInfo {
     bool emulate_depth_negative_one_to_one{};
     u32 user_clip_plane_mask{};
     u32 strmout_buffer_mask{};
-    u32 strmout_stride{};
+    std::array<u32, 4> strmout_strides{};
     std::span<const u32> vs_copy;
     u64 vs_copy_hash;
 
@@ -164,7 +164,7 @@ struct HwGeometryRuntimeInfo {
                emulate_depth_negative_one_to_one == other.emulate_depth_negative_one_to_one &&
                user_clip_plane_mask == other.user_clip_plane_mask &&
                strmout_buffer_mask == other.strmout_buffer_mask &&
-               strmout_stride == other.strmout_stride && vs_copy_hash == other.vs_copy_hash;
+               strmout_strides == other.strmout_strides && vs_copy_hash == other.vs_copy_hash;
     }
 };
 
