@@ -47,6 +47,7 @@
 #include "util/blob.h"
 #include "util/hash_table.h"
 #include "util/u_dynarray.h"
+#include "util/simple_mtx.h"
 #include "util/log.h"
 #include "dzn_drirc.h"
 
@@ -366,7 +367,33 @@ struct dzn_device {
    bool bindless;
    bool support_static_samplers;
    struct dzn_device_descriptor_heap device_heaps[NUM_POOL_TYPES];
+
+   struct {
+      simple_mtx_t lock;
+      struct list_head bufs[2];
+   } internal_buf_pool;
+
+   struct {
+      simple_mtx_t lock;
+      simple_mtx_t save_lock;
+      uint64_t generation;
+      ID3D12PipelineLibrary1 *lib;
+      void *blob;
+      char *path;
+      bool dirty;
+      bool initialized;
+      uint32_t loaded, compiled, compiled_at_draw;
+      uint64_t load_ns, compile_ns;
+   } pso_lib;
 };
+
+static const GUID dzn_root_sig_hash_guid =
+   { 0x5a1c0f3e, 0x8d2b, 0x4c61, { 0x9e, 0x47, 0x31, 0xd0, 0x6b, 0x2a, 0x7c, 0x55 } };
+
+void dzn_pso_lib_init(struct dzn_device *device);
+void dzn_pso_lib_finish(struct dzn_device *device);
+HRESULT dzn_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+                       ID3D12PipelineState **out, bool at_draw);
 
 void dzn_meta_finish(struct dzn_device *device);
 
@@ -632,7 +659,10 @@ struct dzn_internal_resource {
    struct list_head link;
    ID3D12Resource *res;
    uint64_t size;
+   D3D12_RESOURCE_STATES init_state;
 };
+
+void dzn_device_internal_buf_pool_finish(struct dzn_device *device);
 
 enum dzn_event_state {
    DZN_EVENT_STATE_RESET = 0,
@@ -874,6 +904,7 @@ struct dzn_cmd_buffer {
    uint64_t cur_upload_buf_offset;
 
    ID3D12CommandAllocator *cmdalloc;
+   HRESULT allocator_reset_status;
    ID3D12GraphicsCommandList1 *cmdlist;
    ID3D12GraphicsCommandList2 *cmdlist2;
    ID3D12GraphicsCommandList8 *cmdlist8;

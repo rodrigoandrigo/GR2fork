@@ -1,6 +1,8 @@
 #ifndef UWP_UTIL_H
 #define UWP_UTIL_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -11,6 +13,8 @@ extern "C" {
 #define MESA_UWP_EXPORT
 #endif
 
+int uwp_get_cache_directory(char *path, size_t capacity);
+int uwp_is_desktop_device(void);
 MESA_UWP_EXPORT void* uwp_get_window_reference(void);
 /* A failed COM marshaling request makes the window getter return NULL until
  * the host supplies a new reference. Width/height are published together. */

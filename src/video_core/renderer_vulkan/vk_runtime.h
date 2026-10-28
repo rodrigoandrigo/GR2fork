@@ -92,6 +92,8 @@ public:
 
     void FlushBarriers();
 
+    void SynchronizeMemory();
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 

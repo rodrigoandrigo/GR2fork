@@ -1033,6 +1033,10 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
+void Rasterizer::CpSync() {
+    runtime.SynchronizeMemory();
+}
+
 void Rasterizer::OnSubmit() {
     const u64 frame = DebugState.GetFrameNum();
     // Guest packet census. Deliberately outside the skipcache gate below: it describes what the

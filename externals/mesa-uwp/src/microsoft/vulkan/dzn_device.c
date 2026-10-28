@@ -701,7 +701,7 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &pdev->shader_model,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
                      offsetof(struct dzn_physical_device, shader_model));
-   const uint32_t runtime_layout_version = 17;
+   const uint32_t runtime_layout_version = 18;
    _mesa_blake3_update(&blake3_ctx, &runtime_layout_version, sizeof(runtime_layout_version));
    _mesa_blake3_final(&blake3_ctx, blake3);
    memcpy(pdev->pipeline_cache_uuid, blake3, VK_UUID_SIZE);
@@ -3151,6 +3151,8 @@ dzn_device_destroy(struct dzn_device *device, const VkAllocationCallbacks *pAllo
 
    dzn_device_query_finish(device);
    dzn_meta_finish(device);
+   dzn_device_internal_buf_pool_finish(device);
+   dzn_pso_lib_finish(device);
 
    dzn_foreach_pool_type(type) {
       dzn_descriptor_heap_finish(&device->device_heaps[type].heap);
@@ -3425,6 +3427,18 @@ dzn_device_create(struct dzn_physical_device *pdev,
       }
    }
 
+   simple_mtx_init(&device->internal_buf_pool.lock, mtx_plain);
+   for (uint32_t b = 0; b < ARRAY_SIZE(device->internal_buf_pool.bufs); b++)
+      list_inithead(&device->internal_buf_pool.bufs[b]);
+   dzn_pso_lib_init(device);
+
+   const HRESULT device_status = ID3D12Device_GetDeviceRemovedReason(device->dev);
+   if (FAILED(device_status)) {
+      mesa_loge("dzn: device lost during initialization: 0x%08x", (unsigned)device_status);
+      dzn_device_destroy(device, pAllocator);
+      return vk_error(pdev, VK_ERROR_DEVICE_LOST);
+   }
+
    assert(queue_count == qindex);
    *out = dzn_device_to_handle(device);
    return VK_SUCCESS;
@@ -3473,6 +3487,11 @@ dzn_device_create_root_sig(struct dzn_device *device,
                                      ID3D10Blob_GetBufferSize(sig),
                                      &IID_ID3D12RootSignature,
                                      (void **)&root_sig);
+   if (root_sig) {
+      uint8_t hash[BLAKE3_KEY_LEN];
+      _mesa_blake3_compute(ID3D10Blob_GetBufferPointer(sig), ID3D10Blob_GetBufferSize(sig), hash);
+      ID3D12RootSignature_SetPrivateData(root_sig, &dzn_root_sig_hash_guid, sizeof(hash), hash);
+   }
    ID3D10Blob_Release(sig);
    return root_sig;
 }

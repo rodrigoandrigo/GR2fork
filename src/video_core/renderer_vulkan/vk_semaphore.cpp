@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <limits>
+#include <stdexcept>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -21,8 +22,10 @@ Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     };
     auto [semaphore_result, sem] =
         instance.GetDevice().createSemaphoreUnique(semaphore_chain.get());
-    ASSERT_MSG(semaphore_result == vk::Result::eSuccess, "Failed to create master semaphore: {}",
-               vk::to_string(semaphore_result));
+    if (semaphore_result != vk::Result::eSuccess) {
+        throw std::runtime_error(fmt::format("Failed to create master semaphore: {}",
+                                             vk::to_string(semaphore_result)));
+    }
     semaphore = std::move(sem);
 }
 

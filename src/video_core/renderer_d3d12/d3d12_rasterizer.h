@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <d3d12sdklayers.h>
@@ -19,7 +21,7 @@ namespace D3D12 {
 namespace {
 std::string RuntimeErrorTrace(D3D12DeviceContext& device) {
     Microsoft::WRL::ComPtr<ID3D12InfoQueue> queue;
-    if (FAILED(device.Device()->QueryInterface(IID_PPV_ARGS(&queue))))
+    if (!device.Device() || FAILED(device.Device()->QueryInterface(IID_PPV_ARGS(&queue))))
         return {};
     std::string trace;
     const UINT count = queue->GetNumStoredMessages();
@@ -59,15 +61,9 @@ public:
     u64 Flush() override;
     void Finish() override;
     void SetBackground(bool background);
-    void SetExternalMemory(std::function<u64()> usage, std::function<void()> trim) {
-        runtime.SetExternalMemory(std::move(usage), std::move(trim));
-    }
-    void OnSubmit() override {
-        runtime.SubmitReady();
-    }
-    void EndPacketRun() override {
-        runtime.SubmitReady();
-    }
+    void SetExternalMemory(std::function<u64()> usage, std::function<void()> trim);
+    void OnSubmit() override;
+    void EndPacketRun() override;
     void ScopeMarkerBegin(std::string_view, bool = false) override {}
     void ScopeMarkerEnd(bool = false) override {}
     void ScopedMarkerInsertColor(std::string_view, u32, bool = false) override {}
@@ -83,21 +79,28 @@ public:
 private:
     template <typename Function>
     void Execute(Function&& function) {
+        std::scoped_lock lock{runtime_mutex};
         if (failed)
             return;
         try {
-            function();
+            if (recovery_enabled)
+                ExecuteRecoverable(function);
+            else
+                function();
         } catch (const winrt::hresult_error& error) {
             failed = true;
+            runtime->StopAfterFailure();
             Core::Uwp::FailGuestSession(fmt::format(
                 "D3D12 HRESULT {:08x}: {}{}", u32(error.code().value),
-                winrt::to_string(error.message()), RuntimeErrorTrace(runtime.Device())));
+                winrt::to_string(error.message()), RuntimeErrorTrace(runtime->Device())));
         } catch (const std::exception& error) {
             failed = true;
+            runtime->StopAfterFailure();
             Core::Uwp::FailGuestSession(
-                fmt::format("{}{}", error.what(), RuntimeErrorTrace(runtime.Device())));
+                fmt::format("{}{}", error.what(), RuntimeErrorTrace(runtime->Device())));
         } catch (...) {
             failed = true;
+            runtime->StopAfterFailure();
             Core::Uwp::FailGuestSession("D3D12 guest GPU execution failed");
         }
     }
@@ -122,6 +125,14 @@ private:
     void Dispatch(std::array<u32, 3> groups, VAddr indirect_address = 0);
     AmdGpu::Liverpool& liverpool;
     Core::MemoryManager& memory;
-    CommandRuntime runtime;
+    void InitializeRuntime(CommandRuntime& target);
+    void ExecuteRecoverable(const std::function<void()>& function);
+    std::recursive_mutex runtime_mutex;
+    std::unique_ptr<CommandRuntime> runtime;
+    std::optional<CommandRuntime::RecoveryCheckpoint> recovery_checkpoint;
+    std::function<u64()> external_memory;
+    std::function<void()> trim_external_memory;
+    bool recovery_enabled{}, recovered{}, background{};
+    u64 write_generation{};
 };
 } // namespace D3D12

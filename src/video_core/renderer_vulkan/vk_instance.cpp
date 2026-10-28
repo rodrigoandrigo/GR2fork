@@ -4,6 +4,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#include <stdexcept>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -172,7 +173,9 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
-    ASSERT_MSG(CreateDevice(), "Failed to initialize the Vulkan device");
+    if (!CreateDevice()) {
+        throw std::runtime_error("Failed to initialize the Vulkan device");
+    }
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
@@ -658,7 +661,8 @@ bool Instance::CreateDevice() {
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
-        return false;
+        throw std::runtime_error(fmt::format("Failed to create Vulkan device: {}",
+                                             vk::to_string(device_result)));
     }
     device = std::move(dev);
 

@@ -379,9 +379,9 @@ jogo depende de cada item.
 | F17 | Parcial: ampliar o fallback de constantes RGB/alpha para MRT e slots diferentes de zero, e combinações com dual-source guest. | Um RT no slot 0 usa saída secundária do PS para alpha constante, mantendo as constantes RGB no output merger e o alpha original do fragmento. MIN/MAX RGB ficam nativos porque ignoram fatores. Configurações incompatíveis continuam rejeitadas explicitamente. |
 | F18 | Parcial: FP64 por software e demais operações/modos; arredondamentos direcionados, denorm híbrido/FP16/FP64 e semântica completa de NaN; cross-lane sem wave64 garantido. | O perfil nativo preserva FP64 no IR, consulta DoublePrecisionFloatShaderOps e rejeita a ausência de suporte em vez de reduzir para FP32. Bitcasts uint2/double usam asdouble/asuint no HLSL. FP32 flush/preserve seguem ExecutionMode e opções -denorm do DXC, também nos helpers derivados. As guardas de wave64 continuam ativas. |
 | F19 | Parcial: demais opcodes GCN, DPP, SDWA em caminhos de 16/64 bits, append/consume com semântica geral por wave e validação dos demais estágios até DXIL/SM6.4. | SDWA de 32 bits agora aplica seletores, extensão, modificadores e preservação do destino. ORN2/NOR/XNOR B32, CMOV B32 e SEXT I8/I16 implementados, incluindo SCC. DPP sem lowering validado é rejeitado explicitamente. Emissores unreachable isolados não medem a cobertura. |
-| F20 | Predicação e consultas de oclusão reais, além dos comandos PM4 válidos hoje apenas avisados/stubados, como `IT_COPY_DATA` no caminho gráfico. | [liverpool.cpp](../src/video_core/amdgpu/liverpool.cpp): `IT_SET_PREDICATION` não implementado; `PixelPipeStatDump` produz contador sintético; CopyData registra warning. O SGPR de draw index (`draw_index_enable`/`draw_index_loc`) também não é propagado pela interface atual; P03 preserva os SGPRs de base vertex/instância já suportados. É uma lacuna compartilhada do processador de comandos. |
-| F21 | Fechar as combinações ainda rejeitadas de views/formato/layout/alias, incluindo storage MSAA escrito e SRV/UAV que não puderem ser lowerados. | Guardas em [resource_bindings.cpp](../src/video_core/renderer_d3d12/resource_bindings.cpp) e [image_cache.cpp](../src/video_core/renderer_d3d12/image_cache.cpp). A validação deve ser por uso do formato, não somente pela presença em `ConvertFormat`. |
-| F22 | Recuperação controlada após device loss/falha de gravação e restauração dos recursos/estado da sessão, se a continuidade sem reinício for exigida. | O runtime fica marcado como falho e exige recriação; diagnóstico/DRED e drenagem já existem, recuperação transparente não. |
+| F20 | Parcial: demais comandos PM4 válidos, estatísticas/controles guest e fidelidade das consultas nas expansões. | Oclusão D3D12 mede samples aprovados por depth/stencil e resolve resultados após fence, também em contextos assíncronos. SET_PREDICATION aplica ZPASS/PRIMCOUNT/BOOL32/64, polaridade, continuação e espera/no-wait aos pacotes marcados. COPY_DATA gráfico implementa memória/GDS/registradores/imediato/clock, 32/64 bits e confirmação. Restam GET_LOD_STATS, seletores atômicos de COPY_DATA, geração de estatísticas PRIMCOUNT/pipeline, distribuição/controle por RB e SGPR de draw index. |
+| F21 | Parcial: combinações que excedem o lowering raw, orçamento de tabelas ou dependem das semânticas pendentes de F01/F04/F05/F06/F07. | Storage MSAA escrito/atômico/feedback e views MSAA de um sample usam storage compartilhado. Aliases escritos com a mesma base também são lowerados, independentemente do formato/layout. A seleção consulta suporte real de dimensão, load/sample/gather/comparison, UAV typed load/store e sample count; views sem suporte nativo usam o lowering existente. Permanecem as guardas para operações sem representação, formatos/layouts não implementados, metadata comprimida e feedback de attachments com escrita. |
+| F22 | Parcial: continuidade após perda de trabalho já submetido ou de estado GPU sem cópia CPU, e recuperação conjunta do presenter/swapchain. | Modo opcional SHADPS4_D3D12_RECOVERY=1 faz checkpoints sincronizados, desabilita batching assíncrono e permite uma recuperação por sessão na thread PM4. Recria o runtime e restaura GDS, oclusão, filled-size e registradores, recarregando recursos da memória guest. Recusa replay após submissão, escrita CPU, operação já concluída ou checkpoint inválido; erros determinísticos continuam encerrando a sessão. |
 
 Os atômicos 32-bit listados em “Caminhos implementados”, aliases virtuais entre
 estágios, segmentos físicos repetidos, CMASK 0/F e MSAA descomprimido 2×/4×/8× por tile e dirty tracking de
@@ -389,6 +389,69 @@ imagens **não estão pendentes como recursos inteiros**. F01/F02/F06/F21
 identificam os casos residuais concretos. Tampouco se exige coerência definida
 para data races que o próprio contrato guest não define: falta confrontar as
 políticas de sincronização/cache em usos válidos com hardware.
+
+F22 oferece recuperação conservadora, desligada por padrão. Com
+`SHADPS4_D3D12_RECOVERY=1`, o renderer sincroniza os recursos com a memória guest
+antes/depois das operações da thread PM4 e guarda GDS, oclusão e filled-size.
+Perda do dispositivo, HRESULT `E_OUTOFMEMORY` ou `std::bad_alloc` antes de nova submissão
+pode recriar dispositivo/fila, caches, allocators, listas, descritores e pipelines;
+restaura os registradores gráficos/compute da chamada e tenta a operação uma vez.
+Os recursos de imagem/buffer são reconstruídos sob demanda a partir da memória
+guest sincronizada; os callbacks de backing, residência e orçamento são religados.
+Leases CPU/mapping mantêm o runtime vivo até sua liberação. Checkpoints possuem
+identidade de runtime e não são utilizáveis durante mudanças de mapeamento.
+
+A troca não ocorre se a operação já terminou, escreveu memória guest pela CPU,
+submeteu qualquer lista desde o checkpoint ou se a tentativa da sessão já foi
+usada. Esses casos encerram a sessão com diagnóstico. O descarte de um runtime
+falho não submete listas pendentes nem confirma readbacks de trabalho abandonado.
+A recuperação automática é restrita à thread PM4 para não restaurar registradores
+enquanto o parser os modifica. Outros acessos preservam o tratamento de falha.
+Isso tem custo de sincronização/readback e não equivale a savestate de CPU, RAM,
+filas e efeitos externos. Recuperação geral em voo e recriação conjunta da
+apresentação após TDR real permanecem pendentes. O runtime antigo é liberado
+antes da recriação; outros componentes que ainda retenham o device removido,
+incluindo presenter/frames, podem impedir a criação do substituto e levam ao
+encerramento controlado. Isso decorre do
+[device por adapter de D3D12CreateDevice](https://microsoft.github.io/DirectX-Specs/d3d/IndependentDevices.html).
+[Remoção programática do dispositivo](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device5-removedevice).
+
+F21 encaminha storage MSAA para buffers coerentes por texel/sample/camada,
+preservando os bytes vizinhos e o padding, inclusive em formatos de 8/16 bits.
+A seleção de aliases não exige mais bases virtuais diferentes: views RGBA8 e
+R32_UINT da mesma base compartilham as escritas. Suporte nativo é consultado no
+dispositivo por uso; ausência de mapeamento DXGI ou de capacidade da view aciona
+o lowering raw já implementado, sem remover as validações de operação/formato.
+O backend continua em SM6.4. [Capacidades typed UAV](https://learn.microsoft.com/en-us/windows/win32/direct3d12/typed-unordered-access-view-loads).
+
+Isso não fecha toda a F21: o caminho raw ainda limita tabelas a imagens de 16 MiB
+e ao orçamento de descritores, rejeita RGB96 tiled e operações/formatos sem
+packing/lowering, e não resolve as dependências de metadata ou feedback de
+attachments com escrita. Os testes de uso, layout e ordem permanecem necessários
+para cada combinação; a presença em `ConvertFormat` não prova suporte completo.
+[OpenOrbis: views com a mesma base](hardware/image-views/main.cpp), validado
+localmente apenas por sintaxe.
+
+F20 usa consultas `D3D12_QUERY_TYPE_OCCLUSION` no raster final; captura de
+geometria, helpers de stencil e passes auxiliares de depth-fail não entram no
+contador. `PixelPipeStatDump`/`ZpassDone` publicam snapshots válidos, com a soma
+no primeiro par e zero nos demais; `PixelPipeStatReset`/`RstPixCnt` reiniciam a
+soma. A leitura aguarda fences e mantém os readbacks no pool de transferências.
+O contrato de distribuição física e dos controles de contagem por RB ainda não
+está reproduzido. Outros backends mantêm o fallback anterior de contador sintético.
+
+A predicação é resolvida na CPU após sincronização, com espera cooperativa quando
+faltam resultados válidos; o hint no-wait de ZPASS permite executar nesse caso.
+ZPASS acumula visibilidade, enquanto PRIMCOUNT acumula ausência de overflow.
+Os registradores consumidos pelo parser rápido também respeitam a predicação.
+`ACQUIRE_MEM` e `PFP_SYNC_ME` sincronizam o renderer; `COND_EXEC` sincroniza antes
+da leitura. A solução prioriza coerência e ainda pode introduzir stalls.
+`COPY_DATA` rejeita seletores sem implementação e ranges GDS inválidos, em vez de
+prosseguir com dados inventados. O clock usa o contador emulado já existente.
+[OpenOrbis: oclusão/predicação](hardware/occlusion-predication/main.cpp), com
+validação local sintática. Codificação consultada no
+[guia de programação SI da AMD](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-references/si_programming_guide_v2.pdf)
+e nos emissores PM4 de Mesa presentes no repositório.
 
 A auditoria de F19 distingue os placeholders de SSA/registros, eliminados por passes,
 dos caminhos sem tradução. Append/consume já são convertidos em atômicos por
@@ -536,6 +599,10 @@ suíte incluída no repositório nem execução de jogos no Xbox.
 | `Build/f13-gs-validation.log` | Gate com GS: pixels/depth iguais à referência e contador GS=1; zero erros D3D12. | Caso sintético PC, sem validar todas as combinações de GS/tessellation com gate. |
 | `Build/f13-f12-regression-validation.log` | Regressão dos 34 casos F12 de polígonos, IsFrontFace, bias e tessellation, zero erros D3D12. | Diagnóstico nativo PC; sem execução Xbox nesta atualização. |
 | `Build/f12-combined-validation.log` | SM6.4: oito comparações de quad/quad strip/polygon/rect com contadores VS iguais à referência, 16 verificações IsFrontFace, quatro comparações de bias fill/wire nativo e seis de tessellation com/sem GS; zero erros D3D12. | Readbacks PC; sem bias em expansões, gameplay ou validação Xbox. |
+| `Build/f22-recovery-validation.log` | Falha de gravação por alocação e RemoveDevice no renderer isolado recuperados; GDS, oclusão, filled-size, registradores e atômico preservados. Após cada recuperação: 256 pixels corretos, novo frame residente e zero erros na fila de diagnóstico do device restaurado. Leases CPU bloquearam a troca; modo padrão assíncrono também passou. Replay após submissão recusado, com atômico executado uma vez. Uma lista assíncrona pronta foi cancelada após falha de outro contexto; submissão bloqueada e nenhum replay no teardown. | PC com fault injection; prefixo SM6.4 e integração do rasterizer no modelo reportado pelo PC (6.6). Não valida TDR global, presenter/swapchain, gameplay, UWP ou Xbox. |
+| `Build/f21-async-validation.log` | 55 casos em SM6.4: storage MSAA 2×/4×/8× com/sem array e base_array, linear/tiled alternativo, RGBA8/R32_UINT/R8_UINT/R16_UINT, padding e samples não escritos preservados; aliases RGBA8↔R32_UINT da mesma base em linear/tiled e RGB96 store/sample, leitura MSAA 1/16 e quatro escritas assíncronas em samples distintos; zero erros D3D12. | Diagnóstico nativo PC; não prova todas as views, metadata, large images, UWP ou Xbox. |
+| `Build/f20-occlusion-validation.log` / `Build/f20-depth-occlusion-validation.log` | SM6.4: 256 samples por draw, acumulação 512, scissor 128, área vazia e rejeição depth/stencil com zero, reset e 12 draws assíncronos totalizando 3.072; zero erros D3D12. | Diagnóstico nativo PC; não cobre todas as expansões, MSAA/EQAA ou Xbox. |
+| `Build/f20-pm4-validation.log` | Processador Liverpool com sink de diagnóstico: predicação ZPASS/PRIMCOUNT/BOOL32/64, inversão, continuação, no-wait, espera/retomada, registradores predicados no parser rápido, COPY_DATA 32/64 bits entre memória/GDS/registradores gráficos e compute/imediato e dump de contadores. | Valida encaminhamento/estado PM4; o sink deste diagnóstico não rasteriza. |
 | `Build/f19-sdwa-validation.log`, `Build/f19-scalar-validation.log` e `Build/f19-float-validation.log` | 1.176 combinações SDWA inteiras, 1.200 casos escalares com SCC e 112 conversões SDWA para float com omod/clamp, por GCN→IR→HLSL→DXIL/SM6.4 e leitura GPU. Rejeição explícita de DPP conferida; zero erros D3D12. | Compute no PC; não constitui cobertura total de IR/GCN, estágios gráficos, Vulkan, UWP ou Xbox. |
 | `Build/f18-numeric-validation.log` | Três adições GCN FP64 com resultado exato em bits, quatro testes de denorm FP32 entrada/saída e cinco valores especiais (zeros assinados, infinitos e NaN); `F18_ERRORS=0`. | PC/SM6.4 com FP64 nativo; não prova todos os opcodes, payload de NaN em operações gerais, rounding dirigido nem software FP64/cross-lane. |
 | `Build/f18-gs-regression-build.log` e `Build/f18-tess-regression-build.log` | Regressões por captura/replay GS e LS/HS/DS/GS após a alteração do perfil numérico; zero erros D3D12. | Caminhos existentes, sem adicionar cobertura numérica FP64 em todos esses estágios. |

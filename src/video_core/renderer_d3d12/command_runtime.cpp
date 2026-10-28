@@ -19,13 +19,28 @@
 namespace D3D12 {
 namespace {
 Profile runtime_profile;
+std::atomic<u64> runtime_identity{1};
+} // namespace
+CommandRuntime::CommandRuntime() = default;
+u64 CommandRuntime::NextRuntimeIdentity() {
+    return runtime_identity.fetch_add(1, std::memory_order_relaxed);
 }
 CommandRuntime::~CommandRuntime() {
     try {
-        DrainContexts();
-        if (device.DirectQueue())
+        if (failed) {
+            if (!recovery_abandoned)
+                device.DrainAfterFailure();
+            for (auto& context : contexts) {
+                context->failed = true;
+                context->recovery_abandoned = recovery_abandoned;
+            }
+        } else {
+            DrainContexts();
+        }
+        if (!failed && device.DirectQueue())
             device.WaitForGpu();
-        ReadGpuTiming();
+        if (!failed)
+            ReadGpuTiming();
         if (gpu_timing.submissions)
             std::fprintf(stderr, "NATIVE_GPU final_average_us=%.3f submissions=%llu\n",
                          double(gpu_timing.ticks) * 1000000.0 / double(gpu_timing.frequency) /
@@ -35,6 +50,55 @@ CommandRuntime::~CommandRuntime() {
         device.DrainAfterFailure();
     }
     contexts.clear();
+}
+void CommandRuntime::StopAfterFailure() {
+    auto* owner = coordinator ? coordinator : this;
+    std::scoped_lock lock{owner->mutex};
+    owner->failed = true;
+    for (auto& context : owner->contexts)
+        context->failed = true;
+}
+CommandRuntime::RecoveryCheckpoint CommandRuntime::CreateRecoveryCheckpoint() {
+    std::scoped_lock lock{mutex};
+    if (coordinator)
+        throw std::runtime_error("D3D12 recovery requires coordinator access");
+    if (image_mapping_count.load())
+        return {};
+    Flush();
+    RecoveryCheckpoint checkpoint{};
+    checkpoint.owner = this;
+    checkpoint.identity = recovery_identity;
+    checkpoint.device = device.Device();
+    checkpoint.submitted_lists = device.SubmittedLists();
+    checkpoint.gds = gds;
+    checkpoint.strmout_filled = StrmoutFilledSize();
+    checkpoint.occlusion_total = occlusion_total;
+    checkpoint.occlusion_enabled = occlusion_enabled;
+    return checkpoint;
+}
+bool CommandRuntime::CanRecover(const RecoveryCheckpoint& checkpoint) {
+    std::scoped_lock lock{mutex};
+    return !coordinator && !image_mapping_count.load() && checkpoint.owner == this &&
+           checkpoint.identity == recovery_identity && checkpoint.device == device.Device() &&
+           checkpoint.submitted_lists == device.SubmittedLists();
+}
+void CommandRuntime::AbandonForRecovery(const RecoveryCheckpoint& checkpoint) {
+    std::scoped_lock lock{mutex};
+    if (!CanRecover(checkpoint))
+        throw std::runtime_error("D3D12 recovery cannot replay submitted guest commands");
+    failed = recovery_abandoned = true;
+    for (auto& context : contexts)
+        context->failed = context->recovery_abandoned = true;
+}
+void CommandRuntime::RestoreRecoveryCheckpoint(const RecoveryCheckpoint& checkpoint) {
+    std::scoped_lock lock{mutex};
+    if (!checkpoint.owner || !checkpoint.device || !device.Device() || failed || coordinator ||
+        device.SubmittedLists() || !contexts.empty())
+        throw std::runtime_error("D3D12 recovery requires a fresh command runtime");
+    gds = checkpoint.gds;
+    strmout_filled = checkpoint.strmout_filled;
+    occlusion_total = checkpoint.occlusion_total;
+    occlusion_enabled = checkpoint.occlusion_enabled;
 }
 const CommandRuntime::GpuTimingStatistics& CommandRuntime::GpuTimings() {
     auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
@@ -138,7 +202,7 @@ std::shared_ptr<VideoCore::ResidentFrame> CommandRuntime::CapturePresentation(
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
     BeginGpuTiming();
-    RecordingGuard recording{failed};
+    RecordingGuard recording{*this};
     const auto previous = image->state;
     images.Barrier(*image, commands.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
@@ -317,7 +381,7 @@ void CommandRuntime::SynchronizeBuffers(std::span<const ResourceCache::Range> ra
         const auto lease = acquire_memory ? acquire_memory(access) : nullptr;
         winrt::check_hresult(allocator->Reset());
         winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
-        RecordingGuard recording{failed};
+        RecordingGuard recording{*this};
         resources.PrepareDownload(commands.Get());
         winrt::check_hresult(commands->Close());
         ProfileSample(runtime_profile, "runtime_submit_wait", 128,
@@ -381,7 +445,7 @@ void CommandRuntime::SynchronizeImages(std::span<const ResourceCache::Range> ran
         winrt::check_hresult(allocator->Reset());
         winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
         BeginGpuTiming();
-        RecordingGuard recording{failed};
+        RecordingGuard recording{*this};
         images.PrepareDownloads(commands.Get());
         EndGpuTiming();
         winrt::check_hresult(commands->Close());
@@ -748,7 +812,7 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
         }
     } buffer_scope{buffer_commands_open};
     BeginGpuTiming();
-    RecordingGuard recording{failed};
+    RecordingGuard recording{*this};
     if (indirect_address) {
         resources.Upload(*indirect_view.buffer, commands.Get());
         gpu_commands.RecordDispatch(commands.Get(), indirect_view);
@@ -824,7 +888,7 @@ void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
     BeginGpuTiming();
-    RecordingGuard recording{failed};
+    RecordingGuard recording{*this};
     images.Resolve(input, output, commands.Get());
     images.PrepareDownloads(commands.Get());
     EndGpuTiming();

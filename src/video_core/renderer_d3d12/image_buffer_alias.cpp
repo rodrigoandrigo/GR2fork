@@ -10,6 +10,8 @@
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/ir/reinterpret.h"
 #include "video_core/renderer_d3d12/bptc.h"
+#include "video_core/renderer_d3d12/image_cache.h"
+#include "video_core/renderer_d3d12/msaa_transfer.h"
 #include "video_core/renderer_d3d12/resource_cache.h"
 #include "video_core/renderer_d3d12/shader_cache.h"
 #include "video_core/texture_cache/cpu_tiling.h"
@@ -1168,7 +1170,8 @@ std::vector<ShaderResourceRange> GetShaderResourceRanges(const Shader::Info& inf
 }
 bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
                              const ResourceCache* resources,
-                             std::span<const ShaderResourceRange> stage_resources) {
+                             std::span<const ShaderResourceRange> stage_resources,
+                             ID3D12Device* device) {
     auto& info = shader.info;
     const auto overlaps = [&](VAddr first, u64 size, VAddr second, u64 second_size) {
         return resources ? resources->Aliases(first, size, second, second_size)
@@ -1180,11 +1183,62 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
     std::vector<VideoCore::ImageInfo> layouts;
     for (const auto& image : info.images)
         layouts.push_back(ShaderImageLayout(image.GetSharp(info), image));
+    const auto supports_view = [&](u32 index, D3D12_FORMAT_SUPPORT1 usage) {
+        if (!device)
+            return true;
+        const auto& resource = info.images[index];
+        DXGI_FORMAT format{};
+        try {
+            format = ConvertFormat(layouts[index].pixel_format);
+            if (layouts[index].num_samples > 1) {
+                GetMsaaFormat(format, layouts[index].props.is_depth);
+                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{format,
+                                                                      layouts[index].num_samples};
+                if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                       &quality, sizeof(quality))) ||
+                    !quality.NumQualityLevels)
+                    return false;
+            }
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+        if (resource.is_depth)
+            format = resource.GetSharp(info).GetDataFmt() == AmdGpu::DataFormat::Format16
+                         ? DXGI_FORMAT_R16_UNORM
+                         : DXGI_FORMAT_R32_FLOAT;
+        if ((resource.is_written || resource.is_feedback) &&
+            format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+            format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                               sizeof(support))))
+            return false;
+        if ((support.Support1 & usage) != usage)
+            return false;
+        if (resource.is_written || resource.is_feedback || resource.is_atomic)
+            return (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
+                   (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) &&
+                   (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+        return true;
+    };
     const u32 original_buffers = info.buffers.size();
     for (u32 i = 0; i < info.images.size(); ++i) {
-        const auto format = info.images[i].GetSharp(info).GetDataFmt();
+        const auto sharp = info.images[i].GetSharp(info);
+        const auto format = sharp.GetDataFmt();
+        const auto type = sharp.GetViewType(info.images[i].is_array);
+        const bool storage =
+            info.images[i].is_written || info.images[i].is_feedback || info.images[i].is_atomic;
+        const bool multisampled =
+            type == AmdGpu::ImageType::Color2DMsaa || type == AmdGpu::ImageType::Color2DMsaaArray;
+        const auto dimension =
+            type == AmdGpu::ImageType::Color1D || type == AmdGpu::ImageType::Color1DArray
+                ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
+            : type == AmdGpu::ImageType::Color3D ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
+                                                 : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
         selected[i] =
-            format == AmdGpu::DataFormat::FormatGB_GR ||
+            (multisampled && (storage || sharp.NumSamples() == 1)) ||
+            (storage && type == AmdGpu::ImageType::Cube) || info.images[i].is_atomic ||
+            !supports_view(i, dimension) || format == AmdGpu::DataFormat::FormatGB_GR ||
             format == AmdGpu::DataFormat::FormatBG_RG || format == AmdGpu::DataFormat::Format8_24 ||
             format == AmdGpu::DataFormat::Format24_8 ||
             format == AmdGpu::DataFormat::FormatX24_8_32 ||
@@ -1206,9 +1260,28 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
     }
     for (auto* block : program.blocks) {
         for (const auto& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::ImageRead) {
+                const u32 index = inst.Arg(0).U32();
+                const auto sharp = info.images[index].GetSharp(info);
+                const auto usage = sharp.NumSamples() > 1 ? D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD
+                                                          : D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
+                if (!supports_view(index, usage))
+                    selected[index] = true;
+            }
             if (!IsSampledInstruction(inst.GetOpcode()))
                 continue;
             const u32 handle = inst.Arg(0).U32();
+            const bool gather = inst.GetOpcode() == IR::Opcode::ImageGather ||
+                                inst.GetOpcode() == IR::Opcode::ImageGatherDref;
+            const bool comparison = inst.GetOpcode() == IR::Opcode::ImageSampleDrefImplicitLod ||
+                                    inst.GetOpcode() == IR::Opcode::ImageSampleDrefExplicitLod ||
+                                    inst.GetOpcode() == IR::Opcode::ImageGatherDref;
+            const auto usage = gather ? (comparison ? D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON
+                                                    : D3D12_FORMAT_SUPPORT1_SHADER_GATHER)
+                               : comparison ? D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON
+                                            : D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
+            if (!supports_view(handle & 0xffff, usage))
+                selected[handle & 0xffff] = true;
             const auto sampler = info.samplers[handle >> 16].GetSharp(info);
             const auto manual_mode = [](AmdGpu::ClampMode mode) {
                 return mode == AmdGpu::ClampMode::ClampHalfBorder ||
@@ -1231,7 +1304,6 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
     for (u32 i = 0; i < info.images.size(); ++i)
         for (u32 j = 0; j < i; ++j)
             if ((info.images[i].is_written || info.images[j].is_written) &&
-                layouts[i].guest_address != layouts[j].guest_address &&
                 overlaps(layouts[i].guest_address, layouts[i].guest_size, layouts[j].guest_address,
                          layouts[j].guest_size)) {
                 selected[i] = true;

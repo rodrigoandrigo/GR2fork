@@ -65,10 +65,7 @@ public:
     void ProcessDownloadImages() override {
         OnFence();
     }
-    void CpSync() override {
-        Finish();
-        OnFence();
-    }
+    void CpSync() override;
     bool HostMarkersEnabled() const override {
         return host_markers_enabled;
     }

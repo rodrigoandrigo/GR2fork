@@ -41,6 +41,10 @@
 
 #include "util/os_time.h"
 #include "util/u_debug.h"
+#include "vk_common_entrypoints.h"
+#ifdef _XBOX_UWP
+#include "util/uwp_util.h"
+#endif
 
 #ifdef _XBOX_UWP
 static bool dzn_uwp_pso_diagnostic_reported;
@@ -147,7 +151,6 @@ const struct vk_pipeline_cache_object_ops dzn_cached_blob_ops = {
    .destroy = dzn_cached_blob_destroy,
 };
 
-
 static struct vk_pipeline_cache_object *
 dzn_cached_blob_create(struct vk_device *device,
                        const void *hash,
@@ -226,24 +229,402 @@ struct dzn_nir_options {
    const nir_shader_compiler_options *nir_opts;
 };
 
+#define DZN_SUBOBJ_SIZE(id, T) \
+   case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_##id: { \
+      struct dzn_wrap_##id { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; T d; }; \
+      if (off) *off = offsetof(struct dzn_wrap_##id, d); \
+      return sizeof(struct dzn_wrap_##id); }
+static size_t
+dzn_pso_subobject_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, size_t *off)
+{
+   switch (type) {
+   DZN_SUBOBJ_SIZE(ROOT_SIGNATURE, ID3D12RootSignature *)
+   DZN_SUBOBJ_SIZE(VS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(PS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(DS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(HS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(GS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(CS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(STREAM_OUTPUT, D3D12_STREAM_OUTPUT_DESC)
+   DZN_SUBOBJ_SIZE(BLEND, D3D12_BLEND_DESC)
+   DZN_SUBOBJ_SIZE(SAMPLE_MASK, UINT)
+   DZN_SUBOBJ_SIZE(RASTERIZER, D3D12_RASTERIZER_DESC)
+   DZN_SUBOBJ_SIZE(RASTERIZER1, D3D12_RASTERIZER_DESC1)
+   DZN_SUBOBJ_SIZE(RASTERIZER2, D3D12_RASTERIZER_DESC2)
+   DZN_SUBOBJ_SIZE(DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC)
+   DZN_SUBOBJ_SIZE(DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1)
+   DZN_SUBOBJ_SIZE(DEPTH_STENCIL2, D3D12_DEPTH_STENCIL_DESC2)
+   DZN_SUBOBJ_SIZE(INPUT_LAYOUT, D3D12_INPUT_LAYOUT_DESC)
+   DZN_SUBOBJ_SIZE(IB_STRIP_CUT_VALUE, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)
+   DZN_SUBOBJ_SIZE(PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE)
+   DZN_SUBOBJ_SIZE(RENDER_TARGET_FORMATS, struct D3D12_RT_FORMAT_ARRAY)
+   DZN_SUBOBJ_SIZE(DEPTH_STENCIL_FORMAT, DXGI_FORMAT)
+   DZN_SUBOBJ_SIZE(SAMPLE_DESC, DXGI_SAMPLE_DESC)
+   DZN_SUBOBJ_SIZE(NODE_MASK, UINT)
+   DZN_SUBOBJ_SIZE(CACHED_PSO, D3D12_CACHED_PIPELINE_STATE)
+   DZN_SUBOBJ_SIZE(FLAGS, D3D12_PIPELINE_STATE_FLAGS)
+   DZN_SUBOBJ_SIZE(VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC)
+   default: return 0;
+   }
+}
+
+static const GUID dzn_IID_ID3D12PipelineLibrary1 =
+   { 0x80eabf42, 0x2568, 0x4e5e, { 0xbd, 0x82, 0xc3, 0x7f, 0x86, 0x96, 0x1d, 0xc3 } };
+
+static bool
+dzn_pso_stream_hash(const D3D12_PIPELINE_STATE_STREAM_DESC *desc, uint8_t out[BLAKE3_KEY_LEN])
+{
+   struct mesa_blake3 ctx;
+   _mesa_blake3_init(&ctx);
+   const uint8_t *p = (const uint8_t *)desc->pPipelineStateSubobjectStream, *end = p + desc->SizeInBytes;
+   while (p < end) {
+      if ((size_t)(end - p) < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE))
+         return false;
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *)p;
+      size_t off = 0, sz = dzn_pso_subobject_size(t, &off);
+      if (!sz || ALIGN_POT(sz, sizeof(void *)) > (size_t)(end - p))
+         return false;
+      const uint8_t *d = p + off;
+      p += ALIGN_POT(sz, sizeof(void *));
+      _mesa_blake3_update(&ctx, &t, sizeof(t));
+      switch (t) {
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: {
+         ID3D12RootSignature *rs = *(ID3D12RootSignature *const *)d;
+         uint8_t h[BLAKE3_KEY_LEN];
+         UINT hs = sizeof(h);
+         if (!rs || FAILED(ID3D12RootSignature_GetPrivateData(rs, &dzn_root_sig_hash_guid, &hs, h)) || hs != sizeof(h))
+            return false;
+         _mesa_blake3_update(&ctx, h, sizeof(h));
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: {
+         const D3D12_SHADER_BYTECODE *bc = (const D3D12_SHADER_BYTECODE *)d;
+         uint64_t len = bc->pShaderBytecode ? bc->BytecodeLength : 0;
+         _mesa_blake3_update(&ctx, &len, sizeof(len));
+         if (len)
+            _mesa_blake3_update(&ctx, bc->pShaderBytecode, len);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+         const D3D12_INPUT_LAYOUT_DESC *il = (const D3D12_INPUT_LAYOUT_DESC *)d;
+         _mesa_blake3_update(&ctx, &il->NumElements, sizeof(il->NumElements));
+         for (UINT i = 0; i < il->NumElements; i++) {
+            const D3D12_INPUT_ELEMENT_DESC *e = &il->pInputElementDescs[i];
+            const char *sem = e->SemanticName ? e->SemanticName : "";
+            _mesa_blake3_update(&ctx, sem, strlen(sem) + 1);
+            _mesa_blake3_update(&ctx, &e->SemanticIndex, sizeof(*e) - offsetof(D3D12_INPUT_ELEMENT_DESC, SemanticIndex));
+         }
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+         const D3D12_VIEW_INSTANCING_DESC *vi = (const D3D12_VIEW_INSTANCING_DESC *)d;
+         _mesa_blake3_update(&ctx, &vi->ViewInstanceCount, sizeof(vi->ViewInstanceCount));
+         _mesa_blake3_update(&ctx, &vi->Flags, sizeof(vi->Flags));
+         if (vi->pViewInstanceLocations && vi->ViewInstanceCount)
+            _mesa_blake3_update(&ctx, vi->pViewInstanceLocations, vi->ViewInstanceCount * sizeof(*vi->pViewInstanceLocations));
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: {
+         const D3D12_STREAM_OUTPUT_DESC *so = (const D3D12_STREAM_OUTPUT_DESC *)d;
+         if (so->NumEntries || so->NumStrides)
+            return false;
+         _mesa_blake3_update(&ctx, &so->RasterizedStream, sizeof(so->RasterizedStream));
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: {
+         const D3D12_CACHED_PIPELINE_STATE *c = (const D3D12_CACHED_PIPELINE_STATE *)d;
+         if (c->pCachedBlob && c->CachedBlobSizeInBytes)
+            return false;
+         break;
+      }
+      default:
+         _mesa_blake3_update(&ctx, d, sz - off);
+         break;
+      }
+   }
+   _mesa_blake3_final(&ctx, out);
+   return true;
+}
+
+HRESULT
+dzn_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+               ID3D12PipelineState **out, bool at_draw)
+{
+   WCHAR name[2 * BLAKE3_KEY_LEN + 1];
+   bool named = false;
+   const int64_t start = os_time_get_nano();
+   HRESULT hr;
+
+#ifdef _XBOX_UWP
+   const uint8_t *p = desc->pPipelineStateSubobjectStream;
+   const uint8_t *end = p + desc->SizeInBytes;
+   D3D12_COMPUTE_PIPELINE_STATE_DESC compute = {0};
+   bool is_compute = false;
+   while (p < end) {
+      if ((size_t)(end - p) < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE))
+         return E_INVALIDARG;
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *)p;
+      size_t off = 0, size = dzn_pso_subobject_size(t, &off);
+      if (!size || ALIGN_POT(size, sizeof(void *)) > (size_t)(end - p))
+         break;
+      if (t == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE)
+         compute.pRootSignature = *(ID3D12RootSignature *const *)(p + off);
+      if (t == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+         compute.CS = *(const D3D12_SHADER_BYTECODE *)(p + off);
+         is_compute = true;
+      }
+      p += ALIGN_POT(size, sizeof(void *));
+   }
+#endif
+
+   if (device->pso_lib.lib) {
+      uint8_t hash[BLAKE3_KEY_LEN];
+      if (dzn_pso_stream_hash(desc, hash)) {
+         static const char hex[] = "0123456789abcdef";
+         for (unsigned i = 0; i < BLAKE3_KEY_LEN; i++) {
+            name[2 * i] = hex[hash[i] >> 4];
+            name[2 * i + 1] = hex[hash[i] & 15];
+         }
+         name[2 * BLAKE3_KEY_LEN] = 0;
+         named = true;
+
+         simple_mtx_lock(&device->pso_lib.lock);
+#ifdef _XBOX_UWP
+         if (is_compute)
+            hr = ID3D12PipelineLibrary1_LoadComputePipeline(device->pso_lib.lib, name, &compute,
+                                                             &IID_ID3D12PipelineState, (void **)out);
+         else
+#endif
+            hr = ID3D12PipelineLibrary1_LoadPipeline(device->pso_lib.lib, name, desc,
+                                                  &IID_ID3D12PipelineState, (void **)out);
+         simple_mtx_unlock(&device->pso_lib.lock);
+         if (SUCCEEDED(hr)) {
+            p_atomic_inc(&device->pso_lib.loaded);
+            p_atomic_add(&device->pso_lib.load_ns, os_time_get_nano() - start);
+            return hr;
+         }
+         *out = NULL;
+      }
+   }
+
+#ifdef _XBOX_UWP
+   if (is_compute)
+      hr = ID3D12Device4_CreateComputePipelineState(device->dev, &compute, &IID_ID3D12PipelineState, (void **)out);
+   else
+#endif
+      hr = ID3D12Device4_CreatePipelineState(device->dev, desc, &IID_ID3D12PipelineState, (void **)out);
+
+   if (SUCCEEDED(hr) && named) {
+      simple_mtx_lock(&device->pso_lib.lock);
+      HRESULT stored = ID3D12PipelineLibrary1_StorePipeline(device->pso_lib.lib, name, *out);
+      if (SUCCEEDED(stored)) {
+         device->pso_lib.dirty = true;
+         device->pso_lib.generation++;
+      }
+      simple_mtx_unlock(&device->pso_lib.lock);
+   }
+   if (SUCCEEDED(hr)) {
+      p_atomic_inc(&device->pso_lib.compiled);
+      p_atomic_add(&device->pso_lib.compile_ns, os_time_get_nano() - start);
+      if (at_draw)
+         p_atomic_inc(&device->pso_lib.compiled_at_draw);
+   }
+   return hr;
+}
+
+static FILE *
+dzn_pso_lib_open(const char *path, const wchar_t *mode)
+{
+   WCHAR wide[MAX_PATH * 2 + 64];
+   if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, ARRAY_SIZE(wide)))
+      return NULL;
+   return _wfopen(wide, mode);
+}
+
+static void
+dzn_pso_lib_save(struct dzn_device *device)
+{
+   if (!device->pso_lib.lib || FAILED(ID3D12Device_GetDeviceRemovedReason(device->dev)))
+      return;
+
+   simple_mtx_lock(&device->pso_lib.save_lock);
+   simple_mtx_lock(&device->pso_lib.lock);
+   if (!device->pso_lib.dirty) {
+      simple_mtx_unlock(&device->pso_lib.lock);
+      simple_mtx_unlock(&device->pso_lib.save_lock);
+      return;
+   }
+   const uint64_t generation = device->pso_lib.generation;
+   SIZE_T size = ID3D12PipelineLibrary1_GetSerializedSize(device->pso_lib.lib);
+   void *buf = size ? malloc(size) : NULL;
+   HRESULT hr = buf ? ID3D12PipelineLibrary1_Serialize(device->pso_lib.lib, buf, size) : E_OUTOFMEMORY;
+   simple_mtx_unlock(&device->pso_lib.lock);
+   bool ok = false;
+   if (SUCCEEDED(hr)) {
+      char tmp[MAX_PATH * 2 + 64];
+      snprintf(tmp, sizeof(tmp), "%s.%lu.%p.tmp", device->pso_lib.path,
+               (unsigned long)GetCurrentProcessId(), (void *)device);
+      FILE *f = dzn_pso_lib_open(tmp, L"wb");
+      ok = f && fwrite(buf, 1, size, f) == size;
+      if (f)
+         ok = fclose(f) == 0 && ok;
+      WCHAR wtmp[ARRAY_SIZE(tmp)], wpath[MAX_PATH * 2];
+      bool paths_valid = MultiByteToWideChar(CP_UTF8, 0, tmp, -1, wtmp, ARRAY_SIZE(wtmp)) &&
+         MultiByteToWideChar(CP_UTF8, 0, device->pso_lib.path, -1, wpath, ARRAY_SIZE(wpath));
+      ok = ok && paths_valid && MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING);
+      if (!ok && paths_valid)
+         DeleteFileW(wtmp);
+   }
+   free(buf);
+   simple_mtx_lock(&device->pso_lib.lock);
+   if (ok) {
+      if (device->pso_lib.generation == generation)
+         device->pso_lib.dirty = false;
+   } else
+      mesa_logw("dzn: could not persist PSO library to %s", device->pso_lib.path);
+   simple_mtx_unlock(&device->pso_lib.lock);
+   simple_mtx_unlock(&device->pso_lib.save_lock);
+}
+
+void
+dzn_pso_lib_init(struct dzn_device *device)
+{
+   simple_mtx_init(&device->pso_lib.lock, mtx_plain);
+   simple_mtx_init(&device->pso_lib.save_lock, mtx_plain);
+   device->pso_lib.initialized = true;
+
+#ifdef _XBOX_UWP
+   if (!uwp_is_desktop_device()) {
+      mesa_logi("dzn: pipeline libraries disabled on non-desktop UWP devices; using normal PSO creation");
+      return;
+   }
+#endif
+
+   char path[MAX_PATH * 2];
+   DWORD n = GetEnvironmentVariableA("DZN_PSO_LIBRARY", path, sizeof(path));
+   if (n >= sizeof(path))
+      return;
+   if (!n) {
+#ifdef _XBOX_UWP
+      char directory[MAX_PATH * 2];
+      if (!uwp_get_cache_directory(directory, sizeof(directory)))
+         return;
+      int length = snprintf(path, sizeof(path), "%s/mesa-dzn-pso.bin", directory);
+      if (length < 0 || length >= sizeof(path))
+         return;
+#else
+      return;
+#endif
+   }
+
+   D3D12_FEATURE_DATA_SHADER_CACHE cache_caps = { 0 };
+   HRESULT caps_hr = ID3D12Device1_CheckFeatureSupport(device->dev, D3D12_FEATURE_SHADER_CACHE, &cache_caps, sizeof(cache_caps));
+   mesa_logw("dzn: D3D12 shader cache support 0x%x (0x%08x): single PSO %d, library %d, in-process %d, disk %d, driver-managed %d",
+             (unsigned)cache_caps.SupportFlags, (unsigned)caps_hr,
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO),
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_LIBRARY),
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_INPROC_CACHE),
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_DISK_CACHE),
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_DRIVER_MANAGED_CACHE));
+   if (FAILED(caps_hr) || !(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_LIBRARY)) {
+      mesa_logw("dzn: no D3D12 pipeline library support, not keeping PSOs");
+      return;
+   }
+
+   size_t size = 0;
+   void *blob = NULL;
+   FILE *f = dzn_pso_lib_open(path, L"rb");
+   if (f) {
+      if (_fseeki64(f, 0, SEEK_END) == 0) {
+         int64_t len = _ftelli64(f);
+         if (len > 0 && (uint64_t)len <= SIZE_MAX && _fseeki64(f, 0, SEEK_SET) == 0) {
+            blob = malloc(len);
+            if (blob && fread(blob, 1, len, f) == (size_t)len)
+               size = len;
+         }
+      }
+      fclose(f);
+   }
+
+   ID3D12PipelineLibrary1 *lib = NULL;
+   HRESULT hr = E_FAIL;
+   if (size)
+      hr = ID3D12Device1_CreatePipelineLibrary(device->dev, blob, size, &dzn_IID_ID3D12PipelineLibrary1, (void **)&lib);
+   if (FAILED(hr)) {
+      const HRESULT reason = ID3D12Device_GetDeviceRemovedReason(device->dev);
+      if (FAILED(reason)) {
+         mesa_loge("dzn: device lost while initializing pipeline library: 0x%08x", (unsigned)reason);
+         free(blob);
+         return;
+      }
+      if (size)
+         mesa_logw("dzn: the PSO library in %s can't be used (0x%08x), starting a new one", path, (unsigned)hr);
+      free(blob);
+      blob = NULL;
+      size = 0;
+      lib = NULL;
+      hr = ID3D12Device1_CreatePipelineLibrary(device->dev, NULL, 0, &dzn_IID_ID3D12PipelineLibrary1, (void **)&lib);
+   }
+   if (FAILED(hr) || !lib) {
+      mesa_logw("dzn: PSO libraries are not available (0x%08x)", (unsigned)hr);
+      free(blob);
+      return;
+   }
+
+   device->pso_lib.lib = lib;
+   device->pso_lib.blob = blob;
+   device->pso_lib.path = strdup(path);
+   if (!device->pso_lib.path) {
+      ID3D12PipelineLibrary1_Release(lib);
+      free(blob);
+      device->pso_lib.lib = NULL;
+      device->pso_lib.blob = NULL;
+      return;
+   }
+   mesa_logw("dzn: PSO library %s: %u KB loaded", path, (unsigned)(size >> 10));
+}
+
+void
+dzn_pso_lib_finish(struct dzn_device *device)
+{
+   if (!device->pso_lib.initialized)
+      return;
+   mesa_logi("dzn: PSOs loaded=%u (%.2f ms), compiled=%u (%.2f ms), compiled at draw=%u",
+             device->pso_lib.loaded, device->pso_lib.load_ns / 1e6,
+             device->pso_lib.compiled, device->pso_lib.compile_ns / 1e6,
+             device->pso_lib.compiled_at_draw);
+   if (device->pso_lib.lib) {
+      dzn_pso_lib_save(device);
+      ID3D12PipelineLibrary1_Release(device->pso_lib.lib);
+   }
+   free(device->pso_lib.blob);
+   free(device->pso_lib.path);
+   simple_mtx_destroy(&device->pso_lib.lock);
+   simple_mtx_destroy(&device->pso_lib.save_lock);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+dzn_GetPipelineCacheData(VkDevice _device, VkPipelineCache pipelineCache, size_t *pDataSize, void *pData)
+{
+   VK_FROM_HANDLE(dzn_device, device, _device);
+   VkResult result = vk_common_GetPipelineCacheData(_device, pipelineCache, pDataSize, pData);
+   if (pData)
+      dzn_pso_lib_save(device);
+   return result;
+}
+
 static bool
 dzn_device_lowers_16bit(const struct dzn_device *device)
 {
    const struct dzn_physical_device *pdev =
       container_of(device->vk.physical, struct dzn_physical_device, vk);
 
-   return !pdev->options4.Native16BitShaderOpsSupported &&
-          (device->vk.enabled_extensions.KHR_shader_float16_int8 ||
-           device->vk.enabled_extensions.KHR_8bit_storage ||
-           device->vk.enabled_extensions.KHR_16bit_storage ||
-           device->vk.enabled_features.shaderFloat16 ||
-           device->vk.enabled_features.shaderInt16 ||
-           device->vk.enabled_features.shaderInt8 ||
-           device->vk.enabled_features.storageBuffer8BitAccess ||
-           device->vk.enabled_features.uniformAndStorageBuffer8BitAccess ||
-           device->vk.enabled_features.storagePushConstant8 ||
-           device->vk.enabled_features.storageBuffer16BitAccess ||
-           device->vk.enabled_features.uniformAndStorageBuffer16BitAccess);
+   return !pdev->options4.Native16BitShaderOpsSupported;
 }
 
 static VkResult
@@ -294,6 +675,10 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
                                       &spirv_opts, options->nir_opts, NULL, nir);
    if (result != VK_SUCCESS)
       return result;
+
+   if ((*nir)->info.stage == MESA_SHADER_COMPUTE &&
+       !vk_find_struct_const(stage_info->pNext, PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO))
+      (*nir)->info.api_subgroup_size = 0;
 
    NIR_PASS(_, *nir, dxil_nir_lower_amd_cube);
    bool volume_images = false;
@@ -2249,7 +2634,6 @@ dzn_graphics_pipeline_translate_blend(struct dzn_graphics_pipeline *pipeline,
       !support_alpha_blend_factor && constant_alpha && !constant_color;
 }
 
-
 static void
 dzn_pipeline_init(struct dzn_pipeline *pipeline,
                   struct dzn_device *device,
@@ -2754,9 +3138,7 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
    }
 
    if (!pipeline->variants) {
-      hres = ID3D12Device4_CreatePipelineState(device->dev, stream_desc,
-                                               &IID_ID3D12PipelineState,
-                                               (void **)&pipeline->base.state);
+      hres = dzn_create_pso(device, stream_desc, &pipeline->base.state, false);
       if (FAILED(hres)) {
 #ifdef _XBOX_UWP
          if (!dzn_uwp_pso_diagnostic_reported) {
@@ -3297,9 +3679,7 @@ dzn_graphics_pipeline_get_state_locked(struct dzn_graphics_pipeline *pipeline,
          }
       }
 
-      HRESULT hres = ID3D12Device4_CreatePipelineState(device->dev, &stream_desc,
-                                                                &IID_ID3D12PipelineState,
-                                                                (void**)(&variant->state));
+      HRESULT hres = dzn_create_pso(device, &stream_desc, &variant->state, true);
       free((void *)dynamic_vs.pShaderBytecode);
       if (FAILED(hres)) {
          debug_printf("DZN: dynamic graphics PSO failed HRESULT=0x%08x\n", (unsigned)hres);
@@ -3733,19 +4113,7 @@ dzn_compute_pipeline_create(struct dzn_device *device,
    if (ret != VK_SUCCESS)
       goto out;
 
-#ifdef _XBOX_UWP
-   const D3D12_COMPUTE_PIPELINE_STATE_DESC compute_desc = {
-      .pRootSignature = pipeline->base.root.sig,
-      .CS = shader,
-   };
-   HRESULT pso_hr = ID3D12Device4_CreateComputePipelineState(device->dev, &compute_desc,
-                                                           &IID_ID3D12PipelineState,
-                                                           (void **)&pipeline->base.state);
-#else
-   HRESULT pso_hr = ID3D12Device4_CreatePipelineState(device->dev, &stream_desc,
-                                                     &IID_ID3D12PipelineState,
-                                                     (void **)&pipeline->base.state);
-#endif
+   HRESULT pso_hr = dzn_create_pso(device, &stream_desc, &pipeline->base.state, false);
    if (FAILED(pso_hr)) {
       _debug_printf("Dozen compute PSO creation failed (HRESULT 0x%08x, DXIL %zu bytes)\n",
                     (unsigned)pso_hr, shader.BytecodeLength);

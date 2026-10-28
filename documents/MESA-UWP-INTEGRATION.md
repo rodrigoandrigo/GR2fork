@@ -880,3 +880,85 @@ Validações no PC:
 - Núcleo e frontend Release recompilados. Pacote assinado e payload verificado. SHA-256 do núcleo: `533d21b8b84e9b9a6c2a9bb43d5d6969d8ff0f135015d5eac0f641216e5b97a1`.
 
 Os probes usam um host nativo no PC. Não houve instalação do pacote, validação visual do contador dentro de uma instância UWP instalada nem execução no Xbox nesta etapa; o orçamento de RAM e a paginação reais do Xbox ainda precisam de confirmação no console.
+
+## Patches de rpcs3-xbox-main (28/10/2026)
+
+Adaptados de `uwp/toolchain` da árvore local `rpcs3-xbox-main`, preservando
+as alterações anteriores do Dozen:
+
+- Pool de buffers internos por dispositivo, protegido por mutex e reutilizado
+  após reset/destruição de command buffers que já não estejam pendentes.
+  Buffers usam o allocator do dispositivo; imagens temporárias não entram no
+  pool. RELEASE_RESOURCES libera os recursos daquele command buffer.
+- Biblioteca persistente de PSOs, com nomes derivados do conteúdo dos shaders,
+  root signatures e descritores. Consulta primeiro o suporte do dispositivo;
+  falta de suporte ou cache incompatível mantém a criação normal de pipelines.
+  Compute UWP usa LoadComputePipeline/CreateComputePipelineState.
+- No UWP, o arquivo padrão é `LocalCacheFolder/mesa-dzn-pso.bin`.
+  `DZN_PSO_LIBRARY` pode indicar outro caminho. A gravação ocorre ao obter os
+  dados do VkPipelineCache e ao destruir o dispositivo, com substituição por
+  arquivo temporário distinto e preservação de dirty em caso de falha.
+  Escrita em disco não mantém o mutex usado pelas consultas de PSOs.
+- Contagem e tempo agregado de PSOs carregados/compilados, incluindo quantos
+  precisaram de compilação durante draw, registrados ao destruir o dispositivo.
+- Fallback typeless para depth R16/R32 quando falta o caminho de formatos
+  castable, descarte de cópias com extensão vazia e propagação das falhas de Reset.
+- Lowering de 16 bits sempre que faltam operações nativas e remoção do tamanho
+  fixo de subgrupo implícito em compute quando não solicitado pela aplicação.
+  A versão do layout/cache passa de 17 para 18.
+
+Não foram importados os tetos de 256/384 MiB, restrições de capacidade específicas
+do emulador de origem, descarte de draws sem PSO, clamp silencioso de regiões
+inválidas ou os históricos de diagnóstico com ponteiros sem retenção.
+
+Validação no PC: build Release UWP do Dozen; readback de compute `11223344`;
+segunda execução carregou 1 PSO e compilou 0; draw direto, MSAA 4x e indireto
+produziram 4096 pixels vermelhos. Logs em `Build/dozen-patch-*.log` e
+`Build/dozen-gcn-*-probe-patches.log`. Esses resultados não validam jogos,
+AppContainer ou Xbox; o caminho automático de LocalCacheFolder exige validação
+em aplicação empacotada. Não houve instalação de pacote.
+
+## Sincronização PM4 sem espera global da CPU (28/10/2026)
+
+Os handlers `ACQUIRE_MEM` e `PFP_SYNC_ME` preservam a drenagem dos trabalhos
+de cópia e a chamada ao contrato de sincronização do renderer. No Vulkan/Dozen,
+`CpSync` passa a registrar uma dependência de memória na GPU, em vez de executar
+`Finish` e `OnFence`. A barreira publica as escritas anteriores de todos os
+comandos para leituras/escritas posteriores e incorpora as barreiras de recursos
+já pendentes. A gravação usa o caminho existente, inclusive com recording thread.
+As esperas e os downloads dos consumidores CPU permanecem em seus pontos próprios.
+
+O núcleo Release UWP foi recompilado. No PC com RX 6600M, usando uma cópia do save
+do Bloodborne na mesma posição/câmera, a janela de ticks 140–150 passou de 4,2 FPS
+para 19,4 FPS. A telemetria dessa execução registra `finish=0/0ms` por 300 frames.
+Captura e logs ficam em `Build/dozen-performance-investigation/safe_sync/`;
+o resultado estruturado fica em `safe-sync-results.json`. Essa medição não
+comprova cobertura de todos os comandos/cenários nem validação no Xbox.
+
+Uma execução adicional de 45 segundos com a camada de diagnóstico D3D12 ativa,
+sem o readback auxiliar que usa outra fila, terminou com
+`D3D_INFO_QUEUE_MESSAGES=0`, `BOOT_RESULT=0` e `SHUTDOWN=0`.
+O log é `safe_sync/validation-no-capture.log` no mesmo diretório de diagnóstico.
+
+## Proteção da inicialização no Xbox (28/10/2026)
+
+O `frontend-d3d12.log` recebido registra `ErrorDeviceLost` ao criar o semáforo
+principal. Esse erro ocorre na inicialização; o arquivo não contém o HRESULT
+que originou a perda do dispositivo nem comprova qual chamada a provocou.
+
+A biblioteca persistente de PSOs passa a ser ativada automaticamente apenas
+na família `Windows.Desktop`, além da consulta de suporte do driver. Xbox e
+famílias não identificadas usam a criação normal de PSOs. Essa proteção evita
+executar a inicialização opcional da biblioteca nesses dispositivos; os demais
+caches e as barreiras de GPU continuam disponíveis.
+
+A criação de uma biblioteca vazia usa `NULL, 0`; device loss impede nova tentativa
+de criação e gravação do cache. O Dozen verifica a saúde do dispositivo antes de
+concluir a inicialização. Falhas na criação do dispositivo ou do semáforo são
+propagadas como erros tratáveis pelo frontend, em vez de asserções fatais.
+
+Validação no PC: compute `11223344`, reutilização do PSO na segunda execução e
+inicialização/encerramento completos com uma DLL de diagnóstico limitada a SM6.4
+e biblioteca desativada (`INIT=0`, `SMOKE_SHUTDOWN=0`). O pacote Release foi
+recompilado, assinado e teve as DLLs conferidas. Logs em `Build/xbox-device-init/`
+e `Build/uwp-xbox-device-init.log`. A confirmação no Xbox continua pendente.

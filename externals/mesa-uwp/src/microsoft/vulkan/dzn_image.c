@@ -281,6 +281,13 @@ dzn_image_create(struct dzn_device *device,
       }
    }
 
+   if (vk_format_is_depth_or_stencil(pCreateInfo->format) &&
+       image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+       (image->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+       (image->desc.Format == DXGI_FORMAT_R16_UNORM || image->desc.Format == DXGI_FORMAT_R32_FLOAT) &&
+       !(device->dev10 && device->dev12 && image->castable_format_count > 0))
+      image->desc.Format = dzn_get_typeless_dxgi_format(image->desc.Format);
+
    if ((pCreateInfo->sharingMode == VK_SHARING_MODE_CONCURRENT ||
         !pdev->options12.EnhancedBarriersSupported) &&
        image->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&

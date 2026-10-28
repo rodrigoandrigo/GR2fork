@@ -17,7 +17,7 @@
 namespace D3D12 {
 class CommandRuntime {
 public:
-    CommandRuntime() = default;
+    CommandRuntime();
     ~CommandRuntime();
     using AcquireMemory =
         std::function<std::shared_ptr<void>(std::span<const ResourceCache::Range>)>;
@@ -47,6 +47,19 @@ public:
         acquire_memory = std::move(acquire);
     }
     u64 OcclusionCounter(bool reset = false);
+    struct RecoveryCheckpoint {
+        const CommandRuntime* owner{};
+        ID3D12Device* device{};
+        u64 identity{}, submitted_lists{}, occlusion_total{};
+        u32 strmout_filled{};
+        bool occlusion_enabled{};
+        std::array<u8, 65536> gds{};
+    };
+    void StopAfterFailure();
+    RecoveryCheckpoint CreateRecoveryCheckpoint();
+    bool CanRecover(const RecoveryCheckpoint& checkpoint);
+    void AbandonForRecovery(const RecoveryCheckpoint& checkpoint);
+    void RestoreRecoveryCheckpoint(const RecoveryCheckpoint& checkpoint);
     struct DrawRequest {
         struct StencilState {
             u32 fail, depth_fail, pass;
@@ -193,16 +206,19 @@ public:
     }
 
 private:
+    static u64 NextRuntimeIdentity();
+    const u64 recovery_identity{NextRuntimeIdentity()};
     struct RecordingGuard {
-        bool& failed;
+        CommandRuntime& runtime;
         bool completed{};
         ~RecordingGuard() {
-            failed |= !completed;
+            if (!completed)
+                runtime.StopAfterFailure();
         }
     };
     void MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer,
                                    const VideoCore::ImageInfo& info);
-    bool failed{}, trimming_memory{};
+    bool failed{}, trimming_memory{}, recovery_abandoned{};
     MemoryBudget memory_budget;
     std::function<u64()> external_memory;
     std::function<void()> trim_external_memory;

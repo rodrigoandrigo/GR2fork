@@ -3,6 +3,7 @@
 #include "uwp_util.h"
 
 #include <atomic>
+#include <cstring>
 #include <mutex>
 #include <chrono>
 #include <future>
@@ -12,6 +13,7 @@
 #include <wrl/client.h>
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Storage.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.System.Profile.h>
@@ -34,6 +36,37 @@ static unsigned long long dimensions_generation = 0;
 static int current_height = -1;
 static int current_width = -1;
 static std::atomic<bool> offscreen_drawable{false};
+
+extern "C" int uwp_get_cache_directory(char *path, size_t capacity)
+{
+   const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED);
+   int result = 0;
+   try {
+      const auto folder = winrt::Windows::Storage::ApplicationData::Current().LocalCacheFolder();
+      const auto text = winrt::to_string(folder.Path());
+      if (text.size() < capacity) {
+         memcpy(path, text.c_str(), text.size() + 1);
+         result = 1;
+      }
+   } catch (...) {
+   }
+   if (SUCCEEDED(initialized))
+      RoUninitialize();
+   return result;
+}
+
+extern "C" int uwp_is_desktop_device(void)
+{
+   const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED);
+   int result = 0;
+   try {
+      result = AnalyticsInfo::VersionInfo().DeviceFamily() == L"Windows.Desktop";
+   } catch (...) {
+   }
+   if (SUCCEEDED(initialized))
+      RoUninitialize();
+   return result;
+}
 
 extern "C" void mesa_uwp_set_offscreen(int enabled)
 {

@@ -268,6 +268,8 @@ void CommandRuntime::FinishRecording(std::shared_ptr<void> lease, ResourceCache:
 void CommandRuntime::SubmitReady() {
     auto lock = ProfileSample(runtime_profile, "scheduler_lock", 512,
                               [&] { return std::unique_lock{mutex}; });
+    if (failed)
+        throw std::runtime_error("D3D12 cannot submit commands after failure");
     std::vector<CommandRuntime*> pending;
     for (auto& context : contexts)
         if (context->ready)
@@ -284,9 +286,7 @@ void CommandRuntime::SubmitReady() {
     try {
         fence = device.SubmitBatch(lists.data(), static_cast<UINT>(lists.size()));
     } catch (...) {
-        failed = true;
-        for (auto* context : pending)
-            context->failed = true;
+        StopAfterFailure();
         throw;
     }
     ++async_statistics.batches;
@@ -303,9 +303,10 @@ void CommandRuntime::CompleteContext() {
         coordinator->SubmitReady();
     if (!pending_fence)
         throw std::runtime_error("Native submission has no completion fence");
-    ProfileSample(runtime_profile, "context_fence_wait", 128, [&] { device.Wait(pending_fence); });
-    completing = true;
     try {
+        ProfileSample(runtime_profile, "context_fence_wait", 128,
+                      [&] { device.Wait(pending_fence); });
+        completing = true;
         completion();
         completion = {};
         pending_lease.reset();
@@ -314,7 +315,7 @@ void CommandRuntime::CompleteContext() {
         completing = false;
     } catch (...) {
         completing = false;
-        failed = true;
+        StopAfterFailure();
         throw;
     }
 }

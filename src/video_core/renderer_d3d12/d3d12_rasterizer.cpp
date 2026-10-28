@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -502,8 +503,25 @@ std::array<VAddr, 4> ResolveStreamOutBases(
 }
 } // namespace
 Rasterizer::Rasterizer(AmdGpu::Liverpool& gpu, Core::MemoryManager& manager)
-    : liverpool{gpu}, memory{manager} {
-    runtime.Initialize(
+    : liverpool{gpu}, memory{manager}, runtime{std::make_unique<CommandRuntime>()} {
+    const auto* setting = std::getenv("SHADPS4_D3D12_RECOVERY");
+    recovery_enabled = setting && std::string_view{setting} == "1";
+    try {
+        memory.EnableGpuImageTracking(true);
+        InitializeRuntime(*runtime);
+        if (recovery_enabled) {
+            recovery_checkpoint = runtime->CreateRecoveryCheckpoint();
+            LOG_INFO(Core,
+                     "Native D3D12 checkpoint recovery enabled; asynchronous batching disabled");
+        }
+    } catch (...) {
+        memory.EnableGpuImageTracking(false);
+        memory.SetRasterizer(nullptr);
+        throw;
+    }
+}
+void Rasterizer::InitializeRuntime(CommandRuntime& target) {
+    target.Initialize(
         [this](VAddr address, std::span<u8> data) { Read(address, data); },
         [this](VAddr address, std::span<const u8> data) { Write(address, data); },
         [this](VAddr address, u64 size) -> std::optional<VAddr> {
@@ -514,28 +532,27 @@ Rasterizer::Rasterizer(AmdGpu::Liverpool& gpu, Core::MemoryManager& manager)
             return memory.BackingRangesOverlap(first, first_size, second, second_size);
         });
     D3D12_FEATURE_DATA_D3D12_OPTIONS13 options{};
-    alpha_blend_factor_supported = SUCCEEDED(runtime.Device().Device()->CheckFeatureSupport(
+    alpha_blend_factor_supported = SUCCEEDED(target.Device().Device()->CheckFeatureSupport(
                                        D3D12_FEATURE_D3D12_OPTIONS13, &options, sizeof(options))) &&
                                    options.AlphaBlendFactorSupported;
-    runtime.SetMemoryAccess([this](std::span<const ResourceCache::Range> ranges) {
+    target.SetMemoryAccess([this](std::span<const ResourceCache::Range> ranges) {
         std::vector<std::pair<VAddr, u64>> access;
         access.reserve(ranges.size());
         for (const auto& range : ranges)
             access.emplace_back(range.address, range.size);
         return memory.AcquireGpuAccess(access);
     });
-    runtime.Resources().SetBackingResolver(
+    target.Resources().SetBackingResolver(
         [this](VAddr address, u64 size) { return ResolveBacking(memory, address, size); });
     memory.SetRasterizer(this);
-    try {
-        memory.EnableGpuImageTracking(true);
-        runtime.SetImageResidency([this](std::span<const ImageCache::Watch> watches) {
-            std::vector<Core::MemoryManager::GpuImageWatch> ranges;
-            for (const auto& watch : watches)
-                ranges.push_back({watch.address, watch.size, watch.dirty});
-            memory.SetGpuImageWatches(ranges);
-        });
-        runtime.EnableAsync(
+    target.SetImageResidency([this](std::span<const ImageCache::Watch> watches) {
+        std::vector<Core::MemoryManager::GpuImageWatch> ranges;
+        for (const auto& watch : watches)
+            ranges.push_back({watch.address, watch.size, watch.dirty});
+        memory.SetGpuImageWatches(ranges);
+    });
+    if (!recovery_enabled)
+        target.EnableAsync(
             [this](VAddr address, u64 size) { return ResolveBacking(memory, address, size); },
             [this](std::span<const ResourceCache::Range> ranges) {
                 std::vector<std::pair<VAddr, u64>> access;
@@ -544,20 +561,96 @@ Rasterizer::Rasterizer(AmdGpu::Liverpool& gpu, Core::MemoryManager& manager)
                     access.emplace_back(range.address, range.size);
                 return memory.AcquireAsyncGpuAccess(access);
             });
-    } catch (...) {
-        memory.EnableGpuImageTracking(false);
-        memory.SetRasterizer(nullptr);
-        throw;
+    target.SetExternalMemory(external_memory, trim_external_memory);
+    target.SetBackground(background);
+}
+void Rasterizer::ExecuteRecoverable(const std::function<void()>& function) {
+    if (!liverpool.OnGpuThread()) {
+        function();
+        return;
     }
+    Core::MemoryManager::GuestCopyScope scope{&memory};
+    auto registers = std::make_unique<decltype(liverpool.regs)>(liverpool.regs);
+    auto* compute_registers = liverpool.CurrentCsRegs();
+    std::optional<AmdGpu::ComputeProgram> compute;
+    if (compute_registers)
+        compute = *compute_registers;
+    auto generation = write_generation;
+    bool completed{};
+    try {
+        recovery_checkpoint = runtime->CreateRecoveryCheckpoint();
+        generation = write_generation;
+        function();
+        completed = true;
+        recovery_checkpoint = runtime->CreateRecoveryCheckpoint();
+        return;
+    } catch (...) {
+        const auto failure = std::current_exception();
+        bool transient = FAILED(runtime->Device().Device()->GetDeviceRemovedReason());
+        HRESULT retry_reason = S_OK;
+        try {
+            std::rethrow_exception(failure);
+        } catch (const winrt::hresult_error& error) {
+            retry_reason = error.code().value;
+            transient |= retry_reason == E_OUTOFMEMORY;
+        } catch (const std::bad_alloc&) {
+            retry_reason = E_OUTOFMEMORY;
+            transient = true;
+        } catch (...) {
+        }
+        const bool safe_checkpoint =
+            recovery_checkpoint && runtime->CanRecover(*recovery_checkpoint);
+        if (!transient || recovered || completed || generation != write_generation ||
+            !safe_checkpoint) {
+            if (transient)
+                LOG_ERROR(Core,
+                          "Native D3D12 recovery refused: retry_used={} completed={} cpu_write={} "
+                          "safe_checkpoint={}",
+                          recovered, completed, generation != write_generation, safe_checkpoint);
+            std::rethrow_exception(failure);
+        }
+        LOG_WARNING(Core,
+                    "Native D3D12 recovery: recreating unsubmitted command state; HRESULT={:08x} "
+                    "device={:08x}{}",
+                    u32(retry_reason), u32(runtime->Device().Device()->GetDeviceRemovedReason()),
+                    RuntimeErrorTrace(runtime->Device()));
+        runtime->AbandonForRecovery(*recovery_checkpoint);
+        runtime = std::make_unique<CommandRuntime>();
+        InitializeRuntime(*runtime);
+        runtime->RestoreRecoveryCheckpoint(*recovery_checkpoint);
+        recovered = true;
+        liverpool.regs = *registers;
+        if (compute_registers)
+            *compute_registers = *compute;
+    }
+    recovery_checkpoint = runtime->CreateRecoveryCheckpoint();
+    function();
+    recovery_checkpoint = runtime->CreateRecoveryCheckpoint();
+    LOG_INFO(Core, "Native D3D12 recovery completed");
+}
+void Rasterizer::SetExternalMemory(std::function<u64()> usage, std::function<void()> trim) {
+    std::scoped_lock lock{runtime_mutex};
+    external_memory = std::move(usage);
+    trim_external_memory = std::move(trim);
+    runtime->SetExternalMemory(external_memory, trim_external_memory);
+}
+void Rasterizer::OnSubmit() {
+    Execute([&] { runtime->SubmitReady(); });
+}
+void Rasterizer::EndPacketRun() {
+    Execute([&] { runtime->SubmitReady(); });
 }
 void Rasterizer::SetBackground(bool background) {
+    std::scoped_lock lock{runtime_mutex};
+    this->background = background;
     Core::MemoryManager::GuestCopyScope scope{&memory};
-    runtime.SetBackground(background);
+    runtime->SetBackground(background);
 }
 Rasterizer::~Rasterizer() {
+    std::scoped_lock lock{runtime_mutex};
     try {
         Core::MemoryManager::GuestCopyScope scope{&memory};
-        runtime.SetImageResidency({});
+        runtime->SetImageResidency({});
     } catch (...) {
     }
     memory.EnableGpuImageTracking(false);
@@ -566,7 +659,9 @@ Rasterizer::~Rasterizer() {
 std::shared_ptr<VideoCore::ResidentFrame> Rasterizer::CapturePresentation(
     const VideoCore::ImageInfo& info) {
     Core::MemoryManager::GuestCopyScope scope{&memory};
-    return runtime.CapturePresentation(info);
+    std::shared_ptr<VideoCore::ResidentFrame> result;
+    Execute([&] { result = runtime->CapturePresentation(info); });
+    return result;
 }
 void Rasterizer::Read(VAddr address, std::span<u8> data) {
     if (address > UINT64_MAX - data.size())
@@ -574,6 +669,7 @@ void Rasterizer::Read(VAddr address, std::span<u8> data) {
     memory.CopySparseMemory(address, data.data(), data.size());
 }
 void Rasterizer::Write(VAddr address, std::span<const u8> data) {
+    ++write_generation;
     if (address > UINT64_MAX - data.size() ||
         !memory.TryWriteBacking(reinterpret_cast<void*>(address), data.data(), data.size()))
         throw std::runtime_error("D3D12 guest writeback targets unmapped memory");
@@ -599,8 +695,8 @@ void Rasterizer::Dispatch(std::array<u32, 3> groups, VAddr indirect_address) {
     info.hw.cs.tgid_enable = {cs.IsTgidEnabled(0), cs.IsTgidEnabled(1), cs.IsTgidEnabled(2)};
     info.hw.cs.start_offsets = {cs.start_x, cs.start_y, cs.start_z};
     info.hw.cs.shared_memory_size = cs.SharedMemSize();
-    runtime.Dispatch(program.Params(), info, groups, liverpool.regs.ta_bc_base.Address(),
-                     indirect_address);
+    runtime->Dispatch(program.Params(), info, groups, liverpool.regs.ta_bc_base.Address(),
+                      indirect_address);
 }
 void Rasterizer::DispatchDirect() {
     Execute([&] {
@@ -652,20 +748,20 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
         for (u32 i = 0; i < 2; ++i)
             if (regs.color_buffers[i])
-                runtime.MaterializeColorClear(
+                runtime->MaterializeColorClear(
                     regs.color_buffers[i],
                     VideoCore::ImageInfo{regs.color_buffers[i], liverpool.last_cb_extent[i]});
         const VideoCore::ImageInfo source{regs.color_buffers[0], liverpool.last_cb_extent[0]};
         const VideoCore::ImageInfo destination{regs.color_buffers[1], liverpool.last_cb_extent[1]};
-        runtime.Resolve(source, destination, regs.color_buffers[0].BaseSlice(),
-                        regs.color_buffers[1].BaseSlice());
+        runtime->Resolve(source, destination, regs.color_buffers[0].BaseSlice(),
+                         regs.color_buffers[1].BaseSlice());
         return;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear ||
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
         for (u32 i = 0; i < std::size(regs.color_buffers); ++i)
             if (regs.color_buffers[i])
-                runtime.MaterializeColorClear(
+                runtime->MaterializeColorClear(
                     regs.color_buffers[i],
                     VideoCore::ImageInfo{regs.color_buffers[i], liverpool.last_cb_extent[i]});
         return;
@@ -1827,7 +1923,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                     ref.stencil_test_val, ref.stencil_op_val};
             }
         } else {
-            runtime.Draw(pass);
+            runtime->Draw(pass);
         }
     };
     if (face_passes) {
@@ -1872,12 +1968,12 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         }
         draw.point_fill = false;
         draw.line_expand = false;
-        runtime.Draw(draw);
+        runtime->Draw(draw);
     } else {
         submit(draw);
     }
     if (strmout_buffer_mask) {
-        const u32 written = runtime.StrmoutFilledSize();
+        const u32 written = runtime->StrmoutFilledSize();
         u32 mask = strmout_buffer_mask;
         while (mask) {
             const u32 buffer = std::countr_zero(mask);
@@ -1963,7 +2059,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 size, u32 value, bool use_gds) {
 }
 void Rasterizer::FillBufferImpl(VAddr address, u32 size, u32 value, bool use_gds) {
     Core::MemoryManager::GuestCopyScope scope{&memory};
-    const auto gds = runtime.Gds();
+    const auto gds = runtime->Gds();
     if (!size)
         return;
     if (size % 4 || size > 16 * 1024 * 1024)
@@ -1981,7 +2077,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 size, bool dst_gds, bool s
 }
 void Rasterizer::CopyBufferImpl(VAddr dst, VAddr src, u32 size, bool dst_gds, bool src_gds) {
     Core::MemoryManager::GuestCopyScope scope{&memory};
-    const auto gds = runtime.Gds();
+    const auto gds = runtime->Gds();
     if (size > 16 * 1024 * 1024 || (src_gds && (src > gds.size() || size > gds.size() - src)) ||
         (dst_gds && (dst > gds.size() || size > gds.size() - dst)))
         throw std::runtime_error("Guest copy range exceeds backing budget");
@@ -1999,32 +2095,44 @@ u32 Rasterizer::ReadDataFromGds(u32 offset) {
     u32 value{};
     Execute([&] {
         Core::MemoryManager::GuestCopyScope scope{&memory};
-        const auto gds = runtime.Gds();
+        const auto gds = runtime->Gds();
         if (offset > gds.size() - 4)
             throw std::runtime_error("Guest GDS read range overflow");
         std::memcpy(&value, gds.data() + offset, 4);
     });
     return value;
 }
+namespace {
+struct RuntimeAccess {
+    std::unique_lock<std::recursive_mutex> lock;
+    std::shared_ptr<void> access;
+    explicit RuntimeAccess(std::recursive_mutex& mutex) : lock{mutex} {}
+};
+} // namespace
 std::shared_ptr<void> Rasterizer::AcquireCpuAccess(VAddr address, u64 size, bool write) {
     Core::MemoryManager::GuestCopyScope scope{&memory};
-    return runtime.AcquireCpuAccess(address, size, write);
+    auto guard = std::make_shared<RuntimeAccess>(runtime_mutex);
+    guard->access = runtime->AcquireCpuAccess(address, size, write);
+    return guard;
 }
 std::shared_ptr<void> Rasterizer::AcquireMemoryMappingAccess() {
     Core::MemoryManager::GuestCopyScope scope{&memory};
-    return runtime.AcquireMemoryMappingAccess();
+    auto guard = std::make_shared<RuntimeAccess>(runtime_mutex);
+    guard->access = runtime->AcquireMemoryMappingAccess();
+    return guard;
 }
 void Rasterizer::MapMemory(VAddr address, u64 size) {
-    runtime.Resources().MapMemory(address, size);
+    std::scoped_lock lock{runtime_mutex};
+    runtime->Resources().MapMemory(address, size);
 }
 u64 Rasterizer::Flush() {
     Core::MemoryManager::GuestCopyScope scope{&memory};
     u64 ticket{};
-    Execute([&] { ProfileSample(profile, "flush", 64, [&] { ticket = runtime.Flush(); }); });
+    Execute([&] { ProfileSample(profile, "flush", 64, [&] { ticket = runtime->Flush(); }); });
     return ticket;
 }
 bool Rasterizer::OcclusionCounter(u64& value, bool reset) {
-    Execute([&] { value = runtime.OcclusionCounter(reset); });
+    Execute([&] { value = runtime->OcclusionCounter(reset); });
     return true;
 }
 void Rasterizer::Finish() {
@@ -2034,14 +2142,17 @@ void Rasterizer::CpSync() {
     Finish();
 }
 void Rasterizer::RegisterMemory(VAddr address, u64 size) {
-    runtime.Resources().RegisterMemory(address, size);
+    std::scoped_lock lock{runtime_mutex};
+    runtime->Resources().RegisterMemory(address, size);
 }
 void Rasterizer::UnmapMemory(VAddr address, u64 size) {
-    runtime.Resources().UnmapMemory(address, size);
+    std::scoped_lock lock{runtime_mutex};
+    runtime->Resources().UnmapMemory(address, size);
 }
 bool Rasterizer::InvalidateMemory(VAddr address, u64 size, bool locks) {
+    std::scoped_lock lock{runtime_mutex};
     Core::MemoryManager::GuestCopyScope scope{&memory};
-    const auto access = runtime.AcquireCpuAccess(address, size, true);
-    return runtime.Resources().InvalidateMemory(address, size, locks);
+    const auto access = runtime->AcquireCpuAccess(address, size, true);
+    return runtime->Resources().InvalidateMemory(address, size, locks);
 }
 } // namespace D3D12

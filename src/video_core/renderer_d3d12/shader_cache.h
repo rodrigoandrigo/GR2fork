@@ -151,6 +151,7 @@ private:
     bool native_float64{};
     D3D_SHADER_MODEL shader_model{D3D_SHADER_MODEL_6_4};
     const ResourceCache* resources{};
+    ID3D12Device* native_device{};
     void CompileHlsl(ShaderBinary& binary, Shader::SwStage stage);
     void CompileNativeSpirv(std::span<const u32> words, ShaderBinary& binary, Shader::SwStage stage,
                             bool flip_y, const TessellationLink* link, std::span<const u32> peer,

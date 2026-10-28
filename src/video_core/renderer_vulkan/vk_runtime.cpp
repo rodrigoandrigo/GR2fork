@@ -838,6 +838,12 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
 
+void Runtime::SynchronizeMemory() {
+    memory_barrier.srcStageMask |= vk::PipelineStageFlagBits2::eAllCommands;
+    memory_barrier.srcAccessMask |= vk::AccessFlagBits2::eMemoryWrite;
+    FlushBarriers();
+}
+
 void Runtime::FlushBarriers() {
     vk::DependencyInfo dep_info{};
 

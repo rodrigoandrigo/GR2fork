@@ -177,6 +177,11 @@ public:
     inline ComputeProgram& GetCsRegs() {
         return mapped_queues[curr_qid].cs_state;
     }
+    ComputeProgram* CurrentCsRegs() noexcept {
+        return curr_qid >= 0 && u32(curr_qid) < mapped_queues.size()
+                   ? &mapped_queues[curr_qid].cs_state
+                   : nullptr;
+    }
 
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;
@@ -196,8 +201,8 @@ public:
         u64 draws;            // graphics draws submitted by the guest
         u64 predicated_draws; // ... of which carry the predicate header bit
         u64 dispatches;       // compute dispatches
-        u64 occlusion_events; // ZpassDone events answered with a fake count
-        u64 set_predication;  // SET_PREDICATION packets (currently ignored)
+        u64 occlusion_events;
+        u64 set_predication; // SET_PREDICATION packets (currently ignored)
     };
     PacketStats packet_stats{};
 

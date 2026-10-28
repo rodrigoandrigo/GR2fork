@@ -4,6 +4,8 @@
 #include <vector>
 #include "common/types.h"
 
+struct ID3D12Device;
+
 namespace Shader {
 struct Info;
 struct ImageResource;
@@ -44,5 +46,6 @@ bool LowerBufferAliases(CompiledShader& shader, Shader::IR::Program& program,
                         const ResourceCache* resources);
 bool LowerImageBufferAliases(CompiledShader& shader, Shader::IR::Program& program,
                              const ResourceCache* resources,
-                             std::span<const ShaderResourceRange> stage_resources = {});
+                             std::span<const ShaderResourceRange> stage_resources = {},
+                             ID3D12Device* device = nullptr);
 } // namespace D3D12

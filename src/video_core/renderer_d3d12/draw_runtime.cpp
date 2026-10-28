@@ -1788,7 +1788,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     BeginGpuTiming();
     if (first_pipeline)
         LOG_INFO(Core, "[UWP stage] first graphics command list reset completed");
-    RecordingGuard recording{failed};
+    RecordingGuard recording{*this};
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> color_handles{};
     for (u32 i = 0; i < num_render_targets; ++i) {
         if (!colors[i]) {

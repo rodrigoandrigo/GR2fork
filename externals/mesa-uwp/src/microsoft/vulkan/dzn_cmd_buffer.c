@@ -1069,6 +1069,76 @@ dzn_cmd_buffer_release_descriptor_layouts(struct dzn_cmd_buffer *cmdbuf)
    }
 }
 
+static VkResult
+dzn_cmd_buffer_record_failure(struct dzn_cmd_buffer *cmdbuf, HRESULT hr, const char *operation)
+{
+   struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
+   const HRESULT reason = ID3D12Device_GetDeviceRemovedReason(device->dev);
+   mesa_loge("dzn: %s failed: 0x%08x (device reason 0x%08x)", operation, (unsigned)hr, (unsigned)reason);
+   return vk_command_buffer_set_error(&cmdbuf->vk, FAILED(reason) ? VK_ERROR_DEVICE_LOST :
+                                      hr == E_OUTOFMEMORY ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_UNKNOWN);
+}
+
+static void
+dzn_cmd_buffer_release_internal_bufs(struct dzn_cmd_buffer *cmdbuf, bool recycle)
+{
+   struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
+
+   for (uint32_t bucket = 0; bucket < DZN_INTERNAL_BUF_BUCKET_COUNT; ++bucket) {
+      list_for_each_entry_safe(struct dzn_internal_resource, res, &cmdbuf->internal_bufs[bucket], link) {
+         list_del(&res->link);
+
+         if (recycle && res->size &&
+             (bucket == DZN_INTERNAL_BUF_UPLOAD || res->init_state == D3D12_RESOURCE_STATE_COPY_DEST)) {
+            simple_mtx_lock(&device->internal_buf_pool.lock);
+            list_add(&res->link, &device->internal_buf_pool.bufs[bucket]);
+            simple_mtx_unlock(&device->internal_buf_pool.lock);
+            continue;
+         }
+
+         ID3D12Resource_Release(res->res);
+         vk_free(&device->vk.alloc, res);
+      }
+   }
+   cmdbuf->cur_upload_buf = NULL;
+}
+
+static struct dzn_internal_resource *
+dzn_device_take_internal_buf(struct dzn_device *device, enum dzn_internal_buf_bucket bucket,
+                             uint64_t size, D3D12_RESOURCE_STATES init_state)
+{
+   if (bucket == DZN_INTERNAL_BUF_DEFAULT && init_state != D3D12_RESOURCE_STATE_COPY_DEST)
+      return NULL;
+
+   struct dzn_internal_resource *found = NULL;
+   simple_mtx_lock(&device->internal_buf_pool.lock);
+   list_for_each_entry(struct dzn_internal_resource, res, &device->internal_buf_pool.bufs[bucket], link) {
+      if (res->size == size && res->init_state == init_state) {
+         list_del(&res->link);
+         found = res;
+         break;
+      }
+   }
+   simple_mtx_unlock(&device->internal_buf_pool.lock);
+   return found;
+}
+
+void
+dzn_device_internal_buf_pool_finish(struct dzn_device *device)
+{
+   for (uint32_t bucket = 0; bucket < DZN_INTERNAL_BUF_BUCKET_COUNT; ++bucket) {
+      if (!device->internal_buf_pool.bufs[bucket].next)
+         continue;
+      list_for_each_entry_safe(struct dzn_internal_resource, res, &device->internal_buf_pool.bufs[bucket], link) {
+         list_del(&res->link);
+         ID3D12Resource_Release(res->res);
+         vk_free(&device->vk.alloc, res);
+      }
+   }
+   if (device->internal_buf_pool.bufs[0].next)
+      simple_mtx_destroy(&device->internal_buf_pool.lock);
+}
+
 static void
 dzn_cmd_buffer_destroy(struct vk_command_buffer *cbuf)
 {
@@ -1094,13 +1164,7 @@ dzn_cmd_buffer_destroy(struct vk_command_buffer *cbuf)
    if (cmdbuf->cmdalloc)
       ID3D12CommandAllocator_Release(cmdbuf->cmdalloc);
 
-   for (uint32_t bucket = 0; bucket < DZN_INTERNAL_BUF_BUCKET_COUNT; ++bucket) {
-      list_for_each_entry_safe(struct dzn_internal_resource, res, &cmdbuf->internal_bufs[bucket], link) {
-         list_del(&res->link);
-         ID3D12Resource_Release(res->res);
-         vk_free(&cbuf->pool->alloc, res);
-      }
-   }
+   dzn_cmd_buffer_release_internal_bufs(cmdbuf, true);
 
    dzn_descriptor_heap_pool_finish(&cmdbuf->cbv_srv_uav_pool);
    dzn_descriptor_heap_pool_finish(&cmdbuf->sampler_pool);
@@ -1177,15 +1241,7 @@ dzn_cmd_buffer_reset(struct vk_command_buffer *cbuf, VkCommandBufferResetFlags f
    cmdbuf->state.multiview.num_views = 1;
    cmdbuf->state.multiview.view_mask = 1;
 
-   /* TODO: Return resources to the pool */
-   for (uint32_t bucket = 0; bucket < DZN_INTERNAL_BUF_BUCKET_COUNT; ++bucket) {
-      list_for_each_entry_safe(struct dzn_internal_resource, res, &cmdbuf->internal_bufs[bucket], link) {
-         list_del(&res->link);
-         ID3D12Resource_Release(res->res);
-         vk_free(&cmdbuf->vk.pool->alloc, res);
-      }
-   }
-   cmdbuf->cur_upload_buf = NULL;
+   dzn_cmd_buffer_release_internal_bufs(cmdbuf, !(flags & VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT));
 
    util_dynarray_clear(&cmdbuf->events.signal);
    util_dynarray_clear(&cmdbuf->queries.reset);
@@ -1221,8 +1277,11 @@ dzn_cmd_buffer_reset(struct vk_command_buffer *cbuf, VkCommandBufferResetFlags f
 
    vk_command_buffer_reset(&cmdbuf->vk);
 
-   if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY)
-      ID3D12CommandAllocator_Reset(cmdbuf->cmdalloc);
+   if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+      cmdbuf->allocator_reset_status = ID3D12CommandAllocator_Reset(cmdbuf->cmdalloc);
+      if (FAILED(cmdbuf->allocator_reset_status))
+         dzn_cmd_buffer_record_failure(cmdbuf, cmdbuf->allocator_reset_status, "command allocator Reset");
+   }
 }
 
 static uint32_t
@@ -1444,8 +1503,13 @@ dzn_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
    vk_command_buffer_begin(&cmdbuf->vk, info);
-   if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY)
-      ID3D12GraphicsCommandList1_Reset(cmdbuf->cmdlist, cmdbuf->cmdalloc, NULL);
+   if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+      if (FAILED(cmdbuf->allocator_reset_status))
+         return dzn_cmd_buffer_record_failure(cmdbuf, cmdbuf->allocator_reset_status, "command allocator Reset");
+      HRESULT hr = ID3D12GraphicsCommandList1_Reset(cmdbuf->cmdlist, cmdbuf->cmdalloc, NULL);
+      if (FAILED(hr))
+         return dzn_cmd_buffer_record_failure(cmdbuf, hr, "command list Reset");
+   }
    return vk_command_buffer_get_record_result(&cmdbuf->vk);
 }
 
@@ -2686,8 +2750,21 @@ dzn_cmd_buffer_alloc_internal_buf(struct dzn_cmd_buffer *cmdbuf,
       /* Walk through a 4MB upload buffer */
       alloc_size = ALIGN_POT(size, 4 * 1024 * 1024);
    else
-      /* Align size on 64k (the default alignment) */
       alloc_size = ALIGN_POT(size, 64 * 1024);
+
+   struct dzn_internal_resource *pooled =
+      dzn_device_take_internal_buf(device, bucket, alloc_size, init_state);
+   if (pooled) {
+      list_addtail(&pooled->link, &cmdbuf->internal_bufs[bucket]);
+      *out = pooled->res;
+      if (offset)
+         *offset = 0;
+      if (bucket == DZN_INTERNAL_BUF_UPLOAD) {
+         cmdbuf->cur_upload_buf = pooled;
+         cmdbuf->cur_upload_buf_offset = size;
+      }
+      return VK_SUCCESS;
+   }
 
    D3D12_HEAP_PROPERTIES hprops = dzn_ID3D12Device4_GetCustomHeapProperties(device->dev, 0, heap_type);
    D3D12_RESOURCE_DESC rdesc = {
@@ -2714,8 +2791,8 @@ dzn_cmd_buffer_alloc_internal_buf(struct dzn_cmd_buffer *cmdbuf,
    }
 
    struct dzn_internal_resource *entry =
-      vk_alloc(&cmdbuf->vk.pool->alloc, sizeof(*entry), 8,
-               VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      vk_alloc(&device->vk.alloc, sizeof(*entry), 8,
+               VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!entry) {
       ID3D12Resource_Release(res);
       return vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -2723,6 +2800,7 @@ dzn_cmd_buffer_alloc_internal_buf(struct dzn_cmd_buffer *cmdbuf,
 
    entry->res = res;
    entry->size = alloc_size;
+   entry->init_state = init_state;
    list_addtail(&entry->link, &cmdbuf->internal_bufs[bucket]);
    *out = entry->res;
    if (offset)
@@ -3310,6 +3388,8 @@ dzn_cmd_buffer_copy_buf2img_region(struct dzn_cmd_buffer *cmdbuf,
    ID3D12GraphicsCommandList1 *cmdlist = cmdbuf->cmdlist;
 
    VkBufferImageCopy2 region = info->pRegions[r];
+   if (!region.imageExtent.width || !region.imageExtent.height || !region.imageExtent.depth)
+      return;
    enum pipe_format pfmt = vk_format_to_pipe_format(dst_image->vk.format);
    uint32_t blkh = util_format_get_blockheight(pfmt);
    uint32_t blkd = util_format_get_blockdepth(pfmt);
@@ -3391,6 +3471,8 @@ dzn_cmd_buffer_copy_img2buf_region(struct dzn_cmd_buffer *cmdbuf,
    ID3D12GraphicsCommandList1 *cmdlist = cmdbuf->cmdlist;
 
    VkBufferImageCopy2 region = info->pRegions[r];
+   if (!region.imageExtent.width || !region.imageExtent.height || !region.imageExtent.depth)
+      return;
    enum pipe_format pfmt = vk_format_to_pipe_format(src_image->vk.format);
    uint32_t blkh = util_format_get_blockheight(pfmt);
    uint32_t blkd = util_format_get_blockdepth(pfmt);
@@ -3473,6 +3555,8 @@ dzn_cmd_buffer_copy_img_chunk(struct dzn_cmd_buffer *cmdbuf,
    ID3D12GraphicsCommandList1 *cmdlist = cmdbuf->cmdlist;
 
    VkImageCopy2 region = info->pRegions[r];
+   if (!region.extent.width || !region.extent.height || !region.extent.depth)
+      return;
    dzn_image_align_extent(src, &region.extent);
 
    const VkImageSubresourceLayers *src_subres = &region.srcSubresource;
@@ -5614,14 +5698,15 @@ dzn_cmd_buffer_alloc_raw_d32_scratch(struct dzn_cmd_buffer *cmdbuf,
       &IID_ID3D12Resource, (void **)&scratch->res);
    if (FAILED(hr))
       return vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-   struct dzn_internal_resource *entry = vk_alloc(&cmdbuf->vk.pool->alloc,
-      sizeof(*entry), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   struct dzn_internal_resource *entry = vk_alloc(&device->vk.alloc,
+      sizeof(*entry), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!entry) {
       ID3D12Resource_Release(scratch->res);
       return vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
    entry->res = scratch->res;
    entry->size = 0;
+   entry->init_state = D3D12_RESOURCE_STATE_COMMON;
    list_addtail(&entry->link, &cmdbuf->internal_bufs[DZN_INTERNAL_BUF_DEFAULT]);
    return VK_SUCCESS;
 }

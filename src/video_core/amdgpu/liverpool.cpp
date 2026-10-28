@@ -739,7 +739,8 @@ bool Liverpool::TrySetPredication(const PM4Header* header) {
     if (operation > 4)
         throw std::runtime_error("Unsupported SET_PREDICATION operation");
     const VAddr address = words[0] | (u64(control & 255) << 32);
-    if (!address || address % (operation == 4 ? 4 : 8))
+    const u32 alignment = operation == 1 ? 16 : operation == 4 ? 4 : 8;
+    if (!address || address % alignment)
         throw std::runtime_error("Invalid SET_PREDICATION address");
     VideoCore::StreamCopyLane::Instance().DrainProducer();
     if (rasterizer)
@@ -764,10 +765,12 @@ bool Liverpool::TrySetPredication(const PM4Header* header) {
     } else {
         visible = *reinterpret_cast<const volatile u32*>(address) != 0;
     }
-    if (!ready && !(control & (1u << 12)))
+    if (!ready && (operation != 1 || !(control & (1u << 12))))
         return false;
     const bool continuation = (control >> 31) && predicate_enabled;
-    predicate_visible = visible || (continuation && predicate_visible);
+    predicate_visible = continuation ? (operation == 2 ? visible && predicate_visible
+                                                       : visible || predicate_visible)
+                                     : visible;
     predicate_incomplete = !ready || (continuation && predicate_incomplete);
     predicate_pass =
         predicate_incomplete || ((control & (1u << 8)) ? predicate_visible : !predicate_visible);
@@ -824,7 +827,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
         // flight cover the next headers and payload.
         __builtin_prefetch(dcb.data() + 64, 0, 3);
         __builtin_prefetch(dcb.data() + 128, 0, 3);
-        // The mask drops predicate and shader_type, which both handlers ignore,
+        // Predication is checked before masking predicate and shader_type,
         // so this route is bit-identical to the switch arms below. A register
         // packet also opens a run that consumes every register write, pad and
         // empty NOP behind it; a run that consumed nothing is a truncated first
@@ -1174,13 +1177,15 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
                             regs.vgt_strmout_buffers[buffer].offset;
                     }
                 }
-            } else if (event->event_type.Value() == EventType::PixelPipeStatReset) {
+            } else if (event->event_type.Value() == EventType::PixelPipeStatReset ||
+                       event->event_type.Value() == EventType::RstPixCnt) {
                 u64 ignored{};
                 if (rasterizer)
                     rasterizer->OcclusionCounter(ignored, true);
                 pixel_counter = 0;
             } else if (event->event_index.Value() == EventIndex::ZpassDone) {
-                if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                if (event->event_type.Value() == EventType::PixelPipeStatDump ||
+                    event->event_type.Value() == EventType::ZpassDone) {
                     ++packet_stats.occlusion_events;
                     static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                     static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
@@ -1294,6 +1299,19 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             const u32 size = copy_data->count_sel ? 8 : 4;
             const auto source = copy_data->src_sel.Value();
             const auto destination = copy_data->dst_sel.Value();
+            const auto register_address = [&](u32 word) -> u32* {
+                constexpr u32 compute_base = Regs::ShRegWordOffset + 0x200;
+                if (word >= compute_base && word - compute_base < sizeof(ComputeProgram) / 4)
+                    return reinterpret_cast<u32*>(&GetCsRegs()) + word - compute_base;
+                return &regs.reg_array[word];
+            };
+            if ((source == CopyDataSrc::Gds &&
+                 (copy_data->src_addr_hi || copy_data->src_addr_lo % 4 ||
+                  copy_data->src_addr_lo > 65536 - size)) ||
+                (destination == CopyDataDst::Gds &&
+                 (copy_data->dst_addr_hi || copy_data->dst_addr_lo % 4 ||
+                  copy_data->dst_addr_lo > 65536 - size)))
+                throw std::runtime_error("COPY_DATA GDS range is invalid");
             const auto memory_source = source == CopyDataSrc::Memory || source == CopyDataSrc::TCL2;
             const auto memory_destination = destination == CopyDataDst::MemorySync ||
                                             destination == CopyDataDst::MemoryAsync ||
@@ -1318,7 +1336,9 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
                     if (copy_data->src_addr_hi || copy_data->src_addr_lo >= Regs::NumRegs ||
                         size / 4 > Regs::NumRegs - copy_data->src_addr_lo)
                         throw std::runtime_error("COPY_DATA register source is out of range");
-                    std::memcpy(&value, &regs.reg_array[copy_data->src_addr_lo], size);
+                    for (u32 index = 0; index < size / 4; ++index)
+                        value |= u64(*register_address(copy_data->src_addr_lo + index))
+                                 << (index * 32);
                     break;
                 case CopyDataSrc::Memory:
                 case CopyDataSrc::TCL2:
@@ -1340,8 +1360,12 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
                     if (copy_data->dst_addr_hi || copy_data->dst_addr_lo >= Regs::NumRegs ||
                         size / 4 > Regs::NumRegs - copy_data->dst_addr_lo)
                         throw std::runtime_error("COPY_DATA register destination is out of range");
-                    gfx_stamp.WriteRegs(&regs.reg_array[copy_data->dst_addr_lo], &value, size,
-                                        copy_data->dst_addr_lo);
+                    const auto* words = reinterpret_cast<const u32*>(&value);
+                    for (u32 index = 0; index < size / 4; ++index) {
+                        const u32 word = copy_data->dst_addr_lo + index;
+                        gfx_stamp.WriteRegs(register_address(word), words + index, sizeof(u32),
+                                            word);
+                    }
                 } else if (destination == CopyDataDst::Gds && rasterizer) {
                     const auto* words = reinterpret_cast<const u32*>(&value);
                     for (u32 index = 0; index < size / 4; ++index)
@@ -1355,7 +1379,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
                 rasterizer->Finish();
             break;
         }
-        // The only graphics opcodes whose handling can suspend the parser. They
+        // These graphics opcodes can also suspend the parser. They
         // are returned unconsumed; the coroutine owns them, and the packet-run
         // guard has already armed this run's marks. A GPU command thread read
         // of guest memory that is neither bit-guarded nor behind one of those
@@ -1367,7 +1391,9 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
         case PM4ItOpcode::WaitOnCeCounter:
             return dcb;
         case PM4ItOpcode::AcquireMem: {
-            // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
+            VideoCore::StreamCopyLane::Instance().DrainProducer();
+            if (rasterizer)
+                rasterizer->CpSync();
             break;
         }
         case PM4ItOpcode::IncrementDeCounter: {
@@ -1375,6 +1401,9 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             break;
         }
         case PM4ItOpcode::PfpSyncMe: {
+            VideoCore::StreamCopyLane::Instance().DrainProducer();
+            if (rasterizer)
+                rasterizer->CpSync();
             break;
         }
         case PM4ItOpcode::StrmoutBufferUpdate: {
@@ -1443,6 +1472,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             if (cond_exec->command.Value() != 0) {
                 LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
             }
+            FenceDrainAndDownload(rasterizer);
             const auto skip = *cond_exec->Address() == false;
             if (skip) {
                 dcb = NextPacket(dcb, count + 1 + cond_exec->exec_count.Value());

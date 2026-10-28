@@ -435,6 +435,7 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     cache.clear();
     cache_bytes = 0;
     this->resources = resources;
+    native_device = device;
     persistent.Initialize("shaders");
     if (maximum_model < D3D_SHADER_MODEL_6_4 || maximum_model > D3D_SHADER_MODEL_6_6)
         throw std::runtime_error("Invalid D3D12 shader model ceiling");
@@ -625,7 +626,8 @@ PreparedShader ShaderCache::Prepare(std::unique_ptr<TranslatedShader> translated
         for (auto& buffer : result.info.buffers)
             if (buffer.buffer_type == Shader::BufferType::Guest)
                 buffer.is_coherent = true;
-    const bool image_aliases = LowerImageBufferAliases(result, program, resources, stage_resources);
+    const bool image_aliases =
+        LowerImageBufferAliases(result, program, resources, stage_resources, native_device);
     if (LowerBufferAliases(result, program, resources) || image_aliases || index_fetch) {
         Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
         Shader::Optimization::DeadCodeEliminationPass(program);
