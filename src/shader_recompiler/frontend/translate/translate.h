@@ -99,7 +99,8 @@ public:
     void S_CSELECT_B64(const GcnInst& inst);
     void S_AND_B32(NegateMode negate, const GcnInst& inst);
     void S_AND_B64(NegateMode negate, const GcnInst& inst);
-    void S_OR_B32(const GcnInst& inst);
+    void S_OR_B32(NegateMode negate, bool is_xor, const GcnInst& inst);
+    void S_SEXT_I32(const GcnInst& inst, u32 width);
     void S_OR_B64(NegateMode negate, bool is_xor, const GcnInst& inst);
     void S_XOR_B32(const GcnInst& inst);
     void S_LSHL_B32(const GcnInst& inst);
@@ -121,7 +122,7 @@ public:
     void S_MULK_I32(const GcnInst& inst);
 
     // SOP1
-    void S_MOV(const GcnInst& inst);
+    void S_MOV(const GcnInst& inst, bool conditional = false);
     void S_MOV_B64(const GcnInst& inst);
     void S_NOT_B64(const GcnInst& inst);
     void S_BREV_B32(const GcnInst& inst);

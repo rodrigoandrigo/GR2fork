@@ -41,8 +41,10 @@ void main(uint3 thread : SV_DispatchThreadID) {
         return;
     }
     if (mode == 4) {
-        Arguments.Store(i * 20, i);
-        Arguments.Store4(i * 20 + 4, uint4(Input.Load(0) / stride,1,0,0));
+        uint vertices = Input.Load(0) / stride;
+        Arguments.Store(i * 20, primitive != 0 ? 0 : i);
+        Arguments.Store4(i * 20 + 4, primitive != 0 ?
+            uint4(i < vertices / primitive ? primitive : 0,1,0,0) : uint4(vertices,1,0,0));
         return;
     }
     if (mode == 2) {
@@ -81,6 +83,15 @@ void main(uint3 thread : SV_DispatchThreadID) {
         }
     }
     if (primitive == 7) source = i / 2 + (i & 1);
+    if (primitive == 10) source = (i / 2) * 4 + 1 + (i & 1);
+    if (primitive == 11) source = i / 2 + 1 + (i & 1);
+    if (primitive == 12) source = group * 6 + lane * 2;
+    if (primitive == 13 || primitive == 14) {
+        source = group * 2 + lane * 2;
+        if ((group & 1) != 0)
+            source = group * 2 + (primitive == 14 ? (lane == 0 ? 2 : lane == 1 ? 0 : 4) :
+                                                   (lane == 0 ? 0 : lane == 1 ? 4 : 2));
+    }
     if (provoking != 0) {
         if (primitive == 1 || primitive == 7 || primitive == 8) {
             uint other = i ^ 1u;
@@ -243,8 +254,70 @@ void GpuCommands::Execute(ID3D12GraphicsCommandList* list, ID3D12RootSignature* 
     }
     list->ExecuteIndirect(signature.Get(), count, arguments.Get(), 0, nullptr, 0);
 }
+void GpuCommands::PrepareStencil(const D3D12_RESOURCE_DESC& description, u64 bytes) {
+    const auto allocation = device->Device()->GetResourceAllocationInfo(0, 1, &description);
+    const u64 buffer_size = (bytes + 3) & ~u64{3};
+    const u64 buffer_bytes = (bytes + D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT - 1) &
+                             ~(u64(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) - 1);
+    if (!bytes || bytes > 32ULL * 1024 * 1024 ||
+        allocation.SizeInBytes > 32ULL * 1024 * 1024 - buffer_bytes ||
+        description.SampleDesc.Count != 1 || description.DepthOrArraySize != 1 ||
+        description.MipLevels != 1)
+        throw std::runtime_error("Ordered stencil snapshot exceeds supported layout or budget");
+    if (stencil_values.AllocationBytes() > 32ULL * 1024 * 1024 - allocation.SizeInBytes) {
+        stencil_values.Reset();
+        stencil_capacity = 0;
+    }
+    if (!stencil_snapshot.Get() || stencil_description.Width != description.Width ||
+        stencil_description.Height != description.Height ||
+        stencil_description.Format != description.Format) {
+        stencil_snapshot.Reset();
+        winrt::check_hresult(allocator.CreateTexture2D(description, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                       stencil_snapshot));
+        stencil_description = description;
+        stencil_snapshot_state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    if (bytes > stencil_capacity) {
+        stencil_values.Reset();
+        stencil_capacity = 0;
+        winrt::check_hresult(allocator.CreateBuffer(
+            buffer_size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, stencil_values));
+        stencil_capacity = buffer_size;
+        stencil_values_state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+}
+void GpuCommands::BeginStencil(ID3D12GraphicsCommandList* list, ID3D12Resource* source, u32 plane,
+                               const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint) {
+    Transition(list, stencil_snapshot, stencil_snapshot_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    Transition(list, stencil_values, stencil_values_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyResource(stencil_snapshot.Get(), source);
+    D3D12_TEXTURE_COPY_LOCATION input{}, output{};
+    input.pResource = source;
+    input.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    input.SubresourceIndex = plane;
+    output.pResource = stencil_values.Get();
+    output.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    output.PlacedFootprint = footprint;
+    list->CopyTextureRegion(&output, 0, 0, 0, &input, nullptr);
+    Transition(list, stencil_snapshot, stencil_snapshot_state, D3D12_RESOURCE_STATE_DEPTH_READ);
+    Transition(list, stencil_values, stencil_values_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+void GpuCommands::EndStencil(ID3D12GraphicsCommandList* list, ID3D12Resource* destination,
+                             u32 plane, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint) {
+    Transition(list, stencil_values, stencil_values_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION input{}, output{};
+    input.pResource = stencil_values.Get();
+    input.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    input.PlacedFootprint = footprint;
+    output.pResource = destination;
+    output.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    output.SubresourceIndex = plane;
+    list->CopyTextureRegion(&output, 0, 0, 0, &input, nullptr);
+}
 void GpuCommands::PrepareGeometry(u64 bytes, u32 batches) {
-    if (!bytes || bytes > 32ULL * 1024 * 1024)
+    if (!bytes || bytes > 32ULL * 1024 * 1024 || !batches ||
+        u64(batches) * 20 > 32ULL * 1024 * 1024)
         throw std::runtime_error("D3D12 geometry capture exceeds memory budget");
     if (bytes > geometry_capacity) {
         geometry_vertices.Reset();
@@ -292,7 +365,8 @@ D3D12_STREAM_OUTPUT_BUFFER_VIEW GpuCommands::BeginGeometry(ID3D12GraphicsCommand
     return {geometry_vertices->GetGPUVirtualAddress(), geometry_capacity,
             geometry_counter->GetGPUVirtualAddress()};
 }
-void GpuCommands::EndGeometry(ID3D12GraphicsCommandList* list, u32 stride, u32 batches) {
+void GpuCommands::EndGeometry(ID3D12GraphicsCommandList* list, u32 stride, u32 batches,
+                              u32 primitive_vertices) {
     list->SOSetTargets(0, 0, nullptr);
     D3D12_RESOURCE_BARRIER memory{};
     memory.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -305,7 +379,7 @@ void GpuCommands::EndGeometry(ID3D12GraphicsCommandList* list, u32 stride, u32 b
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     list->SetComputeRootSignature(root.Get());
     list->SetPipelineState(pipeline.Get());
-    const std::array<u32, 12> constants{4, batches, 0, 0, stride};
+    const std::array<u32, 12> constants{4, batches, 0, 0, stride, 0, 0, 0, 0, primitive_vertices};
     list->SetComputeRoot32BitConstants(0, constants.size(), constants.data(), 0);
     list->SetComputeRootUnorderedAccessView(1, geometry_counter->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(2, geometry_counter->GetGPUVirtualAddress());
@@ -316,7 +390,7 @@ void GpuCommands::EndGeometry(ID3D12GraphicsCommandList* list, u32 stride, u32 b
                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
 }
 void GpuCommands::ExecuteGeometry(ID3D12GraphicsCommandList* list, ID3D12RootSignature* graphics,
-                                  u32 slot, u32 batches) {
+                                  u32 slot, u32 batches, u32 first) {
     if (geometry_signature_root.Get() != graphics) {
         geometry_draw.Reset();
         geometry_signature_root = graphics;
@@ -330,6 +404,25 @@ void GpuCommands::ExecuteGeometry(ID3D12GraphicsCommandList* list, ID3D12RootSig
         winrt::check_hresult(device->Device()->CreateCommandSignature(
             &description, graphics, IID_PPV_ARGS(&geometry_draw)));
     }
-    list->ExecuteIndirect(geometry_draw.Get(), batches, geometry_arguments.Get(), 0, nullptr, 0);
+    list->ExecuteIndirect(geometry_draw.Get(), batches, geometry_arguments.Get(), u64(first) * 20,
+                          nullptr, 0);
+}
+void GpuCommands::ExecuteGeometryPrimitive(ID3D12GraphicsCommandList* list, u32 slot, u32 primitive,
+                                           u32 batch) {
+    if (!geometry_primitive_draw) {
+        D3D12_INDIRECT_ARGUMENT_DESC argument{};
+        argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        D3D12_COMMAND_SIGNATURE_DESC description{20, 1, &argument};
+        winrt::check_hresult(device->Device()->CreateCommandSignature(
+            &description, nullptr, IID_PPV_ARGS(&geometry_primitive_draw)));
+    }
+    list->SetGraphicsRoot32BitConstant(slot, batch, 0);
+    list->ExecuteIndirect(geometry_primitive_draw.Get(), 1, geometry_arguments.Get(),
+                          u64(primitive) * 20 + 4, nullptr, 0);
+}
+void GpuCommands::CopyGeometryCounter(ID3D12GraphicsCommandList* list,
+                                      ID3D12Resource* destination) {
+    Transition(list, geometry_counter, geometry_counter_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(destination, 0, geometry_counter.Get(), 0, sizeof(u32));
 }
 } // namespace D3D12

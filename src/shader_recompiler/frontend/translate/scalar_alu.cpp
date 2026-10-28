@@ -49,7 +49,7 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
         case Opcode::S_AND_B64:
             return S_AND_B64(NegateMode::None, inst);
         case Opcode::S_OR_B32:
-            return S_OR_B32(inst);
+            return S_OR_B32(NegateMode::None, false, inst);
         case Opcode::S_OR_B64:
             return S_OR_B64(NegateMode::None, false, inst);
         case Opcode::S_XOR_B32:
@@ -62,6 +62,12 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             return S_AND_B32(NegateMode::Src1, inst);
         case Opcode::S_ANDN2_B64:
             return S_AND_B64(NegateMode::Src1, inst);
+        case Opcode::S_ORN2_B32:
+            return S_OR_B32(NegateMode::Src1, false, inst);
+        case Opcode::S_NOR_B32:
+            return S_OR_B32(NegateMode::Result, false, inst);
+        case Opcode::S_XNOR_B32:
+            return S_OR_B32(NegateMode::Result, true, inst);
         case Opcode::S_ORN2_B64:
             return S_OR_B64(NegateMode::Src1, false, inst);
         case Opcode::S_NAND_B32:
@@ -96,6 +102,12 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             // SOP1
         case Opcode::S_MOV_B32:
             return S_MOV(inst);
+        case Opcode::S_CMOV_B32:
+            return S_MOV(inst, true);
+        case Opcode::S_SEXT_I32_I8:
+            return S_SEXT_I32(inst, 8);
+        case Opcode::S_SEXT_I32_I16:
+            return S_SEXT_I32(inst, 16);
         case Opcode::S_MOV_B64:
             return S_MOV_B64(inst);
         case Opcode::S_NOT_B64:
@@ -357,10 +369,14 @@ void Translator::S_AND_B64(NegateMode negate, const GcnInst& inst) {
     SetDst64(inst.dst[0], result);
 }
 
-void Translator::S_OR_B32(const GcnInst& inst) {
+void Translator::S_OR_B32(NegateMode negate, bool is_xor, const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
-    const IR::U32 src1{GetSrc(inst.src[1])};
-    const IR::U32 result{ir.BitwiseOr(src0, src1)};
+    IR::U32 src1{GetSrc(inst.src[1])};
+    if (negate == NegateMode::Src1)
+        src1 = ir.BitwiseNot(src1);
+    IR::U32 result = is_xor ? ir.BitwiseXor(src0, src1) : ir.BitwiseOr(src0, src1);
+    if (negate == NegateMode::Result)
+        result = ir.BitwiseNot(result);
     SetDst(inst.dst[0], result);
     ir.SetScc(ir.INotEqual(result, ir.Imm32(0)));
 }
@@ -524,8 +540,15 @@ void Translator::S_MULK_I32(const GcnInst& inst) {
 
 // SOP1
 
-void Translator::S_MOV(const GcnInst& inst) {
-    SetDst(inst.dst[0], GetSrc(inst.src[0]));
+void Translator::S_MOV(const GcnInst& inst, bool conditional) {
+    const IR::U32 value = GetSrc(inst.src[0]);
+    SetDst(inst.dst[0],
+           conditional ? IR::U32{ir.Select(ir.GetScc(), value, GetSrc(inst.dst[0]))} : value);
+}
+
+void Translator::S_SEXT_I32(const GcnInst& inst, u32 width) {
+    SetDst(inst.dst[0],
+           ir.BitFieldExtract(GetSrc(inst.src[0]), ir.Imm32(0), ir.Imm32(width), true));
 }
 
 void Translator::S_MOV_B64(const GcnInst& inst) {

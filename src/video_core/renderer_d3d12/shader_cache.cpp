@@ -113,7 +113,7 @@ bool SameRanges(std::span<const ShaderResourceRange> first,
     });
 }
 std::vector<u8> ShaderDiskKey(std::span<const u32> key) {
-    std::vector<u8> result{0};
+    std::vector<u8> result{1};
     const auto* bytes = reinterpret_cast<const u8*>(key.data());
     result.insert(result.end(), bytes, bytes + key.size_bytes());
     return result;
@@ -221,6 +221,38 @@ std::string SemanticMember(const std::string& source, std::string_view structure
     if (first == last)
         throw std::runtime_error("Invalid HLSL stage semantic member");
     return source.substr(first, last - first);
+}
+void RemapGeometryPrimitiveInput(std::string& source) {
+    const auto first = source.find("struct SPIRV_Cross_Output");
+    if (first == std::string::npos)
+        return;
+    const auto last = source.find("};", first);
+    auto input_declaration = source.substr(first, last + 2 - first);
+    const auto semantic = input_declaration.find("SV_PrimitiveID");
+    const std::regex signature{R"(SPIRV_Cross_Output input\[(\d+)\])"};
+    std::smatch match;
+    const auto main = source.find("void main(");
+    if (semantic == std::string::npos || main == std::string::npos)
+        return;
+    auto entry = source.substr(main);
+    if (!std::regex_search(entry, match, signature))
+        return;
+    input_declaration.replace(semantic, 14, "TEXCOORD32");
+    input_declaration.replace(input_declaration.find("SPIRV_Cross_Output"), 18, "Capture_Output");
+    const u32 count = std::stoul(match[1].str());
+    entry.replace(match.position(), match.length(),
+                  "Capture_Output captured[" + std::to_string(count) + "]");
+    std::string unpack = "\nSPIRV_Cross_Output input[" + std::to_string(count) + "];\n";
+    const auto output = source.substr(first, last + 2 - first);
+    const std::regex member{R"((\w+)\s*:\s*\w+\s*;)"};
+    for (auto it = std::sregex_iterator(output.begin(), output.end(), member);
+         it != std::sregex_iterator(); ++it)
+        for (u32 i = 0; i < count; ++i)
+            unpack += "input[" + std::to_string(i) + "]." + (*it)[1].str() + " = captured[" +
+                      std::to_string(i) + "]." + (*it)[1].str() + ";\n";
+    entry.insert(entry.find('{') + 1, unpack);
+    source.replace(main, source.size() - main, entry);
+    source.insert(last + 2, "\n" + input_declaration);
 }
 void AddSemanticMember(std::string& source, std::string_view structure,
                        std::string_view declaration) {
@@ -436,6 +468,14 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     profile.max_viewport_height = D3D12_VIEWPORT_BOUNDS_MAX;
     profile.max_shared_memory_size = D3D12_CS_TGSM_REGISTER_COUNT * sizeof(u32);
     profile.support_int64 = options.Int64ShaderOps;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS numeric_options{};
+    winrt::check_hresult(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &numeric_options,
+                                                     sizeof(numeric_options)));
+    native_float64 = numeric_options.DoublePrecisionFloatShaderOps;
+    profile.support_float64 = true;
+    profile.support_fp32_denorm_flush = true;
+    profile.support_fp32_denorm_preserve = true;
+    LOG_INFO(Core, "[UWP stage] native FP64 support={}", native_float64);
     profile.supports_shader_stencil_export = true;
     profile.fast_shader_math = EmulatorSettings.IsFastShaderMath();
     profile.needs_image_load_feedback = true;
@@ -517,6 +557,9 @@ std::unique_ptr<TranslatedShader> ShaderCache::TranslateUncached(Shader::ShaderP
     auto& shader = translated->shader;
     translated->program.emplace(
         Shader::TranslateProgram(params.code, *pools[stage], shader.info, shader.runtime, profile));
+    if (shader.info.uses_fp64 && !native_float64)
+        throw std::runtime_error(
+            "Guest FP64 requires native double precision or a precise software implementation");
     shader.info.RefreshFlatBuf();
     ++statistics.translations;
     translated->params = params;
@@ -817,8 +860,22 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
         throw std::runtime_error("Native tessellation compilation requires linked stage metadata");
     if (native_spirv)
         CompileNativeSpirv(words, *result, stage, flip_y, tessellation_link, peer, flip_x);
-    else
+    else {
         result->hlsl = cross.compile();
+        for (size_t offset = 5; offset < words.size();) {
+            const u32 length = words[offset] >> 16;
+            if (!length || length > words.size() - offset)
+                throw std::runtime_error("Invalid numeric SPIR-V instruction");
+            if ((words[offset] & 0xffff) == spv::OpExecutionMode && length == 4 &&
+                words[offset + 3] == 32) {
+                if (words[offset + 2] == spv::ExecutionModeDenormPreserve)
+                    result->hlsl.insert(0, "#define SHAD_FP32_DENORM_PRESERVE 1\n");
+                else if (words[offset + 2] == spv::ExecutionModeDenormFlushToZero)
+                    result->hlsl.insert(0, "#define SHAD_FP32_DENORM_FLUSH 1\n");
+            }
+            offset += length;
+        }
+    }
     if (!native_spirv) {
         AlignSemanticRows(result->hlsl, "SPIRV_Cross_Input");
         AlignSemanticRows(result->hlsl, "SPIRV_Cross_Output");
@@ -871,9 +928,87 @@ void ShaderCache::Remember(std::vector<u32> key, std::shared_ptr<const ShaderBin
     cache_bytes += bytes_used;
     cache.emplace(std::move(key), result);
 }
+std::shared_ptr<const ShaderBinary> ShaderCache::CompileConstantAlphaBlend(
+    const ShaderBinary& fragment, float alpha) {
+    auto source = fragment.hlsl;
+    const auto entry = source.find(" main(");
+    if (entry == std::string::npos ||
+        SemanticMember(source, "SPIRV_Cross_Output", "SV_Target0").empty())
+        throw std::runtime_error("Constant alpha blending requires color output zero");
+    const auto close = source.find(')', entry);
+    if (close == std::string::npos)
+        throw std::runtime_error("Invalid constant alpha blend fragment entry");
+    const auto arguments = source.substr(entry + 6, close - entry - 6);
+    std::string forwarded;
+    std::istringstream argument_stream(arguments);
+    for (std::string argument; std::getline(argument_stream, argument, ',');) {
+        std::istringstream declaration(argument);
+        std::string type, name;
+        if (!(declaration >> type >> name))
+            throw std::runtime_error("Invalid constant alpha blend fragment argument");
+        if (!forwarded.empty())
+            forwarded += ", ";
+        forwarded += name;
+    }
+    const auto output_start = source.find("struct SPIRV_Cross_Output");
+    const auto output_end = source.find("};", output_start);
+    if (output_start == std::string::npos || output_end == std::string::npos)
+        throw std::runtime_error("Missing constant alpha blend output interface");
+    const std::regex members{R"(((?:float|uint|int)[1-4]?)\s+(\w+)\s*:\s*(\w+)\s*;)"};
+    const auto output = source.substr(output_start, output_end - output_start);
+    std::string declaration = "\nstruct ShadBlendOutput {\n", copies;
+    for (std::sregex_iterator field(output.begin(), output.end(), members), end; field != end;
+         ++field) {
+        const auto semantic = (*field)[3].str();
+        if (semantic.starts_with("SV_Target") && semantic != "SV_Target0")
+            continue;
+        declaration += field->str() + "\n";
+        const auto name = (*field)[2].str();
+        copies += "value." + name + " = guest." + name + ";\n";
+    }
+    declaration += "float4 shadBlendAlpha : SV_Target1; };\n";
+    const auto renamed = source.find(" main(");
+    source.replace(renamed + 1, 4, "shad_blend_guest_main");
+    source += declaration;
+    if (source.find("[earlydepthstencil]") != std::string::npos)
+        source += "\n[earlydepthstencil]\n";
+    source += "\nShadBlendOutput main(" + arguments + ") {\n";
+    source += "SPIRV_Cross_Output guest = shad_blend_guest_main(" + forwarded + ");\n";
+    source += "ShadBlendOutput value;\n" + copies;
+    source += fmt::format("value.shadBlendAlpha = asfloat({}u).xxxx;\n", std::bit_cast<u32>(alpha));
+    source += "return value; }\n";
+    std::vector<u32> key{UINT32_MAX - 6, u32(shader_model)};
+    for (const unsigned char character : source)
+        key.push_back(character);
+    for (const auto& binding : fragment.bindings)
+        key.insert(key.end(), {u32(binding.kind), u32(binding.type), binding.binding, binding.space,
+                               binding.count});
+    if (const auto found = cache.find(key); found != cache.end())
+        return found->second;
+    auto result = std::make_shared<ShaderBinary>(fragment);
+    result->hlsl = std::move(source);
+    CompileHlsl(*result, Shader::SwStage::Fragment);
+    Remember(std::move(key), result);
+    return result;
+}
+std::shared_ptr<const ShaderBinary> ShaderCache::CompileFaceFragment(const ShaderBinary& fragment,
+                                                                     bool front) {
+    auto source = fragment.hlsl;
+    const auto field = SemanticMember(source, "SPIRV_Cross_Input", "SV_IsFrontFace");
+    const std::regex signature{R"(\bmain\s*\(\s*SPIRV_Cross_Input\s+(\w+))"};
+    std::smatch match;
+    if (field.empty() || !std::regex_search(source, match, signature))
+        throw std::runtime_error("Missing fragment front-face interface");
+    const auto body = source.find('{', size_t(match.position() + match.length()));
+    if (body == std::string::npos)
+        throw std::runtime_error("Missing fragment entry body");
+    source.insert(body + 1,
+                  "\n" + match[1].str() + "." + field + " = " + (front ? "true" : "false") + ";\n");
+    return CompileHelperHlsl(source, Shader::SwStage::Fragment);
+}
 std::shared_ptr<const ShaderBinary> ShaderCache::CompilePointFill(
     const ShaderBinary& vertex, bool keep_front, bool front_ccw, bool cull,
-    const Shader::HwFragmentRuntimeInfo* fragment) {
+    const Shader::HwFragmentRuntimeInfo* fragment, bool masks) {
     const auto first = vertex.hlsl.find("struct SPIRV_Cross_Output");
     const auto last = vertex.hlsl.find("};", first);
     if (first == std::string::npos || last == std::string::npos || last - first > 16384)
@@ -883,6 +1018,9 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompilePointFill(
         throw std::runtime_error("Point fill requires a position export");
     auto result = std::make_shared<ShaderBinary>();
     result->hlsl = vertex.hlsl.substr(first, last + 2 - first);
+    if (masks)
+        result->hlsl +=
+            "cbuffer FaceMask : register(b0,space100) { uint face_batch; uint polygon_mask; };\n";
     result->hlsl += "\n[maxvertexcount(3)]\nvoid main(triangle SPIRV_Cross_Output input[3], "
                     "inout PointStream<SPIRV_Cross_Output> stream) {\n";
     for (u32 i = 0; i < 3; ++i)
@@ -891,11 +1029,13 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompilePointFill(
     result->hlsl += "float det = h0.x * (h1.y * h2.w - h1.w * h2.y) - h0.y * (h1.x * h2.w - h1.w * "
                     "h2.x) + h0.w * (h1.x * h2.y - h1.y * h2.x);\n";
     result->hlsl +=
-        std::string("bool frontfacing = ") + (front_ccw ? "det < 0.0" : "det > 0.0") + ";\n";
+        std::string("bool frontfacing = ") + (front_ccw ? "det > 0.0" : "det < 0.0") + ";\n";
     if (cull)
         result->hlsl +=
             std::string("if (!(") + (keep_front ? "frontfacing" : "!frontfacing") + ")) return;\n";
     for (u32 i = 0; i < 3; ++i) {
+        if (masks)
+            result->hlsl += "if ((polygon_mask & " + std::to_string(1u << (i + 3)) + ") != 0) ";
         result->hlsl += "{ SPIRV_Cross_Output value = input[" + std::to_string(i) + "];\n";
         if (fragment)
             for (u32 input = 0; input < fragment->num_inputs; ++input) {
@@ -931,7 +1071,8 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
     const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool keep_front,
     bool front_ccw, D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type, bool adjacency, float width_px,
     u16 pattern, u16 repeat, bool pattern_msb_first, float pattern_scale,
-    const std::array<f32, 32>& viewport_dims, bool cull, bool batches) {
+    const std::array<f32, 32>& viewport_dims, bool cull, bool batches, bool masks, u32 linear_mask,
+    u32 flat_mask, bool depth_clip) {
     const auto first = vertex.hlsl.find("struct SPIRV_Cross_Output");
     const auto last = vertex.hlsl.find("};", first);
     if (first == std::string::npos || last == std::string::npos || last - first > 16384)
@@ -967,9 +1108,9 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
         bases = {0u, 1u, 2u};
     } else {
         input_type = "triangleadj";
-        input_count = 4;
+        input_count = 6;
         pair_count = 3;
-        bases = {1u, 2u, 3u};
+        bases = {0u, 2u, 4u};
     }
     u32 components{};
     for (const auto& output : StageOutputs(vertex))
@@ -978,7 +1119,9 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
         stipple ? std::max(1u, std::min(128u, 1024u / (4 * components))) : 1u;
     const u32 instance_groups = 32 / pair_count;
     if (batches)
-        result->hlsl += "cbuffer LineBatch : register(b0,space100) { uint line_batch; };\n";
+        result->hlsl +=
+            std::string("cbuffer LineBatch : register(b0,space100) { uint line_batch; ") +
+            (masks ? "uint polygon_mask; " : "") + "};\n";
     result->hlsl += "\n[maxvertexcount(" + std::to_string(4u * windows_per_instance) +
                     ")]\n[instance(" + std::to_string(stipple ? 32u : pair_count) +
                     ")]\nvoid main(" + input_type + " SPIRV_Cross_Output input[" +
@@ -986,22 +1129,23 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
                     "], uint inst : SV_GSInstanceID, inout TriangleStream<SPIRV_Cross_Output> "
                     "stream) {\n";
     if (wire && cull) {
-        const u32 a = adjacency ? 1u : 0u;
         const auto at = [&](u32 offset) {
-            return "input[" + std::to_string(a + offset) + "]." + position;
+            return "input[" + std::to_string(bases[offset]) + "]." + position;
         };
         result->hlsl += "float4 h0 = " + at(0) + "; float4 h1 = " + at(1) +
                         "; float4 h2 = " + at(2) +
                         ";\nfloat det = h0.x * (h1.y * h2.w - h1.w * "
                         "h2.y) - h0.y * (h1.x * h2.w - h1.w * h2.x) + h0.w * (h1.x * h2.y - h1.y * "
                         "h2.x);\nbool frontfacing = " +
-                        (front_ccw ? "det < 0.0" : "det > 0.0") + ";\nif (!(" +
+                        (front_ccw ? "det > 0.0" : "det < 0.0") + ";\nif (!(" +
                         (keep_front ? "frontfacing" : "!frontfacing") + ")) return;\n";
     }
     result->hlsl += "if (inst >= " + std::to_string(instance_groups * pair_count) +
                     ") return;\nSPIRV_Cross_Output vset[2];\nfor (uint seg = 0; seg < " +
                     std::to_string(pair_count) + "; ++seg) {\nif (seg != inst % " +
                     std::to_string(pair_count) + ") continue;\n";
+    if (masks)
+        result->hlsl += "if ((polygon_mask & (1u << seg)) == 0) continue;\n";
     result->hlsl += "if (seg == 0) { vset[0] = input[" + std::to_string(bases[0]) +
                     "]; vset[1] = input[" + std::to_string(bases[1]) + "]; }\n";
     if (pair_count == 3) {
@@ -1011,10 +1155,25 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
                         "]; vset[1] = input[" + std::to_string(bases[0]) + "]; }\n";
     }
     result->hlsl += "float4 ha = vset[0]." + position + "; float4 hb = vset[1]." + position + ";\n";
-    result->hlsl += "if (!(ha.w > 0.0 && hb.w > 0.0)) continue;\n"
-                    "float inv_w0 = 1.0 / ha.w; float inv_w1 = 1.0 / hb.w;\n"
-                    "float3 ndc0 = float3(ha.xy * inv_w0, ha.z * inv_w0);\n"
-                    "float3 ndc1 = float3(hb.xy * inv_w1, hb.z * inv_w1);\n";
+    result->hlsl += R"(
+float4 original_a = ha, original_b = hb;
+float clip_lo = 0.0, clip_hi = 1.0;
+float aplanes[6] = {ha.w+ha.x,ha.w-ha.x,ha.w+ha.y,ha.w-ha.y,ha.z,ha.w-ha.z};
+float bplanes[6] = {hb.w+hb.x,hb.w-hb.x,hb.w+hb.y,hb.w-hb.y,hb.z,hb.w-hb.z};
+bool outside = false;
+)";
+    result->hlsl +=
+        "for(uint plane=0;plane<" + std::to_string(depth_clip ? 6 : 4) +
+        ";++plane) { float a=aplanes[plane], b=bplanes[plane]; if(a<0 && b<0) outside=true; else "
+        "if(a<0) clip_lo=max(clip_lo,a/(a-b)); else if(b<0) clip_hi=min(clip_hi,a/(a-b)); }\n";
+    result->hlsl += R"(
+if(outside || clip_lo>clip_hi) continue;
+ha = clip_lo == 0 ? original_a : lerp(original_a,original_b,clip_lo);
+hb = clip_hi == 1 ? original_b : lerp(original_a,original_b,clip_hi);
+if (!(ha.w > 0.0 && hb.w > 0.0)) continue;
+float inv_w0 = 1.0 / ha.w, inv_w1 = 1.0 / hb.w;
+float3 ndc0 = ha.xyz * inv_w0, ndc1 = hb.xyz * inv_w1;
+)";
     std::string vp_table;
     for (u32 k = 0; k < 32; ++k) {
         if (k) {
@@ -1028,7 +1187,8 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
     } else {
         result->hlsl += "uint vp_idx = uint(vset[0]." + viewport_index + ");\n";
     }
-    result->hlsl += "float2 vp = float2(vp_dim[vp_idx * 2], vp_dim[vp_idx * 2 + 1]);\n";
+    result->hlsl += "if(vp_idx>=16) continue; float2 vp = float2(vp_dim[vp_idx * 2], vp_dim[vp_idx "
+                    "* 2 + 1]); if(!(vp.x>0 && vp.y>0)) continue;\n";
     result->hlsl += "float2 dp = (ndc1.xy - ndc0.xy) * 0.5 * vp;\nfloat seg_len = length(dp);\n"
                     "if (!(seg_len > 0.0001)) continue;\n"
                     "float2 dir = dp / seg_len;\nfloat2 perp = float2(dir.y, -dir.x);\n"
@@ -1038,11 +1198,13 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
         "SPIRV_Cross_Output dash[4];\nfor (uint corner = 0; corner < 4; ++corner) {\n"
         "float tsel = (corner == 0 || corner == 1) ? t0 : t1;\n"
         "float2 pdir = (corner == 0 || corner == 3) ? off : -off;\n"
-        "float2 pos_ndc = ndc0.xy + tsel * (ndc1.xy - ndc0.xy) + pdir;\n"
-        "float w = 1.0 / (inv_w0 + tsel * (inv_w1 - inv_w0));\n"
+        "float2 pos_ndc = ndc0.xy + tsel * (ndc1.xy - ndc0.xy);\n"
+        "float w = tsel==0 ? ha.w : tsel==1 ? hb.w : 1.0 / (inv_w0 + tsel * (inv_w1 - inv_w0));\n"
         "dash[corner]." +
         position +
-        " = float4(pos_ndc.x * w, pos_ndc.y * w, (ndc0.z + tsel * (ndc1.z - ndc0.z)) * w, w);\n";
+        " = tsel==0 ? ha : tsel==1 ? hb : float4(pos_ndc * w, lerp(ndc0.z,ndc1.z,tsel) * w,w);\n"
+        "dash[corner]." +
+        position + ".xy += pdir * w;\n";
     const auto body = vertex.hlsl.find('{', first);
     std::istringstream members(vertex.hlsl.substr(body + 1, last - body - 1));
     for (std::string member; std::getline(members, member, ';');) {
@@ -1053,10 +1215,14 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
         if (!(declaration >> name >> colon >> semantic) || colon != ":" ||
             name.find('[') != std::string::npos)
             throw std::runtime_error("Unsupported line expansion stage interface member");
-        bool flat{};
+        bool flat{}, linear{};
         for (u32 i = 0; i < fragment.num_inputs; ++i) {
             const auto& input = fragment.inputs[i];
-            flat |= input.is_flat && semantic == "TEXCOORD" + std::to_string(input.param_index);
+            if (semantic == "TEXCOORD" + std::to_string(input.param_index) &&
+                input.param_index < 32) {
+                flat |= input.is_flat || (flat_mask & (1u << input.param_index));
+                linear |= (linear_mask & (1u << input.param_index)) != 0;
+            }
         }
         if (semantic == "SV_Position") {
             continue;
@@ -1065,23 +1231,36 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
             emit_body +=
                 "dash[corner]." + name + " = " + (wire ? "input[0]." : "vset[0].") + name + ";\n";
         } else {
-            emit_body += "dash[corner]." + name + " = vset[0]." + name + " + tsel * (vset[1]." +
-                         name + " - vset[0]." + name + ");\n";
+            const auto a = "vset[0]." + name;
+            const auto b = "vset[1]." + name;
+            const auto left = "(clip_lo==0 ? " + a + " : lerp(" + a + "," + b + "," +
+                              (linear ? "clip_lo*original_b.w*inv_w0" : "clip_lo") + "))";
+            const auto right = "(clip_hi==1 ? " + b + " : lerp(" + a + "," + b + "," +
+                               (linear ? "clip_hi*original_b.w*inv_w1" : "clip_hi") + "))";
+            emit_body += "dash[corner]." + name + " = tsel==0 ? " + left + " : tsel==1 ? " + right +
+                         " : " +
+                         (linear ? "lerp(" + left + "," + right + ",tsel)"
+                                 : "lerp(" + left + "*inv_w0," + right + "*inv_w1,tsel)*w") +
+                         ";\n";
         }
     }
     emit_body += "}\nstream.Append(dash[0]); stream.Append(dash[1]); stream.Append(dash[3]); "
                  "stream.Append(dash[2]); stream.RestartStrip();\n";
     if (stipple) {
         result->hlsl +=
-            "const float bit_len = " + std::to_string(pattern_scale) +
+            "const float bit_len = " +
+            fmt::format("{:.9e}", double(pattern_scale) * (u32(repeat) + 1)) +
             ";\n"
             "const uint pattern_u = " +
             std::to_string(u32(pattern)) +
             ";\n"
-            "const uint pattern_cap = " +
-            std::to_string(u32(repeat) * 16u + 15u) +
-            ";\n"
-            "const float win_eps = 0.01;\n"
+
+            "float clipped_distance = 0;\n"
+            "if(original_a.w>0 && clip_lo>0) clipped_distance = length((ndc0.xy - "
+            "original_a.xy/original_a.w)*0.5*vp);\n"
+            "float phase = clipped_distance / bit_len; uint phase_bit = "
+            "uint(fmod(floor(phase),16.0));\n"
+            "float phase_fraction = frac(phase);\n"
             "for (uint bit = (inst / " +
             std::to_string(pair_count) + ") * " + std::to_string(windows_per_instance) +
             "; bit < (inst / " + std::to_string(pair_count) + " + 1) * " +
@@ -1089,14 +1268,13 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileLineExpand(
             (batches ? "uint window_bit = bit + line_batch * " +
                            std::to_string(instance_groups * windows_per_instance) + ";\n"
                      : "uint window_bit = bit;\n") +
-            "if (window_bit >= 4096) break;\n"
-            "float win_start = float(window_bit) * bit_len;\n"
+            "float win_start = (float(window_bit) - phase_fraction) * bit_len;\n"
             "if (win_start >= seg_len) break;\n"
-            "uint sel = min(window_bit, pattern_cap) % 16;\nsel = " +
+            "uint sel = (phase_bit + window_bit) % 16;\nsel = " +
             std::string(pattern_msb_first ? "15 - sel" : "sel") +
             ";\nif (!((pattern_u >> sel) & 1)) continue;\n"
-            "float t0 = (win_start + win_eps) / seg_len;\n"
-            "float t1 = (min(win_start + bit_len, seg_len) - win_eps) / seg_len;\n" +
+            "float t0 = max(win_start,0.0) / seg_len;\n"
+            "float t1 = min(win_start + bit_len, seg_len) / seg_len;\n" +
             emit_body + "}\n";
     } else {
         result->hlsl += "{ float t0 = 0.0; float t1 = 1.0;\n" + emit_body + "}\n";
@@ -1248,7 +1426,7 @@ uint LogicUnsignedFloat(float v, uint mantissa) {
     return result;
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
-    const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment) {
+    const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool flat_last) {
     const auto first = vertex.hlsl.find("struct SPIRV_Cross_Output");
     const auto last = vertex.hlsl.find("};", first);
     if (first == std::string::npos || last == std::string::npos || last - first > 16384)
@@ -1291,7 +1469,8 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
             flat |= input.is_flat && semantic == "TEXCOORD" + std::to_string(input.param_index);
         }
         if (flat) {
-            result->hlsl += "for(uint i=0;i<4;++i) v[i]." + name + " = input[0]." + name + ";\n";
+            result->hlsl += "for(uint i=0;i<4;++i) v[i]." + name + " = input[" +
+                            std::string(flat_last ? "2" : "0") + "]." + name + ";\n";
         } else {
             result->hlsl += "v[3]." + name + " = input[0]." + name + " * weight.x + input[1]." +
                             name + " * weight.y + input[2]." + name + " * weight.z;\n";
@@ -1481,7 +1660,7 @@ std::vector<ShaderCache::StageOutput> ShaderCache::StageOutputs(const ShaderBina
             break;
         }
         outputs.push_back({semantic, parameter.SemanticIndex,
-                           u32(std::bit_width(u32(parameter.Mask))),
+                           u32(std::popcount(u32(parameter.Mask))),
                            parameter.ComponentType != D3D_REGISTER_COMPONENT_FLOAT32,
                            parameter.ComponentType == D3D_REGISTER_COMPONENT_SINT32});
     }
@@ -1510,12 +1689,21 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileHelperHlsl(const std::st
         key.push_back(character);
     if (const auto found = cache.find(key); found != cache.end())
         return found->second;
-    auto result = CompileHlslRaw(hlsl, Target(stage, shader_model), {});
+    auto result = std::make_shared<ShaderBinary>();
+    result->hlsl = hlsl;
+    CompileHlsl(*result, stage);
     Remember(std::move(key), result);
     return result;
 }
 void ShaderCache::CompileHlsl(ShaderBinary& result, Shader::SwStage stage) {
-    result.dxil = CompileHlslRaw(result.hlsl, Target(stage, shader_model), {})->dxil;
+    if (stage == Shader::SwStage::Geometry)
+        RemapGeometryPrimitiveInput(result.hlsl);
+    std::vector<std::wstring> arguments;
+    if (result.hlsl.find("#define SHAD_FP32_DENORM_PRESERVE 1") != std::string::npos)
+        arguments = {L"-denorm", L"preserve"};
+    else if (result.hlsl.find("#define SHAD_FP32_DENORM_FLUSH 1") != std::string::npos)
+        arguments = {L"-denorm", L"ftz"};
+    result.dxil = CompileHlslRaw(result.hlsl, Target(stage, shader_model), arguments)->dxil;
 }
 
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileHlslRaw(

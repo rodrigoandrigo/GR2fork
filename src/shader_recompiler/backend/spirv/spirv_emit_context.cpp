@@ -14,6 +14,7 @@
 #include <spirv/unified1/spirv.hpp11>
 
 #include <numbers>
+#include <stdexcept>
 #include <string_view>
 
 namespace Shader::Backend::SPIRV {
@@ -754,6 +755,12 @@ void EmitContext::DefineOutputs() {
     }
     case SwStage::Geometry: {
         DefineVertexBlock();
+        if (runtime_info.hw.gs.export_vertex_order) {
+            if (info.gs_copy_data.num_attrs >= 32)
+                throw std::runtime_error("Geometry flat-last capture exceeds the varying limit");
+            output_vertex_order = DefineOutput(U32[1], 31);
+            vertex_order_counter = DefineVar(U32[1], spv::StorageClass::Private, ConstU32(0u));
+        }
         for (u32 attr_id = 0; attr_id < info.gs_copy_data.num_attrs; attr_id++) {
             const Id id{DefineOutput(F32[4], attr_id)};
             Name(id, fmt::format("out_attr{}", attr_id));

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
+#include <stdexcept>
 #include <boost/container/small_vector.hpp>
 #include <boost/preprocessor/stringize.hpp>
 
@@ -699,6 +700,9 @@ SHAD_NO_INLINE std::span<const u32> Liverpool::RunRegisterRun(std::span<const u3
         if (words + 1 > rem) {
             break;
         }
+        if (!is_pad && h->type3.predicate.Value() == PM4Predicate::PredEnable &&
+            predicate_enabled && !predicate_pass)
+            break;
         if (masked == 0xC0007600u) {
             SetShRegHot(h, words);
         } else if (masked == 0xC0006900u) {
@@ -719,6 +723,56 @@ SHAD_NO_INLINE std::span<const u32> Liverpool::RunRegisterRun(std::span<const u3
         ++run_stats.runs;
     }
     return std::span<const u32>{p, rem};
+}
+
+bool Liverpool::TrySetPredication(const PM4Header* header) {
+    if (header->type3.NumWords() != 2)
+        throw std::runtime_error("Invalid SET_PREDICATION packet size");
+    const auto* words = reinterpret_cast<const u32*>(header + 1);
+    const u32 control = words[1];
+    const u32 operation = (control >> 16) & 7;
+    if (!operation) {
+        predicate_enabled = predicate_visible = predicate_incomplete = false;
+        predicate_pass = true;
+        return true;
+    }
+    if (operation > 4)
+        throw std::runtime_error("Unsupported SET_PREDICATION operation");
+    const VAddr address = words[0] | (u64(control & 255) << 32);
+    if (!address || address % (operation == 4 ? 4 : 8))
+        throw std::runtime_error("Invalid SET_PREDICATION address");
+    VideoCore::StreamCopyLane::Instance().DrainProducer();
+    if (rasterizer)
+        rasterizer->Finish();
+    bool visible{}, ready = true;
+    const auto* values = reinterpret_cast<const volatile u64*>(address);
+    constexpr u64 valid = u64{1} << 63;
+    if (operation == 1) {
+        for (u32 pair = 0; pair < num_counter_pairs; ++pair) {
+            const u64 begin = values[pair * 2], end = values[pair * 2 + 1];
+            ready &= (begin & end & valid) != 0;
+            visible |= ((end - begin) & ~valid) != 0;
+        }
+    } else if (operation == 2) {
+        const u64 written_begin = values[0], generated_begin = values[1];
+        const u64 written_end = values[2], generated_end = values[3];
+        ready = (written_begin & generated_begin & written_end & generated_end & valid) != 0;
+        visible = ((written_end - written_begin) & ~valid) ==
+                  ((generated_end - generated_begin) & ~valid);
+    } else if (operation == 3) {
+        visible = values[0] != 0;
+    } else {
+        visible = *reinterpret_cast<const volatile u32*>(address) != 0;
+    }
+    if (!ready && !(control & (1u << 12)))
+        return false;
+    const bool continuation = (control >> 31) && predicate_enabled;
+    predicate_visible = visible || (continuation && predicate_visible);
+    predicate_incomplete = !ready || (continuation && predicate_incomplete);
+    predicate_pass =
+        predicate_incomplete || ((control & (1u << 8)) ? predicate_visible : !predicate_visible);
+    predicate_enabled = true;
+    return true;
 }
 
 std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uintptr_t base_addr) {
@@ -775,6 +829,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
         // packet also opens a run that consumes every register write, pad and
         // empty NOP behind it; a run that consumed nothing is a truncated first
         // packet, reported through NextPacket.
+        if (header->type3.predicate.Value() == PM4Predicate::PredEnable && predicate_enabled &&
+            !predicate_pass) {
+            dcb = NextPacket(dcb, count + 1);
+            continue;
+        }
         const u32 hdr_masked = header->raw & 0xC000FF00u;
         if (hdr_masked == 0xC0007600u || hdr_masked == 0xC0006900u) {
             if (reg_run_) {
@@ -871,7 +930,8 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
         }
         case PM4ItOpcode::SetPredication: {
             ++packet_stats.set_predication;
-            LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+            if (!TrySetPredication(header))
+                return dcb;
             break;
         }
         case PM4ItOpcode::IndexType: {
@@ -1114,18 +1174,30 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
                             regs.vgt_strmout_buffers[buffer].offset;
                     }
                 }
+            } else if (event->event_type.Value() == EventType::PixelPipeStatReset) {
+                u64 ignored{};
+                if (rasterizer)
+                    rasterizer->OcclusionCounter(ignored, true);
+                pixel_counter = 0;
             } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                 if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                     ++packet_stats.occlusion_events;
                     static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                     static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                    u64* results = event->Address<u64*>();
-                    for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                        *results = pixel_counter | OcclusionCounterValidMask;
+                    u64 measured{};
+                    const bool native =
+                        rasterizer && !occlude_all_ && rasterizer->OcclusionCounter(measured);
+                    if (native)
+                        pixel_counter = measured;
+                    for (s32 i = 0; i < num_counter_pairs; ++i) {
+                        const u64 result =
+                            OcclusionCounterValidMask |
+                            (native && i ? 0 : pixel_counter & ~OcclusionCounterValidMask);
+                        CpWriteOrCopy(rasterizer, event->Address<u64*>() + i * 2, &result,
+                                      sizeof(result));
                     }
-                    if (!occlude_all_) {
+                    if (!native && !occlude_all_)
                         pixel_counter += OcclusionCounterStep;
-                    }
                 }
             }
             break;
@@ -1217,12 +1289,70 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
         }
         case PM4ItOpcode::CopyData: {
             const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
-            LOG_WARNING(Render,
-                        "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
-                        "count_sel = {}, wr_confirm = {}, engine_sel = {}",
-                        u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
-                        copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
-                        u32(copy_data->engine_sel.Value()));
+            if (count != 5 || copy_data->engine_sel.Value() == CopyDataEngine(3))
+                throw std::runtime_error("Invalid COPY_DATA packet");
+            const u32 size = copy_data->count_sel ? 8 : 4;
+            const auto source = copy_data->src_sel.Value();
+            const auto destination = copy_data->dst_sel.Value();
+            const auto memory_source = source == CopyDataSrc::Memory || source == CopyDataSrc::TCL2;
+            const auto memory_destination = destination == CopyDataDst::MemorySync ||
+                                            destination == CopyDataDst::MemoryAsync ||
+                                            destination == CopyDataDst::TCL2;
+            if (rasterizer && (memory_source || source == CopyDataSrc::Gds) &&
+                (memory_destination || destination == CopyDataDst::Gds)) {
+                rasterizer->CopyBuffer(copy_data->DstAddress<VAddr>(),
+                                       copy_data->SrcAddress<VAddr>(), size,
+                                       destination == CopyDataDst::Gds, source == CopyDataSrc::Gds);
+            } else {
+                if (rasterizer)
+                    rasterizer->Finish();
+                u64 value{};
+                switch (source) {
+                case CopyDataSrc::Immediate:
+                    value = copy_data->SrcAddress<u64>();
+                    break;
+                case CopyDataSrc::GpuClock:
+                    value = GetGpuPerfCounter();
+                    break;
+                case CopyDataSrc::MappedRegister:
+                    if (copy_data->src_addr_hi || copy_data->src_addr_lo >= Regs::NumRegs ||
+                        size / 4 > Regs::NumRegs - copy_data->src_addr_lo)
+                        throw std::runtime_error("COPY_DATA register source is out of range");
+                    std::memcpy(&value, &regs.reg_array[copy_data->src_addr_lo], size);
+                    break;
+                case CopyDataSrc::Memory:
+                case CopyDataSrc::TCL2:
+                    std::memcpy(&value, copy_data->SrcAddress<const void*>(), size);
+                    break;
+                case CopyDataSrc::Gds:
+                    if (!rasterizer)
+                        throw std::runtime_error("COPY_DATA GDS requires a renderer");
+                    value = rasterizer->ReadDataFromGds(copy_data->src_addr_lo);
+                    if (size == 8)
+                        value |= u64(rasterizer->ReadDataFromGds(copy_data->src_addr_lo + 4)) << 32;
+                    break;
+                default:
+                    throw std::runtime_error("Unsupported COPY_DATA source selector");
+                }
+                if (memory_destination) {
+                    CpWriteOrCopy(rasterizer, copy_data->DstAddress<void*>(), &value, size);
+                } else if (destination == CopyDataDst::MappedRegister) {
+                    if (copy_data->dst_addr_hi || copy_data->dst_addr_lo >= Regs::NumRegs ||
+                        size / 4 > Regs::NumRegs - copy_data->dst_addr_lo)
+                        throw std::runtime_error("COPY_DATA register destination is out of range");
+                    gfx_stamp.WriteRegs(&regs.reg_array[copy_data->dst_addr_lo], &value, size,
+                                        copy_data->dst_addr_lo);
+                } else if (destination == CopyDataDst::Gds && rasterizer) {
+                    const auto* words = reinterpret_cast<const u32*>(&value);
+                    for (u32 index = 0; index < size / 4; ++index)
+                        rasterizer->FillBuffer(copy_data->dst_addr_lo + index * 4, 4, words[index],
+                                               true);
+                } else {
+                    throw std::runtime_error("Unsupported COPY_DATA destination selector");
+                }
+            }
+            if (copy_data->wr_confirm && rasterizer)
+                rasterizer->Finish();
             break;
         }
         // The only graphics opcodes whose handling can suspend the parser. They
@@ -1346,6 +1476,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         switch (header->type3.opcode) {
+        case PM4ItOpcode::SetPredication:
+            while (!TrySetPredication(header)) {
+                YIELD_GFX();
+            }
+            break;
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {

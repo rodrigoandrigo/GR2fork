@@ -304,6 +304,56 @@ se a amplificação máxima ultrapassar esse limite, o draw é rejeitado antes d
 gravação. Stream-out guest completo continua em F10 e fidelidade das expansões,
 provoking-last e cobertura/interpolação continuam em F15. [Homebrew OpenOrbis](hardware/geometry-expansion/README.md).
 
+Modos polygon diferentes por face (F12) usam uma captura dos estágios guest,
+seguida de comandos indiretos na ordem primitiva→face→batch, com barreiras UAV.
+Isso conserva a execução única de VS/HS/DS/GS e evita agrupar todas as faces de
+um lado antes das demais. Um GS de passagem conserva o reaproveitamento de
+vértices no caminho sem guest GS. Máscaras de arestas/vértices removem diagonais
+e pontos duplicados de quad/polygon/rect; os helpers preservam PrimitiveID e
+IsFrontFace. Cada face mantém rasterizer, depth/stencil e referência próprios.
+A contagem real exige readback de quatro bytes e espera de fence antes do
+replay (`face_capture_wait`); portanto esse fallback ainda introduz um stall.
+Os PSOs e root signatures de todas as faces ficam retidos até a fence.
+[Homebrew OpenOrbis](hardware/polygon-faces/README.md).
+
+O gate de cor por depth (F13) reutiliza essa captura e separa os resultados de
+stencil/depth antes de aplicar as alterações reais do depth/stencil. Os passes
+auxiliares conservam stencil e não escrevem depth; somente o passe base aplica
+os efeitos do output merger. Storage/atômicos do PS usam partições disjuntas em
+sample único, incluindo stencil-fail quando o contrato é late, sem repetir os
+efeitos do VS. As máscaras de cor por passe entram no rastreamento de escrita.
+Depth bounds usa o teste nativo do [depth armazenado](https://microsoft.github.io/DirectX-Specs/d3d/DepthBoundsTest.html),
+com ou sem PS. Intervalos invertidos usam rejeição por depth sem emitir bounds
+inválidos à API, preservando efeitos UAV late e suprimindo-os no contrato early.
+[Homebrew OpenOrbis](hardware/depth-gate/README.md).
+
+Stencil guest sem equivalente direto (F14) usa os testes nativos sobre uma
+cópia GPU readonly do depth/stencil anterior à primitiva. Um PS auxiliar aplica
+a operação de oito bits no buffer de stencil com CAS, preservando bytes vizinhos
+e bits fora da write mask; a cópia de volta altera somente o plano stencil.
+O shader guest executa uma vez, o depth real é preservado e as atualizações são
+intercaladas por primitiva/face, inclusive no gate do F13. `test_val` e `op_val`
+permanecem independentes. Os helpers mantêm os RTs com máscara de escrita zero
+para conservar a extensão de rasterização original. Snapshot/buffer pertencem ao
+contexto em voo, entram no orçamento/trim de `GpuCommands` e têm limite conjunto
+de 32 MiB; seus PSOs/root signatures participam do lease da submissão.
+[Homebrew OpenOrbis](hardware/stencil-ops/README.md).
+
+Stream-out guest conta as emissões executadas na GPU e lê o resultado após a fence,
+incluindo emissão vazia, `EMIT_CUT` e emissão em `GS_DONE`. Buffers esparsos usam seus
+próprios strides; filled-size usa dwords, limita vértices completos e conserva o cursor
+entre draws. Flush/sync/reset aguardam os comandos anteriores. `STRMOUT_BUFFER_UPDATE`
+separa restauração de offset e salvamento de filled-size, incluindo origem em memória,
+unidades em bytes e swaps. [Fonte OpenOrbis](hardware/stream-out/README.md).
+
+Tessellation Pow2 usa o processamento Integer do hardware, preservando o
+pré-processamento dos fatores feito pelo shader GCN; nenhum arredondamento extra
+é aplicado às saídas ou aos buffers guest. O caminho nativo aceita point nos três
+domínios, line em isolines e triangle CW/CCW em tri/quad. Topologias reservadas e
+domínios incompatíveis entre HS/DS são rejeitados antes de executar os shaders.
+[Fonte OpenOrbis](hardware/tessellation/README.md) e
+[contrato de Pow2](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#11.7.7.1%20Pow2%20Partitioning).
+
 ## Trabalho pendente para jogos
 
 ### Correção funcional e fidelidade
@@ -319,16 +369,16 @@ jogo depende de cada item.
 | F04 | CMASK além de 0/F, metadata comprimida/TC-compatible, DCC e HTILE com semântica real; FMASK com remapeamento/compressão guest em vez de valores constantes. | `MaterializeColorClearImpl` aceita 0/F sem compressão e separa clear/cor expandida de FMASK descomprimido em MSAA 2×/4×/8×, preservando seus bits; ainda rejeita EQAA, FMASK comprimido, DCC e TC-compatible quando requerem materialização. HTILE permanece sem decodificação; [resource_patching_pass.cpp](../src/shader_recompiler/ir/passes/resource_patching_pass.cpp) substitui leituras FMASK por constantes e não aceita storage FMASK. |
 | F05 | EQAA verdadeiro, em que samples e fragments diferem, e equivalência da frequência parcial de shading por sample. | `MAX_ANCHOR_SAMPLES` corrigido para três bits; `PS_ITER_SAMPLE` respeitado e contagem de iterações preservada. [draw_runtime.cpp](../src/video_core/renderer_d3d12/draw_runtime.cpp) rejeita EQAA e frequência parcial antes de traduzir/executar o draw, evitando multiplicar efeitos laterais. Falta o fallback de cobertura→fragment/anchor e shading agrupado com interpolação, depth/stencil, blend e FMASK coerentes. |
 | F06 | Completar amostragem de storage compartilhado: LOD implícito com cadeia de mips, filtragem entre mips, anisotropia, seleção min/mag/LOD/reduction fiel e cálculo geral de gradientes. | [Sample](../src/video_core/renderer_d3d12/image_buffer_alias.cpp) calcula derivadas implícitas no PS e gradientes 1D/2D/3D, seleciona mip point/linear, min/mag, bias/clamps e reduction; anisotropia por footprint até 16 taps e borda float tipada. Samplers entram nas dependências do cache de variantes. Ainda faltam equivalência GCN de precisão/controles secundários (aniso threshold/bias, bias secundário, trunc/ceil e seleção coarse por quad); o filtro anisotrópico 3D difere do volume nativo usado como referência no PC. [Homebrew](hardware/shared-sampling/README.md). |
-| F10 | Stream-out completo: draws sem GS, múltiplos streams/rast stream, layout/seleção exata dos descritores, emissão dinâmica, filled-size e sincronização real dos eventos de stream-out. | Captura guest atual cobre stream 0; seleção de buffers é heurística por stride/user data e contagem usa nós estáticos de emissão. Liverpool sinaliza `SoVgtStreamoutFlush` imediatamente. |
-| F11 | Tessellation Pow2 e combinações de domínio/topologia que exigem emulação/expansão adicional. | `CompileNativeSpirv` só mapeia Integer/FracOdd/FracEven e rejeita combinações sem equivalente. |
-| F12 | Modos polygon/bias diferentes por face com geometry/tessellation e com primitivas quad/polygon/rect atualmente rejeitadas; preservar efeitos laterais ao usar múltiplos passes. | Guardas de `mixed_mode`, `bias_split` e `face_passes` no rasterizer. |
-| F13 | Gate de cor por depth com shaders que escrevem storage/atomics, equivalência para depth/stencil que muda entre primitivas do mesmo draw e depth bounds em draw sem pixel shader. | `depth_gated` usa fail/base passes; `writes_memory` restringe efeitos laterais. A pass fail lê o depth anterior à pass que escreve. `DrawImpl` exige PS para o lowering de depth bounds. |
-| F14 | Operações de stencil guest sem mapeamento direto (AND/OR/XOR/NAND/NOR/XNOR) e configurações de refs/máscaras incompatíveis com os valores únicos do output merger. | `StencilOp` e validações front/back em [d3d12_rasterizer.cpp](../src/video_core/renderer_d3d12/d3d12_rasterizer.cpp). |
-| F15 | Provoking-last flat com adjacency/GS/tessellation; orientação/clip-disable por viewport quando diferem do viewport 0; regras precisas de cobertura/interpolação das expansões de linhas/pontos. | Guardas `remap_provoking`, orientação baseada no viewport 0 e GS auxiliares em [shader_cache.cpp](../src/video_core/renderer_d3d12/shader_cache.cpp). |
-| F16 | Line stipple completo: controles de reset/estado/acumulação, perspectiva/cobertura fiel, segmentos com W problemático e padrão sem truncamento pelo limite do GS auxiliar. | `CompileLineExpand` limita janelas/instâncias e usa quads; controles adicionais de stipple não são consumidos integralmente. |
-| F17 | Combinar cor constante RGB e alpha constante RGB quando o dispositivo não oferece `AlphaBlendFactorSupported`, sem alterar silenciosamente os fatores. | O fallback replica alpha nas blend constants e rejeita a combinação conflitante. |
-| F18 | Fidelidade numérica GCN: FP64, modos de arredondamento/denorm/NaN e operações cross-lane nos dispositivos sem garantia wave64. | O perfil nativo não habilita float64/controles completos; [recompiler.cpp](../src/shader_recompiler/recompiler.cpp) reduz FP64 para FP32; `CompileSpirv` rejeita waves incompatíveis. |
-| F19 | Operações IR/GCN ainda sem implementação no recompilador compartilhado e sua passagem completa por DXIL/SM6.4; não basta compartilhar o backend SPIR-V para afirmar cobertura total. | `EmitDataAppend`/`EmitDataConsume` em [emit_spirv_atomic.cpp](../src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp) são unreachable; o frontend também possui variantes SDWA/DPP/opcodes sem tradução. |
+| F10 | Completar stream-out sem GS, múltiplos streams/rast stream, layout/seleção exata dos descritores e compactação ordenada da emissão entre invocações. | A contagem já vem da GPU, com filled-size e eventos sincronizados; a captura de dados ainda cobre stream 0, escolhe descritores por heurística e usa índice de escrita local por invocação. |
+| F11 | Esclarecer a semântica GCN dos pares de domínio/topologia fora do contrato nativo, se forem usados pelo guest. | Pow2 e os oito pares nativos estão cobertos. A especificação D3D restringe line a isolines e triangle a tri/quad. `DumpAllPointsAsInOrderLineList` no tessellator Microsoft/Mesa é identificado como visualização de depuração; o caminho isoline não define geração triangular. Isso não comprova o comportamento GCN desses pares. Sem um contrato guest demonstrado, continuam rejeitados antes da consulta aos caches DXIL, sem inventar conectividade. |
+| F12 | Bias por face em point fill e linhas expandidas, calculado sobre a primitiva original. | Modos mistos com GS/tessellation e quad/polygon/rect usam captura única e replay por primitiva/face; fill e wireframe nativo preservam bias independente. Pontos, linhas largas/stipple e contornos expandidos ainda rejeitam bias não zero quando depth está ativo. O gate por depth aceita replay por face em fill/wire nativo; expansões continuam restritas em F13. |
+| F13 | Completar gate com PS que escreve depth/coverage/stencil ref ou usa discard, MSAA/alpha-to-coverage, gate simultâneo a bounds/storage, feedback de depth, rasterização expandida, captura de adjacency sem GS e logic ops MRT com máscaras densas incompatíveis. | Gate com storage/atômicos em sample único usa captura dos estágios anteriores ao PS e replay por primitiva, separando stencil-fail, depth-fail e pass sem repetir escritas. Depth/stencil evoluem entre primitivas; fill/wire nativo por face compartilha essa captura. Depth bounds usa o depth armazenado e funciona sem PS; exige suporte nativo `DepthBoundsTestSupported`. As combinações restantes continuam rejeitadas explicitamente. |
+| F14 | Integrar a atualização auxiliar de stencil com MSAA, alpha-to-coverage, discard/exportações do PS, rasterização expandida, adjacency sem GS e múltiplas camadas nativas. | AND/OR/XOR/NAND/NOR/XNOR, Ones e ReplaceTest/ReplaceOp independentes usam snapshot GPU do depth/stencil anterior à primitiva, testes nativos readonly e atualização atômica dos bytes pela write mask. Add/Sub clamp/wrap usam `op_val`, com caminho nativo quando ele vale 1. Refs/read/write masks diferentes por face usam captura única e replay ordenado; backface desabilitado herda corretamente a configuração frontal. O fallback cobre sample único e uma camada nativa; rejeita as combinações restantes antes de executar shaders guest. |
+| F15 | Parcial: equivalência guest de provoking-last em tessellation e limites de interface; cobertura/interpolação completa de linhas/pontos, inclusive recorte de polígonos e degenerados. | Captura única com ordinal de emissão do GS, compactação adjacency CPU/GPU, seleção flat pós-captura e transformação pelo viewport selecionado implementadas. Linhas usam clipping homogêneo e interpolação smooth/noperspective ao subdividir. Limites abaixo. |
+| F16 | Parcial: reset/estado/acumulacao entre segmentos e packets; metricas major/full-length, fractional/diamond; cobertura guest completa e W degenerado. | REPEAT_COUNT agora repete cada bit (valor + 1), o padrao volta ciclicamente e o recorte preserva a fase para endpoint inicial com W positivo. Batches dimensionados pelo viewport/escala substituem o corte silencioso em 4.096 janelas; limites de memoria/endereco geram erro explicito. A continuidade dos registradores SU/SC ainda nao esta implementada. |
+| F17 | Parcial: ampliar o fallback de constantes RGB/alpha para MRT e slots diferentes de zero, e combinações com dual-source guest. | Um RT no slot 0 usa saída secundária do PS para alpha constante, mantendo as constantes RGB no output merger e o alpha original do fragmento. MIN/MAX RGB ficam nativos porque ignoram fatores. Configurações incompatíveis continuam rejeitadas explicitamente. |
+| F18 | Parcial: FP64 por software e demais operações/modos; arredondamentos direcionados, denorm híbrido/FP16/FP64 e semântica completa de NaN; cross-lane sem wave64 garantido. | O perfil nativo preserva FP64 no IR, consulta DoublePrecisionFloatShaderOps e rejeita a ausência de suporte em vez de reduzir para FP32. Bitcasts uint2/double usam asdouble/asuint no HLSL. FP32 flush/preserve seguem ExecutionMode e opções -denorm do DXC, também nos helpers derivados. As guardas de wave64 continuam ativas. |
+| F19 | Parcial: demais opcodes GCN, DPP, SDWA em caminhos de 16/64 bits, append/consume com semântica geral por wave e validação dos demais estágios até DXIL/SM6.4. | SDWA de 32 bits agora aplica seletores, extensão, modificadores e preservação do destino. ORN2/NOR/XNOR B32, CMOV B32 e SEXT I8/I16 implementados, incluindo SCC. DPP sem lowering validado é rejeitado explicitamente. Emissores unreachable isolados não medem a cobertura. |
 | F20 | Predicação e consultas de oclusão reais, além dos comandos PM4 válidos hoje apenas avisados/stubados, como `IT_COPY_DATA` no caminho gráfico. | [liverpool.cpp](../src/video_core/amdgpu/liverpool.cpp): `IT_SET_PREDICATION` não implementado; `PixelPipeStatDump` produz contador sintético; CopyData registra warning. O SGPR de draw index (`draw_index_enable`/`draw_index_loc`) também não é propagado pela interface atual; P03 preserva os SGPRs de base vertex/instância já suportados. É uma lacuna compartilhada do processador de comandos. |
 | F21 | Fechar as combinações ainda rejeitadas de views/formato/layout/alias, incluindo storage MSAA escrito e SRV/UAV que não puderem ser lowerados. | Guardas em [resource_bindings.cpp](../src/video_core/renderer_d3d12/resource_bindings.cpp) e [image_cache.cpp](../src/video_core/renderer_d3d12/image_cache.cpp). A validação deve ser por uso do formato, não somente pela presença em `ConvertFormat`. |
 | F22 | Recuperação controlada após device loss/falha de gravação e restauração dos recursos/estado da sessão, se a continuidade sem reinício for exigida. | O runtime fica marcado como falho e exige recriação; diagnóstico/DRED e drenagem já existem, recuperação transparente não. |
@@ -339,6 +389,28 @@ imagens **não estão pendentes como recursos inteiros**. F01/F02/F06/F21
 identificam os casos residuais concretos. Tampouco se exige coerência definida
 para data races que o próprio contrato guest não define: falta confrontar as
 políticas de sincronização/cache em usos válidos com hardware.
+
+A auditoria de F19 distingue os placeholders de SSA/registros, eliminados por passes,
+dos caminhos sem tradução. Append/consume já são convertidos em atômicos por
+`PatchGlobalDataShareAccess`, com reconhecimento e remoção de padrões de prefixo
+em `RemoveAppendBufferLaneOffset`; isso não implementa o contrato geral de retorno
+uniforme e atualização por contagem de lanes da wave. Permanecem, entre outros,
+`S_BREV_B64`, variantes FP64 e instruções GWS/DS. Contar cases do frontend também
+não é um oráculo: comparações e outras famílias usam dispatch compartilhado.
+Fonte de verificação: [OpenOrbis SDWA/escalares](hardware/ir-gcn/main.cpp), com
+validação local somente sintática.
+
+O avanço de F15 preserva os estágios guest por captura única. O ordinal ocupa
+`TEXCOORD31` no GS nativo com flat-last; 32 atributos guest exigem outro layout e
+permanecem rejeitados. A reflexão conta componentes efetivos, incluindo semânticas
+empacotadas de viewport/primitive ID. A transformação por viewport preserva o
+contrato anterior de clip-disable; W não unitário ainda requer validação.
+A ordem de tessellation, cobertura exata de bordas/caps/diamond, polígonos recortados
+em point fill, tamanhos de ponto e todos os casos degenerados continuam pendentes.
+F16 preserva a fase do trecho recortado quando o endpoint inicial tem W positivo;
+continuidade entre primitivas/packets e os controles SU/SC ainda permanecem pendentes.
+A fonte [OpenOrbis de provoking-last](hardware/flat-viewport/main.cpp) compara
+rotação dos vértices e contador do GS; sua validação local é somente sintática.
 
 ### Desempenho, memória e escalabilidade
 
@@ -452,11 +524,29 @@ estão ausentes: precisam de cobertura de cenários e eventual ampliação.
 ## Evidências já disponíveis
 
 Esta seção reúne registros anteriores e diagnósticos executados nas atualizações
-P01–P06 e F01–F09. Os diagnósticos em `Build/` são artefatos locais temporários, não uma
+P01–P06 e F01–F14. Os diagnósticos em `Build/` são artefatos locais temporários, não uma
 suíte incluída no repositório nem execução de jogos no Xbox.
 
 | Evidência | Resultado registrado | Limite da conclusão |
 | --- | --- | --- |
+| `Build/f14-stencil-validation.log` | SM6.4: 1536 casos das 16 operações, três resultados, quatro write masks, quatro operandos e duas faces; 393216 comparações de bytes. Quatro draws com refs/masks diferentes, depth/stencil mutáveis, early/late e gate F13 conferem stencil/depth/cor e contadores. Extensão com RT menor, largura ímpar, D16S8/D24S8/D32S8, orçamento e oito submissões assíncronas com eviction de PSOs passaram; VS=120/PS=10240, zero erros D3D12. | Diagnóstico GPU PC com referência CPU; workers assíncronos também limitados a SM6.4. Uma camada/sample; fonte OpenOrbis conferido somente quanto à sintaxe. |
+| `Build/f14-stencil-extra-validation.log` | Repetição dirigida dos casos de ordem, formatos, extensão e orçamento, stencil sem PS guest e oito evictions com a fila bloqueada por fence; zero erros D3D12. | Confirma trabalho pendente durante eviction; não mede paralelismo de contextos (pico 1). |
+| `Build/f14-f13-regression-validation.log` / `Build/f14-f12-regression-validation.log` | Regressões de gate/storage/bounds e dos 34 casos F12. | Diagnósticos nativos PC; sem validação Xbox nesta atualização. |
+| `Build/f13-gate-validation.log` | SM6.4: oito gates com storage/store e atômicos, stencil mutável e masks pass/fail; VS=9, PS=140 late ou 112 com stencil early. Store em imagem storage e máscaras R/B-pass/G-fail com XOR também conferidos. Dois casos point/line, bounds sem PS com intervalo válido/invertido e quatro bounds com UAV (256 invocações late, 128/0 early). Oito submissões assíncronas somam VS=72/PS=1120; zero erros D3D12. | Readbacks PC; restrições F13 acima preservadas. PS ausente também foi aceito com RTs de máscara zero. |
+| `Build/f13-gs-validation.log` | Gate com GS: pixels/depth iguais à referência e contador GS=1; zero erros D3D12. | Caso sintético PC, sem validar todas as combinações de GS/tessellation com gate. |
+| `Build/f13-f12-regression-validation.log` | Regressão dos 34 casos F12 de polígonos, IsFrontFace, bias e tessellation, zero erros D3D12. | Diagnóstico nativo PC; sem execução Xbox nesta atualização. |
+| `Build/f12-combined-validation.log` | SM6.4: oito comparações de quad/quad strip/polygon/rect com contadores VS iguais à referência, 16 verificações IsFrontFace, quatro comparações de bias fill/wire nativo e seis de tessellation com/sem GS; zero erros D3D12. | Readbacks PC; sem bias em expansões, gameplay ou validação Xbox. |
+| `Build/f19-sdwa-validation.log`, `Build/f19-scalar-validation.log` e `Build/f19-float-validation.log` | 1.176 combinações SDWA inteiras, 1.200 casos escalares com SCC e 112 conversões SDWA para float com omod/clamp, por GCN→IR→HLSL→DXIL/SM6.4 e leitura GPU. Rejeição explícita de DPP conferida; zero erros D3D12. | Compute no PC; não constitui cobertura total de IR/GCN, estágios gráficos, Vulkan, UWP ou Xbox. |
+| `Build/f18-numeric-validation.log` | Três adições GCN FP64 com resultado exato em bits, quatro testes de denorm FP32 entrada/saída e cinco valores especiais (zeros assinados, infinitos e NaN); `F18_ERRORS=0`. | PC/SM6.4 com FP64 nativo; não prova todos os opcodes, payload de NaN em operações gerais, rounding dirigido nem software FP64/cross-lane. |
+| `Build/f18-gs-regression-build.log` e `Build/f18-tess-regression-build.log` | Regressões por captura/replay GS e LS/HS/DS/GS após a alteração do perfil numérico; zero erros D3D12. | Caminhos existentes, sem adicionar cobertura numérica FP64 em todos esses estágios. |
+| `Build/f17-blend-extra-validation.log` | 240 casos RGB constantes/alpha e inversos, ADD/SUB/REV_SUB/MIN/MAX, máscaras RGB/alpha, saídas adicionais não ligadas e duas instâncias sobrepostas; referência CPU com tolerância de um nível UNORM e 256/512 atômicos PS; zero erros D3D12. | Fallback forçado no PC/SM6.4, um RT RGBA8 no slot 0; não cobre MRT, formatos float, MSAA ou Xbox. |
+| `Build/f16-stipple-validation.log` | 16 comparacoes CPU/GPU: REPEAT_COUNT 0/1/3/255, LSB/MSB, clipping fracionario e linha visivel apos 4.096 janelas. Tres comparacoes com recorte explicito para W negativo/zero/pequeno; `F16_ERRORS=0`. | PC/SM6.4, linhas horizontais com width=2 e PS constante; nao prova reset, estado/acumulacao nem cobertura geral. |
+| `Build/f15-clip-validation.log` | Cinco configuracoes do viewport 1 (incluindo clip-disable com W=1), cinco modos adjacency GPU e oito casos flat-last GS (strips/cuts x fill/point/wide/stipple); pixels e contadores iguais as referencias, `F15_ERRORS=0`. | PC/SM6.4; nao cobre tessellation provoking-last nem viewport diferente em cada primitiva. |
+| `Build/f15-interpolation-validation.log` | W distinto nos endpoints, smooth/noperspective, com e sem clipping: linha continua e subdividida identicas, `max_error=0` nos quatro casos; zero erros D3D12. | Nao estabelece cobertura/interpolacao completa em todos os casos. |
+| `Build/f14-f12-regression-validation.log` e `Build/f14-f13-regression-validation.log` | Reexecutados apos F15: faces/GS/tessellation, gate por depth, storage e submissao assincrona; zero erros D3D12. | Arquivos conservam o nome do runner anterior. |
+| `Build/f12-face-geometry-validation.log` | 60 comparações por face com GS: point/wide/stipple, strips/cuts, emissão vazia, 2/32 invocações, adjacency, múltiplas primitivas, rings e RectList; pixels e atômicos conferidos, zero erros D3D12. | Referência GPU; permanecem as restrições F12/F15/F16 descritas acima. |
+| `Build/f12-order-validation.log` | Duas comparações de três triângulos sobrepostos com orientação alternada: blend e depth preservam a ordem original; nove execuções VS e zero erros D3D12. | Referência nativa PC; não comprova ordenação de data races indefinidas pelo contrato guest. |
+| `Build/f12-async-validation.log` | Oito submissões de replay por face, contador final 8 e zero erros D3D12. | Hazard no mesmo backing, pico de um contexto em voo. |
 | `Build/f09-package-build.log` / `Build/f09-package-verification.log` | Core Release compilado, bundle assinado com CMS válido e payload/core de produção coincidentes. | Pacote não instalado nem executado no host UWP; sem validação Xbox desta revisão. |
 | `Build/f09-production-pacman.log` / `Build/real-game-frame.png` | PAC-MAN 256 chegou à tela inicial em 1920×1080, 56 apresentações em 75 s, `BOOT_RESULT=0` e `SHUTDOWN=0`; core com hash igual ao empacotado. | Conferência visual no harness PC, sem gameplay prolongado ou execução UWP/Xbox. |
 | `Build/f09-geometry-matrix-validation.log` | 33 comparações em SM6.4: point fill, wide/stipple, strips/cuts, emissão vazia, 2/32 invocações, saída de linhas, adjacency, múltiplas primitivas, rings ES→GS e entrada RectList; pixels e contador atômico conferidos, zero erros D3D12. | Referência GPU pelo caminho sem guest GS; os efeitos do GS ocorrem uma vez por invocação. Linha sólida tem verificação independente de intensidade por fragmento. |

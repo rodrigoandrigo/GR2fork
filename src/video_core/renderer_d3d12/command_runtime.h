@@ -46,7 +46,21 @@ public:
     void SetMemoryAccess(AcquireMemory acquire) {
         acquire_memory = std::move(acquire);
     }
+    u64 OcclusionCounter(bool reset = false);
     struct DrawRequest {
+        struct StencilState {
+            u32 fail, depth_fail, pass;
+            u8 test_ref, op_ref;
+        };
+        struct FacePass {
+            D3D12_RASTERIZER_DESC rasterizer;
+            D3D12_DEPTH_STENCIL_DESC depth;
+            u32 stencil_ref;
+            bool point_fill, line_expand, keep_front;
+            std::optional<std::array<u8, 8>> color_masks;
+            std::optional<StencilState> stencil;
+            bool count_occlusion{true};
+        };
         Shader::ShaderParams vertex, fragment;
         Shader::RuntimeInfo vertex_runtime, fragment_runtime;
         std::optional<Shader::ShaderParams> geometry;
@@ -74,6 +88,10 @@ public:
         u32 stencil_clear{};
         bool clear_depth{};
         bool clear_stencil{};
+        bool flat_last{}, viewport_transform{};
+        std::array<std::array<float, 4>, 16> viewport_xy{};
+        std::array<u32, 16> viewport_flags{};
+        std::vector<u32> flat_vertices;
         bool depth_gated{};
         std::array<u8, 8> depth_fail_masks{};
         bool depth_bounds{};
@@ -82,6 +100,7 @@ public:
         std::array<ResourceBindings::StreamOutSlot, 4> strmout{};
         std::array<float, 24> clip_planes{};
         D3D12_BLEND_DESC blend{};
+        bool constant_alpha_blend_emulation{};
         D3D12_RASTERIZER_DESC rasterizer{};
         D3D12_DEPTH_STENCIL_DESC depth{};
         std::array<D3D12_VIEWPORT, AmdGpu::NUM_VIEWPORTS> viewports{};
@@ -119,6 +138,8 @@ public:
         u32 samples{1};
         std::array<u32, 4> sample_masks{UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX};
         std::vector<D3D12_SAMPLE_POSITION> sample_positions;
+        std::vector<FacePass> faces;
+        std::vector<u32> face_masks;
     };
     void Initialize(ResourceCache::Read read, ResourceCache::Write write,
                     ResourceCache::Resolve resolve = {}, ResourceCache::Overlaps overlaps = {});
@@ -234,6 +255,14 @@ private:
     u64 pending_fence{}, context_order{}, next_order{};
     AsyncStatistics async_statistics{};
     mutable ImageCache::Statistics residency_statistics{};
+    void BeginOcclusion(bool enabled = true);
+    void EndOcclusion();
+    void CompleteOcclusion();
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_heap;
+    std::vector<D3D12Resource> occlusion_readbacks;
+    u64 occlusion_total{};
+    u32 occlusion_queries{};
+    bool occlusion_enabled{}, occlusion_recording{};
     void BeginGpuTiming();
     void EndGpuTiming();
     void ReadGpuTiming();

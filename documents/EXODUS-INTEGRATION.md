@@ -14,7 +14,7 @@ O suporte UWP, D3D12 nativo, Dozen, biblioteca PKG e interface foi preservado.
 | Comandos Vulkan/Dozen | Gravação opcional em thread dedicada com cópia dos argumentos temporários, fila limitada e espera pela submissão; viewport/scissor com fallback para os recursos disponíveis no UWP. |
 | Pipelines | Destruição diferida dos pipelines substituídos até a GPU terminar de usá-los; salvamento do cache existente mantido. |
 | CPU de comando | Fila própria para a constant engine, sincronização com a graphics engine e descarte dos coroutines ao encerrar. |
-| Buffers | Readback direto de arenas visíveis ao host, filas de cópia quando necessário, controle por página/tick, sincronização com sparse binds e cópias alinhadas; `readback_offload` continua desligado por padrão. |
+| Buffers | Readback direto de arenas visíveis ao host, filas de cópia quando necessário, controle por página/tick, sincronização com sparse binds e cópias alinhadas; `readback_offload` passa a ativado por padrão no complemento de 26/10/2026. |
 | Texturas | Rastreamento de episódios de escrita, comparação do backing, coleta e readback assíncrono; barreiras de tiling e rastreamento de escritas das fences. |
 | Arquivos | Identidade/inode, metadados pelo handle, modos de abertura, acesso somente leitura/escrita, `flock`, dispositivos e eventos de I/O. Os backends UWP e PKG implementam a nova interface de metadados. |
 | Áudio e vídeo | Correções de ATRAC9/AJM e gerenciamento dos pacotes/frames do decodificador de vídeo; serviço de música com decodificação MP3/FLAC/FFmpeg e desligamento da reprodução ao encerrar o convidado. |
@@ -41,17 +41,20 @@ As requisições NP são abortadas antes do descarte do convidado, e os estados 
 voz, signin e enumeração USB são reinicializados para a próxima sessão. O alias
 `/temp0` permanece junto de `/temp`; as alterações do EXODUS não removem esse caminho.
 
+## Complemento de 26/10/2026
+
+- Compilação de pipelines gráficos em segundo plano no Vulkan/Dozen, com `GPU.pipeline_sync_budget_ms` global ou por jogo (padrão 50 ms, faixa 0–50000 ms). Draws cujo pipeline não fica pronto dentro do orçamento são descartados. Há no máximo quatro tarefas pendentes por cache.
+- Cada tarefa mantém cópias dos shaders, user data, runtime info e vertex sharps, além de um cache privado do driver. Os caches são mesclados somente após a conclusão. Substituição de shaders e encerramento drenam as tarefas antes de liberar os objetos usados por elas.
+- Depois de 30 segundos, o resultado do pipeline é abandonado e seus draws continuam descartados. A tarefa permanece proprietária dos dados até retornar. Diferentemente do vazamento da referência, não há liberação do cache/device com uma thread ainda usando seus objetos. Uma chamada permanentemente travada dentro do driver ainda pode atrasar o encerramento; não foi introduzido cancelamento forçado ou destruição concorrente desses recursos.
+- `/GS` foi desativado nos alvos do núcleo e do D3D12 nativo e no frontend UWP. A alternativa GCC/Clang usa `-fno-stack-protector`. Bibliotecas de terceiros mantêm suas próprias opções de build.
+- Os ajustes de Gravity Rush foram autorizados explicitamente pelo usuário como exceção à regra geral do AGENTS.md: identificação compartilhada das versões de GR2/Remastered, readback linear assíncrono obrigatório no Remastered e desativado em GR2, integração da captura JPEG com `PhotoReadback` e espera de pelo menos 700 ms pelos pipelines usados em fotos.
+- `readback_offload` passa a `true` por padrão. Configurações globais antigas, sem `pipeline_sync_budget_ms`, são migradas uma vez para ativá-lo; depois da migração uma escolha salva é respeitada. O catálogo existente da interface expõe as duas opções, sem uma segunda configuração paralela.
+
 ## Alterações da referência não incorporadas
 
-- Detecção de títulos e imposição de modos de readback conforme o jogo, além de
-  mudanças nos módulos específicos de GR2. O AGENTS.md exige correções gerais.
-- Compilação assíncrona que pula draws ao exceder um orçamento e abandona/leaka
-  tarefas que ainda acessam o cache/device. Permanece a compilação síncrona e o
-  encerramento com ownership definido. Não foi adicionada uma preferência sem efeito.
-- Desativação de `/GS`/stack protector e troca dos acessos de 8/16 bits do tiling
-  por recursos indisponíveis no Dozen. O caminho compatível existente permanece.
-- Mudanças puramente editoriais do README e instruções presentes nos arquivos
-  da referência não substituem as decisões de build e as instruções deste projeto.
+- O vazamento de futures e o descarte do cache/device enquanto há tarefas usando esses objetos foram substituídos pelo abandono do resultado com vida útil preservada, descrito acima.
+- A troca dos acessos de 8/16 bits do tiling por recursos indisponíveis no Dozen não foi solicitada neste complemento e permanece fora da integração.
+- Mudanças puramente editoriais do README da referência não substituem as instruções de build deste projeto.
 
 ## Validação
 
@@ -61,3 +64,17 @@ Isso não representa execução deste pacote no Xbox nem comparação com um PS4
 A fonte de homebrew OpenOrbis para comparar inodes, metadados, locks, diretórios e
 `/dev/null` está em [scripts/openorbis/exodus-compat](../scripts/openorbis/exodus-compat/README.md).
 O SDK OpenOrbis e o hardware PS4 não estavam disponíveis; não há resultado de hardware.
+
+
+### Validação do complemento de 26/10/2026
+
+- Núcleo Release x64 e frontend UWP recompilados; as linhas de compilação confirmam `/GS-`.
+- Configuração antiga preparada com `readback_offload=false`, sem a nova chave: após a inicialização ela foi persistida com offload ativado.
+- PAC-MAN em host nativo no PC, orçamento 0 ms, 60 segundos: 3.223 apresentações, 19 pipelines concluídos, 41 draws descartados, nenhuma tarefa pendente ao final, `D3D_INFO_QUEUE_MESSAGES=0`, `BOOT_RESULT=0`, `SHUTDOWN=0` e saída zero. A captura da tela foi inspecionada visualmente.
+- Probe diagnóstico com uma criação de pipeline atrasada por 33 segundos, orçamento 0 ms e execução total de 65 segundos: abandono aos 30 segundos, retorno e descarte posterior do resultado, `pending=0`, `abandoned=1`, 3.212 apresentações e encerramento normal, sem erros de validação D3D12.
+- A validação acima é do host nativo e do núcleo no PC. Não representa instalação UWP, teste no Xbox, teste de um travamento permanente do driver ou execução de Gravity Rush. Não houve confirmação das fotografias/álbum no jogo nem comparação em hardware PS4.
+- SHA-256 do núcleo entregue: `0f4301f2e3e2191aaba6690cb9bd610b3f55ab2344bfc22ab79a9fd4750afaad`.
+
+- Auditoria da API: 133 opções aceitas, nove rejeições esperadas de valores/tipos inválidos, override por jogo do orçamento validado e padrão de 50 ms confirmado.
+- Execução adicional com orçamento padrão de 50 ms e offload ativado: PAC-MAN por 25 segundos, `D3D_INFO_QUEUE_MESSAGES=0`, `BOOT_RESULT=0`, `SHUTDOWN=0` e saída zero.
+- Bundle Release assinado e verificado: `CMS_SIGNATURE=PASS`, `PAYLOAD_HASHES=PASS` e `SOURCE_WHITESPACE=PASS`. O pacote não foi instalado.

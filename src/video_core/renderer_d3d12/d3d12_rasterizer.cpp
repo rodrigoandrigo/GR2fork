@@ -180,6 +180,13 @@ D3D12_BLEND AlphaBlendFactor(AmdGpu::BlendControl::BlendFactor factor) {
         return BlendFactor(factor);
     }
 }
+bool NeedsStencilLowering(AmdGpu::StencilFunc op, const AmdGpu::StencilRefMask& ref) {
+    using F = AmdGpu::StencilFunc;
+    return op >= F::And || op == F::Ones ||
+           (op == F::ReplaceOp && ref.stencil_op_val != ref.stencil_test_val) ||
+           ((op == F::AddClamp || op == F::SubClamp || op == F::AddWrap || op == F::SubWrap) &&
+            ref.stencil_op_val != 1);
+}
 D3D12_STENCIL_OP StencilOp(AmdGpu::StencilFunc op) {
     using F = AmdGpu::StencilFunc;
     switch (op) {
@@ -700,11 +707,12 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             color_writes_suppressed = off_depth_pass;
         } else if (depth_all_fail) {
             if (on_depth_fail) {
-                if (stencil_test_enable)
-                    throw std::runtime_error(
-                        "Guest depth-fail color writes with stencil exceeded D3D12 "
-                        "output merger state");
-                color_writes_unconditional = true;
+                if (stencil_test_enable) {
+                    depth_gated = true;
+                    color_writes_suppressed = off_depth_pass;
+                } else {
+                    color_writes_unconditional = true;
+                }
             } else {
                 color_writes_suppressed = true;
             }
@@ -752,6 +760,11 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     Program ps{};
     if (regs.ps_program.Address<VAddr>())
         ps = ReadProgram(memory, regs.ps_program);
+    if (ps.code.empty()) {
+        color_writes_suppressed = true;
+        color_writes_unconditional = false;
+        depth_gated = false;
+    }
     CommandRuntime::DrawRequest draw{vs.Params(), ps.Params()};
     draw.samples = regs.aa_config.NumSamples();
     if (draw.samples > 16)
@@ -974,26 +987,33 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         normalize_alpha(target.SrcBlendAlpha);
         normalize_alpha(target.DestBlendAlpha);
         for (auto* factor : {&target.SrcBlend, &target.DestBlend}) {
-            if (target.BlendEnable && (target.RenderTargetWriteMask & 7)) {
+            if (target.BlendEnable && (target.RenderTargetWriteMask & 7) &&
+                target.BlendOp != D3D12_BLEND_OP_MIN && target.BlendOp != D3D12_BLEND_OP_MAX) {
                 constant_color_rgb |=
                     *factor == D3D12_BLEND_BLEND_FACTOR || *factor == D3D12_BLEND_INV_BLEND_FACTOR;
                 constant_alpha_rgb |=
                     *factor == D3D12_BLEND_ALPHA_FACTOR || *factor == D3D12_BLEND_INV_ALPHA_FACTOR;
             }
-            if (!alpha_blend_factor_supported)
+            if (!alpha_blend_factor_supported &&
+                (target.BlendOp == D3D12_BLEND_OP_MIN || target.BlendOp == D3D12_BLEND_OP_MAX))
                 normalize_alpha(*factor);
         }
     }
     if (!alpha_blend_factor_supported && constant_alpha_rgb) {
-        if (constant_color_rgb)
-            throw std::runtime_error(
-                "D3D12 device cannot combine constant color and constant alpha RGB blending");
-        draw.blend_factor.fill(regs.blend_constants[3]);
+        draw.constant_alpha_blend_emulation = constant_color_rgb;
+        if (!constant_color_rgb) {
+            draw.blend_factor.fill(regs.blend_constants[3]);
+            for (auto& target : draw.blend.RenderTarget)
+                for (auto* factor : {&target.SrcBlend, &target.DestBlend}) {
+                    if (*factor == D3D12_BLEND_ALPHA_FACTOR)
+                        *factor = D3D12_BLEND_BLEND_FACTOR;
+                    else if (*factor == D3D12_BLEND_INV_ALPHA_FACTOR)
+                        *factor = D3D12_BLEND_INV_BLEND_FACTOR;
+                }
+        }
     }
     draw.border_colors = regs.ta_bc_base.Address();
     const auto& polygon = regs.polygon_control;
-    if (polygon.cull_front && polygon.cull_back)
-        return;
     AmdGpu::PolygonMode front_mode =
         polygon.enable_polygon_mode ? polygon.polygon_mode_front : AmdGpu::PolygonMode::Fill;
     AmdGpu::PolygonMode back_mode =
@@ -1021,26 +1041,47 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         polygon.enable_polygon_offset_front ? regs.poly_offset.front_scale : 0.f;
     const float back_bias_scale =
         polygon.enable_polygon_offset_back ? regs.poly_offset.back_scale : 0.f;
-    const bool bias_split = polygon.NeedsBias() && (front_bias_offset != back_bias_offset ||
-                                                    front_bias_scale != back_bias_scale);
-    const bool face_passes =
-        mixed_mode || (point_face && (polygon.cull_front || polygon.cull_back)) || bias_split;
+    const bool bias_split =
+        triangle_output && polygon.NeedsBias() &&
+        (front_bias_offset != back_bias_offset || front_bias_scale != back_bias_scale);
+    const auto& stencil_ops = regs.stencil_control;
+    const auto needs_stencil = [&](bool back) {
+        const bool bf = back && regs.depth_control.backface_enable;
+        const auto& ref = bf ? regs.stencil_ref_back : regs.stencil_ref_front;
+        return NeedsStencilLowering(
+                   bf ? stencil_ops.stencil_fail_back : stencil_ops.stencil_fail_front, ref) ||
+               NeedsStencilLowering(
+                   bf ? stencil_ops.stencil_zfail_back : stencil_ops.stencil_zfail_front, ref) ||
+               NeedsStencilLowering(
+                   bf ? stencil_ops.stencil_zpass_back : stencil_ops.stencil_zpass_front, ref);
+    };
+    const bool manual_stencil =
+        stencil_test_enable && (needs_stencil(false) || needs_stencil(true));
+    const auto& stencil_front = regs.stencil_ref_front;
+    const auto& stencil_back = regs.stencil_ref_back;
+    const bool stencil_faces =
+        stencil_test_enable &&
+        (manual_stencil || (triangle_output && regs.depth_control.backface_enable &&
+                            (stencil_front.stencil_test_val != stencil_back.stencil_test_val ||
+                             stencil_front.stencil_op_val != stencil_back.stencil_op_val ||
+                             stencil_front.stencil_mask != stencil_back.stencil_mask ||
+                             stencil_front.stencil_write_mask != stencil_back.stencil_write_mask)));
+    const bool has_flat =
+        !ps.code.empty() &&
+        std::any_of(regs.ps_inputs.data(), regs.ps_inputs.data() + regs.num_interp,
+                    [](const auto& input) { return input.flat_shade; });
+    const bool wants_flat_last =
+        polygon.provoking_vtx_last == AmdGpu::ProvokingVtxLast::Last && has_flat;
+    const bool flat_polygon_faces =
+        wants_flat_last && !has_geometry && !tessellation &&
+        (point_face || regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
+         regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip ||
+         regs.primitive_type == AmdGpu::PrimitiveType::Polygon ||
+         regs.primitive_type == AmdGpu::PrimitiveType::RectList);
+    const bool face_passes = mixed_mode ||
+                             (point_face && (polygon.cull_front || polygon.cull_back)) ||
+                             bias_split || stencil_faces || flat_polygon_faces;
     const bool point_cpu = point_face && !face_passes && !tessellation && !has_geometry;
-    if (bias_split && (tessellation || has_geometry))
-        throw std::runtime_error(
-            "D3D12 per-face depth bias requires per-face passes conflicting with guest "
-            "tessellation or geometry side effects");
-    if (mixed_mode && (tessellation || has_geometry))
-        throw std::runtime_error(
-            "D3D12 mixed guest polygon modes require per-face passes conflicting with "
-            "guest tessellation or geometry side effects");
-    if ((mixed_mode || bias_split) && (regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
-                                       regs.primitive_type == AmdGpu::PrimitiveType::Polygon ||
-                                       regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
-                                       regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip))
-        throw std::runtime_error(
-            "D3D12 per-face guest fill or depth bias on polygon primitives requires per-face "
-            "primitive lowering");
     const bool line_primitive =
         has_geometry
             ? regs.vgt_gs_out_prim_type.GetPrimitiveType(0) ==
@@ -1057,8 +1098,15 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     const float line_pattern_scale =
         stipple_scale > 0.f && std::isfinite(stipple_scale) ? stipple_scale * 0.5f : 1.f;
     const bool line_stipple = regs.mode_control.line_stripple_enable;
-    const bool line_expand = (line_width != 1.f || line_stipple) &&
-                             (line_primitive || polygon_mode == AmdGpu::PolygonMode::Line);
+    const bool expanded_polygon = !has_geometry && !tessellation &&
+                                  (regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
+                                   regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip ||
+                                   regs.primitive_type == AmdGpu::PrimitiveType::Polygon ||
+                                   regs.primitive_type == AmdGpu::PrimitiveType::RectList);
+    const bool line_expand =
+        (line_width != 1.f || line_stipple || (face_passes && expanded_polygon)) &&
+        (line_primitive || front_mode == AmdGpu::PolygonMode::Line ||
+         back_mode == AmdGpu::PolygonMode::Line);
 
     draw.rasterizer.FillMode = FillMode(polygon_mode);
     draw.rasterizer.CullMode = polygon.cull_front  ? D3D12_CULL_MODE_FRONT
@@ -1100,13 +1148,18 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     u32 front_ref_value{}, back_ref_value{}, front_mask{}, back_mask{}, front_write{}, back_write{};
     if (stencil_test_enable) {
         const auto& sc = regs.stencil_control;
-        guest_front = {StencilOp(sc.stencil_fail_front), StencilOp(sc.stencil_zfail_front),
-                       StencilOp(sc.stencil_zpass_front),
+        const auto native_op = [&](AmdGpu::StencilFunc op) {
+            return manual_stencil ? D3D12_STENCIL_OP_KEEP : StencilOp(op);
+        };
+        guest_front = {native_op(sc.stencil_fail_front), native_op(sc.stencil_zfail_front),
+                       native_op(sc.stencil_zpass_front),
                        D3D12_COMPARISON_FUNC(u32(regs.depth_control.stencil_ref_func) + 1)};
         if (regs.depth_control.backface_enable) {
-            guest_back = {StencilOp(sc.stencil_fail_back), StencilOp(sc.stencil_zfail_back),
-                          StencilOp(sc.stencil_zpass_back),
+            guest_back = {native_op(sc.stencil_fail_back), native_op(sc.stencil_zfail_back),
+                          native_op(sc.stencil_zpass_back),
                           D3D12_COMPARISON_FUNC(u32(regs.depth_control.stencil_bf_func) + 1)};
+        } else {
+            guest_back = guest_front;
         }
         const auto& front_ref = regs.stencil_ref_front;
         const auto& back_ref =
@@ -1123,8 +1176,10 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             regs.depth_control.backface_enable
                 ? uses_op_val(sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
                 : front_op;
-        front_ref_value = front_op ? front_ref.stencil_op_val : front_ref.stencil_test_val;
-        back_ref_value = back_op ? back_ref.stencil_op_val : back_ref.stencil_test_val;
+        front_ref_value =
+            !manual_stencil && front_op ? front_ref.stencil_op_val : front_ref.stencil_test_val;
+        back_ref_value =
+            !manual_stencil && back_op ? back_ref.stencil_op_val : back_ref.stencil_test_val;
         front_mask = front_ref.stencil_mask;
         back_mask = back_ref.stencil_mask;
         const bool stencil_clear = regs.depth_render_control.stencil_clear_enable;
@@ -1232,6 +1287,10 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         throw std::runtime_error("D3D12 guest viewport orientation is not implemented");
     draw.flip_y = yscale > 0;
     draw.flip_x = xscale < 0;
+    draw.viewport_xy[0] = {xscale, yscale, xoffset, yoffset};
+    draw.viewport_flags[0] =
+        (xscale < 0 ? 1u : 0u) | (yscale > 0 ? 2u : 0u) | (clip_disabled ? 4u : 0u);
+    draw.viewport_transform = clip_disabled;
     draw.viewports[0] = {xoffset - std::abs(xscale),
                          yoffset - std::abs(yscale),
                          std::abs(xscale) * 2,
@@ -1248,8 +1307,8 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         draw.viewports[0].TopLeftX += regs.window_offset.window_x_offset;
         draw.viewports[0].TopLeftY += regs.window_offset.window_y_offset;
     }
-    const bool multi_viewport = regs.vs_output_control.vs_out_misc_enable &&
-                                regs.vs_output_control.use_vtx_viewport_idx && !clip_disabled;
+    const bool multi_viewport =
+        regs.vs_output_control.vs_out_misc_enable && regs.vs_output_control.use_vtx_viewport_idx;
     draw.viewport_count = multi_viewport ? AmdGpu::NUM_VIEWPORTS : 1;
     if (multi_viewport) {
         for (u32 index = 1; index < AmdGpu::NUM_VIEWPORTS; ++index) {
@@ -1279,12 +1338,20 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                 draw.viewports[index] = out;
                 continue;
             }
+            draw.viewport_xy[index] = {ixscale, iyscale, ixoffset, iyoffset};
+            draw.viewport_flags[index] =
+                (ixscale < 0 ? 1u : 0u) | (iyscale > 0 ? 2u : 0u) | (clip_disabled ? 4u : 0u);
+            draw.viewport_transform |= draw.viewport_flags[index] != draw.viewport_flags[0];
             out = {ixoffset - std::abs(ixscale),
                    iyoffset - std::abs(iyscale),
                    std::abs(ixscale) * 2,
                    std::abs(iyscale) * 2,
                    out.MinDepth,
                    out.MaxDepth};
+            if (clip_disabled) {
+                out.TopLeftX = out.TopLeftY = 0;
+                out.Width = out.Height = 16384;
+            }
             if (polygon.enable_window_offset) {
                 out.TopLeftX += regs.window_offset.window_x_offset;
                 out.TopLeftY += regs.window_offset.window_y_offset;
@@ -1326,10 +1393,14 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         for (u32 index = 1; index < AmdGpu::NUM_VIEWPORTS; ++index)
             draw.scissors[index] = clip_scissor(index);
     }
+    if (triangle_output && polygon.cull_front && polygon.cull_back)
+        draw.scissors.fill({});
     draw.push = {xoffset, yoffset, xscale, yscale, {}};
     static_assert(sizeof(regs.clip_user_data) == sizeof(draw.clip_planes));
     std::memcpy(draw.clip_planes.data(), regs.clip_user_data.data(), sizeof(draw.clip_planes));
     if (line_expand) {
+        draw.line_pattern = 0xffff;
+        draw.line_pattern_scale = 0;
         draw.line_width = line_width;
         if (line_stipple) {
             draw.line_pattern = u16(regs.line_stipple.Pattern());
@@ -1466,44 +1537,34 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                            regs.primitive_type == AmdGpu::PrimitiveType::Polygon ||
                            regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
                            regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip;
-    const bool contour = polygon_mode == AmdGpu::PolygonMode::Line &&
+    const bool contour = !face_passes && polygon_mode == AmdGpu::PolygonMode::Line &&
                          (regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
                           regs.primitive_type == AmdGpu::PrimitiveType::Polygon ||
                           regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
                           regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip);
-    const bool remap_provoking =
-        draw.provoking_last && !point_face && !contour &&
-        std::any_of(regs.ps_inputs.data(), regs.ps_inputs.data() + regs.num_interp,
-                    [](const auto& input) { return input.flat_shade; });
-    if (remap_provoking && (has_geometry || tessellation))
-        throw std::runtime_error(
-            "D3D12 last-provoking vertex with flat shading and geometry or tessellation "
-            "requires vertex reordering");
-    if (remap_provoking) {
-        switch (regs.primitive_type) {
-        case AmdGpu::PrimitiveType::AdjLineList:
-        case AmdGpu::PrimitiveType::AdjLineStrip:
-        case AmdGpu::PrimitiveType::AdjTriangleList:
-        case AmdGpu::PrimitiveType::AdjTriangleStrip:
-            throw std::runtime_error(
-                "D3D12 last-provoking vertex with flat shading and adjacency primitives requires "
-                "vertex reordering");
-        default:
-            break;
-        }
-    }
+    const bool adjacency = regs.primitive_type == AmdGpu::PrimitiveType::AdjLineList ||
+                           regs.primitive_type == AmdGpu::PrimitiveType::AdjLineStrip ||
+                           regs.primitive_type == AmdGpu::PrimitiveType::AdjTriangleList ||
+                           regs.primitive_type == AmdGpu::PrimitiveType::AdjTriangleStrip;
+    draw.flat_last = wants_flat_last && (has_geometry || tessellation || adjacency || point_face ||
+                                         line_expand || flat_polygon_faces);
+    const bool remap_provoking = wants_flat_last && !draw.flat_last && !point_face && !contour;
+    const bool compact_adjacency =
+        adjacency && !has_geometry && !tessellation && (draw.flat_last || draw.viewport_transform);
     const bool provoking_lines =
         remap_provoking && (regs.primitive_type == AmdGpu::PrimitiveType::LineList ||
                             regs.primitive_type == AmdGpu::PrimitiveType::LineStrip);
-    const bool wire_expand_conv = !has_geometry && !tessellation && line_expand &&
-                                  !line_primitive && polygon_mode == AmdGpu::PolygonMode::Line;
+    const bool wire_expand_conv = !face_passes && !has_geometry && !tessellation && line_expand &&
+                                  !draw.flat_last && !line_primitive &&
+                                  polygon_mode == AmdGpu::PolygonMode::Line;
     const bool convert = regs.primitive_type == AmdGpu::PrimitiveType::LineLoop ||
                          regs.primitive_type == AmdGpu::PrimitiveType::TriangleFan ||
                          regs.primitive_type == AmdGpu::PrimitiveType::Polygon ||
                          regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
                          regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip || point_cpu ||
-                         contour || provoking_lines || (remap_provoking && polygonal) ||
-                         wire_expand_conv || (depth_gated && !has_geometry && !tessellation) ||
+                         contour || compact_adjacency || provoking_lines ||
+                         (remap_provoking && polygonal) || wire_expand_conv ||
+                         (depth_gated && !has_geometry && !tessellation) ||
                          (indexed && regs.enable_primitive_restart &&
                           regs.primitive_type != AmdGpu::PrimitiveType::AdjLineStrip &&
                           regs.primitive_type != AmdGpu::PrimitiveType::AdjTriangleStrip);
@@ -1558,6 +1619,22 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             mode = 8;
             output = (draw.count / 2) * 2;
             break;
+        case P::AdjLineList:
+            mode = 10;
+            output = (draw.count / 4) * 2;
+            break;
+        case P::AdjLineStrip:
+            mode = 11;
+            output = draw.count >= 4 ? (draw.count - 3) * 2 : 0;
+            break;
+        case P::AdjTriangleList:
+            mode = 12;
+            output = (draw.count / 6) * 3;
+            break;
+        case P::AdjTriangleStrip:
+            mode = draw.flat_last ? 14 : 13;
+            output = draw.count >= 6 ? ((draw.count - 4) / 2) * 3 : 0;
+            break;
         default:
             break;
         }
@@ -1574,10 +1651,10 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                 draw.base_vertex = draw.first_vertex;
             draw.count = output;
             draw.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
-            draw.topology = mode == 1 || mode == 7 || mode == 8
+            draw.topology = mode == 1 || mode == 7 || mode == 8 || mode == 10 || mode == 11
                                 ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
                                 : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-            draw.topology_type = mode == 1 || mode == 7 || mode == 8
+            draw.topology_type = mode == 1 || mode == 7 || mode == 8 || mode == 10 || mode == 11
                                      ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                      : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         }
@@ -1629,6 +1706,10 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         const auto restart = indexed && regs.enable_primitive_restart
                                  ? std::optional<u32>{regs.primitive_restart_index}
                                  : std::nullopt;
+        if (face_passes)
+            draw.face_masks = ConvertPolygonFaceMasks(regs.primitive_type, indices, restart);
+        if (draw.flat_last && !has_geometry && !tessellation)
+            draw.flat_vertices = ConvertPolygonFlatVertices(regs.primitive_type, indices, restart);
         if (point_cpu && polygonal) {
             draw.converted_indices = ConvertPolygonPoints(regs.primitive_type, indices, restart);
         } else if (contour) {
@@ -1637,8 +1718,8 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                     "D3D12 expanded primitives preceding geometry require lowering");
             draw.converted_indices = ConvertPolygonEdges(regs.primitive_type, indices, restart);
         } else {
-            draw.converted_indices =
-                ConvertPrimitiveIndices(regs.primitive_type, indices, restart, remap_provoking);
+            draw.converted_indices = ConvertPrimitiveIndices(regs.primitive_type, indices, restart,
+                                                             remap_provoking || draw.flat_last);
         }
         draw.count = draw.converted_indices.size();
         draw.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
@@ -1661,6 +1742,11 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                 indices[i + 2] = indices[i + 1];
                 indices[i + 1] = indices[i];
                 indices[i] = provoker;
+                if (i / 3 < draw.face_masks.size()) {
+                    const u32 mask = draw.face_masks[i / 3];
+                    const auto rotate = [](u32 value) { return ((value << 1) | (value >> 2)) & 7; };
+                    draw.face_masks[i / 3] = rotate(mask & 7) | (rotate(mask >> 3) << 3);
+                }
             }
         } else if (draw.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE) {
             for (size_t i = 0; i + 1 < indices.size(); i += 2)
@@ -1714,10 +1800,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             pass.rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
             pass.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
         }
-        const bool pass_lines = has_geometry
-                                    ? line_primitive
-                                    : pass.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE ||
-                                          pass.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        const bool pass_lines = line_primitive;
         if (line_expand && (pass_lines || pass.rasterizer.FillMode == D3D12_FILL_MODE_WIREFRAME)) {
             pass.line_keep_front = pass.rasterizer.CullMode != D3D12_CULL_MODE_FRONT;
             pass.line_cull = pass.rasterizer.CullMode != D3D12_CULL_MODE_NONE;
@@ -1727,11 +1810,31 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             if (pass.depth.StencilEnable)
                 pass.depth.BackFace = pass.depth.FrontFace;
         }
-        runtime.Draw(pass);
+        if (face_passes) {
+            draw.faces.push_back(
+                {pass.rasterizer, pass.depth, pass.stencil_ref, pass.point_fill, pass.line_expand,
+                 pass.point_fill    ? pass.point_keep_front
+                 : pass.line_expand ? pass.line_keep_front
+                                    : pass.rasterizer.CullMode != D3D12_CULL_MODE_FRONT});
+            if (manual_stencil) {
+                const bool back = triangle_output && !draw.faces.back().keep_front &&
+                                  regs.depth_control.backface_enable;
+                const auto& ref = back ? regs.stencil_ref_back : regs.stencil_ref_front;
+                draw.faces.back().stencil = CommandRuntime::DrawRequest::StencilState{
+                    u32(back ? stencil_ops.stencil_fail_back : stencil_ops.stencil_fail_front),
+                    u32(back ? stencil_ops.stencil_zfail_back : stencil_ops.stencil_zfail_front),
+                    u32(back ? stencil_ops.stencil_zpass_back : stencil_ops.stencil_zpass_front),
+                    ref.stencil_test_val, ref.stencil_op_val};
+            }
+        } else {
+            runtime.Draw(pass);
+        }
     };
     if (face_passes) {
         const auto build_pass = [&](CommandRuntime::DrawRequest& pass, bool face_front,
                                     AmdGpu::PolygonMode mode) {
+            pass.point_fill = false;
+            pass.line_expand = false;
             if (mode == AmdGpu::PolygonMode::Point) {
                 pass.point_fill = true;
                 pass.point_keep_front = face_front;
@@ -1754,7 +1857,9 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                     (enabled ? (face_front ? front_bias_scale : back_bias_scale) : 0.f) / 16.f;
             }
         };
-        const bool dual = mixed_mode || (bias_split && !polygon.cull_front && !polygon.cull_back);
+        const bool dual =
+            mixed_mode || ((bias_split || stencil_faces || flat_polygon_faces) && triangle_output &&
+                           !polygon.cull_front && !polygon.cull_back);
         if (dual) {
             build_pass(draw, true, mixed_mode ? front_mode : polygon_mode);
             CommandRuntime::DrawRequest back_pass{draw};
@@ -1762,9 +1867,12 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             submit(draw);
             submit(back_pass);
         } else {
-            build_pass(draw, !polygon.cull_front, polygon_mode);
+            build_pass(draw, !triangle_output || !polygon.cull_front, polygon_mode);
             submit(draw);
         }
+        draw.point_fill = false;
+        draw.line_expand = false;
+        runtime.Draw(draw);
     } else {
         submit(draw);
     }
@@ -1914,6 +2022,10 @@ u64 Rasterizer::Flush() {
     u64 ticket{};
     Execute([&] { ProfileSample(profile, "flush", 64, [&] { ticket = runtime.Flush(); }); });
     return ticket;
+}
+bool Rasterizer::OcclusionCounter(u64& value, bool reset) {
+    Execute([&] { value = runtime.OcclusionCounter(reset); });
+    return true;
 }
 void Rasterizer::Finish() {
     static_cast<void>(Flush());

@@ -18,9 +18,21 @@
 
 #include <algorithm>
 #include <numbers>
+#include <stdexcept>
 #include <magic_enum/magic_enum.hpp>
 
 namespace Shader::Gcn {
+
+static std::pair<u32, u32> SdwaLayout(SdwaSelector selector) {
+    const auto value = u32(selector);
+    if (value < 4)
+        return {value * 8, 8};
+    if (value < 6)
+        return {(value - 4) * 16, 16};
+    if (selector == SdwaSelector::Dword)
+        return {0, 32};
+    throw std::runtime_error("Invalid SDWA operand selector");
+}
 
 static IR::VectorReg IterateBarycentrics(const RuntimeInfo& runtime_info, auto&& set_attribute) {
     if (runtime_info.hw_stage != HwStage::Fragment) {
@@ -454,6 +466,27 @@ T Translator::GetSrc(const InstOperand& operand) {
         UNREACHABLE_MSG("Unexpected operand: {}", std::to_underlying(operand.field));
     }
 
+    if (operand.sdwa_sel != SdwaSelector::Invalid) {
+        const auto [offset, width] = SdwaLayout(operand.sdwa_sel);
+        IR::U32 bits;
+        if constexpr (is_float)
+            bits = ir.BitCast<IR::U32>(value);
+        else
+            bits = value;
+        bits = ir.BitFieldExtract(bits, ir.Imm32(offset), ir.Imm32(width),
+                                  operand.input_modifier.sext);
+        if constexpr (is_float)
+            value = ir.BitCast<IR::F32>(bits);
+        else {
+            if (operand.input_modifier.abs)
+                bits =
+                    IR::U32{ir.Select(ir.ILessThan(bits, ir.Imm32(0), true), ir.INeg(bits), bits)};
+            if (operand.input_modifier.neg)
+                bits = ir.INeg(bits);
+            return bits;
+        }
+    }
+
     if constexpr (is_float) {
         if (operand.input_modifier.abs) {
             value = ir.FPAbs(value);
@@ -477,6 +510,8 @@ template IR::F32 Translator::GetSrc<IR::F32>(const InstOperand&);
 
 template <typename T, bool is_signed>
 T Translator::GetSrc16(const InstOperand& operand) {
+    if (operand.sdwa_sel != SdwaSelector::Invalid)
+        throw std::runtime_error("SDWA requires a validated lowering for this operand width");
     constexpr bool is_float = std::is_same_v<T, IR::F32>;
 
     const auto get_imm = [&](auto value) -> T {
@@ -721,6 +756,8 @@ IR::F32 Translator::GetSrcMix(const InstOperand& operand) {
 
 template <typename T>
 T Translator::GetSrc64(const InstOperand& operand) {
+    if (operand.sdwa_sel != SdwaSelector::Invalid)
+        throw std::runtime_error("SDWA requires a validated lowering for this operand width");
     constexpr bool is_float = std::is_same_v<T, IR::F64>;
 
     const auto get_imm = [&](auto value) -> T {
@@ -987,6 +1024,32 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
         }
     }
 
+    if (operand.sdwa_sel != SdwaSelector::Invalid) {
+        if (operand.field != OperandField::VectorGPR)
+            throw std::runtime_error("SDWA output requires a vector register");
+        const auto [offset, width] = SdwaLayout(operand.sdwa_sel);
+        const auto bits =
+            result.Type() == IR::Type::F32 ? ir.BitCast<IR::U32>(IR::F32{result}) : IR::U32{result};
+        IR::U32 packed;
+        switch (operand.sdwa_dst) {
+        case SdwaDstUnused::Pad:
+            packed = ir.ShiftLeftLogical(ir.BitFieldExtract(bits, ir.Imm32(0), ir.Imm32(width)),
+                                         ir.Imm32(offset));
+            break;
+        case SdwaDstUnused::Sext:
+            packed = ir.ShiftLeftLogical(
+                ir.BitFieldExtract(bits, ir.Imm32(0), ir.Imm32(width), true), ir.Imm32(offset));
+            break;
+        case SdwaDstUnused::Preserve:
+            packed = ir.BitFieldInsert(ir.GetVectorReg<IR::U32>(IR::VectorReg(operand.code)), bits,
+                                       ir.Imm32(offset), ir.Imm32(width));
+            break;
+        default:
+            throw std::runtime_error("Invalid SDWA unused destination mode");
+        }
+        return ir.SetVectorReg(IR::VectorReg(operand.code), packed);
+    }
+
     switch (operand.field) {
     case OperandField::ScalarGPR:
         return ir.SetScalarReg(IR::ScalarReg(operand.code), result);
@@ -1005,6 +1068,8 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
 
 template <bool is_signed>
 void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
+    if (operand.sdwa_sel != SdwaSelector::Invalid)
+        throw std::runtime_error("SDWA requires a validated lowering for this operand width");
     IR::U32F32 result = value;
     if (value.Type() == IR::Type::F32) {
         if (operand.output_modifier.multiplier != 0.f) {
@@ -1063,6 +1128,8 @@ template void Translator::SetDst16<false>(const InstOperand&, const IR::U32F32& 
 template void Translator::SetDst16<true>(const InstOperand&, const IR::U32F32& value);
 
 void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_raw) {
+    if (operand.sdwa_sel != SdwaSelector::Invalid)
+        throw std::runtime_error("SDWA requires a validated lowering for this operand width");
     IR::U64F64 value_untyped = value_raw;
 
     const bool is_float = value_raw.Type() == IR::Type::F64 || value_raw.Type() == IR::Type::F32;
@@ -1253,6 +1320,8 @@ void Translator::Translate(IR::Block* block, u32 start_pc, IR::Condition cond,
 }
 
 void Translator::TranslateInstruction(const GcnInst& inst) {
+    if (std::ranges::any_of(inst.src, [](const auto& operand) { return operand.dpp.has_value(); }))
+        throw std::runtime_error("DPP instruction requires a validated cross-lane lowering");
     // Emit instructions for each category.
     switch (inst.category) {
     case InstCategory::DataShare:

@@ -215,11 +215,11 @@ void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write w
                                     true);
     sampler_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 128, true);
     color_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, false);
-    depth_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
+    depth_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, false);
     static_cast<void>(resource_descriptors.Allocate(512));
     static_cast<void>(sampler_descriptors.Allocate(128));
     static_cast<void>(color_descriptors.Allocate(8));
-    static_cast<void>(depth_descriptors.Allocate(1));
+    static_cast<void>(depth_descriptors.Allocate(2));
     if (std::getenv("GAME_PROFILE") &&
         SUCCEEDED(device.DirectQueue()->GetTimestampFrequency(&gpu_timing.frequency)) &&
         gpu_timing.frequency) {

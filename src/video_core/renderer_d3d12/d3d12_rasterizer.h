@@ -53,6 +53,7 @@ public:
     void FillBuffer(VAddr address, u32 size, u32 value, bool gds) override;
     void CopyBuffer(VAddr dst, VAddr src, u32 size, bool dst_gds, bool src_gds) override;
     u32 ReadDataFromGds(u32 offset) override;
+    bool OcclusionCounter(u64& value, bool reset = false) override;
     void ProcessDownloadImages() override {}
     void CpSync() override;
     u64 Flush() override;
@@ -61,8 +62,12 @@ public:
     void SetExternalMemory(std::function<u64()> usage, std::function<void()> trim) {
         runtime.SetExternalMemory(std::move(usage), std::move(trim));
     }
-    void OnSubmit() override { runtime.SubmitReady(); }
-    void EndPacketRun() override { runtime.SubmitReady(); }
+    void OnSubmit() override {
+        runtime.SubmitReady();
+    }
+    void EndPacketRun() override {
+        runtime.SubmitReady();
+    }
     void ScopeMarkerBegin(std::string_view, bool = false) override {}
     void ScopeMarkerEnd(bool = false) override {}
     void ScopedMarkerInsertColor(std::string_view, u32, bool = false) override {}
@@ -110,7 +115,8 @@ private:
         u16 vertex_sgpr, instance_sgpr;
         std::optional<GpuCommands::Arguments> gpu;
     };
-    void DrawImpl(bool indexed, u32 index_offset, std::optional<IndirectDraw> indirect, bool gpu_conversion = true);
+    void DrawImpl(bool indexed, u32 index_offset, std::optional<IndirectDraw> indirect,
+                  bool gpu_conversion = true);
     void Read(VAddr address, std::span<u8> data);
     void Write(VAddr address, std::span<const u8> data);
     void Dispatch(std::array<u32, 3> groups, VAddr indirect_address = 0);

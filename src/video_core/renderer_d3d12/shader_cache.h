@@ -95,20 +95,26 @@ public:
                                                        const std::array<DXGI_FORMAT, 8>& formats,
                                                        const std::array<u32, 8>& masks);
     std::shared_ptr<const ShaderBinary> CompileRectangle(
-        const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment);
+        const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment,
+        bool flat_last = false);
     std::shared_ptr<const ShaderBinary> CompilePointFill(
         const ShaderBinary& vertex, bool keep_front, bool front_ccw, bool cull = true,
-        const Shader::HwFragmentRuntimeInfo* fragment = nullptr);
+        const Shader::HwFragmentRuntimeInfo* fragment = nullptr, bool masks = false);
     std::shared_ptr<const ShaderBinary> CompileLineExpand(
         const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool keep_front,
         bool front_ccw, D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type, bool adjacency, float width_px,
         u16 pattern, u16 repeat, bool pattern_msb_first, float pattern_scale,
-        const std::array<f32, 32>& viewport_dims, bool cull = true, bool batches = false);
+        const std::array<f32, 32>& viewport_dims, bool cull = true, bool batches = false,
+        bool masks = false, u32 linear_mask = 0, u32 flat_mask = 0, bool depth_clip = true);
     std::shared_ptr<const ShaderBinary> CompileHlslRaw(const std::string& hlsl,
                                                        std::wstring_view target,
                                                        std::span<const std::wstring> defines);
     std::shared_ptr<const ShaderBinary> CompileHelperHlsl(const std::string& hlsl,
                                                           Shader::SwStage stage);
+    std::shared_ptr<const ShaderBinary> CompileConstantAlphaBlend(const ShaderBinary& fragment,
+                                                                  float alpha);
+    std::shared_ptr<const ShaderBinary> CompileFaceFragment(const ShaderBinary& fragment,
+                                                            bool front);
     u64 MemoryBytes() const {
         return cache_bytes + variant_bytes;
     }
@@ -142,6 +148,7 @@ private:
     std::map<std::vector<u32>, std::shared_ptr<const ShaderBinary>> cache;
     size_t cache_bytes{};
     bool fixed_graphics_wave64{};
+    bool native_float64{};
     D3D_SHADER_MODEL shader_model{D3D_SHADER_MODEL_6_4};
     const ResourceCache* resources{};
     void CompileHlsl(ShaderBinary& binary, Shader::SwStage stage);

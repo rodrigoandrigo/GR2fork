@@ -72,6 +72,30 @@ inline std::vector<u32> ConvertPrimitiveIndices(AmdGpu::PrimitiveType primitive,
                     emit({indices[i - 2], indices[i - 1], indices[i]});
             }
             break;
+        case P::AdjLineList:
+            for (size_t i = 0; i + 3 < indices.size(); i += 4)
+                emit({indices[i + 1], indices[i + 2]});
+            break;
+        case P::AdjLineStrip:
+            for (size_t i = 0; i + 3 < indices.size(); ++i)
+                emit({indices[i + 1], indices[i + 2]});
+            break;
+        case P::AdjTriangleList:
+            for (size_t i = 0; i + 5 < indices.size(); i += 6)
+                emit({indices[i], indices[i + 2], indices[i + 4]});
+            break;
+        case P::AdjTriangleStrip:
+            for (size_t i = 0; i + 5 < indices.size(); i += 2) {
+                if ((i / 2) & 1) {
+                    if (provoking_last)
+                        emit({indices[i + 2], indices[i], indices[i + 4]});
+                    else
+                        emit({indices[i], indices[i + 4], indices[i + 2]});
+                } else {
+                    emit({indices[i], indices[i + 2], indices[i + 4]});
+                }
+            }
+            break;
         case P::TriangleFan:
         case P::Polygon:
             for (size_t i = 2; i < indices.size(); ++i)
@@ -101,6 +125,59 @@ inline std::vector<u32> ConvertPrimitiveIndices(AmdGpu::PrimitiveType primitive,
         }
     }
     segment(input.subspan(first));
+    return output;
+}
+inline std::vector<u32> ConvertPolygonFaceMasks(AmdGpu::PrimitiveType primitive,
+                                                std::span<const u32> input,
+                                                std::optional<u32> restart = {}) {
+    std::vector<u32> output;
+    const auto segment = [&](size_t count) {
+        if (primitive == AmdGpu::PrimitiveType::Polygon) {
+            for (size_t vertex = 2; vertex < count; ++vertex)
+                output.push_back(2u | (vertex == 2 ? 1u : 0u) | (vertex + 1 == count ? 4u : 0u) |
+                                 ((vertex == 2 ? 7u : 4u) << 3));
+        } else if (primitive == AmdGpu::PrimitiveType::QuadList ||
+                   primitive == AmdGpu::PrimitiveType::QuadStrip) {
+            const size_t step = primitive == AmdGpu::PrimitiveType::QuadList ? 4 : 2;
+            for (size_t vertex = 0; vertex + 3 < count; vertex += step) {
+                output.push_back(59);
+                output.push_back(38);
+            }
+        }
+    };
+    size_t first{};
+    for (size_t index = 0; index < input.size(); ++index)
+        if (restart && input[index] == *restart) {
+            segment(index - first);
+            first = index + 1;
+        }
+    segment(input.size() - first);
+    return output;
+}
+inline std::vector<u32> ConvertPolygonFlatVertices(AmdGpu::PrimitiveType primitive,
+                                                   std::span<const u32> input,
+                                                   std::optional<u32> restart = {}) {
+    std::vector<u32> output;
+    const auto segment = [&](size_t count) {
+        if (primitive == AmdGpu::PrimitiveType::Polygon && count >= 3) {
+            const u32 triangles = u32(count - 2);
+            output.insert(output.end(), triangles, (u32(output.size()) + triangles) * 3 - 1);
+        } else if (primitive == AmdGpu::PrimitiveType::QuadList ||
+                   primitive == AmdGpu::PrimitiveType::QuadStrip) {
+            const size_t step = primitive == AmdGpu::PrimitiveType::QuadList ? 4 : 2;
+            for (size_t i = 0; i + 3 < count; i += step) {
+                const u32 index = u32(output.size()) * 3 + (step == 4 ? 5 : 2);
+                output.insert(output.end(), {index, index});
+            }
+        }
+    };
+    size_t first{};
+    for (size_t i = 0; i < input.size(); ++i)
+        if (restart && input[i] == *restart) {
+            segment(i - first);
+            first = i + 1;
+        }
+    segment(input.size() - first);
     return output;
 }
 inline std::vector<u32> ConvertPolygonPoints(AmdGpu::PrimitiveType primitive,

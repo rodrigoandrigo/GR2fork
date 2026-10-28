@@ -296,6 +296,8 @@ private:
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
+    bool TrySetPredication(const PM4Header* header);
+    bool predicate_enabled{}, predicate_visible{}, predicate_incomplete{}, predicate_pass{true};
     u64 pixel_counter{};
     // Frozen counter = every query pair differences to zero samples passed:
     // the title's own visibility logic then culls those draws before issue.

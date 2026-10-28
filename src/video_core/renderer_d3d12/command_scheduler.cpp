@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <winrt/base.h>
 #include "common/logging/log.h"
 #include "video_core/renderer_d3d12/profile.h"
 
@@ -234,6 +235,7 @@ void CommandRuntime::FinishRecording(std::shared_ptr<void> lease, ResourceCache:
     const auto commit = [this, lease, gds_buffer, strmout_counter,
                          cpu_ranges = std::move(cpu_ranges)] {
         resources.CommitDownloads(bool(lease));
+        CompleteOcclusion();
         if (strmout_counter) {
             std::memcpy(&strmout_filled, strmout_counter->host_data.data(), sizeof(strmout_filled));
         }
@@ -347,5 +349,57 @@ std::span<u8, 65536> CommandRuntime::Gds() {
                               [&] { return std::unique_lock{mutex}; });
     DrainContexts();
     return gds;
+}
+u64 CommandRuntime::OcclusionCounter(bool reset) {
+    std::scoped_lock lock{mutex};
+    DrainContexts();
+    if (reset)
+        occlusion_total = 0;
+    occlusion_enabled = true;
+    return occlusion_total;
+}
+void CommandRuntime::BeginOcclusion(bool enabled) {
+    if (!enabled || !(coordinator ? coordinator : this)->occlusion_enabled)
+        return;
+    if (occlusion_recording)
+        throw std::runtime_error("Nested native occlusion query");
+    if (!occlusion_heap) {
+        D3D12_QUERY_HEAP_DESC description{};
+        description.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+        description.Count = 1;
+        winrt::check_hresult(
+            device.Device()->CreateQueryHeap(&description, IID_PPV_ARGS(&occlusion_heap)));
+    }
+    if (occlusion_queries % 4096 == 0)
+        occlusion_readbacks.push_back(
+            transfer_pool->Acquire(4096 * sizeof(u64), D3D12_HEAP_TYPE_READBACK));
+    commands->BeginQuery(occlusion_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+    occlusion_recording = true;
+}
+void CommandRuntime::EndOcclusion() {
+    if (!occlusion_recording)
+        return;
+    commands->EndQuery(occlusion_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+    commands->ResolveQueryData(occlusion_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1,
+                               occlusion_readbacks.back().Get(),
+                               u64(occlusion_queries % 4096) * sizeof(u64));
+    ++occlusion_queries;
+    occlusion_recording = false;
+}
+void CommandRuntime::CompleteOcclusion() {
+    for (u32 block = 0; block < occlusion_readbacks.size(); ++block) {
+        const u32 count = std::min(4096u, occlusion_queries - block * 4096);
+        void* mapped{};
+        D3D12_RANGE range{0, size_t(count) * sizeof(u64)};
+        winrt::check_hresult(occlusion_readbacks[block]->Map(0, &range, &mapped));
+        const auto* values = static_cast<const u64*>(mapped);
+        for (u32 index = 0; index < count; ++index)
+            (coordinator ? coordinator : this)->occlusion_total += values[index];
+        D3D12_RANGE empty{};
+        occlusion_readbacks[block]->Unmap(0, &empty);
+        transfer_pool->Retire(std::move(occlusion_readbacks[block]), device.CompletedValue());
+    }
+    occlusion_readbacks.clear();
+    occlusion_queries = 0;
 }
 } // namespace D3D12

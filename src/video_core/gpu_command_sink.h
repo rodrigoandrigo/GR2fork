@@ -26,6 +26,9 @@ public:
     virtual void FillBuffer(VAddr address, u32 size, u32 value, bool gds) = 0;
     virtual void CopyBuffer(VAddr dst, VAddr src, u32 size, bool dst_gds, bool src_gds) = 0;
     virtual u32 ReadDataFromGds(u32 offset) = 0;
+    virtual bool OcclusionCounter(u64&, bool = false) {
+        return false;
+    }
     virtual void ProcessDownloadImages() = 0;
     virtual void CpSync() = 0;
     virtual u64 Flush() = 0;

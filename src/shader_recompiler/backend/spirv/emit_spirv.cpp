@@ -464,6 +464,10 @@ void SetupDenormFlushMode(EmitContext& ctx, const Profile& profile, const Runtim
                 LOG_WARNING(Render_Vulkan, "Float32 denorm flushing is not supported by the GPU");
             });
         }
+    } else if (fp32_denorm_mode == AmdGpu::FpDenormMode::InOutAllow &&
+               profile.support_fp32_denorm_preserve) {
+        ctx.AddCapability(spv::Capability::DenormPreserve);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 32U);
     } else {
         LOG_WARNING(Render_Vulkan, "Unknown FP denorm mode {}", u32(fp32_denorm_mode));
     }

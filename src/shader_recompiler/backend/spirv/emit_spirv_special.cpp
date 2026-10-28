@@ -148,6 +148,11 @@ void EmitEmitVertex(EmitContext& ctx) {
         ctx.runtime_info.hw.gs.emulate_depth_negative_one_to_one) {
         ConvertDepthMode(ctx);
     }
+    if (Sirit::ValidId(ctx.output_vertex_order)) {
+        const Id order = ctx.OpLoad(ctx.U32[1], ctx.vertex_order_counter);
+        ctx.OpStore(ctx.output_vertex_order, order);
+        ctx.OpStore(ctx.vertex_order_counter, ctx.OpIAdd(ctx.U32[1], order, ctx.ConstU32(1u)));
+    }
     ctx.OpEmitVertex();
 }
 
