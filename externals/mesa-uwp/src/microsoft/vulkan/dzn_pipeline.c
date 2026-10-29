@@ -627,6 +627,107 @@ dzn_device_lowers_16bit(const struct dzn_device *device)
    return !pdev->options4.Native16BitShaderOpsSupported;
 }
 
+static bool
+dzn_nir_descriptor_depends_on_scalar(nir_scalar value, nir_def *resource, unsigned depth)
+{
+   value = nir_scalar_chase_movs(value);
+   if (value.def == resource)
+      return value.comp == 0;
+   if (!depth)
+      return false;
+   nir_instr *instr = nir_def_instr(value.def);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+         unsigned component = nir_op_infos[alu->op].input_sizes[i] ? 0 : value.comp;
+         if (dzn_nir_descriptor_depends_on_scalar(nir_get_scalar(alu->src[i].src.ssa,
+               alu->src[i].swizzle[component]), resource, depth - 1))
+            return true;
+      }
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_load_vulkan_descriptor ||
+          intr->intrinsic == nir_intrinsic_vulkan_resource_reindex)
+         return dzn_nir_descriptor_depends_on_scalar(nir_get_scalar(intr->src[0].ssa, value.comp),
+            resource, depth - 1);
+   }
+   return false;
+}
+
+static bool
+dzn_nir_descriptor_depends_on(nir_def *value, nir_def *resource, unsigned depth)
+{
+   return dzn_nir_descriptor_depends_on_scalar(nir_get_scalar(value, 0), resource, depth);
+}
+
+static bool
+dzn_nir_raw_resource_written(nir_shader *nir, nir_def *resource)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            nir_def *descriptor = NULL;
+            if (intr->intrinsic == nir_intrinsic_store_ssbo)
+               descriptor = intr->src[1].ssa;
+            else if (intr->intrinsic == nir_intrinsic_ssbo_atomic ||
+                     intr->intrinsic == nir_intrinsic_ssbo_atomic_swap)
+               descriptor = intr->src[0].ssa;
+            if (descriptor && dzn_nir_descriptor_depends_on(descriptor, resource, 16))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static void
+dzn_pipeline_collect_raw_images(struct dzn_pipeline *pipeline, nir_shader *nir,
+                                 const struct dzn_pipeline_layout *layout)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_vulkan_resource_index)
+               continue;
+            unsigned set = nir_intrinsic_desc_set(intr);
+            if (set < DZN_REGISTER_SPACE_RAW_IMAGES || set >= DZN_REGISTER_SPACE_RAW_IMAGES + MAX_SETS)
+               continue;
+            unsigned binding = nir_intrinsic_binding(intr);
+            struct dzn_raw_image_binding use = {0};
+            use.set = set - DZN_REGISTER_SPACE_RAW_IMAGES;
+            use.binding = binding;
+            const struct dzn_descriptor_set_layout *set_layout = container_of(
+               layout->vk.set_layouts[use.set], struct dzn_descriptor_set_layout, vk);
+            use.write = set_layout->bindings[binding].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+                        dzn_nir_raw_resource_written(nir, &intr->def);
+            use.count = set_layout->bindings[binding].descriptor_count *
+                        set_layout->bindings[binding].descriptor_stride;
+            if (nir_src_is_const(intr->src[0])) {
+               use.first = nir_src_as_uint(intr->src[0]);
+               use.count = 1;
+            }
+            bool found = false;
+            util_dynarray_foreach(&pipeline->raw_image_bindings, struct dzn_raw_image_binding, old) {
+               if (old->set == use.set && old->binding == use.binding &&
+                   old->first == use.first && old->count == use.count) {
+                  old->write |= use.write;
+                  found = true;
+                  break;
+               }
+            }
+            if (!found)
+               util_dynarray_append(&pipeline->raw_image_bindings, use);
+         }
+      }
+   }
+}
+
 static VkResult
 dzn_pipeline_get_nir_shader(struct dzn_device *device,
                             const struct dzn_pipeline_layout *layout,
@@ -726,8 +827,13 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
       NIR_PASS(_, *nir, nir_lower_clip_halfz);
    }
 
+   if (device->raw_image_lowering) {
+      NIR_PASS(_, *nir, dzn_nir_lower_raw_images, layout);
+      NIR_PASS(_, *nir, dzn_nir_lower_raw_textures, layout);
+   }
+
    if (!device->bindless && unformatted_images)
-      NIR_PASS(_, *nir, dzn_nir_lower_unformatted_image_loads, layout);
+      NIR_PASS(_, *nir, dzn_nir_lower_unformatted_image_loads, layout, device->integer_image_loads);
 
    bool robust_images = options->robustness.images ==
                             VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT ||
@@ -803,6 +909,11 @@ adjust_resource_index_binding(struct nir_builder *builder,
    unsigned set = nir_intrinsic_desc_set(intrin);
    unsigned binding = nir_intrinsic_binding(intrin);
 
+   if (set >= DZN_REGISTER_SPACE_RAW_IMAGES && set < DZN_REGISTER_SPACE_RAW_IMAGES + layout->set_count)
+      set -= DZN_REGISTER_SPACE_RAW_IMAGES;
+   if (set >= DZN_REGISTER_SPACE_INTEGER_IMAGES &&
+       set < DZN_REGISTER_SPACE_INTEGER_IMAGES + layout->set_count)
+      set -= DZN_REGISTER_SPACE_INTEGER_IMAGES;
    if (set >= layout->set_count ||
        binding >= layout->binding_translation[set].binding_count)
       return false;
@@ -859,6 +970,11 @@ adjust_var_bindings(nir_shader *shader,
 
       unsigned s = var->data.descriptor_set, b = var->data.binding;
 
+      if (s >= DZN_REGISTER_SPACE_RAW_IMAGES && s < DZN_REGISTER_SPACE_RAW_IMAGES + layout->set_count)
+         s -= DZN_REGISTER_SPACE_RAW_IMAGES;
+      if (s >= DZN_REGISTER_SPACE_INTEGER_IMAGES &&
+          s < DZN_REGISTER_SPACE_INTEGER_IMAGES + layout->set_count)
+         s -= DZN_REGISTER_SPACE_INTEGER_IMAGES;
       if (s >= layout->set_count)
          continue;
 
@@ -1113,6 +1229,8 @@ struct dzn_cached_gfx_pipeline_header {
    uint32_t needs_draw_sysvals : 1;
    uint32_t rast_disabled_from_missing_position : 1;
    uint32_t input_count;
+   VkPrimitiveTopology raster_topology;
+   uint32_t raw_binding_count;
 };
 
 static VkResult
@@ -1160,7 +1278,26 @@ dzn_pipeline_cache_lookup_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
       offset += sizeof(*inputs) * info->input_count;
    }
 
-   assert(cached_blob->size == offset + util_bitcount(info->stages) * BLAKE3_KEY_LEN);
+   size_t raw_offset = offset + util_bitcount(info->stages) * BLAKE3_KEY_LEN;
+   if (raw_offset > cached_blob->size ||
+       info->raw_binding_count > (cached_blob->size - raw_offset) / sizeof(struct dzn_raw_image_binding)) {
+      vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+      return VK_SUCCESS;
+   }
+   size_t raw_bytes = info->raw_binding_count * sizeof(struct dzn_raw_image_binding);
+   if (raw_offset + raw_bytes != cached_blob->size) {
+      vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+      return VK_SUCCESS;
+   }
+   if (raw_bytes) {
+      void *bindings = util_dynarray_resize(&pipeline->base.raw_image_bindings,
+         struct dzn_raw_image_binding, info->raw_binding_count);
+      if (!bindings) {
+         vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+         return vk_error(cache->base.device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      memcpy(bindings, (char *)cached_blob->data + raw_offset, raw_bytes);
+   }
 
    u_foreach_bit(s, info->stages) {
       uint8_t *dxil_hash = (uint8_t *)cached_blob->data + offset;
@@ -1178,6 +1315,7 @@ dzn_pipeline_cache_lookup_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
       offset += BLAKE3_KEY_LEN;
    }
 
+   pipeline->ia.raster_topology = info->raster_topology;
    pipeline->rast_disabled_from_missing_position = info->rast_disabled_from_missing_position;
    pipeline->needs_draw_sysvals = info->needs_draw_sysvals;
 
@@ -1206,8 +1344,9 @@ dzn_pipeline_cache_add_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
       }
    }
 
+   size_t raw_bytes = pipeline->base.raw_image_bindings.size;
    struct vk_pipeline_cache_object *cache_obj =
-      dzn_cached_blob_create(cache->base.device, pipeline_hash, NULL, offset);
+      dzn_cached_blob_create(cache->base.device, pipeline_hash, NULL, offset + raw_bytes);
    if (!cache_obj)
       return;
 
@@ -1218,8 +1357,11 @@ dzn_pipeline_cache_add_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
    struct dzn_cached_gfx_pipeline_header *info =
       (struct dzn_cached_gfx_pipeline_header *)(cached_blob->data);
 
+   info->raster_topology = pipeline->ia.raster_topology;
    info->input_count = vertex_input_count;
    info->stages = stages;
+   info->raw_binding_count = util_dynarray_num_elements(&pipeline->base.raw_image_bindings,
+      struct dzn_raw_image_binding);
    info->needs_draw_sysvals = pipeline->needs_draw_sysvals;
    info->rast_disabled_from_missing_position = pipeline->rast_disabled_from_missing_position;
 
@@ -1237,6 +1379,9 @@ dzn_pipeline_cache_add_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
       memcpy(dxil_hash, dxil_hashes[s], BLAKE3_KEY_LEN);
       offset += BLAKE3_KEY_LEN;
    }
+
+   if (raw_bytes)
+      memcpy((char *)cached_blob->data + offset, pipeline->base.raw_image_bindings.data, raw_bytes);
 
    cache_obj = vk_pipeline_cache_add_object(cache, cache_obj);
    vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
@@ -1300,6 +1445,8 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
          vk_to_mesa_shader_stage(info->pStages[i].stage);
 
       assert((unsigned)stage <= MESA_SHADER_FRAGMENT);
+      if (stage == MESA_SHADER_GEOMETRY || stage == MESA_SHADER_TESS_EVAL)
+         pipeline->ia.raster_topology_from_shader = true;
 
       if ((stage == MESA_SHADER_VERTEX ||
            stage == MESA_SHADER_TESS_EVAL ||
@@ -1505,12 +1652,27 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
       if (ret != VK_SUCCESS)
          return ret;
 
+      if (device->raw_image_lowering)
+         dzn_pipeline_collect_raw_images(&pipeline->base, pipeline->templates.shaders[stage].nir, layout);
+
       if (stage == MESA_SHADER_VERTEX)
          pipeline->needs_draw_sysvals = metadata.needs_draw_sysvals;
       pipeline->large_points_expanded |= metadata.lowered_large_points;
    }
 
    nir_shader *domain_shader = pipeline->templates.shaders[MESA_SHADER_TESS_EVAL].nir;
+   pipeline->ia.raster_topology = domain_shader ?
+      domain_shader->info.tess.point_mode ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
+      domain_shader->info.tess._primitive_mode == TESS_PRIMITIVE_ISOLINES ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST :
+      VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : pipeline->ia.vk_topology;
+   const nir_shader *geometry_shader = pipeline->templates.shaders[MESA_SHADER_GEOMETRY].nir;
+   if (geometry_shader) {
+      pipeline->ia.raster_topology = pipeline->large_points_expanded ||
+         geometry_shader->info.gs.output_primitive == MESA_PRIM_POINTS ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
+         geometry_shader->info.gs.output_primitive == MESA_PRIM_LINE_STRIP ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST :
+         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+   }
+
    if (domain_shader && domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT)
       domain_shader->info.tess.ccw = !domain_shader->info.tess.ccw;
    if (pipeline->use_gs_for_polygon_mode_point || pipeline->use_gs_for_provoking_vertex ||
@@ -2269,14 +2431,18 @@ translate_stencil_test(struct dzn_graphics_pipeline *pipeline,
    const VkPipelineDepthStencilStateCreateInfo *in_zsa =
       in->pDepthStencilState;
 
+   VkCullModeFlags cull_mode = in->pRasterizationState->cullMode;
+   if (cull_mode == VK_CULL_MODE_FRONT_AND_BACK)
+      cull_mode = VK_CULL_MODE_NONE;
+
    bool front_test_uses_ref =
-      !(in->pRasterizationState->cullMode & VK_CULL_MODE_FRONT_BIT) &&
+      !(cull_mode & VK_CULL_MODE_FRONT_BIT) &&
       in_zsa->front.compareOp != VK_COMPARE_OP_NEVER &&
       in_zsa->front.compareOp != VK_COMPARE_OP_ALWAYS &&
       (pipeline->zsa.stencil_test.dynamic_compare_mask ||
        in_zsa->front.compareMask != 0);
    bool back_test_uses_ref =
-      !(in->pRasterizationState->cullMode & VK_CULL_MODE_BACK_BIT) &&
+      !(cull_mode & VK_CULL_MODE_BACK_BIT) &&
       in_zsa->back.compareOp != VK_COMPARE_OP_NEVER &&
       in_zsa->back.compareOp != VK_COMPARE_OP_ALWAYS &&
       (pipeline->zsa.stencil_test.dynamic_compare_mask ||
@@ -2297,7 +2463,7 @@ translate_stencil_test(struct dzn_graphics_pipeline *pipeline,
       pipeline->zsa.stencil_test.back.compare_mask = 0;
 
    bool back_wr_uses_ref =
-      !(in->pRasterizationState->cullMode & VK_CULL_MODE_BACK_BIT) &&
+      !(cull_mode & VK_CULL_MODE_BACK_BIT) &&
       ((in_zsa->back.compareOp != VK_COMPARE_OP_ALWAYS &&
         in_zsa->back.failOp == VK_STENCIL_OP_REPLACE) ||
        (in_zsa->back.compareOp != VK_COMPARE_OP_NEVER &&
@@ -2307,7 +2473,7 @@ translate_stencil_test(struct dzn_graphics_pipeline *pipeline,
         in_zsa->depthCompareOp != VK_COMPARE_OP_ALWAYS &&
         in_zsa->back.depthFailOp == VK_STENCIL_OP_REPLACE));
    bool front_wr_uses_ref =
-      !(in->pRasterizationState->cullMode & VK_CULL_MODE_FRONT_BIT) &&
+      !(cull_mode & VK_CULL_MODE_FRONT_BIT) &&
       ((in_zsa->front.compareOp != VK_COMPARE_OP_ALWAYS &&
         in_zsa->front.failOp == VK_STENCIL_OP_REPLACE) ||
        (in_zsa->front.compareOp != VK_COMPARE_OP_NEVER &&
@@ -2319,11 +2485,11 @@ translate_stencil_test(struct dzn_graphics_pipeline *pipeline,
 
    pipeline->zsa.stencil_test.front.write_mask =
       (pipeline->zsa.stencil_test.dynamic_write_mask ||
-       (in->pRasterizationState->cullMode & VK_CULL_MODE_FRONT_BIT)) ?
+       (cull_mode & VK_CULL_MODE_FRONT_BIT)) ?
       0 : in_zsa->front.writeMask;
    pipeline->zsa.stencil_test.back.write_mask =
       (pipeline->zsa.stencil_test.dynamic_write_mask ||
-       (in->pRasterizationState->cullMode & VK_CULL_MODE_BACK_BIT)) ?
+       (cull_mode & VK_CULL_MODE_BACK_BIT)) ?
       0 : in_zsa->back.writeMask;
 
    pipeline->zsa.stencil_test.front.uses_ref = front_test_uses_ref || front_wr_uses_ref;
@@ -2355,8 +2521,7 @@ dzn_graphics_pipeline_translate_zsa(struct dzn_device *device,
       in_rast->rasterizerDiscardEnable ? NULL : in->pDepthStencilState;
    const VkPipelineRenderingCreateInfo *ri = vk_find_struct_const(in, PIPELINE_RENDERING_CREATE_INFO);
 
-   if (!in_zsa ||
-       in_rast->cullMode == VK_CULL_MODE_FRONT_AND_BACK) {
+   if (!in_zsa) {
       /* Ensure depth is disabled if the rasterizer should be disabled / everything culled */
       if (pdev->options14.IndependentFrontAndBackStencilRefMaskSupported) {
          d3d12_gfx_pipeline_state_stream_new_desc(out, DEPTH_STENCIL2, D3D12_DEPTH_STENCIL_DESC2, stream_desc);
@@ -2642,6 +2807,7 @@ dzn_pipeline_init(struct dzn_pipeline *pipeline,
                   struct dzn_pipeline_layout *layout,
                   D3D12_PIPELINE_STATE_STREAM_DESC *stream_desc)
 {
+   pipeline->raw_image_bindings = UTIL_DYNARRAY_INIT;
    pipeline->image_metadata_offset = layout->image_metadata_offset;
    pipeline->type = type;
    pipeline->device = device;
@@ -2679,6 +2845,7 @@ dzn_pipeline_init(struct dzn_pipeline *pipeline,
 static void
 dzn_pipeline_finish(struct dzn_pipeline *pipeline)
 {
+   util_dynarray_fini(&pipeline->raw_image_bindings);
    if (pipeline->state)
       ID3D12PipelineState_Release(pipeline->state);
    if (pipeline->root.sig)
@@ -2812,6 +2979,7 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
                  VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!pipeline)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   pipeline->static_cull_mode = pCreateInfo->pRasterizationState->cullMode;
    pipeline->provoking_vertex_last = provoking &&
       provoking->provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
 
@@ -3431,8 +3599,7 @@ dzn_update_extended_ds(struct dzn_graphics_pipeline *pipeline,
       ds->BackFace.StencilFunc = dzn_translate_compare_op(state->stencil[1].compare);
    }
    if (pipeline->zsa.ds_fmt == DXGI_FORMAT_UNKNOWN || pipeline->rast_disabled_from_missing_position ||
-       ((dyn & DZN_DYNAMIC_DISCARD) && state->discard) ||
-       ((dyn & DZN_DYNAMIC_CULL) && state->cull_mode == VK_CULL_MODE_FRONT_AND_BACK))
+       ((dyn & DZN_DYNAMIC_DISCARD) && state->discard))
       ds->DepthEnable = ds->StencilEnable = ds->DepthBoundsTestEnable = false;
    if (pipeline->zsa.ds_fmt != DXGI_FORMAT_D24_UNORM_S8_UINT &&
        pipeline->zsa.ds_fmt != DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
@@ -3569,8 +3736,7 @@ dzn_graphics_pipeline_get_state_locked(struct dzn_graphics_pipeline *pipeline,
          if (blend)
             blend->AlphaToCoverageEnable = extended->alpha_to_coverage;
       }
-      if (((dyn & DZN_DYNAMIC_DISCARD) && extended->discard) ||
-          ((dyn & DZN_DYNAMIC_CULL) && extended->cull_mode == VK_CULL_MODE_FRONT_AND_BACK)) {
+      if ((dyn & DZN_DYNAMIC_DISCARD) && extended->discard) {
          D3D12_SHADER_BYTECODE *ps = dzn_graphics_pipeline_get_desc(pipeline, stream_buf, ps);
          if (ps)
             *ps = (D3D12_SHADER_BYTECODE){0};
@@ -3894,8 +4060,14 @@ dzn_compute_pipeline_destroy(struct dzn_compute_pipeline *pipeline,
    vk_free2(&pipeline->base.base.device->alloc, alloc, pipeline);
 }
 
+struct dzn_cached_compute_pipeline_header {
+   uint8_t dxil_hash[BLAKE3_KEY_LEN];
+   uint32_t raw_binding_count;
+};
+
 static VkResult
-dzn_pipeline_cache_lookup_compute_pipeline(struct vk_pipeline_cache *cache,
+dzn_pipeline_cache_lookup_compute_pipeline(struct dzn_pipeline *pipeline,
+                                           struct vk_pipeline_cache *cache,
                                            uint8_t *pipeline_hash,
                                            D3D12_PIPELINE_STATE_STREAM_DESC *stream_desc,
                                            D3D12_SHADER_BYTECODE *dxil,
@@ -3918,9 +4090,27 @@ dzn_pipeline_cache_lookup_compute_pipeline(struct vk_pipeline_cache *cache,
    struct dzn_cached_blob *cached_blob =
       container_of(cache_obj, struct dzn_cached_blob, base);
 
-   assert(cached_blob->size == BLAKE3_KEY_LEN);
-
-   const uint8_t *dxil_hash = cached_blob->data;
+   if (cached_blob->size < sizeof(struct dzn_cached_compute_pipeline_header)) {
+      vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+      return VK_SUCCESS;
+   }
+   const struct dzn_cached_compute_pipeline_header *info = (const void *)cached_blob->data;
+   if (info->raw_binding_count > (cached_blob->size - sizeof(*info)) / sizeof(struct dzn_raw_image_binding) ||
+       cached_blob->size != sizeof(*info) + info->raw_binding_count * sizeof(struct dzn_raw_image_binding)) {
+      vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+      return VK_SUCCESS;
+   }
+   if (info->raw_binding_count) {
+      void *bindings = util_dynarray_resize(&pipeline->raw_image_bindings,
+         struct dzn_raw_image_binding, info->raw_binding_count);
+      if (!bindings) {
+         vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+         return vk_error(cache->base.device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      memcpy(bindings, (char *)cached_blob->data + sizeof(*info),
+         info->raw_binding_count * sizeof(struct dzn_raw_image_binding));
+   }
+   const uint8_t *dxil_hash = info->dxil_hash;
    mesa_shader_stage stage;
 
    VkResult ret =
@@ -3941,19 +4131,27 @@ out:
 }
 
 static void
-dzn_pipeline_cache_add_compute_pipeline(struct vk_pipeline_cache *cache,
+dzn_pipeline_cache_add_compute_pipeline(struct dzn_pipeline *pipeline,
+                                        struct vk_pipeline_cache *cache,
                                         uint8_t *pipeline_hash,
                                         uint8_t *dxil_hash)
 {
    struct vk_pipeline_cache_object *cache_obj =
-      dzn_cached_blob_create(cache->base.device, pipeline_hash, NULL, BLAKE3_KEY_LEN);
+      dzn_cached_blob_create(cache->base.device, pipeline_hash, NULL,
+         sizeof(struct dzn_cached_compute_pipeline_header) + pipeline->raw_image_bindings.size);
    if (!cache_obj)
       return;
 
    struct dzn_cached_blob *cached_blob =
       container_of(cache_obj, struct dzn_cached_blob, base);
 
-   memcpy((void *)cached_blob->data, dxil_hash, BLAKE3_KEY_LEN);
+   struct dzn_cached_compute_pipeline_header *info = (void *)cached_blob->data;
+   memcpy(info->dxil_hash, dxil_hash, BLAKE3_KEY_LEN);
+   info->raw_binding_count = util_dynarray_num_elements(&pipeline->raw_image_bindings,
+      struct dzn_raw_image_binding);
+   if (pipeline->raw_image_bindings.size)
+      memcpy((char *)cached_blob->data + sizeof(*info), pipeline->raw_image_bindings.data,
+         pipeline->raw_image_bindings.size);
 
    cache_obj = vk_pipeline_cache_add_object(cache, cache_obj);
    vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
@@ -3990,7 +4188,7 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
       _mesa_blake3_final(&pipeline_hash_ctx, pipeline_hash);
 
       bool cache_hit = false;
-      ret = dzn_pipeline_cache_lookup_compute_pipeline(cache, pipeline_hash,
+      ret = dzn_pipeline_cache_lookup_compute_pipeline(&pipeline->base, cache, pipeline_hash,
                                                        stream_desc, shader,
                                                        &cache_hit);
       pipeline->base.cache_hit = cache_hit;
@@ -4034,6 +4232,9 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
    if (ret != VK_SUCCESS)
       return ret;
 
+   if (device->raw_image_lowering)
+      dzn_pipeline_collect_raw_images(&pipeline->base, nir, layout);
+
    uint8_t bindings_hash[BLAKE3_KEY_LEN], dxil_hash[BLAKE3_KEY_LEN];
 
    NIR_PASS(_, nir, adjust_var_bindings, device, layout, cache ? bindings_hash : NULL);
@@ -4057,7 +4258,7 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
          assert(stage == MESA_SHADER_COMPUTE);
          d3d12_compute_pipeline_state_stream_new_desc(stream_desc, CS, D3D12_SHADER_BYTECODE, cs);
          *cs = *shader;
-         dzn_pipeline_cache_add_compute_pipeline(cache, pipeline_hash, dxil_hash);
+         dzn_pipeline_cache_add_compute_pipeline(&pipeline->base, cache, pipeline_hash, dxil_hash);
          goto out;
       }
    }
@@ -4071,7 +4272,7 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
 
    if (cache) {
       dzn_pipeline_cache_add_dxil_shader(cache, dxil_hash, MESA_SHADER_COMPUTE, shader);
-      dzn_pipeline_cache_add_compute_pipeline(cache, pipeline_hash, dxil_hash);
+      dzn_pipeline_cache_add_compute_pipeline(&pipeline->base, cache, pipeline_hash, dxil_hash);
    }
 
 out:

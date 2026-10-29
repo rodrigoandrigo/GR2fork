@@ -37,6 +37,7 @@
 #include "git_sha1.h"
 
 #include "util/u_debug.h"
+#include "util/uwp_util.h"
 #include "util/disk_cache.h"
 #include "util/format_srgb.h"
 #include "util/macros.h"
@@ -65,6 +66,36 @@
 #endif
 
 #define DZN_API_VERSION VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION)
+
+static unsigned dzn_shader_model_limit = UINT32_MAX;
+static unsigned dzn_force_legacy_barriers;
+static unsigned dzn_raw_image_lowering;
+
+MESA_UWP_EXPORT void
+mesa_uwp_set_raw_image_lowering(int enabled)
+{
+   p_atomic_set(&dzn_raw_image_lowering, enabled != 0);
+}
+
+bool
+dzn_raw_image_lowering_enabled(void)
+{
+   return p_atomic_read(&dzn_raw_image_lowering) != 0;
+}
+
+MESA_UWP_EXPORT void
+mesa_uwp_force_legacy_barriers(int enabled)
+{
+   p_atomic_set(&dzn_force_legacy_barriers, enabled != 0);
+}
+
+MESA_UWP_EXPORT void
+mesa_uwp_set_shader_model_limit(unsigned limit)
+{
+   p_atomic_set(&dzn_shader_model_limit,
+                limit >= D3D_SHADER_MODEL_6_1 && limit <= D3D_SHADER_MODEL_6_8 ? limit : UINT32_MAX);
+}
+
 
 #define MAX_TIER2_MEMORY_TYPES 4
 #define DZN_TEXEL_BUFFER_OFFSET_ALIGNMENT 32
@@ -701,8 +732,10 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &pdev->shader_model,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
                      offsetof(struct dzn_physical_device, shader_model));
-   const uint32_t runtime_layout_version = 18;
+   const uint32_t runtime_layout_version = 28;
    _mesa_blake3_update(&blake3_ctx, &runtime_layout_version, sizeof(runtime_layout_version));
+   bool raw_lowering = dzn_raw_image_lowering_enabled();
+   _mesa_blake3_update(&blake3_ctx, &raw_lowering, sizeof(raw_lowering));
    _mesa_blake3_final(&blake3_ctx, blake3);
    memcpy(pdev->pipeline_cache_uuid, blake3, VK_UUID_SIZE);
 
@@ -801,6 +834,8 @@ dzn_physical_device_cache_caps(struct dzn_physical_device *pdev)
    dzn_physical_device_get_options(pdev, 7, D3D12_FEATURE_D3D12_OPTIONS7, &pdev->options7, sizeof(pdev->options7));
    dzn_physical_device_get_options(pdev, 9, D3D12_FEATURE_D3D12_OPTIONS9, &pdev->options9, sizeof(pdev->options9));
    dzn_physical_device_get_options(pdev, 12, D3D12_FEATURE_D3D12_OPTIONS12, &pdev->options12, sizeof(pdev->options12));
+   if (p_atomic_read(&dzn_force_legacy_barriers))
+      pdev->options12.EnhancedBarriersSupported = false;
    dzn_physical_device_get_options(pdev, 13, D3D12_FEATURE_D3D12_OPTIONS13, &pdev->options13, sizeof(pdev->options13));
    dzn_physical_device_get_options(pdev, 14, D3D12_FEATURE_D3D12_OPTIONS14, &pdev->options14, sizeof(pdev->options14));
    dzn_physical_device_get_options(pdev, 15, D3D12_FEATURE_D3D12_OPTIONS15, &pdev->options15, sizeof(pdev->options15));
@@ -814,6 +849,8 @@ dzn_physical_device_cache_caps(struct dzn_physical_device *pdev)
    if (!dzn_physical_device_get_options(pdev, 21, D3D12_FEATURE_D3D12_OPTIONS21, &pdev->options21, sizeof(pdev->options21))) {
       pdev->options21.ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_0;
    }
+   if (pdev->shader_model < D3D_SHADER_MODEL_6_8)
+      pdev->options21.ExtendedCommandInfoSupported = false;
    {
       D3D12_FEATURE_DATA_FORMAT_SUPPORT a4b4g4r4_support = {
          .Format = DXGI_FORMAT_A4B4G4R4_UNORM
@@ -1370,6 +1407,7 @@ dzn_physical_device_get_properties(const struct dzn_physical_device *pdev,
       devtype = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
    }
 
+   uint32_t image_descriptor_count = dzn_integer_image_loads_supported(pdev) ? 3 : 2;
    *properties = (struct vk_properties){
       .primitiveOverestimationSize =
          pdev->options.ConservativeRasterizationTier >= D3D12_CONSERVATIVE_RASTERIZATION_TIER_2 ?
@@ -1424,8 +1462,8 @@ dzn_physical_device_get_properties(const struct dzn_physical_device *pdev,
          128u : MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
       .maxPerStageDescriptorStorageImages =
          pdev->options.ResourceBindingTier <= D3D12_RESOURCE_BINDING_TIER_2 ?
-         64u / DZN_IMAGE_MIP_DESCRIPTORS :
-         MAX_DESCS_PER_CBV_SRV_UAV_HEAP / (2 * DZN_IMAGE_MIP_DESCRIPTORS),
+         64u / ((image_descriptor_count - 1) * DZN_IMAGE_MIP_DESCRIPTORS) :
+         MAX_DESCS_PER_CBV_SRV_UAV_HEAP / (image_descriptor_count * DZN_IMAGE_MIP_DESCRIPTORS),
       .maxPerStageDescriptorInputAttachments =
          pdev->options.ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_1 ?
          128u : MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
@@ -1436,7 +1474,7 @@ dzn_physical_device_get_properties(const struct dzn_physical_device *pdev,
       .maxDescriptorSetStorageBuffers = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
       .maxDescriptorSetStorageBuffersDynamic = MAX_DYNAMIC_STORAGE_BUFFERS,
       .maxDescriptorSetSampledImages = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
-      .maxDescriptorSetStorageImages = MAX_DESCS_PER_CBV_SRV_UAV_HEAP / (2 * DZN_IMAGE_MIP_DESCRIPTORS),
+      .maxDescriptorSetStorageImages = MAX_DESCS_PER_CBV_SRV_UAV_HEAP / (image_descriptor_count * DZN_IMAGE_MIP_DESCRIPTORS),
       .maxDescriptorSetInputAttachments = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
       .maxVertexInputAttributes = MIN2(D3D12_STANDARD_VERTEX_ELEMENT_COUNT, MAX_VERTEX_GENERIC_ATTRIBS),
       .maxVertexInputBindings = MAX_VBS,
@@ -1627,7 +1665,7 @@ dzn_physical_device_get_properties(const struct dzn_physical_device *pdev,
       .maxPerStageDescriptorUpdateAfterBindUniformBuffers = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
       .maxPerStageDescriptorUpdateAfterBindStorageBuffers = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
       .maxPerStageDescriptorUpdateAfterBindSampledImages = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
-      .maxPerStageDescriptorUpdateAfterBindStorageImages = MAX_DESCS_PER_CBV_SRV_UAV_HEAP / (2 * DZN_IMAGE_MIP_DESCRIPTORS),
+      .maxPerStageDescriptorUpdateAfterBindStorageImages = MAX_DESCS_PER_CBV_SRV_UAV_HEAP / (image_descriptor_count * DZN_IMAGE_MIP_DESCRIPTORS),
       .maxPerStageDescriptorUpdateAfterBindInputAttachments = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
       .maxPerStageUpdateAfterBindResources = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
       .maxDescriptorSetUpdateAfterBindSamplers = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
@@ -1636,7 +1674,7 @@ dzn_physical_device_get_properties(const struct dzn_physical_device *pdev,
       .maxDescriptorSetUpdateAfterBindStorageBuffers = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
       .maxDescriptorSetUpdateAfterBindStorageBuffersDynamic = MAX_DYNAMIC_STORAGE_BUFFERS,
       .maxDescriptorSetUpdateAfterBindSampledImages = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
-      .maxDescriptorSetUpdateAfterBindStorageImages = MAX_DESCS_PER_CBV_SRV_UAV_HEAP / (2 * DZN_IMAGE_MIP_DESCRIPTORS),
+      .maxDescriptorSetUpdateAfterBindStorageImages = MAX_DESCS_PER_CBV_SRV_UAV_HEAP / (image_descriptor_count * DZN_IMAGE_MIP_DESCRIPTORS),
       .maxDescriptorSetUpdateAfterBindInputAttachments = MAX_DESCS_PER_CBV_SRV_UAV_HEAP,
 
       .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT | VK_RESOLVE_MODE_AVERAGE_BIT |
@@ -1825,6 +1863,104 @@ dzn_get_most_capable_format_for_casting(VkFormat format, VkImageCreateFlags crea
    }
 }
 
+DXGI_FORMAT
+dzn_image_get_integer_uav_format(const struct dzn_physical_device *pdev, VkFormat format)
+{
+   if (!pdev->options.TypedUAVLoadAdditionalFormats || dzn_bindless_supported(pdev))
+      return DXGI_FORMAT_UNKNOWN;
+   DXGI_FORMAT integer, normalized;
+   switch (format) {
+   case VK_FORMAT_R8_SNORM:
+      integer = DXGI_FORMAT_R8_UINT;
+      normalized = DXGI_FORMAT_R8_SNORM;
+      break;
+   case VK_FORMAT_R8G8B8A8_SNORM:
+      integer = DXGI_FORMAT_R8G8B8A8_UINT;
+      normalized = DXGI_FORMAT_R8G8B8A8_SNORM;
+      break;
+   case VK_FORMAT_R16_UNORM:
+      integer = DXGI_FORMAT_R16_UINT;
+      normalized = DXGI_FORMAT_R16_UNORM;
+      break;
+   case VK_FORMAT_R16G16B16A16_UNORM:
+      integer = DXGI_FORMAT_R16G16B16A16_UINT;
+      normalized = DXGI_FORMAT_R16G16B16A16_UNORM;
+      break;
+   case VK_FORMAT_R8_UNORM:
+      integer = DXGI_FORMAT_R8_UINT;
+      normalized = DXGI_FORMAT_R8_UNORM;
+      break;
+   case VK_FORMAT_R8G8B8A8_UNORM:
+      integer = DXGI_FORMAT_R8G8B8A8_UINT;
+      normalized = DXGI_FORMAT_R8G8B8A8_UNORM;
+      break;
+   case VK_FORMAT_R16_SFLOAT:
+      integer = DXGI_FORMAT_R16_UINT;
+      normalized = DXGI_FORMAT_R16_FLOAT;
+      break;
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
+      integer = DXGI_FORMAT_R16G16B16A16_UINT;
+      normalized = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      break;
+   case VK_FORMAT_R32_SFLOAT:
+      integer = DXGI_FORMAT_R32_UINT;
+      normalized = DXGI_FORMAT_R32_FLOAT;
+      break;
+   case VK_FORMAT_R32G32B32A32_SFLOAT:
+      integer = DXGI_FORMAT_R32G32B32A32_UINT;
+      normalized = DXGI_FORMAT_R32G32B32A32_FLOAT;
+      break;
+   default:
+      return DXGI_FORMAT_UNKNOWN;
+   }
+   D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {.Format = integer};
+   HRESULT hr = ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_FORMAT_SUPPORT,
+                                                 &support, sizeof(support));
+   if (FAILED(hr) || !(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW))
+      return DXGI_FORMAT_UNKNOWN;
+   support = (D3D12_FEATURE_DATA_FORMAT_SUPPORT) {.Format = normalized};
+   hr = ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_FORMAT_SUPPORT,
+                                         &support, sizeof(support));
+   if (FAILED(hr) || !(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) ||
+       !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
+      return DXGI_FORMAT_UNKNOWN;
+   return integer;
+}
+
+bool
+dzn_integer_image_loads_supported(const struct dzn_physical_device *pdev)
+{
+   return dzn_image_get_integer_uav_format(pdev, VK_FORMAT_R8_SNORM) != DXGI_FORMAT_UNKNOWN ||
+          dzn_image_get_integer_uav_format(pdev, VK_FORMAT_R8G8B8A8_SNORM) != DXGI_FORMAT_UNKNOWN ||
+          dzn_image_get_integer_uav_format(pdev, VK_FORMAT_R16_UNORM) != DXGI_FORMAT_UNKNOWN ||
+          dzn_image_get_integer_uav_format(pdev, VK_FORMAT_R16G16B16A16_UNORM) != DXGI_FORMAT_UNKNOWN;
+}
+
+static bool
+dzn_required_additional_uav_format(DXGI_FORMAT format)
+{
+   switch (format) {
+   case DXGI_FORMAT_R32G32B32A32_FLOAT:
+   case DXGI_FORMAT_R32G32B32A32_UINT:
+   case DXGI_FORMAT_R32G32B32A32_SINT:
+   case DXGI_FORMAT_R16G16B16A16_FLOAT:
+   case DXGI_FORMAT_R16G16B16A16_UINT:
+   case DXGI_FORMAT_R16G16B16A16_SINT:
+   case DXGI_FORMAT_R8G8B8A8_UNORM:
+   case DXGI_FORMAT_R8G8B8A8_UINT:
+   case DXGI_FORMAT_R8G8B8A8_SINT:
+   case DXGI_FORMAT_R16_FLOAT:
+   case DXGI_FORMAT_R16_UINT:
+   case DXGI_FORMAT_R16_SINT:
+   case DXGI_FORMAT_R8_UNORM:
+   case DXGI_FORMAT_R8_UINT:
+   case DXGI_FORMAT_R8_SINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 D3D12_FEATURE_DATA_FORMAT_SUPPORT
 dzn_physical_device_get_format_support(struct dzn_physical_device *pdev,
                                        VkFormat format,
@@ -1866,6 +2002,11 @@ dzn_physical_device_get_format_support(struct dzn_physical_device *pdev,
       ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_FORMAT_SUPPORT,
                                         &dfmt_info, sizeof(dfmt_info));
    assert(!FAILED(hres));
+
+   if (pdev->options.TypedUAVLoadAdditionalFormats &&
+       (dfmt_info.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
+       dzn_required_additional_uav_format(dfmt_info.Format))
+      dfmt_info.Support2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
 
    if (usage != VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
       return dfmt_info;
@@ -2070,6 +2211,28 @@ dzn_physical_device_get_format_properties(struct dzn_physical_device *pdev,
       base_props->bufferFeatures = 0;
 
    dzn_physical_device_fill_format_properties3(properties, dfmt_info.Support2);
+   if (dzn_image_get_integer_uav_format(pdev, format) != DXGI_FORMAT_UNKNOWN) {
+      vk_foreach_struct(ext, properties->pNext) {
+         if (ext->sType != VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3)
+            continue;
+         VkFormatProperties3 *properties3 = (VkFormatProperties3 *)ext;
+         if (properties3->optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT)
+            properties3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
+         if (properties3->linearTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT)
+            properties3->linearTilingFeatures |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
+      }
+   }
+   if (dzn_raw_image_lowering_enabled() && dzn_integer_image_loads_supported(pdev) &&
+       dzn_raw_image_format(format)) {
+      vk_foreach_struct(ext, properties->pNext) {
+         if (ext->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) {
+            VkFormatProperties3 *props = (VkFormatProperties3 *)ext;
+            if (props->optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT)
+               props->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
+         }
+      }
+   }
+
 }
 
 static VkResult
@@ -2317,7 +2480,9 @@ dzn_physical_device_get_format_features2(struct dzn_physical_device *pdev,
          dzn_physical_device_get_format_support(pdev, format, 0);
 
       features2 |= VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
-      if (dfmt_info.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD)
+      if ((dfmt_info.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) ||
+          ((features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
+           dzn_image_get_integer_uav_format(pdev, format) != DXGI_FORMAT_UNKNOWN))
          features2 |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
    }
 
@@ -2348,6 +2513,10 @@ dzn_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
          dzn_physical_device_get_format_features2(pdev, format, props->optimalTilingFeatures);
       props3->bufferFeatures =
          dzn_physical_device_get_format_features2(pdev, format, props->bufferFeatures);
+      if (dzn_raw_image_lowering_enabled() && dzn_integer_image_loads_supported(pdev) &&
+          dzn_raw_image_format(format) &&
+          (props3->optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT))
+         props3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
    }
 }
 
@@ -2545,6 +2714,7 @@ dzn_instance_create(const VkInstanceCreateInfo *pCreateInfo,
    instance->max_shader_model =
       max_shader_model && sscanf(max_shader_model, "%u.%u", &sm_major, &sm_minor) == 2 ?
       (sm_major << 4) | sm_minor : UINT32_MAX;
+   instance->max_shader_model = MIN2(instance->max_shader_model, p_atomic_read(&dzn_shader_model_limit));
    instance->max_d3d12_options =
       debug_get_num_option("DZN_MAX_D3D12_OPTIONS", UINT32_MAX);
 
@@ -3274,6 +3444,8 @@ dzn_device_create(struct dzn_physical_device *pdev,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
+   list_inithead(&device->raw_image_backings);
+
    /* Must be done after vk_device_init() because this function memset(0) the
     * whole struct.
     */
@@ -3391,6 +3563,11 @@ dzn_device_create(struct dzn_physical_device *pdev,
       device->need_swapchain_blits = true;
    }
 
+   device->integer_image_loads = dzn_integer_image_loads_supported(pdev);
+   device->raw_image_lowering = dzn_raw_image_lowering_enabled() && device->integer_image_loads && !device->bindless;
+   _debug_printf("Dozen device shader_model=0x%x integer_image_loads=%u resource_binding_tier=%u enhanced_barriers=%u\n",
+                 pdev->shader_model, device->integer_image_loads, pdev->options.ResourceBindingTier,
+                 pdev->options12.EnhancedBarriersSupported);
    device->support_static_samplers = true;
    /* Direct heap indexing has a rare custom-view-cache fallback to a whole-
     * buffer view. Keep robustness2-enabled devices on bounded descriptor
@@ -4987,6 +5164,7 @@ dzn_sampler_create(struct dzn_device *device,
       }
    }
 
+   sampler->unnormalized = pCreateInfo->unnormalizedCoordinates;
    if (pCreateInfo->unnormalizedCoordinates && pdev->options17.NonNormalizedCoordinateSamplersSupported)
       sampler->desc.Flags |= D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
 

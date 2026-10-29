@@ -97,6 +97,54 @@ dzn_meta_compile_shader(struct dzn_device *device, nir_shader *nir,
    slot->BytecodeLength = size;
 }
 
+static void
+dzn_meta_raw_image_merge_finish(struct dzn_device *device)
+{
+   if (device->raw_image_merge.reset)
+      ID3D12PipelineState_Release(device->raw_image_merge.reset);
+   if (device->raw_image_merge.merge)
+      ID3D12PipelineState_Release(device->raw_image_merge.merge);
+   if (device->raw_image_merge.root_sig)
+      ID3D12RootSignature_Release(device->raw_image_merge.root_sig);
+   memset(&device->raw_image_merge, 0, sizeof(device->raw_image_merge));
+}
+
+static VkResult
+dzn_meta_raw_image_merge_init(struct dzn_device *device)
+{
+   D3D12_ROOT_PARAMETER1 params[] = {
+      {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+       .Constants = {.ShaderRegister = 0, .Num32BitValues = 3}},
+      {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV, .Descriptor = {.ShaderRegister = 1}},
+      {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV, .Descriptor = {.ShaderRegister = 2}},
+   };
+   D3D12_VERSIONED_ROOT_SIGNATURE_DESC root = {.Version = D3D_ROOT_SIGNATURE_VERSION_1_1,
+      .Desc_1_1 = {.NumParameters = ARRAY_SIZE(params), .pParameters = params}};
+   device->raw_image_merge.root_sig = dzn_device_create_root_sig(device, &root);
+   if (!device->raw_image_merge.root_sig)
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   glsl_type_singleton_init_or_ref();
+   VkResult result = VK_SUCCESS;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_shader *nir = dzn_nir_raw_image_merge_shader(i == 0);
+      D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {.pRootSignature = device->raw_image_merge.root_sig};
+      dzn_meta_compile_shader(device, nir, &desc.CS);
+      ID3D12PipelineState **state = i == 0 ? &device->raw_image_merge.reset : &device->raw_image_merge.merge;
+      HRESULT hr = ID3D12Device1_CreateComputePipelineState(device->dev, &desc,
+         &IID_ID3D12PipelineState, (void **)state);
+      free((void *)desc.CS.pShaderBytecode);
+      ralloc_free(nir);
+      if (FAILED(hr)) {
+         result = vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         break;
+      }
+   }
+   glsl_type_singleton_decref();
+   if (result != VK_SUCCESS)
+      dzn_meta_raw_image_merge_finish(device);
+   return result;
+}
+
 #define DZN_META_INDIRECT_DRAW_MAX_PARAM_COUNT 5
 
 static void
@@ -953,6 +1001,7 @@ dzn_meta_blits_init(struct dzn_device *device)
 void
 dzn_meta_finish(struct dzn_device *device)
 {
+   dzn_meta_raw_image_merge_finish(device);
    dzn_meta_large_point_draw_args_finish(device);
    dzn_meta_query_reduce_finish(device);
    for (uint32_t i = 0; i < ARRAY_SIZE(device->triangle_fan); i++)
@@ -975,6 +1024,12 @@ dzn_meta_init(struct dzn_device *device)
    result = dzn_meta_query_reduce_init(device);
    if (result != VK_SUCCESS)
       goto out;
+
+   if (dzn_raw_image_lowering_enabled()) {
+      result = dzn_meta_raw_image_merge_init(device);
+      if (result != VK_SUCCESS)
+         goto out;
+   }
 
    result = dzn_meta_large_point_draw_args_init(device);
    if (result != VK_SUCCESS)

@@ -216,7 +216,17 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR>();
+        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
+        vk::PhysicalDeviceCustomBorderColorFeaturesEXT,
+        vk::PhysicalDeviceDepthClipControlFeaturesEXT, vk::PhysicalDeviceDepthClipEnableFeaturesEXT,
+        vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT,
+        vk::PhysicalDeviceProvokingVertexFeaturesEXT, vk::PhysicalDeviceImageViewMinLodFeaturesEXT,
+        vk::PhysicalDeviceMaintenance5FeaturesKHR, vk::PhysicalDeviceMaintenance6FeaturesKHR,
+        vk::PhysicalDeviceMaintenance8FeaturesKHR,
+        vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT,
+        vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+        vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT,
+        vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -235,12 +245,19 @@ bool Instance::CreateDevice() {
     }
 
     boost::container::static_vector<const char*, 48> enabled_extensions;
-    const auto add_extension = [&](std::string_view extension) -> bool {
+    const auto add_extension = [&](std::string_view extension,
+                                   bool feature_supported = true) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
                          [&](const std::string& name) { return name == extension; });
 
         if (result != available_extensions.end()) {
+            if (!feature_supported) {
+                LOG_WARNING(Render_Vulkan,
+                            "Optional extension {} lacks the required feature; using fallback",
+                            extension);
+                return false;
+            }
             LOG_INFO(Render_Vulkan, "Enabling extension: {}", extension);
             enabled_extensions.push_back(extension.data());
             return true;
@@ -251,15 +268,17 @@ bool Instance::CreateDevice() {
     };
 
 #ifdef SHADPS4_UWP
-    for (const char* extension : {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
-                                 VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
-                                 VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
-                                 VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME,
-                                 VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME,
-                                 VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME}) {
+    for (const char* extension :
+         {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+          VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
+          VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME,
+          VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME}) {
         ASSERT_MSG(add_extension(extension), "Required Dozen extension unavailable: {}", extension);
     }
-    dynamic_state = add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    dynamic_state =
+        add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
+                      feature_chain.get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>()
+                          .extendedDynamicState);
     if (!dynamic_state) {
         LOG_WARNING(Render_Vulkan, "Using static pipeline states without extended dynamic state");
     }
@@ -284,13 +303,24 @@ bool Instance::CreateDevice() {
                "Required Vulkan feature unavailable: nullDescriptor");
 
     // Optional
-    maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
-    maintenance_6 = add_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME);
-    maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
-    attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+    maintenance_5 =
+        add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME,
+                      feature_chain.get<vk::PhysicalDeviceMaintenance5FeaturesKHR>().maintenance5);
+    maintenance_6 =
+        add_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME,
+                      feature_chain.get<vk::PhysicalDeviceMaintenance6FeaturesKHR>().maintenance6);
+    maintenance_8 =
+        add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+                      feature_chain.get<vk::PhysicalDeviceMaintenance8FeaturesKHR>().maintenance8);
+    attachment_feedback_loop =
+        add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
+                      feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>()
+                          .attachmentFeedbackLoopLayout);
     if (attachment_feedback_loop) {
-        attachment_feedback_loop =
-            add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+        attachment_feedback_loop = add_extension(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
+            feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>()
+                .attachmentFeedbackLoopDynamicState);
         if (!attachment_feedback_loop) {
             // We want both extensions so remove the first if the second isn't available
             enabled_extensions.pop_back();
@@ -304,10 +334,21 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- extendedDynamicState3ColorWriteMask: {}",
                  dynamic_state_3_features.extendedDynamicState3ColorWriteMask);
     }
-    custom_border_color = add_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
-    depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
-    depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
-    vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    custom_border_color = add_extension(
+        VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
+        feature_chain.get<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>().customBorderColors &&
+            feature_chain.get<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>()
+                .customBorderColorWithoutFormat);
+    depth_clip_control = add_extension(
+        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+        feature_chain.get<vk::PhysicalDeviceDepthClipControlFeaturesEXT>().depthClipControl);
+    depth_clip_enable = add_extension(
+        VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
+        feature_chain.get<vk::PhysicalDeviceDepthClipEnableFeaturesEXT>().depthClipEnable);
+    vertex_input_dynamic_state =
+        add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME,
+                      feature_chain.get<vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT>()
+                          .vertexInputDynamicState);
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
     // slows down KosmicKrisp due to unrolling. Revisit if KosmicKrisp moves this to mesh shaders.
     list_restart = driver_id != vk::DriverId::eMesaKosmickrisp &&
@@ -323,10 +364,14 @@ bool Instance::CreateDevice() {
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
     if (!amd_shader_explicit_vertex_parameter) {
-        fragment_shader_barycentric =
-            add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+        fragment_shader_barycentric = add_extension(
+            VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+            feature_chain.get<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>()
+                .fragmentShaderBarycentric);
     }
-    provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    provoking_vertex = add_extension(
+        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+        feature_chain.get<vk::PhysicalDeviceProvokingVertexFeaturesEXT>().provokingVertexLast);
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     image_load_store_lod = add_extension(VK_AMD_SHADER_IMAGE_LOAD_STORE_LOD_EXTENSION_NAME);
     amd_gcn_shader = add_extension(VK_AMD_GCN_SHADER_EXTENSION_NAME);
@@ -366,7 +411,9 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- sampler2DViewOf3D: {}",
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
-    image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    image_view_min_lod =
+        add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
+                      feature_chain.get<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>().minLod);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
@@ -891,7 +938,8 @@ vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const
         UNIMPLEMENTED_MSG("Properties of format {} have not been queried.", vk::to_string(format));
     }
 
-    return it->second.optimalTilingFeatures | it->second.bufferFeatures;
+    return it->second.optimalTilingFeatures |
+           (it->second.bufferFeatures & vk::FormatFeatureFlagBits2::eVertexBuffer);
 }
 
 bool Instance::IsFormatSupported(const vk::Format format,

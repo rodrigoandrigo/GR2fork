@@ -962,3 +962,186 @@ inicialização/encerramento completos com uma DLL de diagnóstico limitada a SM
 e biblioteca desativada (`INIT=0`, `SMOKE_SHUTDOWN=0`). O pacote Release foi
 recompilado, assinado e teve as DLLs conferidas. Logs em `Build/xbox-device-init/`
 e `Build/uwp-xbox-device-init.log`. A confirmação no Xbox continua pendente.
+
+
+### Seleção de capacidades Vulkan por dispositivo (28/10/2026)
+
+A seleção de extensões opcionais consulta também os bits de funcionalidade usados
+pelo renderer: estados dinâmicos, custom border, depth clip, vertex input,
+barycentrics, provoking vertex, min LOD, maintenance 5/6/8 e feedback loop.
+Uma extensão anunciada com a funcionalidade necessária desativada não habilita
+esse caminho. As consultas de formatos de imagem usam optimalTilingFeatures;
+capacidade de buffer só participa da consulta de entrada de vértices. Isso evita
+considerar uma imagem legível por storage apenas porque o buffer aceita a operação.
+
+Os arquivos shadps4-PC.log e shadps4-Xbox.log fornecidos registram inicialização.
+O arquivo do Xbox ainda contém a tentativa antiga de criar a biblioteca de PSOs,
+seguida de ErrorDeviceLost na criação da fence, anterior à proteção já aplicada.
+Não contém execução de shaders de um jogo que permita atribuir uma falha de
+renderização a cada extensão/formato ausente. O usuário confirmou posteriormente
+que a inicialização no Xbox passou.
+
+Esta alteração não implementa conversão geral de imagens sem UAV_TYPED_LOAD,
+formatos compactados alternativos ou extensões ausentes; as pendências de imagens
+continuam descritas em DOZEN-FORMAT-CONVERSION.md.
+
+Validação: Release compilado e bundle assinado (CMS_SIGNATURE=PASS), com hashes
+das quatro DLLs conferidos dentro do payload x64. O harness existente completou
+inicialização/encerramento no PC com driver normal e com o diagnóstico SM6.4:
+INIT=0 e SMOKE_SHUTDOWN=0 em ambos. Logs em Build/vulkan-capabilities/.
+Essas verificações não validam a ausência de elementos na gameplay do Xbox
+relatada pelo usuário; o log fornecido termina antes dessa etapa.
+
+
+### Parâmetros de draw em Shader Model 6.4 (28/10/2026)
+
+O diagnóstico do PC limitado a SM6.4 e sem estados dinâmicos/barycentrics
+reproduziu uma rejeição DXIL na criação do pipeline de apresentação:
+`Opcode StartVertexLocation not valid in shader model vs_6_4`.
+A seleção anterior considerava apenas OPTIONS21.ExtendedCommandInfoSupported,
+mesmo quando o Shader Model selecionado não admitia essas instruções.
+
+O cache de capacidades agora desativa ExtendedCommandInfoSupported abaixo de
+SM6.8. Com isso, tanto a tradução de shaders quanto a preparação dos draws
+indiretos selecionam o caminho existente de constantes de runtime, preservando
+first vertex e base instance. Não há substituição desses valores por zero.
+A versão do cache passou a 19 para invalidar os shaders anteriores.
+
+PAC-MAN 256 passou de falha de criação do pipeline a 3251 presents em 60 segundos
+no diagnóstico limitado do PC, com captura do cenário/personagens e encerramento
+BOOT_RESULT=0 / SHUTDOWN=0. O diagnóstico não reproduz todas as limitações de
+formatos do Xbox, e não prova correção dos artefatos no console. Arquivos locais
+em Build/xbox-visual-investigation/.
+
+Bloodborne também exibiu a tela inicial com imagem no diagnóstico SM6.4 após
+120 segundos, com BOOT_RESULT=0 e SHUTDOWN=0. A primeira execução fria de
+75 segundos capturou um quadro preto durante a inicialização; não foi usada
+como prova de falha persistente. Os probes existentes de draw direto e indireto
+em SM6.4 produziram 4096 pixels vermelhos. O bundle Release foi assinado e os
+hashes das DLLs conferidos com o núcleo e Mesa recém-compilados. A confirmação
+visual no Xbox continua necessária.
+
+
+### Diagnóstico independente no Xbox
+
+`tools/DozenDiagnostics/README.md` descreve a aplicação UWP separada, sua compilação
+e a coleta de `LocalState/dozen-diagnostics.log`. A primeira bateria cobre 22
+formatos e 110 combinações de leitura/escrita, com verificação dos valores lidos
+da GPU. O pacote foi compilado e assinado; o verificador passou no PC e rejeitou
+um controle negativo. A execução no Xbox e a cobertura de rasterização permanecem
+pendentes. O diagnóstico não altera o renderer do emulador.
+
+
+No Xbox, a bateria schema 1 concluiu com `passed=91 failed=0 unsupported=19
+api_errors=0`. Todos os 19 casos não executados eram leituras storage sem formato;
+as leituras tipadas dos mesmos formatos passaram. Isso não comprova equivalência
+para amostragem filtrada, rasterização ou combinações de uso fora da bateria.
+O pacote 1.0.1.0/schema 2 acrescenta 48 casos de rasterização/blending/depth/stencil.
+O verificador no PC registrou quatro falhas de cull_both no Dozen. Esses novos
+casos ainda aguardam execução no Xbox.
+
+
+O Xbox concluiu o schema 2 com `passed=135 failed=4 unsupported=19 api_errors=0`.
+As quatro divergências ocorreram em cull_both, nos quatro formatos de render target.
+O mapeamento D3D12 usava CULL_MODE_NONE e não eliminava a cobertura dos triângulos.
+A correção aplica scissors vazios aos polígonos com descarte de ambas as faces,
+restaura os scissors no draw seguinte e mantém os estágios anteriores executando.
+Pontos e linhas conservam o tratamento próprio, incluindo depth/stencil. A topologia
+de saída de GS/TES é mantida no cache; a versão do cache do driver passou a 20.
+
+O schema 3/pacote 1.0.2.0 inclui essa correção e amplia a bateria a 182 casos.
+A bateria anterior passou integralmente no PC com o driver corrigido; a ampliada
+também passou, incluindo cobertura de pontos/linhas e contadores de efeitos
+laterais. O Xbox confirmou essa execução: `passed=163 failed=0 unsupported=19 api_errors=0`,
+com cobertura preservada de pontos/linhas e contadores vertex=3/fragment=0 nos
+casos de descarte. Isso valida a correção de cull_both nos casos dessa bateria.
+
+
+O schema 4/pacote 1.0.3.0 corrige a consulta do grupo D3D12 garantido por
+TypedUAVLoadAdditionalFormats: nove dos 19 formatos do relatório Xbox pertencem
+a esse grupo. Os dez opcionais continuam condicionados à consulta individual.
+A leitura sem formato ganhou uma segunda fase de leitura/escrita/releitura,
+conferida pelo verificador. O PC passou em 182 casos e o controle negativo
+da nova fase foi detectado. O Xbox confirmou o schema 4: `passed=172 failed=0 unsupported=10 api_errors=0`,
+incluindo as duas fases dos nove casos recuperados. A versão do cache do driver
+passou a 21. Detalhes e lista dos formatos no README do diagnóstico.
+
+
+O schema 5/pacote de diagnóstico 1.0.4.0 acrescenta probes D3D12/SM6.4 para
+conversão por aliases UAV inteiras em quatro dos dez formatos restantes. Eles
+usam o mesmo recurso para leitura inteira e escrita normalizada, conferem valores
+intermediários/negativos e releitura após barreira, no adaptador do Dozen. Não
+alteram o suporte Vulkan anunciado. A integração de produção e a confirmação no
+Xbox continuam pendentes; detalhes no README de tools/DozenDiagnostics.
+
+
+O Xbox confirmou os quatro probes nativos do schema 5. O schema 6/pacote de
+diagnóstico 1.0.5.0 integra esse fallback a quatro formatos no Dozen e adiciona
+casos de arrays/aliases e cópia de descritores. O PC confirmou 186 casos Vulkan e
+quatro probes nativos com limite SM6.4 explícito, registrado pelo driver. A versão
+do cache passou a 22. Os limites por variável de ambiente usados anteriormente
+não eram efetivos na build UWP; o novo diagnóstico aplica o limite por API antes
+de criar a instância. A integração no Xbox e os seis formatos restantes seguem
+pendentes. Evidências e limites estão no README de tools/DozenDiagnostics.
+
+
+O Xbox confirmou os quatro fallbacks e os casos de arrays/cópia do schema 6,
+mas registrou três regressões na leitura inicial de outros formatos: total
+177 PASS, 3 FAIL e 6 sem suporte. Foi corrigida uma dependência UAV ausente quando
+uma barreira Vulkan de imagem mantém o mesmo estado no caminho D3D12 legado.
+O pacote de diagnóstico 1.0.6.0/schema 7 força esse caminho também no PC. A
+confirmação da correção das três falhas no Xbox ainda depende do novo log.
+
+
+O schema 7 no Xbox retornou 176 PASS, 4 FAIL e 6 sem suporte: a correção de
+barreira não eliminou as leituras float divergentes. O pacote 1.0.7.0/schema 8
+amplia a leitura por UAV inteira para UNORM8 e float16/32 nas famílias garantidas,
+com decodificação por formato e escritas na vista original. Cache 23. No PC,
+192 casos Vulkan e quatro probes nativos passaram com SM6.4 e barreiras legadas
+explícitos. O Xbox confirmou o schema 8: 186 PASS, 0 FAIL, 6 sem suporte e 0 erros de API,
+além dos quatro probes nativos aprovados. As quatro divergências anteriores
+foram eliminadas nessa bateria; os seis formatos opcionais seguem pendentes.
+Detalhes e evidências no README do diagnóstico.
+
+
+O pacote de diagnóstico 1.0.8.0/schema 9 acrescenta uma ponte experimental GPU
+textura -> buffer raw -> textura para os seis formatos restantes. No PC passaram
+os seis probes, incluindo releitura e conferência dos bits de retorno; um controle
+negativo dessa última etapa foi detectado. O driver e o suporte Vulkan anunciado
+permanecem inalterados. O Xbox confirmou os seis probes raw, incluindo releitura e bits de retorno à
+textura: 186 PASS Vulkan, 0 FAIL, 6 sem suporte, 0 erros de API, quatro probes de
+aliases e seis probes raw aprovados. A integração persistente/coerente ao Dozen
+segue pendente. Detalhes no README do diagnóstico.
+
+
+O pacote 1.0.9.0/schema 10 integra a ponte raw explícita ao Dozen: backing por
+imagem, memória contabilizada pelo driver, autoridade/layout por subrecurso,
+reutilização limpa e materialização em barreiras e no fim da lista. Os doze casos
+Vulkan da ponte passaram no PC, incluindo mip/camada não zero e três submissões
+com o mesmo buffer. O Xbox confirmou os doze casos, incluindo os contadores esperados e o mesmo
+buffer em três submissões: 186 PASS Vulkan, 0 FAIL, 6 sem suporte e 0 erros de API.
+O lowering automático e a coerência geral entre todos os acessos/aliases continuam pendentes;
+o suporte sem formato dos seis formatos não foi habilitado. Contrato e evidências
+estão no README de tools/DozenDiagnostics.
+
+
+O pacote 1.0.10.0/schema 11 acrescenta compartilhamento/refcount do backing raw
+entre aliases físicos com a mesma memória/offset e layout nativo compatível.
+Dezoito casos passaram no PC, incluindo escrita/leitura entre duas imagens e
+sobrevivência do backing após destruir a imagem criadora. O Xbox confirmou os
+18 casos, sem falhas ou erros de API; os seis casos sem formato seguem sem suporte.
+
+O pacote 1.0.11.0/schema 12 acrescenta materialização/invalidação por subrecurso
+nos consumidores nativos da ponte: cópias, blits, resolves, clears e color attachments.
+O Xbox confirmou os 24 casos persistentes, incluindo clear/upload/attachment
+seguidos por leitura raw e amostragem, sem falhas ou erros de API.
+
+O pacote 1.0.12.0/schema 13 implementa lowering NIR automático de cargas/stores
+para os seis formatos, metadados por descritor e conservação dos bindings no
+cache serializado de pipelines. O diagnóstico ativa o caminho explicitamente;
+o emulador mantém o padrão desativado. No PC passaram 198 casos Vulkan, 24 casos
+da ponte e 18 casos automáticos com valores especiais, mip/layer,
+clear/upload/attachment, amostragem, bytes nativos e cache hit após serialização. O perfil normal também passou.
+Xbox/schema 13 ainda não validado; combinações simultâneas de storage, sampler e
+attachments e os demais limites da representação continuam pendentes. Contrato
+e evidências no README do diagnóstico.

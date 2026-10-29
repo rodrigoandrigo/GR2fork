@@ -20,6 +20,9 @@ MESA_UWP_EXPORT void* uwp_get_window_reference(void);
  * the host supplies a new reference. Width/height are published together. */
 MESA_UWP_EXPORT void uwp_set_window_reference(void *window, int width, int height);
 MESA_UWP_EXPORT void mesa_uwp_set_offscreen(int enabled);
+MESA_UWP_EXPORT void mesa_uwp_set_shader_model_limit(unsigned limit);
+MESA_UWP_EXPORT void mesa_uwp_force_legacy_barriers(int enabled);
+MESA_UWP_EXPORT void mesa_uwp_set_raw_image_lowering(int enabled);
 MESA_UWP_EXPORT int mesa_uwp_is_offscreen(void);
 typedef long (__cdecl *mesa_uwp_swapchain_attach_callback)(void *opaque,
                                                            void *swapchain);
