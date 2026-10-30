@@ -1163,7 +1163,7 @@ bool RunMixedCmask(uint8_t *bytes, uint32_t format = 10, uint32_t number = 0,
   for (uint32_t i = 0; i < target_bytes; ++i)
     target[i] = 0xee;
   std::memset(metadata, expanded | (expanded << 4), 2048);
-  metadata[0] = (expanded << 4) | coverage_log2;
+  metadata[0] = (expanded << 4) | 0u;
   const auto vop1 = [](uint32_t op, uint32_t dst, uint32_t src) {
     return 0x7e000000u | (dst << 17) | (op << 9) | src;
   };

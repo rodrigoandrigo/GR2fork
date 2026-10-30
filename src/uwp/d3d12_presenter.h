@@ -42,7 +42,17 @@ public:
 
 private:
     struct Frame;
-    void ConvertResident(Frame& frame);
+    struct CommandFrame {
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commands;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> conversion_heap;
+        D3D12::FsrPass fsr;
+        std::shared_ptr<Frame> submitted_frame;
+        u64 fence{};
+    };
+    void ConvertResident(Frame& frame, CommandFrame& command_frame,
+                         ID3D12GraphicsCommandList* commands);
+    void WaitForFrameUse(const Frame& frame);
     void GetBuffers();
     void RenderFrame();
     void ResizeBuffers(uint32_t width, uint32_t height, DXGI_FORMAT format);
@@ -61,16 +71,13 @@ private:
     mutable std::mutex mutex;
     D3D12DeviceContext context;
     D3D12::ShaderCache conversion_shaders;
-    D3D12::FsrPass fsr;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> conversion_root;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> conversion_pipeline;
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> conversion_heap;
     D3D12ResourceAllocator resources;
     D3D12DescriptorArena descriptors;
     D3D12TransferStats transfers;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> commands_allocator;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commands;
+    std::array<CommandFrame, 2> command_frames;
     mutable D3D12::Profile presenter_profile;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> buffers;
     uint32_t width{};

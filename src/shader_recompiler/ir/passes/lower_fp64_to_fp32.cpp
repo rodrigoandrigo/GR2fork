@@ -8,8 +8,8 @@
 
 namespace Shader::Optimization {
 
-constexpr s32 F64ToF32Exp = +1023 - 127;
-constexpr s32 F32ToF64Exp = +127 - 1023;
+constexpr u32 F64ToF32Bias = 1023 - 127;
+constexpr u32 F32ToF64Bias = 1023 - 127;
 
 static IR::F32 PackedF64ToF32(IR::IREmitter& ir, const IR::Value& packed) {
     const IR::U32 lo{ir.CompositeExtract(packed, 0)};
@@ -17,16 +17,41 @@ static IR::F32 PackedF64ToF32(IR::IREmitter& ir, const IR::Value& packed) {
     const IR::U32 sign{ir.BitFieldExtract(hi, ir.Imm32(31), ir.Imm32(1))};
     const IR::U32 exp{ir.BitFieldExtract(hi, ir.Imm32(20), ir.Imm32(11))};
     const IR::U32 mantissa_hi{ir.BitFieldExtract(hi, ir.Imm32(0), ir.Imm32(20))};
-    const IR::U32 mantissa_lo{ir.BitFieldExtract(lo, ir.Imm32(29), ir.Imm32(3))};
-    const IR::U32 mantissa{
-        ir.BitwiseOr(ir.ShiftLeftLogical(mantissa_hi, ir.Imm32(3)), mantissa_lo)};
-    const IR::U32 exp_if_subnorm{
-        ir.Select(ir.IEqual(exp, ir.Imm32(0)), ir.Imm32(0), ir.IAdd(exp, ir.Imm32(F64ToF32Exp)))};
-    const IR::U32 exp_if_infnan{
-        ir.Select(ir.IEqual(exp, ir.Imm32(0x7ff)), ir.Imm32(0xff), exp_if_subnorm)};
+    const IR::U32 significand_hi{ir.BitwiseOr(mantissa_hi, ir.Imm32(1u << 20))};
+    const IR::U32 significand_top{ir.BitwiseOr(ir.ShiftLeftLogical(significand_hi, ir.Imm32(3)),
+                                               ir.ShiftRightLogical(lo, ir.Imm32(29)))};
+    const IR::U32 shift{ir.ISub(ir.Imm32(926), exp)};
+    const IR::U32 short_shift{ir.UMin(shift, ir.Imm32(31))};
+    const IR::U32 short_left_shift{ir.UMin(ir.ISub(ir.Imm32(32), short_shift), ir.Imm32(31))};
+    const IR::U32 subnormal_short{
+        ir.BitwiseOr(ir.ShiftRightLogical(lo, short_shift),
+                     ir.ShiftLeftLogical(significand_hi, short_left_shift))};
+    const IR::U32 subnormal_long{
+        ir.ShiftRightLogical(significand_hi, ir.UMin(ir.ISub(shift, ir.Imm32(32)), ir.Imm32(31)))};
+    const IR::U32 subnormal_value{ir.Select(
+        ir.IEqual(shift, ir.Imm32(32)), significand_hi,
+        ir.Select(ir.ILessThan(shift, ir.Imm32(32), false), subnormal_short, subnormal_long))};
+    const IR::U1 normal{ir.LogicalAnd(ir.ILessThan(ir.Imm32(F64ToF32Bias), exp, false),
+                                      ir.ILessThan(exp, ir.Imm32(1151), false))};
+    const IR::U1 subnormal{ir.LogicalAnd(ir.ILessThanEqual(ir.Imm32(874), exp, false),
+                                         ir.ILessThanEqual(exp, ir.Imm32(F64ToF32Bias), false))};
+    const IR::U1 special{ir.IEqual(exp, ir.Imm32(0x7ff))};
+    const IR::U1 overflow_or_special{ir.ILessThanEqual(ir.Imm32(1151), exp, false)};
+    const IR::U32 exp32{
+        ir.Select(overflow_or_special, ir.Imm32(0xff),
+                  ir.Select(normal, ir.ISub(exp, ir.Imm32(F64ToF32Bias)), ir.Imm32(0)))};
+    const IR::U1 has_nan_payload{
+        ir.LogicalOr(ir.INotEqual(mantissa_hi, ir.Imm32(0)), ir.INotEqual(lo, ir.Imm32(0)))};
+    const IR::U32 nan_payload{
+        ir.Select(ir.IEqual(ir.BitwiseAnd(significand_top, ir.Imm32(0x7fffff)), ir.Imm32(0)),
+                  ir.Imm32(0x400000), ir.BitwiseAnd(significand_top, ir.Imm32(0x7fffff)))};
+    const IR::U32 mantissa{ir.Select(
+        normal, ir.BitwiseAnd(significand_top, ir.Imm32(0x7fffff)),
+        ir.Select(subnormal, subnormal_value,
+                  ir.Select(ir.LogicalAnd(special, has_nan_payload), nan_payload, ir.Imm32(0))))};
     const IR::U32 result{
         ir.BitwiseOr(ir.ShiftLeftLogical(sign, ir.Imm32(31)),
-                     ir.BitwiseOr(ir.ShiftLeftLogical(exp_if_infnan, ir.Imm32(23)), mantissa))};
+                     ir.BitwiseOr(ir.ShiftLeftLogical(exp32, ir.Imm32(23)), mantissa))};
     return ir.BitCast<IR::F32>(result);
 }
 
@@ -35,17 +60,22 @@ IR::Value F32ToPackedF64(IR::IREmitter& ir, const IR::Value& raw) {
     const IR::U32 sign{ir.BitFieldExtract(value, ir.Imm32(31), ir.Imm32(1))};
     const IR::U32 exp{ir.BitFieldExtract(value, ir.Imm32(23), ir.Imm32(8))};
     const IR::U32 mantissa{ir.BitFieldExtract(value, ir.Imm32(0), ir.Imm32(23))};
-    const IR::U32 mantissa_hi{ir.BitFieldExtract(mantissa, ir.Imm32(3), ir.Imm32(20))};
-    const IR::U32 mantissa_lo{ir.BitFieldExtract(mantissa, ir.Imm32(0), ir.Imm32(3))};
-    const IR::U32 exp_if_subnorm{
-        ir.Select(ir.IEqual(exp, ir.Imm32(0)), ir.Imm32(0), ir.IAdd(exp, ir.Imm32(F32ToF64Exp)))};
-    const IR::U32 exp_if_infnan{
-        ir.Select(ir.IEqual(exp, ir.Imm32(0xff)), ir.Imm32(0x7ff), exp_if_subnorm)};
-    const IR::U32 lo{ir.ShiftLeftLogical(mantissa_lo, ir.Imm32(29))};
+    const IR::U32 subnormal_msb{ir.UMin(ir.FindUMsb(mantissa), ir.Imm32(22))};
+    const IR::U32 normalized_subnormal{ir.BitwiseAnd(
+        ir.ShiftLeftLogical(mantissa, ir.ISub(ir.Imm32(23), subnormal_msb)), ir.Imm32(0x7fffff))};
+    const IR::U32 subnormal_exp{ir.Select(ir.IEqual(mantissa, ir.Imm32(0)), ir.Imm32(0),
+                                          ir.IAdd(subnormal_msb, ir.Imm32(874)))};
+    const IR::U32 exp64{ir.Select(ir.IEqual(exp, ir.Imm32(0)), subnormal_exp,
+                                  ir.Select(ir.IEqual(exp, ir.Imm32(0xff)), ir.Imm32(0x7ff),
+                                            ir.IAdd(exp, ir.Imm32(F32ToF64Bias))))};
+    const IR::U32 fraction64{
+        ir.Select(ir.IEqual(exp, ir.Imm32(0)), normalized_subnormal, mantissa)};
+    const IR::U32 mantissa_hi{ir.ShiftRightLogical(fraction64, ir.Imm32(3))};
+    const IR::U32 mantissa_lo{ir.ShiftLeftLogical(fraction64, ir.Imm32(29))};
     const IR::U32 hi{
         ir.BitwiseOr(ir.ShiftLeftLogical(sign, ir.Imm32(31)),
-                     ir.BitwiseOr(ir.ShiftLeftLogical(exp_if_infnan, ir.Imm32(20)), mantissa_hi))};
-    return ir.CompositeConstruct(lo, hi);
+                     ir.BitwiseOr(ir.ShiftLeftLogical(exp64, ir.Imm32(20)), mantissa_hi))};
+    return ir.CompositeConstruct(mantissa_lo, hi);
 }
 
 static IR::Opcode Replace(IR::Opcode op) {

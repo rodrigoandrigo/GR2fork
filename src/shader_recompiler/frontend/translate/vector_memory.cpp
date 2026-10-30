@@ -244,7 +244,8 @@ void Translator::BUFFER_LOAD(u32 num_dwords, bool is_inst_typed, bool is_buffer_
     const IR::U32 index = mubuf.idxen ? ir.GetVectorReg(vaddr) : ir.Imm32(0);
     const IR::VectorReg voffset_vgpr = mubuf.idxen ? vaddr + 1 : vaddr;
     const IR::U32 voffset = mubuf.offen ? ir.GetVectorReg(voffset_vgpr) : ir.Imm32(0);
-    const IR::U32 soffset{GetSrc(inst.src[3])};
+    // The ISA leaves memory-read source data undefined when an SGPR is out of range.
+    const IR::U32 soffset{GetSrc(inst.src[3], false)};
     const IR::Value address = ir.CompositeConstruct(index, voffset, soffset);
 
     IR::BufferInstInfo buffer_info{};
@@ -380,7 +381,8 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
     const IR::U32 index = mubuf.idxen ? ir.GetVectorReg(vaddr) : ir.Imm32(0);
     const IR::VectorReg voffset_vgpr = mubuf.idxen ? vaddr + 1 : vaddr;
     const IR::U32 voffset = mubuf.offen ? ir.GetVectorReg(voffset_vgpr) : ir.Imm32(0);
-    const IR::U32 soffset{GetSrc(inst.src[3])};
+    // With GLC, the atomic returns data; out-of-range sources are undefined by the ISA.
+    const IR::U32 soffset{GetSrc(inst.src[3], !mubuf.glc)};
     const IR::Value address = ir.CompositeConstruct(index, voffset, soffset);
 
     IR::BufferInstInfo buffer_info{};

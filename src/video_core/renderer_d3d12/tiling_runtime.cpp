@@ -251,7 +251,9 @@ uint ComputeSurfaceAddrFromCoordMacroTiled(uint x, uint y, uint slice, uint pitc
     uint tile_offset = tile_index * micro_tile_bytes;
     uint total_offset = slice_offset + macro_tile_offset + element_offset + tile_offset;
 
-    if (ARRAY_MODE == ARRAY_PRT_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_TILED_THICK) {
+    if (ARRAY_MODE == ARRAY_PRT_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_TILED_THICK ||
+        ARRAY_MODE == ARRAY_PRT_2D_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_2D_TILED_THICK ||
+        ARRAY_MODE == ARRAY_PRT_3D_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_3D_TILED_THICK) {
         x %= macro_tile_pitch;
         y %= macro_tile_height;
     }

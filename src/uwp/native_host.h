@@ -14,6 +14,7 @@ namespace Core::Uwp {
 class D3D12Presenter;
 bool NativeGraphicsSelected();
 void InitializeNativeGpu();
+void CheckNativeGraphicsProfile();
 void CheckNativeGraphicsEnvironment();
 class NativeHost {
 public:

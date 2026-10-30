@@ -57,6 +57,7 @@ struct PreparedShader {
 };
 class ShaderCache {
 public:
+    enum class RectangleMode { Fill, Wireframe, Points };
     struct StageOutput {
         std::string semantic;
         u32 index, components;
@@ -95,8 +96,8 @@ public:
                                                        const std::array<DXGI_FORMAT, 8>& formats,
                                                        const std::array<u32, 8>& masks);
     std::shared_ptr<const ShaderBinary> CompileRectangle(
-        const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment,
-        bool flat_last = false);
+        const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool flat_last,
+        RectangleMode mode);
     std::shared_ptr<const ShaderBinary> CompilePointFill(
         const ShaderBinary& vertex, bool keep_front, bool front_ccw, bool cull = true,
         const Shader::HwFragmentRuntimeInfo* fragment = nullptr, bool masks = false);

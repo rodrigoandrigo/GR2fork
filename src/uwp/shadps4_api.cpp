@@ -238,6 +238,17 @@ int32_t shadps4_set_graphics_backend(uint32_t backend) {
     if (state.load() != SHADPS4_UNINITIALIZED || native_presentation || presentation ||
         backend > SHADPS4_GRAPHICS_D3D12_NATIVE)
         return Fail("Select a valid graphics backend before initializing the core");
+    if (backend == SHADPS4_GRAPHICS_D3D12_NATIVE) {
+        try {
+            Core::Uwp::CheckNativeGraphicsProfile();
+        } catch (const winrt::hresult_error& exception) {
+            return Fail("Could not validate the native D3D12 platform profile: HRESULT " +
+                        std::to_string(static_cast<uint32_t>(exception.code().value)) + ": " +
+                        winrt::to_string(exception.message()));
+        } catch (const std::exception& exception) {
+            return Fail(exception.what());
+        }
+    }
     graphics_backend.store(backend);
     return 0;
 }

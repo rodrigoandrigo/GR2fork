@@ -76,4 +76,4 @@ O caso `COMMAND_DEPENDENCIES` também lê duas vezes os mesmos 12 bytes de `/app
 
 `BOUNDED_INDEX_FETCH` mantém `INDEX_COUNT=3` e varia `MAX_SIZE` entre 0, 1, 2 e 3 no pacote `DRAW_INDEX_2`, usando um alias físico para os índices. Somente capacidade 3 deve produzir o quadrado; nos demais casos os índices ausentes são zero e a primitiva é degenerada. O contador do VS é observado entre 1 e 3, sem presumir reutilização exata pelo vertex cache. Não submete memória GPU desmapeada.
 
-O grupo `CMASK_MSAA` acrescenta superfícies 2×/4×/8× com FMASK em memória, CMASK inicialmente expandido D/E/F e um tile em clear 1/2/3. Após eliminar o clear, conta os texels materializados e verifica a preservação dos outros texels e dos estados FMASK.
+O grupo `CMASK_MSAA` acrescenta superfícies 2×/4×/8× com FMASK em memória, CMASK inicialmente expandido D/E/F e um tile com o nibble de fast-clear zero. Após eliminar o clear, conta os texels materializados e verifica a preservação dos outros texels e dos estados FMASK. É um probe de hardware GNM para executar no PS4; não integra os testes automatizados do emulador.

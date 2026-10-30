@@ -205,6 +205,7 @@ inline std::vector<u32> ConvertPolygonEdges(AmdGpu::PrimitiveType primitive,
         using P = AmdGpu::PrimitiveType;
         switch (primitive) {
         case P::RectList:
+            throw std::runtime_error("D3D12 RectList wireframe requires a synthesized vertex");
         case P::QuadList:
             for (size_t i = 0; i + 3 < indices.size(); i += 4) {
                 emit_edge(indices[i], indices[i + 1]);

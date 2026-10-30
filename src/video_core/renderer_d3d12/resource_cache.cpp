@@ -94,9 +94,15 @@ void ResourceCache::InvalidateCpu(std::span<const Range> ranges, bool all) {
             for (const auto& requested : ranges) {
                 if (!requested.address || !requested.size)
                     continue;
-                const Range range{requested.address & ~u64{4095},
-                                  ((requested.address + requested.size + 4095) & ~u64{4095}) -
-                                      (requested.address & ~u64{4095})};
+                const u64 page_begin = requested.address & ~u64{4095};
+                const u64 maximum = std::numeric_limits<u64>::max();
+                if (requested.address > maximum - requested.size) {
+                    buffer->dirty.emplace_back(source.offset, source.size);
+                    continue;
+                }
+                const u64 end = requested.address + requested.size;
+                const u64 page_end = end > maximum - 4095 ? maximum : (end + 4095) & ~u64{4095};
+                const Range range{page_begin, page_end - page_begin};
                 if (!Aliases(range.address, range.size, source.address, source.size))
                     continue;
                 const auto requested_identity = Canonicalize(range.address, range.size);
@@ -305,7 +311,7 @@ void ResourceCache::MarkWritten(const View& view) {
     }
 }
 ResourceCache::Buffer& ResourceCache::GetHostBuffer(VAddr identity, std::span<const u8> data) {
-    auto& buffer = GetBuffer(identity, data.size());
+    auto& buffer = GetBuffer(identity, data.size(), false, false, true);
     buffer.host = true;
     buffer.host_data.assign(data.begin(), data.end());
     return buffer;
@@ -506,20 +512,20 @@ std::vector<ResourceCache::View> ResourceCache::GetBackingViews(std::span<const 
     return views;
 }
 ResourceCache::Buffer& ResourceCache::GetBuffer(VAddr address, u64 size, bool physical,
-                                                bool gathered) {
+                                                bool gathered, bool host) {
     if (!address || !size || size > 16ULL * 1024 * 1024 ||
         size > std::numeric_limits<VAddr>::max() - address)
         throw std::runtime_error("Invalid D3D12 guest buffer range");
-    const auto key = std::tuple{physical, address, size};
+    const auto key = std::tuple{host, physical, address, size};
     if (const auto found = buffers.find(key); found != buffers.end()) {
         found->second->used = ++age;
         found->second->batch = batch;
         return *found->second;
     }
     for (const auto& [existing, buffer] : buffers)
-        if (!gathered && buffer->sources.empty() && buffer->physical == physical &&
-            buffer->batch == batch && address < buffer->address + buffer->size &&
-            buffer->address < address + size)
+        if (!host && !buffer->host && !gathered && buffer->sources.empty() &&
+            buffer->physical == physical && buffer->batch == batch &&
+            address < buffer->address + buffer->size && buffer->address < address + size)
             throw std::runtime_error("Overlapping D3D12 buffer views require a shared allocation");
     EnsureSpace(0, true);
     auto result = std::make_unique<Buffer>();

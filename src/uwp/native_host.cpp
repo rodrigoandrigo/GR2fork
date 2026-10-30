@@ -1,13 +1,21 @@
 #include "uwp/native_host.h"
 
+#include <windows.h>
+
 #include <stdexcept>
-#include "core/memory.h"
+#include <basetyps.h>
+#include <gamingdeviceinformation.h>
+#include <winrt/Windows.System.Profile.h>
+#include <winrt/base.h>
 #include "common/logging/log.h"
 #include "core/libraries/videoout/video_out.h"
+#include "core/memory.h"
 #include "sdl_window.h"
 #include "uwp/d3d12_presenter.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_d3d12/d3d12_rasterizer.h"
+
+#pragma comment(lib, "OneCore.lib")
 
 extern Frontend::WindowSDL* g_window;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -16,7 +24,42 @@ namespace Core::Uwp {
 namespace {
 NativeHost* current_host;
 }
+void CheckNativeGraphicsProfile() {
+    if (winrt::Windows::System::Profile::AnalyticsInfo::VersionInfo().DeviceFamily() !=
+        L"Windows.Xbox")
+        return;
+
+    GAMING_DEVICE_MODEL_INFORMATION model{};
+    const HRESULT model_result = GetGamingDeviceModelInformation(&model);
+    if (FAILED(model_result))
+        throw std::runtime_error("Could not query the Xbox model for native D3D12: HRESULT " +
+                                 std::to_string(static_cast<uint32_t>(model_result)));
+    if (model.vendorId != GAMING_DEVICE_VENDOR_ID_MICROSOFT)
+        throw std::runtime_error("Native D3D12 is blocked because the Xbox vendor is unknown");
+
+    const bool xbox_one = model.deviceId == GAMING_DEVICE_DEVICE_ID_XBOX_ONE ||
+                          model.deviceId == GAMING_DEVICE_DEVICE_ID_XBOX_ONE_S ||
+                          model.deviceId == GAMING_DEVICE_DEVICE_ID_XBOX_ONE_X ||
+                          model.deviceId == GAMING_DEVICE_DEVICE_ID_XBOX_ONE_X_DEVKIT;
+    const bool xbox_series = model.deviceId == GAMING_DEVICE_DEVICE_ID_XBOX_SERIES_S ||
+                             model.deviceId == GAMING_DEVICE_DEVICE_ID_XBOX_SERIES_X ||
+                             model.deviceId == GAMING_DEVICE_DEVICE_ID_XBOX_SERIES_X_DEVKIT;
+    if (!xbox_one && !xbox_series)
+        throw std::runtime_error("Native D3D12 is blocked because this Xbox model is unrecognized");
+
+    if (xbox_one)
+        throw std::runtime_error(
+            "Native D3D12 on Xbox One is disabled because this UWP host cannot verify the "
+            "package's actual App/Game Mode. HasExpandedResources reports resource state, not "
+            "mode permission; use Vulkan / Dozen until a trustworthy mode signal is available");
+
+    LOG_INFO(Core,
+             "Native D3D12 Xbox Series profile accepted: device_id={:#x}; runtime mode, "
+             "quotas and capabilities remain subject to validation",
+             static_cast<uint32_t>(model.deviceId));
+}
 void CheckNativeGraphicsEnvironment() {
+    CheckNativeGraphicsProfile();
     D3D12Presenter::CheckEnvironment();
 }
 NativeHost::NativeHost() = default;
@@ -38,6 +81,7 @@ NativeHost::~NativeHost() {
     LOG_INFO(Core, "Native D3D12 host released");
 }
 void NativeHost::Initialize(const ShadPS4Config& config) {
+    CheckNativeGraphicsProfile();
     window = std::make_unique<Frontend::WindowSDL>(config.width, config.height, config.panel);
     presentation = std::make_shared<D3D12Presenter>();
     attach = config.attach_swapchain;

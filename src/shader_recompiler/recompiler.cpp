@@ -91,7 +91,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::InjectClipDistanceAttributes(program, runtime_info);
 
     // Run optimization passes on unstructured graph
-    if (!profile.support_float64) {
+    if (!profile.support_float64 && profile.allow_fp64_to_fp32_lowering) {
         Shader::Optimization::LowerFp64ToFp32(program);
     }
     Shader::Optimization::SsaRewritePass(program);

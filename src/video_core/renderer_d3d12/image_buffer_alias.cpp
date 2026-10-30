@@ -344,9 +344,14 @@ IR::Value Atomic(IR::IREmitter& ir, IR::Inst& inst, IR::Value handle, IR::U32 ad
 
 IR::U32 BlendChannel(IR::IREmitter& ir, const IR::U32& a, const IR::U32& b, const IR::U32& weight,
                      u32 den, bool is_signed) {
-    const auto word = ir.IAdd(ir.IAdd(ir.IMul(a, ir.Imm32(den)), ir.IMul(weight, ir.ISub(b, a))),
-                              IR::U32{ir.Imm32(den / 2)});
-    return IR::U32{ir.IDiv(word, ir.Imm32(den), is_signed)};
+    const auto value = IR::U32{ir.IAdd(ir.IMul(a, ir.Imm32(den)), ir.IMul(weight, ir.ISub(b, a)))};
+    const auto bias = ir.Imm32(den / 2);
+    if (!is_signed)
+        return IR::U32{ir.IDiv(ir.IAdd(value, bias), ir.Imm32(den))};
+    const auto negative = ir.ILessThan(value, ir.Imm32(0u), true);
+    const auto rounded = IR::U32{
+        ir.Select(negative, IR::Value{ir.ISub(value, bias)}, IR::Value{ir.IAdd(value, bias)})};
+    return IR::U32{ir.IDiv(rounded, ir.Imm32(den), true)};
 }
 
 IR::U32 Sign8(IR::IREmitter& ir, const IR::U32& value) {
@@ -400,18 +405,23 @@ IR::U32 AlphaMachinery(IR::IREmitter& ir, const IR::U32& first_word, const IR::U
     const auto a0 = is_signed ? Sign8(ir, a0raw) : a0raw;
     const auto a1 = is_signed ? Sign8(ir, a1raw) : a1raw;
     const auto extended = ir.ILessThan(a1, a0, is_signed);
-    const auto bit = IR::U32{ir.IAdd(ir.ShiftLeftLogical(index, ir.Imm32(3u)), ir.Imm32(16u))};
+    const auto bit = IR::U32{ir.IAdd(ir.IMul(index, ir.Imm32(3u)), ir.Imm32(16u))};
     const auto overflow = ir.ILessThanEqual(IR::U32{ir.Imm32(32u)}, bit, false);
     const auto span = IR::U32{ir.Select(overflow, ir.ISub(bit, ir.Imm32(32u)), bit)};
     const auto word = IR::U32{ir.Select(overflow, IR::Value{second_word}, IR::Value{first_word})};
-    const auto selection = IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(word, span), ir.Imm32(7u))};
+    const auto selection = IR::U32{
+        ir.Select(ir.IEqual(bit, ir.Imm32(31u)),
+                  ir.BitwiseAnd(ir.BitwiseOr(ir.ShiftRightLogical(first_word, ir.Imm32(31u)),
+                                             ir.ShiftLeftLogical(second_word, ir.Imm32(1u))),
+                                ir.Imm32(7u)),
+                  ir.BitwiseAnd(ir.ShiftRightLogical(word, span), ir.Imm32(7u)))};
     const auto weight = IR::U32{ir.ISub(selection, IR::U32{ir.Imm32(1u)})};
     const auto eight = BlendChannel(ir, a0, a1, weight, 7, is_signed);
     const auto six = BlendChannel(ir, a0, a1, weight, 5, is_signed);
     const auto ring = IR::U32{ir.Imm32(is_signed ? 127u : 255u)};
-    const auto six_value =
-        IR::U32{ir.Select(ir.IEqual(selection, ir.Imm32(6u)), IR::U32{ir.Imm32(0u)},
-                          ir.Select(ir.IEqual(selection, ir.Imm32(7u)), ring, six))};
+    const auto six_value = IR::U32{ir.Select(
+        ir.IEqual(selection, ir.Imm32(6u)), IR::U32{ir.Imm32(is_signed ? 0xffffff81u : 0u)},
+        ir.Select(ir.IEqual(selection, ir.Imm32(7u)), ring, six))};
     const auto value = IR::U32{
         ir.Select(ir.IEqual(selection, ir.Imm32(0u)), a0,
                   ir.Select(ir.IEqual(selection, ir.Imm32(1u)), a1,
@@ -1084,8 +1094,7 @@ bool LowerIndexFetch(CompiledShader& shader, IR::Program& program, const IndexFe
                 inst.Arg(0).Attribute() != IR::Attribute::VertexId)
                 continue;
             IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
-            const auto vertex = ir.ISub(ir.GetAttributeU32(IR::Attribute::VertexId),
-                                        ir.GetAttributeU32(IR::Attribute::BaseVertex));
+            const auto vertex = ir.GetAttributeU32(IR::Attribute::VertexId);
             const auto base = ir.IMul(vertex, ir.Imm32(indices.element_size));
             auto index = ir.Imm32(0u);
             for (u32 byte = 0; byte < indices.element_size; ++byte) {
@@ -1230,11 +1239,8 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
             info.images[i].is_written || info.images[i].is_feedback || info.images[i].is_atomic;
         const bool multisampled =
             type == AmdGpu::ImageType::Color2DMsaa || type == AmdGpu::ImageType::Color2DMsaaArray;
-        const auto dimension =
-            type == AmdGpu::ImageType::Color1D || type == AmdGpu::ImageType::Color1DArray
-                ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
-            : type == AmdGpu::ImageType::Color3D ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
-                                                 : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
+        const auto dimension = type == AmdGpu::ImageType::Color3D ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
+                                                                  : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
         selected[i] =
             (multisampled && (storage || sharp.NumSamples() == 1)) ||
             (storage && type == AmdGpu::ImageType::Cube) || info.images[i].is_atomic ||
@@ -1605,18 +1611,32 @@ bool LowerBufferAliases(CompiledShader& shader, IR::Program& program,
             const auto shift = metadata(1);
             const auto bias = metadata(2);
             const auto size = metadata(3);
-            const auto translate = [&](IR::U32 address, u32 scale) {
+            const auto translate = [&](IR::U32 address, u32 scale, IR::U1 address_valid) {
                 const auto bytes = ir.ShiftLeftLogical(address, ir.Imm32(scale));
-                const auto valid = ir.ILessThan(bytes, size, false);
                 const auto offset = ir.IAdd(bytes, bias);
+                const u32 element_size = 1u << scale;
+                const auto enough_size = ir.IGreaterThanEqual(size, ir.Imm32(element_size), false);
+                const auto in_range =
+                    ir.ILessThanEqual(bytes, ir.ISub(size, ir.Imm32(element_size)), false);
+                const auto no_shift_overflow =
+                    ir.ILessThanEqual(address, ir.Imm32(UINT32_MAX >> scale), false);
+                const auto no_offset_overflow = ir.IGreaterThanEqual(offset, bytes, false);
+                const auto valid = ir.LogicalAnd(
+                    address_valid,
+                    ir.LogicalAnd(
+                        no_shift_overflow,
+                        ir.LogicalAnd(enough_size, ir.LogicalAnd(in_range, no_offset_overflow))));
                 const auto page =
                     ir.Select(valid, ir.ShiftRightLogical(offset, shift), ir.Imm32(0));
                 const auto base =
                     IR::U32{ir.LoadBufferU32(1, table, ir.IAdd(map, IR::U32{page}), {})};
                 const auto mask = ir.ISub(ir.ShiftLeftLogical(ir.Imm32(1), shift), ir.Imm32(1));
                 const auto physical = ir.IAdd(base, ir.BitwiseAnd(offset, mask));
+                const auto no_physical_overflow = ir.IGreaterThanEqual(physical, base, false);
                 return ir.ShiftRightLogical(
-                    IR::U32{ir.Select(valid, physical, ir.Imm32(UINT32_MAX))}, ir.Imm32(scale));
+                    IR::U32{ir.Select(ir.LogicalAnd(valid, no_physical_overflow), physical,
+                                      ir.Imm32(UINT32_MAX))},
+                    ir.Imm32(scale));
             };
             const auto opcode = inst.GetOpcode();
             if (info.buffers[handle].is_coherent) {
@@ -1629,9 +1649,18 @@ bool LowerBufferAliases(CompiledShader& shader, IR::Program& program,
             }
             if (opcode == IR::Opcode::LoadBufferU64 || opcode == IR::Opcode::StoreBufferU64) {
                 info.buffers[handle].used_types |= IR::Type::U32;
-                const auto address = ir.ShiftLeftLogical(IR::U32{inst.Arg(1)}, ir.Imm32(1));
-                const auto first = translate(address, 2);
-                const auto second = translate(ir.IAdd(address, ir.Imm32(1)), 2);
+                const IR::U32 index{inst.Arg(1)};
+                const auto address = ir.ShiftLeftLogical(index, ir.Imm32(1));
+                const auto bytes = ir.ShiftLeftLogical(index, ir.Imm32(3));
+                const auto index_valid = ir.LogicalAnd(
+                    ir.ILessThanEqual(index, ir.Imm32(UINT32_MAX >> 3), false),
+                    ir.LogicalAnd(ir.IGreaterThanEqual(size, ir.Imm32(8), false),
+                                  ir.ILessThanEqual(bytes, ir.ISub(size, ir.Imm32(8)), false)));
+                const auto first = translate(address, 2, index_valid);
+                const auto second_address = ir.IAdd(address, ir.Imm32(1));
+                const auto second_valid = ir.LogicalAnd(
+                    index_valid, ir.IGreaterThanEqual(second_address, address, false));
+                const auto second = translate(second_address, 2, second_valid);
                 const auto flags = inst.Flags<IR::BufferInstInfo>();
                 if (opcode == IR::Opcode::StoreBufferU64) {
                     const auto words = ir.UnpackUint2x32(IR::U64{inst.Arg(2)});
@@ -1707,22 +1736,25 @@ bool LowerBufferAliases(CompiledShader& shader, IR::Program& program,
                 break;
             }
             if (components == 1) {
-                inst.SetArg(1, translate(IR::U32{inst.Arg(1)}, scale));
+                inst.SetArg(1, translate(IR::U32{inst.Arg(1)}, scale, ir.Imm1(true)));
                 continue;
             }
             std::array<IR::Value, 4> values;
+            const IR::U32 base_address{inst.Arg(1)};
             for (u32 i = 0; i < components; ++i) {
-                const auto address = translate(ir.IAdd(IR::U32{inst.Arg(1)}, ir.Imm32(i)), 2);
+                const auto address = ir.IAdd(base_address, ir.Imm32(i));
+                const auto address_valid = ir.IGreaterThanEqual(address, base_address, false);
+                const auto translated = translate(address, 2, address_valid);
                 const auto flags = inst.Flags<IR::BufferInstInfo>();
                 if (store) {
                     const auto value = ir.CompositeExtract(inst.Arg(2), i);
                     if (floating)
-                        ir.StoreBufferF32(1, inst.Arg(0), address, value, flags);
+                        ir.StoreBufferF32(1, inst.Arg(0), translated, value, flags);
                     else
-                        ir.StoreBufferU32(1, inst.Arg(0), address, value, flags);
+                        ir.StoreBufferU32(1, inst.Arg(0), translated, value, flags);
                 } else {
-                    values[i] = floating ? ir.LoadBufferF32(1, inst.Arg(0), address, flags)
-                                         : ir.LoadBufferU32(1, inst.Arg(0), address, flags);
+                    values[i] = floating ? ir.LoadBufferF32(1, inst.Arg(0), translated, flags)
+                                         : ir.LoadBufferU32(1, inst.Arg(0), translated, flags);
                 }
             }
             if (store)

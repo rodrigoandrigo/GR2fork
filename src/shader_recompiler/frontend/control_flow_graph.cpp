@@ -165,6 +165,13 @@ void CFG::SplitDivergenceScopes() {
         // but also saves the previous value to restore later. This indicates
         // we are entering a scope.
         return inst.opcode == Opcode::S_AND_SAVEEXEC_B64 ||
+               inst.opcode == Opcode::S_OR_SAVEEXEC_B64 ||
+               inst.opcode == Opcode::S_XOR_SAVEEXEC_B64 ||
+               inst.opcode == Opcode::S_ANDN2_SAVEEXEC_B64 ||
+               inst.opcode == Opcode::S_ORN2_SAVEEXEC_B64 ||
+               inst.opcode == Opcode::S_NAND_SAVEEXEC_B64 ||
+               inst.opcode == Opcode::S_NOR_SAVEEXEC_B64 ||
+               inst.opcode == Opcode::S_XNOR_SAVEEXEC_B64 ||
                // While this instruction does not save EXEC it is often used paired
                // with SAVEEXEC to mask the threads that didn't pass the condition
                // of initial branch.

@@ -473,7 +473,8 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     winrt::check_hresult(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &numeric_options,
                                                      sizeof(numeric_options)));
     native_float64 = numeric_options.DoublePrecisionFloatShaderOps;
-    profile.support_float64 = true;
+    profile.support_float64 = native_float64;
+    profile.allow_fp64_to_fp32_lowering = false;
     profile.support_fp32_denorm_flush = true;
     profile.support_fp32_denorm_preserve = true;
     LOG_INFO(Core, "[UWP stage] native FP64 support={}", native_float64);
@@ -486,6 +487,7 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     profile.supports_image_sample_min_lod = true;
     profile.needs_unified_buffer_types = true;
     profile.needs_buffer_offsets = true;
+    profile.reject_approximate_fmask_access = true;
 }
 void TessellationLink::ValidateNativeTopology() const {
     if (u32(type) > u32(AmdGpu::TessellationType::Quad))
@@ -1428,7 +1430,9 @@ uint LogicUnsignedFloat(float v, uint mantissa) {
     return result;
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
-    const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool flat_last) {
+    const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool flat_last,
+    RectangleMode mode) {
+    const bool points = mode == RectangleMode::Points;
     const auto first = vertex.hlsl.find("struct SPIRV_Cross_Output");
     const auto last = vertex.hlsl.find("};", first);
     if (first == std::string::npos || last == std::string::npos || last - first > 16384)
@@ -1438,8 +1442,12 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
         throw std::runtime_error("Rectangle expansion requires a position export");
     auto result = std::make_shared<ShaderBinary>();
     result->hlsl = vertex.hlsl.substr(first, last + 2 - first);
-    result->hlsl += "\n[maxvertexcount(4)]\nvoid main(triangle SPIRV_Cross_Output input[3], "
-                    "inout TriangleStream<SPIRV_Cross_Output> stream) {\n";
+    const u32 max_vertices = points ? 6 : 4;
+    const std::string stream = points ? "PointStream" : "TriangleStream";
+    result->hlsl += "\n[maxvertexcount(" + std::to_string(max_vertices) +
+                    ")]\n"
+                    "void main(triangle SPIRV_Cross_Output input[3], inout " +
+                    stream + "<SPIRV_Cross_Output> stream) {\n";
     result->hlsl += "float3 weight; uint corner = 0;\n";
     for (u32 i = 0; i < 3; ++i) {
         const auto a = "input[" + std::to_string(i) + "]." + position;
@@ -1464,7 +1472,8 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
         if (!(declaration >> name >> colon >> semantic) || colon != ":" ||
             name.find('[') != std::string::npos ||
             (type != "float" && type != "float2" && type != "float3" && type != "float4"))
-            throw std::runtime_error("Unsupported rectangle stage interface member");
+            throw std::runtime_error(
+                "D3D12 RectList cannot lower array or non-float vertex outputs");
         bool flat{};
         for (u32 i = 0; i < fragment.num_inputs; ++i) {
             const auto& input = fragment.inputs[i];
@@ -1478,7 +1487,12 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
                             name + " * weight.y + input[2]." + name + " * weight.z;\n";
         }
     }
-    result->hlsl += "for(uint i=0;i<4;++i) stream.Append(v[i]); stream.RestartStrip();\n}\n";
+    if (points) {
+        result->hlsl += "stream.Append(v[0]); stream.Append(v[1]); stream.Append(v[2]); "
+                        "stream.Append(v[2]); stream.Append(v[1]); stream.Append(v[3]);\n}\n";
+    } else {
+        result->hlsl += "for(uint i=0;i<4;++i) stream.Append(v[i]); stream.RestartStrip();\n}\n";
+    }
     std::vector<u32> key{UINT32_MAX};
     for (const unsigned char character : result->hlsl)
         key.push_back(character);

@@ -84,24 +84,40 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             return S_LSHL_B64(inst);
         case Opcode::S_LSHR_B32:
             return S_LSHR_B32(inst);
+        case Opcode::S_LSHR_B64:
+            return S_LSHR_B64(inst);
         case Opcode::S_ASHR_I32:
             return S_ASHR_I32(inst);
         case Opcode::S_ASHR_I64:
             return S_ASHR_I64(inst);
         case Opcode::S_BFM_B32:
             return S_BFM_B32(inst);
+        case Opcode::S_BFM_B64:
+            return S_BFM_B64(inst);
         case Opcode::S_MUL_I32:
             return S_MUL_I32(inst);
         case Opcode::S_BFE_I32:
             return S_BFE(inst, true);
         case Opcode::S_BFE_U32:
             return S_BFE(inst, false);
+        case Opcode::S_BFE_U64:
+            return S_BFE64(inst, false);
+        case Opcode::S_BFE_I64:
+            return S_BFE64(inst, true);
         case Opcode::S_ABSDIFF_I32:
             return S_ABSDIFF_I32(inst);
 
-            // SOP1
+        // SOP1
         case Opcode::S_MOV_B32:
             return S_MOV(inst);
+        case Opcode::S_MOVRELS_B32:
+            return S_MOVRELS_B32(inst);
+        case Opcode::S_MOVRELS_B64:
+            return S_MOVRELS_B64(inst);
+        case Opcode::S_MOVRELD_B32:
+            return S_MOVRELD_B32(inst);
+        case Opcode::S_MOVRELD_B64:
+            return S_MOVRELD_B64(inst);
         case Opcode::S_CMOV_B32:
             return S_MOV(inst, true);
         case Opcode::S_SEXT_I32_I8:
@@ -110,12 +126,26 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             return S_SEXT_I32(inst, 16);
         case Opcode::S_MOV_B64:
             return S_MOV_B64(inst);
+        case Opcode::S_CMOV_B64:
+            return S_MOV_B64(inst, true);
         case Opcode::S_NOT_B64:
             return S_NOT_B64(inst);
+        case Opcode::S_WQM_B32:
+            return S_WQM_B32(inst);
         case Opcode::S_WQM_B64:
-            break;
+            return S_WQM_B64(inst);
+        case Opcode::S_QUADMASK_B32:
+            return S_QUADMASK_B32(inst);
+        case Opcode::S_QUADMASK_B64:
+            return S_QUADMASK_B64(inst);
         case Opcode::S_BREV_B32:
             return S_BREV_B32(inst);
+        case Opcode::S_BREV_B64:
+            return S_BREV_B64(inst);
+        case Opcode::S_BCNT0_I32_B32:
+            return S_BCNT0_I32_B32(inst);
+        case Opcode::S_BCNT0_I32_B64:
+            return S_BCNT0_I32_B64(inst);
         case Opcode::S_BCNT1_I32_B32:
             return S_BCNT1_I32_B32(inst);
         case Opcode::S_BCNT1_I32_B64:
@@ -124,10 +154,18 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             return S_FF1_I32_B32(inst);
         case Opcode::S_FF1_I32_B64:
             return S_FF1_I32_B64(inst);
+        case Opcode::S_FF0_I32_B32:
+            return S_FF0_I32_B32(inst);
+        case Opcode::S_FF0_I32_B64:
+            return S_FF0_I32_B64(inst);
         case Opcode::S_FLBIT_I32_B32:
             return S_FLBIT_I32_B32(inst);
         case Opcode::S_FLBIT_I32_B64:
             return S_FLBIT_I32_B64(inst);
+        case Opcode::S_FLBIT_I32:
+            return S_FLBIT_I32(inst);
+        case Opcode::S_FLBIT_I32_I64:
+            return S_FLBIT_I32_I64(inst);
         case Opcode::S_BITSET0_B32:
             return S_BITSET_B32(inst, 0);
         case Opcode::S_BITSET1_B32:
@@ -137,9 +175,14 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
         case Opcode::S_BITSET1_B64:
             return S_BITSET_B64(inst, 1);
         case Opcode::S_AND_SAVEEXEC_B64:
-            return S_SAVEEXEC_B64(NegateMode::None, false, inst);
+        case Opcode::S_OR_SAVEEXEC_B64:
+        case Opcode::S_XOR_SAVEEXEC_B64:
+        case Opcode::S_ANDN2_SAVEEXEC_B64:
         case Opcode::S_ORN2_SAVEEXEC_B64:
-            return S_SAVEEXEC_B64(NegateMode::Src1, true, inst);
+        case Opcode::S_NAND_SAVEEXEC_B64:
+        case Opcode::S_NOR_SAVEEXEC_B64:
+        case Opcode::S_XNOR_SAVEEXEC_B64:
+            return S_SAVEEXEC_B64(inst);
         case Opcode::S_ABS_I32:
             return S_ABS_I32(inst);
         default:
@@ -365,7 +408,7 @@ void Translator::S_AND_B64(NegateMode negate, const GcnInst& inst) {
     if (negate == NegateMode::Result) {
         result = ir.BitwiseNot(result);
     }
-    ir.SetScc(ir.InverseBallot(result));
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
     SetDst64(inst.dst[0], result);
 }
 
@@ -391,7 +434,7 @@ void Translator::S_OR_B64(NegateMode negate, bool is_xor, const GcnInst& inst) {
     if (negate == NegateMode::Result) {
         result = ir.BitwiseNot(result);
     }
-    ir.SetScc(ir.InverseBallot(result));
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
     SetDst64(inst.dst[0], result);
 }
 
@@ -420,8 +463,8 @@ void Translator::S_LSHL_B32(const GcnInst& inst) {
 
 void Translator::S_LSHL_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    const IR::U64 src1{GetSrc64(inst.src[1])};
-    const IR::U64 result = ir.ShiftLeftLogical(src0, ir.BitwiseAnd(src1, ir.Imm64(u64(0x3F))));
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    const IR::U64 result = ir.ShiftLeftLogical(src0, ir.BitwiseAnd(src1, ir.Imm32(0x3F)));
     SetDst64(inst.dst[0], result);
     ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
 }
@@ -435,6 +478,14 @@ void Translator::S_LSHR_B32(const GcnInst& inst) {
     ir.SetScc(ir.INotEqual(result, ir.Imm32(0)));
 }
 
+void Translator::S_LSHR_B64(const GcnInst& inst) {
+    const IR::U64 src0{GetSrc64(inst.src[0])};
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    const IR::U64 result = ir.ShiftRightLogical(src0, ir.BitwiseAnd(src1, ir.Imm32(0x3F)));
+    SetDst64(inst.dst[0], result);
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
+}
+
 void Translator::S_ASHR_I32(const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
@@ -445,8 +496,8 @@ void Translator::S_ASHR_I32(const GcnInst& inst) {
 
 void Translator::S_ASHR_I64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    const IR::U64 src1{GetSrc64(inst.src[1])};
-    const IR::U64 result{ir.ShiftRightArithmetic(src0, ir.BitwiseAnd(src1, ir.Imm64(u64(0x3F))))};
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    const IR::U64 result{ir.ShiftRightArithmetic(src0, ir.BitwiseAnd(src1, ir.Imm32(0x3F)))};
     SetDst64(inst.dst[0], result);
     ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
 }
@@ -458,18 +509,55 @@ void Translator::S_BFM_B32(const GcnInst& inst) {
     SetDst(inst.dst[0], ir.ShiftLeftLogical(mask, src1));
 }
 
+void Translator::S_BFM_B64(const GcnInst& inst) {
+    const IR::U32 src0{ir.BitwiseAnd(GetSrc(inst.src[0]), ir.Imm32(0x3F))};
+    const IR::U32 src1{ir.BitwiseAnd(GetSrc(inst.src[1]), ir.Imm32(0x3F))};
+    const IR::U64 mask{ir.ISub(ir.ShiftLeftLogical(ir.Imm64(u64(1)), src0), ir.Imm64(u64(1)))};
+    SetDst64(inst.dst[0], ir.ShiftLeftLogical(mask, src1));
+}
+
 void Translator::S_MUL_I32(const GcnInst& inst) {
     SetDst(inst.dst[0], ir.IMul(GetSrc(inst.src[0]), GetSrc(inst.src[1])));
 }
 
+// The ISA summary tables mark S_BFE_U32/I32/U64/I64 as not setting SCC. Detailed opcode
+// descriptions contradict this; preserve SCC per the summary until hardware validation.
 void Translator::S_BFE(const GcnInst& inst, bool is_signed) {
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 offset{ir.BitwiseAnd(src1, ir.Imm32(0x1F))};
-    const IR::U32 count{ir.BitFieldExtract(src1, ir.Imm32(16), ir.Imm32(7))};
-    const IR::U32 result{ir.BitFieldExtract(src0, offset, count, is_signed)};
-    SetDst(inst.dst[0], result);
-    ir.SetScc(ir.INotEqual(result, ir.Imm32(0)));
+    const IR::U32 width{ir.BitFieldExtract(src1, ir.Imm32(16), ir.Imm32(7))};
+    const IR::U32 remaining{ir.ISub(ir.Imm32(32), offset)};
+    const IR::U32 safe_width{ir.UMin(width, remaining)};
+    SetDst(inst.dst[0], ir.BitFieldExtract(src0, offset, safe_width, is_signed));
+}
+
+void Translator::S_BFE64(const GcnInst& inst, bool is_signed) {
+    const IR::U64 src0{GetSrc64(inst.src[0])};
+    const IR::U32 control{GetSrc(inst.src[1])};
+    const IR::U32 offset{ir.BitwiseAnd(control, ir.Imm32(0x3F))};
+    const IR::U32 width{ir.BitFieldExtract(control, ir.Imm32(16), ir.Imm32(7))};
+    const IR::U64 shifted{ir.ShiftRightLogical(src0, offset)};
+    const IR::U32 mask_shift{ir.BitwiseAnd(width, ir.Imm32(0x3F))};
+    const IR::U64 low_mask{
+        ir.ISub(ir.ShiftLeftLogical(ir.Imm64(u64(1)), mask_shift), ir.Imm64(u64(1)))};
+    const IR::U1 empty_width{ir.IEqual(width, ir.Imm32(0))};
+    const IR::U1 full_width{ir.IGreaterThanEqual(width, ir.Imm32(64), false)};
+    const IR::U64 mask{ir.Select(empty_width, ir.Imm64(u64(0)),
+                                 IR::U64{ir.Select(full_width, ir.Imm64(~u64(0)), low_mask)})};
+    const IR::U64 extracted{ir.BitwiseAnd(shifted, mask)};
+    const IR::U32 effective_width{ir.UMax(ir.UMin(width, ir.Imm32(64)), ir.Imm32(1))};
+    const IR::U32 sign_shift{ir.ISub(ir.Imm32(64), effective_width)};
+    const IR::U64 sign_extended{
+        ir.ShiftRightArithmetic(ir.ShiftLeftLogical(extracted, sign_shift), sign_shift)};
+    IR::U64 result{extracted};
+    if (is_signed) {
+        const IR::U1 crosses_msb{ir.IGreaterThanEqual(ir.IAdd(offset, width), ir.Imm32(64), false)};
+        const IR::U64 signed_result{
+            ir.Select(crosses_msb, ir.ShiftRightArithmetic(src0, offset), sign_extended)};
+        result = IR::U64{ir.Select(empty_width, ir.Imm64(u64(0)), signed_result)};
+    }
+    SetDst64(inst.dst[0], result);
 }
 
 void Translator::S_ABSDIFF_I32(const GcnInst& inst) {
@@ -546,24 +634,255 @@ void Translator::S_MOV(const GcnInst& inst, bool conditional) {
            conditional ? IR::U32{ir.Select(ir.GetScc(), value, GetSrc(inst.dst[0]))} : value);
 }
 
+void Translator::S_MOVRELS_B32(const GcnInst& inst) {
+    const u32 max_sgprs = static_cast<u32>(IR::NumScalarRegs);
+    const u32 allocated_sgprs = runtime_info.props.num_allocated_sgprs;
+    const u32 num_sgprs = allocated_sgprs < max_sgprs ? allocated_sgprs : max_sgprs;
+    if (inst.dst[0].code >= num_sgprs) {
+        return;
+    }
+    InstOperand source = inst.src[0];
+    if (source.field == OperandField::ScalarGPR && source.code >= num_sgprs) {
+        source.code = static_cast<u32>(IR::ScalarReg::S0);
+    }
+    const IR::U32 base = GetSrc(source);
+    const IR::U32 index = ir.IAdd(base, ir.GetM0());
+    const IR::U1 no_overflow = ir.IGreaterThanEqual(index, base, false);
+    // GCN3 returns SGPR0 when the relative source index is outside the wave's allocation.
+    IR::U32 result = ir.GetScalarReg<IR::U32>(IR::ScalarReg::S0);
+    for (u32 sgpr = 1; sgpr < num_sgprs; ++sgpr) {
+        const IR::U1 is_index = ir.LogicalAnd(no_overflow, ir.IEqual(index, ir.Imm32(sgpr)));
+        const auto reg = static_cast<IR::ScalarReg>(sgpr);
+        result = IR::U32{ir.Select(is_index, ir.GetScalarReg<IR::U32>(reg), result)};
+    }
+    SetDst(inst.dst[0], result);
+}
+
+void Translator::S_MOVRELS_B64(const GcnInst& inst) {
+    const u32 max_sgprs = static_cast<u32>(IR::NumScalarRegs);
+    const u32 allocated_sgprs = runtime_info.props.num_allocated_sgprs;
+    const u32 num_sgprs = allocated_sgprs < max_sgprs ? allocated_sgprs : max_sgprs;
+    if ((inst.dst[0].code & 1) != 0 || inst.dst[0].code + 1 >= num_sgprs) {
+        return;
+    }
+    InstOperand source = inst.src[0];
+    if (source.field == OperandField::ScalarGPR && source.code >= num_sgprs) {
+        source.code = static_cast<u32>(IR::ScalarReg::S0);
+    }
+    const IR::U32 base = GetSrc(source);
+    const IR::U32 m0 = ir.GetM0();
+    const IR::U32 index = ir.IAdd(base, m0);
+    // GCN3 requires the source value and M0 to be even independently.
+    const IR::U1 base_even = ir.IEqual(ir.BitwiseAnd(base, ir.Imm32(1)), ir.Imm32(0));
+    const IR::U1 m0_even = ir.IEqual(ir.BitwiseAnd(m0, ir.Imm32(1)), ir.Imm32(0));
+    const IR::U1 valid_index =
+        ir.LogicalAnd(ir.IGreaterThanEqual(index, base, false), ir.LogicalAnd(base_even, m0_even));
+    const IR::U32 sgpr0 = ir.GetScalarReg<IR::U32>(IR::ScalarReg::S0);
+    IR::U32 lo = sgpr0;
+    IR::U32 hi = sgpr0;
+    // GCN3 requires an even source index. Each out-of-range source dword reads SGPR0.
+    for (u32 sgpr = 0; sgpr < num_sgprs; sgpr += 2) {
+        const IR::U1 is_index = ir.LogicalAnd(valid_index, ir.IEqual(index, ir.Imm32(sgpr)));
+        const auto reg = static_cast<IR::ScalarReg>(sgpr);
+        const IR::U32 pair_hi = sgpr + 1 < num_sgprs
+                                    ? ir.GetScalarReg<IR::U32>(static_cast<IR::ScalarReg>(sgpr + 1))
+                                    : sgpr0;
+        lo = IR::U32{ir.Select(is_index, ir.GetScalarReg<IR::U32>(reg), lo)};
+        hi = IR::U32{ir.Select(is_index, pair_hi, hi)};
+    }
+    SetDst64(inst.dst[0], ir.PackUint2x32(ir.CompositeConstruct(lo, hi)));
+}
+
+void Translator::S_MOVRELD_B32(const GcnInst& inst) {
+    const u32 max_sgprs = static_cast<u32>(IR::NumScalarRegs);
+    const u32 allocated_sgprs = runtime_info.props.num_allocated_sgprs;
+    const u32 num_sgprs = allocated_sgprs < max_sgprs ? allocated_sgprs : max_sgprs;
+    InstOperand source = inst.src[0];
+    if (source.field == OperandField::ScalarGPR && source.code >= num_sgprs) {
+        source.code = static_cast<u32>(IR::ScalarReg::S0);
+    }
+    const IR::U32 value = GetSrc(source);
+    const IR::U32 base = ir.Imm32(inst.dst[0].code);
+    const IR::U32 index = ir.IAdd(base, ir.GetM0());
+    const IR::U1 no_overflow = ir.IGreaterThanEqual(index, base, false);
+    // A destination outside the wave's SGPR allocation is ignored.
+    for (u32 sgpr = 0; sgpr < num_sgprs; ++sgpr) {
+        const IR::U1 is_index = ir.LogicalAnd(no_overflow, ir.IEqual(index, ir.Imm32(sgpr)));
+        const auto reg = static_cast<IR::ScalarReg>(sgpr);
+        ir.SetScalarReg(reg, IR::U32{ir.Select(is_index, value, ir.GetScalarReg<IR::U32>(reg))});
+    }
+}
+
+void Translator::S_MOVRELD_B64(const GcnInst& inst) {
+    const u32 max_sgprs = static_cast<u32>(IR::NumScalarRegs);
+    const u32 allocated_sgprs = runtime_info.props.num_allocated_sgprs;
+    const u32 num_sgprs = allocated_sgprs < max_sgprs ? allocated_sgprs : max_sgprs;
+    const InstOperand& source = inst.src[0];
+    IR::U64 value{};
+    if (source.field == OperandField::ScalarGPR) {
+        if ((source.code & 1) != 0) {
+            return;
+        }
+        const IR::U32 sgpr0 = ir.GetScalarReg<IR::U32>(IR::ScalarReg::S0);
+        const IR::U32 lo = source.code < num_sgprs
+                               ? ir.GetScalarReg<IR::U32>(static_cast<IR::ScalarReg>(source.code))
+                               : sgpr0;
+        const IR::U32 hi =
+            source.code + 1 < num_sgprs
+                ? ir.GetScalarReg<IR::U32>(static_cast<IR::ScalarReg>(source.code + 1))
+                : sgpr0;
+        IR::U32 adjusted_hi = hi;
+        if (source.input_modifier.abs) {
+            adjusted_hi = ir.BitwiseAnd(adjusted_hi, ir.Imm32(0x7FFFFFFFu));
+        }
+        if (source.input_modifier.neg) {
+            adjusted_hi = ir.BitwiseXor(adjusted_hi, ir.Imm32(0x80000000u));
+        }
+        value = ir.PackUint2x32(ir.CompositeConstruct(lo, adjusted_hi));
+    } else {
+        value = GetSrc64(source);
+    }
+    const IR::U32 base = ir.Imm32(inst.dst[0].code);
+    const IR::U32 m0 = ir.GetM0();
+    const IR::U32 index = ir.IAdd(base, m0);
+    // GCN3 requires D and M0 to be even independently.
+    const IR::U1 base_even = ir.IEqual(ir.BitwiseAnd(base, ir.Imm32(1)), ir.Imm32(0));
+    const IR::U1 m0_even = ir.IEqual(ir.BitwiseAnd(m0, ir.Imm32(1)), ir.Imm32(0));
+    const IR::U1 valid_index =
+        ir.LogicalAnd(ir.IGreaterThanEqual(index, base, false), ir.LogicalAnd(base_even, m0_even));
+    const auto words = ir.UnpackUint2x32(value);
+    const IR::U32 lo{ir.CompositeExtract(words, 0)};
+    const IR::U32 hi{ir.CompositeExtract(words, 1)};
+    // An invalid or out-of-range destination pair is not written.
+    for (u32 sgpr = 0; sgpr + 1 < num_sgprs; sgpr += 2) {
+        const IR::U1 is_index = ir.LogicalAnd(valid_index, ir.IEqual(index, ir.Imm32(sgpr)));
+        const auto lo_reg = static_cast<IR::ScalarReg>(sgpr);
+        const auto hi_reg = static_cast<IR::ScalarReg>(sgpr + 1);
+        ir.SetScalarReg(lo_reg, IR::U32{ir.Select(is_index, lo, ir.GetScalarReg<IR::U32>(lo_reg))});
+        ir.SetScalarReg(hi_reg, IR::U32{ir.Select(is_index, hi, ir.GetScalarReg<IR::U32>(hi_reg))});
+    }
+}
+
 void Translator::S_SEXT_I32(const GcnInst& inst, u32 width) {
     SetDst(inst.dst[0],
            ir.BitFieldExtract(GetSrc(inst.src[0]), ir.Imm32(0), ir.Imm32(width), true));
 }
 
-void Translator::S_MOV_B64(const GcnInst& inst) {
-    SetDst64(inst.dst[0], GetSrc64(inst.src[0]));
+void Translator::S_MOV_B64(const GcnInst& inst, bool conditional) {
+    if (inst.dst[0].field == OperandField::ScalarGPR) {
+        // A 64-bit SGPR destination must fit entirely in the shader allocation.
+        if (!IsScalarGprAllocated(inst.dst[0].code) ||
+            !IsScalarGprAllocated(inst.dst[0].code + 1)) {
+            return;
+        }
+    }
+    const IR::U64 value{GetSrc64(inst.src[0])};
+    if (conditional) {
+        const IR::U64 old_value{GetSrc64(inst.dst[0])};
+        SetDst64(inst.dst[0], IR::U64{ir.Select(ir.GetScc(), value, old_value)});
+        return;
+    }
+    SetDst64(inst.dst[0], value);
+}
+
+void Translator::S_WQM_B32(const GcnInst& inst) {
+    IR::U32 result{GetSrc(inst.src[0])};
+    result = ir.BitwiseOr(
+        result, ir.ShiftRightLogical(ir.BitwiseAnd(result, ir.Imm32(0xAAAAAAAA)), ir.Imm32(1)));
+    result = ir.BitwiseOr(
+        result, ir.ShiftLeftLogical(ir.BitwiseAnd(result, ir.Imm32(0x55555555)), ir.Imm32(1)));
+    result = ir.BitwiseOr(
+        result, ir.ShiftRightLogical(ir.BitwiseAnd(result, ir.Imm32(0xCCCCCCCC)), ir.Imm32(2)));
+    result = ir.BitwiseOr(
+        result, ir.ShiftLeftLogical(ir.BitwiseAnd(result, ir.Imm32(0x33333333)), ir.Imm32(2)));
+    SetDst(inst.dst[0], result);
+    ir.SetScc(ir.INotEqual(result, ir.Imm32(0)));
+}
+
+void Translator::S_WQM_B64(const GcnInst& inst) {
+    IR::U64 result{GetSrc64(inst.src[0])};
+    result = ir.BitwiseOr(
+        result,
+        ir.ShiftRightLogical(ir.BitwiseAnd(result, ir.Imm64(0xAAAAAAAAAAAAAAAAULL)), ir.Imm32(1)));
+    result = ir.BitwiseOr(
+        result,
+        ir.ShiftLeftLogical(ir.BitwiseAnd(result, ir.Imm64(0x5555555555555555ULL)), ir.Imm32(1)));
+    result = ir.BitwiseOr(
+        result,
+        ir.ShiftRightLogical(ir.BitwiseAnd(result, ir.Imm64(0xCCCCCCCCCCCCCCCCULL)), ir.Imm32(2)));
+    result = ir.BitwiseOr(
+        result,
+        ir.ShiftLeftLogical(ir.BitwiseAnd(result, ir.Imm64(0x3333333333333333ULL)), ir.Imm32(2)));
+    SetDst64(inst.dst[0], result);
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
+}
+
+void Translator::S_QUADMASK_B32(const GcnInst& inst) {
+    const IR::U32 src0{GetSrc(inst.src[0])};
+    IR::U32 result{ir.Imm32(0)};
+    for (u32 quad = 0; quad < 8; ++quad) {
+        const IR::U32 group{
+            ir.BitwiseAnd(ir.ShiftRightLogical(src0, ir.Imm32(quad * 4)), ir.Imm32(0xF))};
+        const IR::U32 bit{
+            ir.Select(ir.INotEqual(group, ir.Imm32(0)), ir.Imm32(1U << quad), ir.Imm32(0))};
+        result = ir.BitwiseOr(result, bit);
+    }
+    SetDst(inst.dst[0], result);
+    ir.SetScc(ir.INotEqual(result, ir.Imm32(0)));
+}
+
+void Translator::S_QUADMASK_B64(const GcnInst& inst) {
+    const IR::U64 src0{GetSrc64(inst.src[0])};
+    IR::U64 result{ir.Imm64(u64(0))};
+    for (u32 quad = 0; quad < 16; ++quad) {
+        const IR::U64 group{
+            ir.BitwiseAnd(ir.ShiftRightLogical(src0, ir.Imm32(quad * 4)), ir.Imm64(u64(0xF)))};
+        const IR::U64 bit{ir.Select(ir.INotEqual(group, ir.Imm64(u64(0))), ir.Imm64(u64(1) << quad),
+                                    ir.Imm64(u64(0)))};
+        result = ir.BitwiseOr(result, bit);
+    }
+    SetDst64(inst.dst[0], result);
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
 }
 
 void Translator::S_NOT_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
     const IR::U64 result = ir.BitwiseNot(src0);
-    ir.SetScc(ir.InverseBallot(result));
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
     SetDst64(inst.dst[0], result);
 }
 
 void Translator::S_BREV_B32(const GcnInst& inst) {
     SetDst(inst.dst[0], ir.BitReverse(GetSrc(inst.src[0])));
+}
+void Translator::S_BREV_B64(const GcnInst& inst) {
+    IR::U64 result{GetSrc64(inst.src[0])};
+    const auto swap_bits = [&](u32 shift, u64 mask) {
+        const IR::U64 right{
+            ir.BitwiseAnd(ir.ShiftRightLogical(result, ir.Imm32(shift)), ir.Imm64(mask))};
+        const IR::U64 left{
+            ir.ShiftLeftLogical(ir.BitwiseAnd(result, ir.Imm64(mask)), ir.Imm32(shift))};
+        result = ir.BitwiseOr(left, right);
+    };
+    swap_bits(1, 0x5555555555555555ULL);
+    swap_bits(2, 0x3333333333333333ULL);
+    swap_bits(4, 0x0F0F0F0F0F0F0F0FULL);
+    swap_bits(8, 0x00FF00FF00FF00FFULL);
+    swap_bits(16, 0x0000FFFF0000FFFFULL);
+    swap_bits(32, 0x00000000FFFFFFFFULL);
+    SetDst64(inst.dst[0], result);
+}
+
+void Translator::S_BCNT0_I32_B32(const GcnInst& inst) {
+    const IR::U32 result = ir.BitCount(ir.BitwiseNot(GetSrc(inst.src[0])));
+    SetDst(inst.dst[0], result);
+    ir.SetScc(ir.INotEqual(result, ir.Imm32(0)));
+}
+
+void Translator::S_BCNT0_I32_B64(const GcnInst& inst) {
+    const IR::U32 result = ir.BitCount(ir.BitwiseNot(GetSrc64(inst.src[0])));
+    SetDst(inst.dst[0], result);
+    ir.SetScc(ir.INotEqual(result, ir.Imm32(0)));
 }
 
 void Translator::S_BCNT1_I32_B32(const GcnInst& inst) {
@@ -586,7 +905,18 @@ void Translator::S_FF1_I32_B32(const GcnInst& inst) {
 
 void Translator::S_FF1_I32_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    SetDst(inst.dst[0], ir.BallotFindLsb(src0));
+    // This is a scalar bit scan, not a lane-mask query; keep it independent of subgroup width.
+    SetDst(inst.dst[0], ir.FindILsb(src0));
+}
+
+void Translator::S_FF0_I32_B32(const GcnInst& inst) {
+    const IR::U32 src0{ir.BitwiseNot(GetSrc(inst.src[0]))};
+    SetDst(inst.dst[0], ir.FindILsb(src0));
+}
+
+void Translator::S_FF0_I32_B64(const GcnInst& inst) {
+    const IR::U64 src0{ir.BitwiseNot(GetSrc64(inst.src[0]))};
+    SetDst(inst.dst[0], ir.FindILsb(src0));
 }
 
 void Translator::S_FLBIT_I32_B32(const GcnInst& inst) {
@@ -611,6 +941,25 @@ void Translator::S_FLBIT_I32_B64(const GcnInst& inst) {
     SetDst(inst.dst[0], IR::U32{ir.Select(cond, pos_from_left, ir.Imm32(~0U))});
 }
 
+void Translator::S_FLBIT_I32(const GcnInst& inst) {
+    const IR::U32 src0{GetSrc(inst.src[0])};
+    const IR::U1 is_negative{ir.INotEqual(ir.ShiftRightLogical(src0, ir.Imm32(31)), ir.Imm32(0))};
+    const IR::U32 normalized{ir.Select(is_negative, ir.BitwiseNot(src0), src0)};
+    const IR::U32 leading_sign_bits{ir.ISub(ir.Imm32(31), ir.FindUMsb(normalized))};
+    const IR::U1 has_transition{ir.INotEqual(normalized, ir.Imm32(0))};
+    SetDst(inst.dst[0], IR::U32{ir.Select(has_transition, leading_sign_bits, ir.Imm32(~0U))});
+}
+
+void Translator::S_FLBIT_I32_I64(const GcnInst& inst) {
+    const IR::U64 src0{GetSrc64(inst.src[0])};
+    const IR::U64 sign{ir.ShiftRightLogical(src0, ir.Imm32(63))};
+    const IR::U1 is_negative{ir.INotEqual(sign, ir.Imm64(u64(0)))};
+    const IR::U64 normalized{ir.Select(is_negative, ir.BitwiseNot(src0), src0)};
+    const IR::U32 leading_sign_bits{ir.ISub(ir.Imm32(63), ir.FindUMsb(normalized))};
+    const IR::U1 has_transition{ir.INotEqual(normalized, ir.Imm64(u64(0)))};
+    SetDst(inst.dst[0], IR::U32{ir.Select(has_transition, leading_sign_bits, ir.Imm32(~0U))});
+}
+
 void Translator::S_BITSET_B32(const GcnInst& inst, u32 bit_value) {
     const IR::U32 old_value{GetSrc(inst.dst[0])};
     const IR::U32 offset{ir.BitFieldExtract(GetSrc(inst.src[0]), ir.Imm32(0U), ir.Imm32(5U))};
@@ -626,22 +975,36 @@ void Translator::S_BITSET_B64(const GcnInst& inst, u32 bit_value) {
     SetDst64(inst.dst[0], result);
 }
 
-void Translator::S_SAVEEXEC_B64(NegateMode negate, bool is_or, const GcnInst& inst) {
-    IR::U64 exec{ir.Ballot(ir.GetExec())};
+void Translator::S_SAVEEXEC_B64(const GcnInst& inst) {
+    const IR::U64 exec{ir.Ballot(ir.GetExec())};
     const IR::U64 src{GetSrc64(inst.src[0])};
     SetDst64(inst.dst[0], exec);
 
-    // Update EXEC.
-    if (negate == NegateMode::Src1) {
-        exec = ir.BitwiseNot(exec);
-    }
-    IR::U64 result = is_or ? ir.BitwiseOr(exec, src) : ir.BitwiseAnd(exec, src);
-    if (negate == NegateMode::Result) {
-        result = ir.BitwiseNot(result);
-    }
-    const IR::U1 result_u1 = ir.InverseBallot(result);
-    ir.SetExec(result_u1);
-    ir.SetScc(result_u1);
+    const IR::U64 result{[&] {
+        switch (inst.opcode) {
+        case Opcode::S_AND_SAVEEXEC_B64:
+            return ir.BitwiseAnd(src, exec);
+        case Opcode::S_OR_SAVEEXEC_B64:
+            return ir.BitwiseOr(src, exec);
+        case Opcode::S_XOR_SAVEEXEC_B64:
+            return ir.BitwiseXor(src, exec);
+        case Opcode::S_ANDN2_SAVEEXEC_B64:
+            return ir.BitwiseAnd(src, ir.BitwiseNot(exec));
+        case Opcode::S_ORN2_SAVEEXEC_B64:
+            return ir.BitwiseOr(src, ir.BitwiseNot(exec));
+        case Opcode::S_NAND_SAVEEXEC_B64:
+            return ir.BitwiseNot(ir.BitwiseAnd(src, exec));
+        case Opcode::S_NOR_SAVEEXEC_B64:
+            return ir.BitwiseNot(ir.BitwiseOr(src, exec));
+        case Opcode::S_XNOR_SAVEEXEC_B64:
+            return ir.BitwiseNot(ir.BitwiseXor(src, exec));
+        default:
+            UNREACHABLE();
+        }
+    }()};
+    const IR::U1 exec_lane = ir.InverseBallot(result);
+    ir.SetExec(exec_lane);
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
 }
 
 void Translator::S_ABS_I32(const GcnInst& inst) {

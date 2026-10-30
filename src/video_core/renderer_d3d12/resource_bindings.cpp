@@ -228,7 +228,11 @@ void ResourceBindings::ValidateInputRange(VAddr address, u64 size) const {
             const auto sharp = resource.GetSharp(entry.shader->info);
             if (sharp && resource.is_written) {
                 const auto info = ShaderImageLayout(sharp, resource);
-                if (Aliases(address, size, info.guest_address, info.guest_size))
+                const bool aliases_depth =
+                    Aliases(address, size, info.guest_address, info.guest_size);
+                const bool aliases_stencil =
+                    Aliases(address, size, info.stencil_addr, info.stencil_size);
+                if (aliases_depth || aliases_stencil)
                     throw std::runtime_error(
                         "D3D12 writable image/input alias requires coherent fetching");
             }
@@ -379,10 +383,24 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
     std::vector<ResourceCache::Buffer*> uploaded_buffers;
     std::vector<ImageCache::Image*> uploaded_images;
     struct BoundImage {
-        VAddr address;
-        u64 size;
+        struct BackingRanges {
+            VAddr depth_address;
+            u64 depth_size;
+            VAddr stencil_address;
+            u64 stencil_size;
+        } ranges;
         bool writable;
         ImageCache::Image* image;
+    };
+    const auto image_overlaps_range = [&](const BoundImage::BackingRanges& image, VAddr address,
+                                          u64 size) {
+        return Aliases(image.depth_address, image.depth_size, address, size) ||
+               Aliases(image.stencil_address, image.stencil_size, address, size);
+    };
+    const auto image_ranges_overlap = [&](const BoundImage::BackingRanges& first,
+                                          const BoundImage::BackingRanges& second) {
+        return image_overlaps_range(first, second.depth_address, second.depth_size) ||
+               image_overlaps_range(first, second.stencil_address, second.stencil_size);
     };
     std::vector<BoundImage> bound_images;
     for (u32 i = 0; i < entries.size(); ++i) {
@@ -484,7 +502,7 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                         words[entry + 6 + c] = std::bit_cast<u32>(border_float[c]);
                     std::memcpy(words.data() + entry + 12, &sharp, sizeof(sharp));
                 }
-                const u64 identity = 0xfff8000000000000ULL + (u64(info.sw_stage) << 32);
+                const u64 identity = 0xfff7000000000000ULL + (u64(info.sw_stage) << 32);
                 view = {&buffers.GetHostBuffer(identity, {reinterpret_cast<const u8*>(words.data()),
                                                           words.size() * sizeof(u32)}),
                         0, words.size() * sizeof(u32)};
@@ -541,8 +559,7 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                           reduction);
             descriptor.MipLODBias = std::clamp(sharp.LodBias(), -16.0f, 15.99f);
             descriptor.MinLOD = sharp.MinLod();
-            descriptor.MaxLOD =
-                sharp.mip_filter == AmdGpu::MipFilter::None ? descriptor.MinLOD : sharp.MaxLod();
+            descriptor.MaxLOD = sharp.MaxLod();
             descriptor.MaxAnisotropy = static_cast<UINT>(sharp.MaxAniso());
             descriptor.ComparisonFunc =
                 D3D12_COMPARISON_FUNC(u32(sharp.depth_compare_func.Value()) + 1);
@@ -597,9 +614,11 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
             ImageCache::Image* image{};
             if (sharp) {
                 const auto image_info = ShaderImageLayout(sharp, resource);
+                const BoundImage::BackingRanges image_ranges{
+                    image_info.guest_address, image_info.guest_size, image_info.stencil_addr,
+                    image_info.stencil_size};
                 for (const auto& bound : bound_images)
-                    if (Aliases(image_info.guest_address, image_info.guest_size, bound.address,
-                                bound.size) &&
+                    if (image_ranges_overlap(image_ranges, bound.ranges) &&
                         bound.writable != writable)
                         throw std::runtime_error(
                             "D3D12 SRV/UAV image alias was not lowered to shared storage");
@@ -607,10 +626,9 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                     const auto& buffer_entry = entries[buffer_index];
                     const auto& range = guest_ranges[buffer_index];
                     if (buffer_entry.binding.kind == ResourceKind::Buffer &&
-                        (writable || resource.is_written || resource.is_atomic ||
+                        (writable || resource.is_written ||
                          buffer_entry.shader->info.buffers[buffer_entry.index].is_written) &&
-                        Aliases(image_info.guest_address, image_info.guest_size, range.address,
-                                range.size))
+                        image_overlaps_range(image_ranges, range.address, range.size))
                         throw std::runtime_error(
                             "D3D12 simultaneous image/buffer aliases require coherent views");
                 }
@@ -619,16 +637,27 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                                                   : D3D12_RESOURCE_FLAG_NONE,
                                          array ? 0 : sharp.base_array, array ? 0 : 1);
                 for (const auto& bound : bound_images)
-                    if (Aliases(image_info.guest_address, image_info.guest_size, bound.address,
-                                bound.size) &&
-                        bound.image != image && (writable || bound.writable))
+                    if (image_ranges_overlap(image_ranges, bound.ranges) && bound.image != image &&
+                        (writable || bound.writable))
                         throw std::runtime_error(
                             "D3D12 overlapping texture layouts require shared image views");
-                bound_images.push_back(
-                    {image_info.guest_address, image_info.guest_size, writable, image});
+                bound_images.push_back({image_ranges, writable, image});
                 if (std::ranges::find(uploaded_images, image) == uploaded_images.end()) {
                     images.Upload(*image, commands);
                     uploaded_images.push_back(image);
+                }
+                if (resource.is_depth && !writable && image->has_stencil) {
+                    switch (image->dsv_format) {
+                    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+                        format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+                        break;
+                    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+                        format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+                        break;
+                    default:
+                        throw std::runtime_error(
+                            "D3D12 depth/stencil image has no compatible sampled view format");
+                    }
                 }
                 images.Barrier(*image, commands,
                                writable ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS

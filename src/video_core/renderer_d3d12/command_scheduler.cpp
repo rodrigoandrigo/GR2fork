@@ -231,10 +231,10 @@ void CommandRuntime::PrepareContext(std::span<CompiledShader*> stages) {
 }
 void CommandRuntime::FinishRecording(std::shared_ptr<void> lease, ResourceCache::Buffer* gds_buffer,
                                      std::vector<ResourceCache::Range> cpu_ranges,
-                                     ResourceCache::Buffer* strmout_counter) {
-    const auto commit = [this, lease, gds_buffer, strmout_counter,
+                                     ResourceCache::Buffer* strmout_counter, bool mapping_stable) {
+    const auto commit = [this, lease, gds_buffer, strmout_counter, mapping_stable,
                          cpu_ranges = std::move(cpu_ranges)] {
-        resources.CommitDownloads(bool(lease));
+        resources.CommitDownloads(mapping_stable);
         CompleteOcclusion();
         if (strmout_counter) {
             std::memcpy(&strmout_filled, strmout_counter->host_data.data(), sizeof(strmout_filled));

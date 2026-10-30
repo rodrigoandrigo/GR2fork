@@ -10,10 +10,12 @@
 
 namespace D3D12 {
 inline uint64_t CmaskBytes(const AmdGpu::ColorBuffer& buffer) {
-    const uint64_t bytes = (uint64_t(buffer.cmask_slice.tile_max) + 1) * 128 * buffer.NumSlices();
-    if (bytes > 64 * 1024 * 1024)
+    constexpr uint64_t max_bytes = 64 * 1024 * 1024;
+    const uint64_t slices = buffer.NumSlices();
+    const uint64_t bytes_per_slice = (uint64_t(buffer.cmask_slice.tile_max) + 1) * 128;
+    if (!slices || bytes_per_slice > max_bytes / slices)
         throw std::runtime_error("D3D12 CMASK exceeds metadata budget");
-    return bytes;
+    return bytes_per_slice * slices;
 }
 
 struct CmaskAddress {

@@ -379,8 +379,10 @@ void D3D12Presenter::Initialize(const ShadPS4Config& config) {
                       (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0;
     winrt::check_hresult(swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709));
     GetBuffers();
-    context.CreateDirectCommands(commands_allocator, commands);
-    winrt::check_hresult(commands->Close());
+    for (auto& command_frame : command_frames) {
+        context.CreateDirectCommands(command_frame.allocator, command_frame.commands);
+        winrt::check_hresult(command_frame.commands->Close());
+    }
     winrt::check_hresult(config.attach_swapchain(config.attach_context, chain.Get()));
 }
 
@@ -397,11 +399,21 @@ void D3D12Presenter::Render() {
                               [&] { return std::unique_lock{mutex}; });
     ProfileSample(presenter_profile, "presenter_render", 128, [&] { RenderFrame(); });
 }
-void D3D12Presenter::ConvertResident(Frame& frame) {
+void D3D12Presenter::WaitForFrameUse(const Frame& frame) {
+    for (auto& command_frame : command_frames) {
+        if (command_frame.submitted_frame.get() != &frame || !command_frame.fence)
+            continue;
+        context.Wait(command_frame.fence);
+        command_frame.submitted_frame.reset();
+    }
+}
+void D3D12Presenter::ConvertResident(Frame& frame, CommandFrame& command_frame,
+                                     ID3D12GraphicsCommandList* commands) {
     D3D12::ProfileScope timing{presenter_profile, "presenter_convert"};
     if (frame.converted && frame.upload_hdr == hdr_enabled &&
         frame.upload_sdr_white == sdr_white_nits)
         return;
+    WaitForFrameUse(frame);
     if (!conversion_pipeline) {
         conversion_shaders.Initialize(context.Device());
         const auto binary =
@@ -428,10 +440,12 @@ void D3D12Presenter::ConvertResident(Frame& frame) {
         pipeline.CS = {binary->dxil.data(), binary->dxil.size()};
         winrt::check_hresult(context.Device()->CreateComputePipelineState(
             &pipeline, IID_PPV_ARGS(&conversion_pipeline)));
+    }
+    if (!command_frame.conversion_heap) {
         D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-        winrt::check_hresult(
-            context.Device()->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&conversion_heap)));
+        winrt::check_hresult(context.Device()->CreateDescriptorHeap(
+            &heap, IID_PPV_ARGS(&command_frame.conversion_heap)));
     }
     if (!frame.source)
         winrt::check_hresult(context.Device()->OpenSharedHandle(frame.resident->handle.get(),
@@ -455,7 +469,7 @@ void D3D12Presenter::ConvertResident(Frame& frame) {
     view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     context.Device()->CreateUnorderedAccessView(
         frame.converted.Get(), nullptr, &view,
-        conversion_heap->GetCPUDescriptorHandleForHeapStart());
+        command_frame.conversion_heap->GetCPUDescriptorHandleForHeapStart());
     using Format = Libraries::VideoOut::PixelFormat;
     const u32 mode = frame.format == Format::A8R8G8B8Srgb          ? 0
                      : frame.format == Format::A8B8G8R8Srgb        ? 1
@@ -483,11 +497,11 @@ void D3D12Presenter::ConvertResident(Frame& frame) {
     frame.upload->Unmap(0, &contents);
     commands->SetComputeRootSignature(conversion_root.Get());
     commands->SetPipelineState(conversion_pipeline.Get());
-    auto* descriptors = conversion_heap.Get();
+    auto* descriptors = command_frame.conversion_heap.Get();
     commands->SetDescriptorHeaps(1, &descriptors);
     commands->SetComputeRootShaderResourceView(0, frame.source->GetGPUVirtualAddress());
-    commands->SetComputeRootDescriptorTable(1,
-                                            conversion_heap->GetGPUDescriptorHandleForHeapStart());
+    commands->SetComputeRootDescriptorTable(
+        1, command_frame.conversion_heap->GetGPUDescriptorHandleForHeapStart());
     commands->SetComputeRoot32BitConstants(2, constants.size(), constants.data(), 0);
     commands->SetComputeRootShaderResourceView(3, frame.upload->GetGPUVirtualAddress());
     D3D12_RESOURCE_BARRIER source{};
@@ -532,20 +546,27 @@ void D3D12Presenter::RenderFrame() {
             }
         }
     }
-    if (!upscale)
-        fsr.ResetImages();
-    ResizeBuffers(output_width, output_height, floating_point ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                                              : DXGI_FORMAT_R8G8B8A8_UNORM);
+    ResizeBuffers(output_width, output_height,
+                  floating_point ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM);
     const float scale = std::min(float(display_width) / width, float(display_height) / height);
     const DXGI_MATRIX_3X2_F transform{
         scale / composition_scale_x, 0, 0, scale / composition_scale_y,
         (display_width - width * scale) * 0.5f / composition_scale_x,
         (display_height - height * scale) * 0.5f / composition_scale_y};
     winrt::check_hresult(swapchain->SetMatrixTransform(&transform));
-    winrt::check_hresult(commands_allocator->Reset());
-    winrt::check_hresult(commands->Reset(commands_allocator.Get(), nullptr));
     const auto index = swapchain->GetCurrentBackBufferIndex();
-    D3D12CommandEncoder encoder{commands.Get(), transfers};
+    auto& command_frame = command_frames[index];
+    if (command_frame.fence)
+        ProfileSample(presenter_profile, "presenter_fence_wait", 128,
+                      [&] { context.Wait(command_frame.fence); });
+    command_frame.fence = 0;
+    command_frame.submitted_frame.reset();
+    if (!upscale)
+        command_frame.fsr.ResetImages();
+    winrt::check_hresult(command_frame.allocator->Reset());
+    winrt::check_hresult(command_frame.commands->Reset(command_frame.allocator.Get(), nullptr));
+    auto* commands = command_frame.commands.Get();
+    D3D12CommandEncoder encoder{commands, transfers};
     encoder.Track(buffers[index].Get(), D3D12_RESOURCE_STATE_PRESENT);
     ID3D12Resource* upscale_source{};
     if (last_frame && last_frame->resident) {
@@ -578,7 +599,7 @@ void D3D12Presenter::RenderFrame() {
                 presenter_profile.Record("presenter_direct_bytes", 128, 0,
                                          u64(width) * height * 4);
         } else {
-            ConvertResident(*last_frame);
+            ConvertResident(*last_frame, command_frame, commands);
             if (upscale)
                 upscale_source = last_frame->converted.Get();
             else {
@@ -597,8 +618,10 @@ void D3D12Presenter::RenderFrame() {
         context.Device()->GetCopyableFootprints(&description, 0, 1, 0, &footprint, nullptr, nullptr,
                                                 &bytes);
         if (last_frame->upload.Get() && (last_frame->upload_hdr != hdr_enabled ||
-                                         last_frame->upload_sdr_white != sdr_white_nits))
+                                         last_frame->upload_sdr_white != sdr_white_nits)) {
+            WaitForFrameUse(*last_frame);
             last_frame->upload = {};
+        }
         if (!last_frame->upload.Get()) {
             const auto pixels =
                 ConvertPixels(*last_frame, format == DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -643,18 +666,18 @@ void D3D12Presenter::RenderFrame() {
                            {0.025f, 0.035f, 0.05f, 1.0f});
     }
     if (upscale_source) {
-        auto* filtered = fsr.Record(context.Device(), commands.Get(), upscale_source, width, height,
-                                   EmulatorSettings.IsRcasEnabled(),
-                                   EmulatorSettings.GetRcasAttenuation() / 1000.f);
+        auto* filtered = command_frame.fsr.Record(context.Device(), commands, upscale_source, width,
+                                                  height, EmulatorSettings.IsRcasEnabled(),
+                                                  EmulatorSettings.GetRcasAttenuation() / 1000.f);
         commands->CopyResource(buffers[index].Get(), filtered);
     }
     encoder.Transition(buffers[index].Get(), D3D12_RESOURCE_STATE_PRESENT);
     winrt::check_hresult(commands->Close());
-    const auto ticket = context.Submit(commands.Get());
+    const auto ticket = context.Submit(commands);
+    command_frame.fence = ticket;
+    command_frame.submitted_frame = last_frame;
     ProfileSample(presenter_profile, "swapchain_present", 128,
                   [&] { winrt::check_hresult(swapchain->Present(1, 0)); });
-    ProfileSample(presenter_profile, "presenter_fence_wait", 128,
-                  [&] { context.Wait(ticket); });
 }
 
 void D3D12Presenter::Resize(uint32_t new_width, uint32_t new_height, float scale_x, float scale_y) {
@@ -681,8 +704,10 @@ D3D12Presenter::~D3D12Presenter() {
 u64 D3D12Presenter::MemoryBytes() const {
     auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
                               [&] { return std::unique_lock{mutex}; });
-    u64 bytes = resources.Stats().live_bytes + fsr.MemoryBytes() +
-                conversion_shaders.MemoryBytes() + frame_bytes->load();
+    u64 bytes =
+        resources.Stats().live_bytes + conversion_shaders.MemoryBytes() + frame_bytes->load();
+    for (const auto& command_frame : command_frames)
+        bytes += command_frame.fsr.MemoryBytes();
     for (const auto& buffer : buffers)
         if (buffer) {
             const auto description = buffer->GetDesc();
@@ -696,21 +721,36 @@ void D3D12Presenter::TrimMemory() {
     if (!context.DirectQueue())
         return;
     context.WaitForGpu();
-    fsr.TrimMemory();
+    for (auto& command_frame : command_frames) {
+        command_frame.fence = 0;
+        command_frame.submitted_frame.reset();
+    }
+    for (auto& command_frame : command_frames)
+        command_frame.fsr.TrimMemory();
     conversion_shaders.TrimMemory(0);
     static_cast<void>(context.TryTrim());
 }
 void D3D12Presenter::Drain() {
     auto lock = ProfileSample(presenter_profile, "presenter_lock", 128,
                               [&] { return std::unique_lock{mutex}; });
-    if (context.DirectQueue())
+    if (context.DirectQueue()) {
         context.WaitForGpu();
+        for (auto& command_frame : command_frames) {
+            command_frame.fence = 0;
+            command_frame.submitted_frame.reset();
+        }
+    }
 }
 void D3D12Presenter::ResizeBuffers(uint32_t new_width, uint32_t new_height, DXGI_FORMAT new_format) {
     if (!swapchain || !new_width || !new_height || (new_width == width && new_height == height && new_format == format)) {
         return;
     }
     context.WaitForGpu();
+    for (auto& command_frame : command_frames) {
+        command_frame.fence = 0;
+        command_frame.submitted_frame.reset();
+        command_frame.fsr.ResetImages();
+    }
     D3D12::NativeTemporalJitter().Reset();
     for (auto& buffer : buffers) {
         buffer.Reset();

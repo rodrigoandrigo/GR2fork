@@ -40,13 +40,19 @@ MsaaFormat GetMsaaFormat(DXGI_FORMAT format, bool depth) {
         MSAA_FAMILY(R8G8);
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
         MSAA_FAMILY(R8G8B8A8);
-    case DXGI_FORMAT_R16_FLOAT:
-        MSAA_FAMILY(R16);
-    case DXGI_FORMAT_R16G16_FLOAT:
-        MSAA_FAMILY(R16G16);
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:
-        MSAA_FAMILY(R16G16B16A16);
 #undef MSAA_FAMILY
+#define MSAA_FAMILY_16(prefix)                                                                     \
+    case DXGI_FORMAT_##prefix##_TYPELESS:                                                          \
+    case DXGI_FORMAT_##prefix##_UNORM:                                                             \
+    case DXGI_FORMAT_##prefix##_SNORM:                                                             \
+    case DXGI_FORMAT_##prefix##_FLOAT:                                                             \
+    case DXGI_FORMAT_##prefix##_UINT:                                                              \
+    case DXGI_FORMAT_##prefix##_SINT:                                                              \
+        return {DXGI_FORMAT_##prefix##_TYPELESS, DXGI_FORMAT_##prefix##_UINT, true}
+        MSAA_FAMILY_16(R16);
+        MSAA_FAMILY_16(R16G16);
+        MSAA_FAMILY_16(R16G16B16A16);
+#undef MSAA_FAMILY_16
     case DXGI_FORMAT_R10G10B10A2_TYPELESS:
     case DXGI_FORMAT_R10G10B10A2_UNORM:
     case DXGI_FORMAT_R10G10B10A2_UINT:
@@ -69,7 +75,11 @@ void SetSamplePositions(ID3D12GraphicsCommandList* commands, u32 samples,
             extended->SetSamplePositions(0, 0, nullptr);
         return;
     }
-    if ((positions.size() != samples && positions.size() != samples * 4) || positions.size() > 16)
+    const bool supported_sample_count =
+        samples == 1 || samples == 2 || samples == 4 || samples == 8 || samples == 16;
+    if (!supported_sample_count ||
+        (positions.size() != samples && positions.size() != static_cast<size_t>(samples) * 4) ||
+        positions.size() > 16)
         throw std::runtime_error("Invalid D3D12 sample position pattern");
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     winrt::check_hresult(commands->GetDevice(IID_PPV_ARGS(&device)));

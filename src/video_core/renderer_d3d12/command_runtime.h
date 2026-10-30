@@ -60,6 +60,7 @@ public:
     bool CanRecover(const RecoveryCheckpoint& checkpoint);
     void AbandonForRecovery(const RecoveryCheckpoint& checkpoint);
     void RestoreRecoveryCheckpoint(const RecoveryCheckpoint& checkpoint);
+    bool DrainForDestruction() noexcept;
     struct DrawRequest {
         struct StencilState {
             u32 fail, depth_fail, pass;
@@ -87,6 +88,7 @@ public:
         u32 index_capacity{UINT32_MAX};
         u32 index_read_count{UINT32_MAX};
         bool rectangles{};
+        bool rectangle_points{};
         std::vector<VideoCore::ImageInfo> colors;
         std::vector<AmdGpu::ColorBuffer> color_clear_buffers;
         std::vector<u32> color_slots;
@@ -101,6 +103,7 @@ public:
         u32 stencil_clear{};
         bool clear_depth{};
         bool clear_stencil{};
+        bool clear_only{};
         bool flat_last{}, viewport_transform{};
         std::array<std::array<float, 4>, 16> viewport_xy{};
         std::array<u32, 16> viewport_flags{};
@@ -218,7 +221,8 @@ private:
     };
     void MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer,
                                    const VideoCore::ImageInfo& info);
-    bool failed{}, trimming_memory{}, recovery_abandoned{};
+    void DrawClearOnly(const DrawRequest& request);
+    bool failed{}, trimming_memory{}, recovery_abandoned{}, destruction_drained{};
     MemoryBudget memory_budget;
     std::function<u64()> external_memory;
     std::function<void()> trim_external_memory;
@@ -260,7 +264,7 @@ private:
     void PrepareContext(std::span<CompiledShader*> stages);
     void FinishRecording(std::shared_ptr<void> lease, ResourceCache::Buffer* gds_buffer,
                          std::vector<ResourceCache::Range> cpu_ranges,
-                         ResourceCache::Buffer* strmout_counter = nullptr);
+                         ResourceCache::Buffer* strmout_counter, bool mapping_stable);
     CommandRuntime* coordinator{};
     CommandRuntime* last_context{};
     std::vector<std::unique_ptr<CommandRuntime>> contexts;

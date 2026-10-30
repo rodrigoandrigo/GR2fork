@@ -355,8 +355,20 @@ IR::VectorReg Translator::GetScratchVgpr(u32 offset) {
     return it->second;
 }
 
+bool Translator::IsScalarGprAllocated(u32 index) const {
+    const u32 max_sgprs = static_cast<u32>(IR::NumScalarRegs);
+    const u32 allocated_sgprs = runtime_info.props.num_allocated_sgprs;
+    return index < std::min(allocated_sgprs, max_sgprs);
+}
+
 template <typename T>
-T Translator::GetSrc(const InstOperand& operand) {
+T Translator::GetScalarGpr(u32 index) {
+    const u32 source = IsScalarGprAllocated(index) ? index : static_cast<u32>(IR::ScalarReg::S0);
+    return ir.GetScalarReg<T>(IR::ScalarReg(source));
+}
+
+template <typename T>
+T Translator::GetSrc(const InstOperand& operand, bool sgpr_oob_returns_sgpr0) {
     constexpr bool is_float = std::is_same_v<T, IR::F32>;
 
     const auto get_imm = [&](auto value) -> T {
@@ -370,7 +382,11 @@ T Translator::GetSrc(const InstOperand& operand) {
     T value{};
     switch (operand.field) {
     case OperandField::ScalarGPR:
-        value = ir.GetScalarReg<T>(IR::ScalarReg(operand.code));
+        if (sgpr_oob_returns_sgpr0) {
+            value = GetScalarGpr<T>(operand.code);
+        } else {
+            value = ir.GetScalarReg<T>(IR::ScalarReg(operand.code));
+        }
         break;
     case OperandField::VectorGPR:
         value = ir.GetVectorReg<T>(IR::VectorReg(operand.code));
@@ -505,8 +521,8 @@ T Translator::GetSrc(const InstOperand& operand) {
     return value;
 }
 
-template IR::U32 Translator::GetSrc<IR::U32>(const InstOperand&);
-template IR::F32 Translator::GetSrc<IR::F32>(const InstOperand&);
+template IR::U32 Translator::GetSrc<IR::U32>(const InstOperand&, bool);
+template IR::F32 Translator::GetSrc<IR::F32>(const InstOperand&, bool);
 
 template <typename T, bool is_signed>
 T Translator::GetSrc16(const InstOperand& operand) {
@@ -552,7 +568,7 @@ T Translator::GetSrc16(const InstOperand& operand) {
     T value{};
     switch (operand.field) {
     case OperandField::ScalarGPR: {
-        const auto f = ir.GetScalarReg<T>(IR::ScalarReg(operand.code));
+        const auto f = GetScalarGpr<T>(operand.code);
         value = cast(IR::F32{
             ir.CompositeExtract(ir.Unpack2x16(number_format, bitcast_to_u(f)), op_sel ? 1 : 0)});
         break;
@@ -653,14 +669,14 @@ IR::F32 Translator::GetSrcMix(const InstOperand& operand) {
     const auto extract = [&](auto value) -> IR::F32 {
         const auto getter_u = [&]() {
             if constexpr (std::same_as<decltype(value), IR::ScalarReg>) {
-                return ir.GetScalarReg<IR::U32>(value);
+                return GetScalarGpr<IR::U32>(static_cast<u32>(value));
             } else {
                 return ir.GetVectorReg<IR::U32>(value);
             }
         }();
         if (!operand.op_sel.op_sel_hi) {
             if constexpr (std::same_as<decltype(value), IR::ScalarReg>) {
-                return ir.GetScalarReg<IR::F32>(value);
+                return GetScalarGpr<IR::F32>(static_cast<u32>(value));
             } else {
                 return ir.GetVectorReg<IR::F32>(value);
             }
@@ -771,8 +787,8 @@ T Translator::GetSrc64(const InstOperand& operand) {
     T value{};
     switch (operand.field) {
     case OperandField::ScalarGPR: {
-        const auto value_lo = ir.GetScalarReg(IR::ScalarReg(operand.code));
-        const auto value_hi = ir.GetScalarReg(IR::ScalarReg(operand.code + 1));
+        const auto value_lo = GetScalarGpr<IR::U32>(operand.code);
+        const auto value_hi = GetScalarGpr<IR::U32>(operand.code + 1);
         if constexpr (is_float) {
             value = ir.PackDouble2x32(ir.CompositeConstruct(value_lo, value_hi));
         } else {
@@ -921,7 +937,7 @@ pk_type<T> Translator::GetSrcPk(const InstOperand& operand) {
     pk_type<T> value{};
     switch (operand.field) {
     case OperandField::ScalarGPR: {
-        value = extract(ir.GetScalarReg<IR::U32>(IR::ScalarReg(operand.code)));
+        value = extract(GetScalarGpr<IR::U32>(operand.code));
         break;
     }
     case OperandField::VectorGPR: {
@@ -1052,6 +1068,8 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
 
     switch (operand.field) {
     case OperandField::ScalarGPR:
+        if (!IsScalarGprAllocated(operand.code))
+            return;
         return ir.SetScalarReg(IR::ScalarReg(operand.code), result);
     case OperandField::VectorGPR:
         return ir.SetVectorReg(IR::VectorReg(operand.code), result);
@@ -1106,6 +1124,8 @@ void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
 
     switch (operand.field) {
     case OperandField::ScalarGPR: {
+        if (!IsScalarGprAllocated(operand.code))
+            return;
         const auto prev_dst = ir.GetScalarReg<IR::U32>(IR::ScalarReg(operand.code));
         const auto result_16 = cast(result);
         const auto new_dst =
@@ -1156,6 +1176,8 @@ void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_ra
     };
     switch (operand.field) {
     case OperandField::ScalarGPR: {
+        if (!IsScalarGprAllocated(operand.code) || !IsScalarGprAllocated(operand.code + 1))
+            return;
         const auto [lo, hi] = split();
         ir.SetScalarReg(IR::ScalarReg(operand.code + 1), hi);
         ir.SetScalarReg(IR::ScalarReg(operand.code), lo);

@@ -26,30 +26,52 @@ u64 CommandRuntime::NextRuntimeIdentity() {
     return runtime_identity.fetch_add(1, std::memory_order_relaxed);
 }
 CommandRuntime::~CommandRuntime() {
+    const bool drained = DrainForDestruction();
+    if (!drained) {
+        LOG_ERROR(Core, "Could not prove native D3D12 queue completion while destroying runtime");
+    } else if (!failed) {
+        try {
+            ReadGpuTiming();
+        } catch (...) {
+            LOG_ERROR(Core, "Could not read native D3D12 GPU timing while destroying runtime");
+        }
+    }
+    if (gpu_timing.submissions)
+        std::fprintf(stderr, "NATIVE_GPU final_average_us=%.3f submissions=%llu\n",
+                     double(gpu_timing.ticks) * 1000000.0 / double(gpu_timing.frequency) /
+                         double(gpu_timing.submissions),
+                     static_cast<unsigned long long>(gpu_timing.submissions));
+    contexts.clear();
+}
+bool CommandRuntime::DrainForDestruction() noexcept {
+    if (destruction_drained)
+        return true;
     try {
         if (failed) {
-            if (!recovery_abandoned)
-                device.DrainAfterFailure();
+            if (!recovery_abandoned && !device.DrainAfterFailure())
+                return false;
             for (auto& context : contexts) {
                 context->failed = true;
                 context->recovery_abandoned = recovery_abandoned;
             }
         } else {
             DrainContexts();
+            if (device.DirectQueue())
+                device.Wait(device.LastSignaledValue());
         }
-        if (!failed && device.DirectQueue())
-            device.WaitForGpu();
-        if (!failed)
-            ReadGpuTiming();
-        if (gpu_timing.submissions)
-            std::fprintf(stderr, "NATIVE_GPU final_average_us=%.3f submissions=%llu\n",
-                         double(gpu_timing.ticks) * 1000000.0 / double(gpu_timing.frequency) /
-                             double(gpu_timing.submissions),
-                         static_cast<unsigned long long>(gpu_timing.submissions));
     } catch (...) {
-        device.DrainAfterFailure();
+        if (!recovery_abandoned && !device.DrainAfterFailure())
+            return false;
+        failed = true;
+        for (auto& context : contexts) {
+            context->failed = true;
+            context->recovery_abandoned = recovery_abandoned;
+        }
     }
-    contexts.clear();
+    for (auto& context : contexts)
+        context->destruction_drained = true;
+    destruction_drained = true;
+    return true;
 }
 void CommandRuntime::StopAfterFailure() {
     auto* owner = coordinator ? coordinator : this;
@@ -578,6 +600,8 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
         info.guest_address > UINT64_MAX - info.guest_size ||
         buffer.CmaskAddress() > UINT64_MAX - metadata_bytes)
         throw std::runtime_error("Invalid D3D12 CMASK storage or view");
+    if (buffer.info.dcc_enable || buffer.info.cmask_addr_type)
+        throw std::runtime_error("D3D12 CMASK requires non-DCC non-TC-compatible color");
     std::vector<u8> metadata(metadata_bytes);
     read(buffer.CmaskAddress(), metadata);
     const auto original_metadata = metadata;
@@ -591,6 +615,8 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
         (!coverage_log2 || coverage_log2 > 3 || buffer.attrib.num_fragments_log2 != coverage_log2))
         throw std::runtime_error("Unsupported D3D12 CMASK sample/fragment configuration");
     const u32 expanded_code = buffer.info.compression ? (12u | coverage_log2) : 15u;
+    // Sea Islands uses CMASK code 0 for non-DCC fast clears, including FMASK-backed MSAA.
+    const u32 clear_code = 0u;
     for (u32 layer = buffer.BaseSlice(); layer < buffer.NumSlices(); ++layer) {
         const auto slice = std::span{metadata}.subspan(layer * slice_bytes, slice_bytes);
         if (std::ranges::all_of(slice, [expanded_code](u8 value) {
@@ -598,8 +624,6 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
             }))
             continue;
         if (!address) {
-            if (buffer.info.dcc_enable || buffer.info.cmask_addr_type)
-                throw std::runtime_error("D3D12 CMASK requires non-DCC non-TC-compatible color");
             address.emplace(buffer.Pitch(), buffer.Height(),
                             info.alt_tile ? AmdGpu::GetAltPipeConfig(buffer.GetTileMode())
                                           : AmdGpu::GetPipeConfig(buffer.GetTileMode()),
@@ -611,7 +635,6 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
             for (u32 x = 0; x < info.size.width; x += 8) {
                 const auto [byte, shift] = address->At(layer, x, y);
                 const u32 code = (metadata.at(byte) >> shift) & 15;
-                const u32 clear_code = buffer.info.compression ? coverage_log2 : 0u;
                 if (code != clear_code && code != expanded_code)
                     throw std::runtime_error("Unsupported D3D12 CMASK color/FMASK tile state");
                 if (code == clear_code) {
@@ -670,6 +693,9 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
                               VAddr indirect_address) {
     auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
                               [&] { return std::unique_lock{mutex}; });
+    if (failed)
+        throw std::runtime_error(
+            "D3D12 command runtime requires recreation after recording failure");
     MaintainMemory();
     if (!contexts.empty()) {
         const auto shader = shaders.Compile(params, runtime);
@@ -777,6 +803,7 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
         });
     auto& root = cached.root;
     auto& pipeline = cached.state;
+    std::vector<Pipeline> submission_pipelines{cached};
     resources.BeginBatch();
     BeginImages();
     const auto cpu_ranges = bindings.CpuRanges(border_colors);
@@ -847,7 +874,15 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
     images.PrepareDownloads(commands.Get());
     EndGpuTiming();
     winrt::check_hresult(commands->Close());
-    FinishRecording(memory_access, bindings.GdsBuffer(), bindings.CpuRanges(0, true));
+    struct SubmissionLease {
+        std::shared_ptr<void> memory;
+        std::vector<Pipeline> pipelines;
+    };
+    std::shared_ptr<void> submission_lease = std::make_shared<SubmissionLease>(
+        SubmissionLease{memory_access, std::move(submission_pipelines)});
+    const bool mapping_stable = bool(memory_access);
+    FinishRecording(std::move(submission_lease), bindings.GdsBuffer(), bindings.CpuRanges(0, true),
+                    nullptr, mapping_stable);
     recording.completed = true;
 }
 void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
@@ -855,6 +890,9 @@ void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
                              u32 destination_layer, u32 layers) {
     auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
                               [&] { return std::unique_lock{mutex}; });
+    if (failed)
+        throw std::runtime_error(
+            "D3D12 command runtime requires recreation after recording failure");
     MaintainMemory();
     if (!contexts.empty()) {
         const ResourceCache::Range target{destination.guest_address, destination.guest_size};

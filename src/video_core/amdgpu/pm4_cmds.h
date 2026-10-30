@@ -1266,4 +1266,24 @@ struct PM4CmdCondExec {
     }
 };
 
+struct PM4CmdGetLodStats {
+    PM4Type3Header header;
+    union {
+        BitField<0, 16, u32> data_offset;
+        BitField<16, 16, u32> control_flags;
+        u32 control;
+    };
+    u32 addr_lo;
+    u32 addr_hi;
+
+    [[nodiscard]] VAddr Address() const noexcept {
+        return static_cast<VAddr>(addr_lo) | (static_cast<VAddr>(addr_hi) << 32);
+    }
+
+    [[nodiscard]] u32 DataOffset() const noexcept {
+        return data_offset.Value();
+    }
+};
+static_assert(sizeof(PM4CmdGetLodStats) == 0x10);
+
 } // namespace AmdGpu

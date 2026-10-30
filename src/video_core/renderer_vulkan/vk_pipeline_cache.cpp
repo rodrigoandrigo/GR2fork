@@ -596,6 +596,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.props.fp_round_mode32 = program.settings.fp_round_mode32;
         info.props.fp_round_mode16_64 = program.settings.fp_round_mode64;
         info.props.num_allocated_vgprs = program.NumVgprs();
+        info.props.num_allocated_sgprs = program.NumSgprs();
         info.props.num_user_data = program.settings.num_user_regs;
         info.props.num_input_vgprs = program.settings.vgpr_comp_cnt;
         info.props.dx10_clamp = program.settings.dx10_clamp;
@@ -724,6 +725,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         const auto& cs_pgm = liverpool->GetCsRegs();
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
+        info.props.num_allocated_sgprs = cs_pgm.NumSgprs();
         info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
         info.props.fp_denorm_mode16_64 = cs_pgm.settings.fp_denorm_mode64;
         info.props.fp_round_mode32 = cs_pgm.settings.fp_round_mode32;

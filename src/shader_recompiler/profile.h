@@ -19,6 +19,7 @@ struct Profile {
     bool support_int64{};
     bool support_float16{};
     bool support_float64{};
+    bool allow_fp64_to_fp32_lowering{true};
     bool supports_denorm_behavior_independence{};
     bool supports_rounding_mode_independence{};
     bool support_fp16_denorm_preserve{};
@@ -59,6 +60,7 @@ struct Profile {
     bool needs_inline_vertex_fetch{};
     bool needs_unified_buffer_types{};
     bool fast_shader_math{};
+    bool reject_approximate_fmask_access{};
 
     bool operator==(const Profile&) const = default;
 };

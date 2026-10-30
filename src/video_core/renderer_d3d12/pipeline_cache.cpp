@@ -20,8 +20,8 @@ CommandRuntime::Pipeline& CommandRuntime::GetPipeline(
         return found->second;
     }
     ProfileScope timing{pipeline_profile, "pipeline_miss", 16};
-    if (!coordinator)
-        device.WaitForGpu();
+    // Synchronous submissions wait in FinishRecording; async contexts are reused only after their
+    // fence completes. PSO creation itself does not require an idle queue.
     while (!pipelines.empty() && (pipelines.size() >= 128 || pipeline_bytes + key.size() > limit)) {
         pipeline_bytes -= pipelines.begin()->first.size();
         pipelines.erase(pipelines.begin());

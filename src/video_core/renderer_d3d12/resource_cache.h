@@ -81,7 +81,8 @@ public:
     u64 MemoryBytes() const;
     void TrimMemory(u64 target, bool writeback);
     void BeginBatch();
-    Buffer& GetBuffer(VAddr address, u64 size, bool physical = false, bool gathered = false);
+    Buffer& GetBuffer(VAddr address, u64 size, bool physical = false, bool gathered = false,
+                      bool host = false);
     Buffer& GetHostBuffer(VAddr identity, std::span<const u8> data);
     std::vector<View> GetViews(std::span<const Range> ranges);
     struct UploadStatistics {
@@ -139,7 +140,7 @@ private:
     Resolve resolve;
     Overlaps overlaps;
     ResolveBacking resolve_backing;
-    std::map<std::tuple<bool, VAddr, u64>, std::unique_ptr<Buffer>> buffers;
+    std::map<std::tuple<bool, bool, VAddr, u64>, std::unique_ptr<Buffer>> buffers;
     mutable std::mutex invalidation_mutex;
     u64 mapping_generation{};
     std::vector<Invalidation> invalidations;

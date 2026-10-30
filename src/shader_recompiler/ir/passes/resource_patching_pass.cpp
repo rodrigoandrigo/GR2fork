@@ -295,12 +295,17 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     // Patch image instruction if image is FMask.
     if (AmdGpu::IsFmask(image.GetDataFmt())) {
+        if (is_written && profile.reject_approximate_fmask_access)
+            throw std::runtime_error("Guest FMASK storage is not implemented for this backend");
         ASSERT_MSG(!is_written, "FMask storage instructions are not supported");
 
         IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
         switch (inst.GetOpcode()) {
         case IR::Opcode::ImageRead:
         case IR::Opcode::ImageSampleRaw: {
+            if (profile.reject_approximate_fmask_access)
+                throw std::runtime_error("Guest FMASK reads require metadata-aware sample "
+                                         "remapping; identity mapping is not valid");
             IR::F32 fmaskx = ir.BitCast<IR::F32>(ir.Imm32(0x76543210));
             IR::F32 fmasky = ir.BitCast<IR::F32>(ir.Imm32(0xfedcba98));
             inst.ReplaceUsesWith(ir.CompositeConstruct(fmaskx, fmasky));

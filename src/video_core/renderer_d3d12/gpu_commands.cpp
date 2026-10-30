@@ -44,7 +44,7 @@ void main(uint3 thread : SV_DispatchThreadID) {
         uint vertices = Input.Load(0) / stride;
         Arguments.Store(i * 20, primitive != 0 ? 0 : i);
         Arguments.Store4(i * 20 + 4, primitive != 0 ?
-            uint4(i < vertices / primitive ? primitive : 0,1,0,0) : uint4(vertices,1,0,0));
+            uint4(i < vertices / primitive ? primitive : 0,1,i * primitive,0) : uint4(vertices,1,0,0));
         return;
     }
     if (mode == 2) {

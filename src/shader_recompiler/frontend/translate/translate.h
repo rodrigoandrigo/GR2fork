@@ -106,11 +106,14 @@ public:
     void S_LSHL_B32(const GcnInst& inst);
     void S_LSHL_B64(const GcnInst& inst);
     void S_LSHR_B32(const GcnInst& inst);
+    void S_LSHR_B64(const GcnInst& inst);
     void S_ASHR_I32(const GcnInst& inst);
     void S_ASHR_I64(const GcnInst& inst);
     void S_BFM_B32(const GcnInst& inst);
+    void S_BFM_B64(const GcnInst& inst);
     void S_MUL_I32(const GcnInst& inst);
     void S_BFE(const GcnInst& inst, bool is_signed);
+    void S_BFE64(const GcnInst& inst, bool is_signed);
     void S_BFE_I32(const GcnInst& inst);
     void S_ABSDIFF_I32(const GcnInst& inst);
     void S_NOT_B32(const GcnInst& inst);
@@ -123,20 +126,35 @@ public:
 
     // SOP1
     void S_MOV(const GcnInst& inst, bool conditional = false);
-    void S_MOV_B64(const GcnInst& inst);
+    void S_MOVRELS_B32(const GcnInst& inst);
+    void S_MOVRELS_B64(const GcnInst& inst);
+    void S_MOVRELD_B32(const GcnInst& inst);
+    void S_MOVRELD_B64(const GcnInst& inst);
+    void S_MOV_B64(const GcnInst& inst, bool conditional = false);
+    void S_WQM_B32(const GcnInst& inst);
+    void S_WQM_B64(const GcnInst& inst);
+    void S_QUADMASK_B32(const GcnInst& inst);
+    void S_QUADMASK_B64(const GcnInst& inst);
     void S_NOT_B64(const GcnInst& inst);
     void S_BREV_B32(const GcnInst& inst);
+    void S_BREV_B64(const GcnInst& inst);
+    void S_BCNT0_I32_B32(const GcnInst& inst);
+    void S_BCNT0_I32_B64(const GcnInst& inst);
     void S_BCNT1_I32_B32(const GcnInst& inst);
     void S_BCNT1_I32_B64(const GcnInst& inst);
+    void S_FF0_I32_B32(const GcnInst& inst);
+    void S_FF0_I32_B64(const GcnInst& inst);
     void S_FF1_I32_B32(const GcnInst& inst);
     void S_FF1_I32_B64(const GcnInst& inst);
     void S_FLBIT_I32_B32(const GcnInst& inst);
     void S_FLBIT_I32_B64(const GcnInst& inst);
+    void S_FLBIT_I32(const GcnInst& inst);
+    void S_FLBIT_I32_I64(const GcnInst& inst);
     void S_BITSET_B32(const GcnInst& inst, u32 bit_value);
     void S_BITSET_B64(const GcnInst& inst, u32 bit_value);
     void S_GETREG_B32(const GcnInst& inst);
     void S_GETPC_B64(const GcnInst& inst);
-    void S_SAVEEXEC_B64(NegateMode negate, bool is_or, const GcnInst& inst);
+    void S_SAVEEXEC_B64(const GcnInst& inst);
     void S_ABS_I32(const GcnInst& inst);
 
     // SOPC
@@ -364,8 +382,11 @@ public:
     void IMAGE_GET_LOD(const GcnInst& inst);
 
 private:
+    [[nodiscard]] bool IsScalarGprAllocated(u32 index) const;
+    template <typename T>
+    [[nodiscard]] T GetScalarGpr(u32 index);
     template <typename T = IR::U32>
-    [[nodiscard]] T GetSrc(const InstOperand& operand);
+    [[nodiscard]] T GetSrc(const InstOperand& operand, bool sgpr_oob_returns_sgpr0 = true);
     template <typename T = IR::U32, bool is_signed = false>
     [[nodiscard]] T GetSrc16(const InstOperand& operand);
     template <typename T = IR::U64>

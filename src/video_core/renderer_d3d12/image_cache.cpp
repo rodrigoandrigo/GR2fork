@@ -13,12 +13,52 @@
 #include "video_core/texture_cache/cpu_tiling.h"
 
 namespace D3D12 {
+namespace {
+bool CompatibleTypelessView(DXGI_FORMAT resource, DXGI_FORMAT view) {
+    if (resource == view)
+        return true;
+    switch (resource) {
+    case DXGI_FORMAT_R8_TYPELESS:
+        return view == DXGI_FORMAT_R8_UNORM || view == DXGI_FORMAT_R8_SNORM ||
+               view == DXGI_FORMAT_R8_UINT || view == DXGI_FORMAT_R8_SINT;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        return view == DXGI_FORMAT_R8G8B8A8_UNORM || view == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+               view == DXGI_FORMAT_R8G8B8A8_UINT || view == DXGI_FORMAT_R8G8B8A8_SINT ||
+               view == DXGI_FORMAT_R8G8B8A8_SNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        return view == DXGI_FORMAT_B8G8R8A8_UNORM || view == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case DXGI_FORMAT_R16_TYPELESS:
+        return view == DXGI_FORMAT_R16_FLOAT || view == DXGI_FORMAT_R16_UNORM ||
+               view == DXGI_FORMAT_R16_SNORM || view == DXGI_FORMAT_R16_UINT ||
+               view == DXGI_FORMAT_R16_SINT || view == DXGI_FORMAT_D16_UNORM;
+    case DXGI_FORMAT_R32_TYPELESS:
+        return view == DXGI_FORMAT_R32_FLOAT || view == DXGI_FORMAT_R32_UINT ||
+               view == DXGI_FORMAT_R32_SINT || view == DXGI_FORMAT_D32_FLOAT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+        return view == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+               view == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
+               view == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+        return view == DXGI_FORMAT_D24_UNORM_S8_UINT || view == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+               view == DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        return view == DXGI_FORMAT_R10G10B10A2_UNORM || view == DXGI_FORMAT_R10G10B10A2_UINT;
+    default:
+        return false;
+    }
+}
+bool CompatibleImageViews(DXGI_FORMAT resource, DXGI_FORMAT first, DXGI_FORMAT second) {
+    return CompatibleTypelessView(resource, first) && CompatibleTypelessView(resource, second);
+}
+} // namespace
+
 ImageCache::Image* ImageCache::FindPresentation(const VideoCore::ImageInfo& info) {
     Image* result{};
     for (auto& [key, image] : images) {
         const auto& source = image->info;
         if (!image->resident || image->cpu_dirty || image->logic_op || source.props.is_depth ||
-            source.props.is_volume || source.num_samples != 1 || image->base_layer != 0 ||
+            source.props.is_volume || source.pixel_format != info.pixel_format ||
+            source.num_samples != 1 || image->base_layer != 0 ||
             source.size.width != info.size.width || source.size.height != info.size.height ||
             source.num_bits != info.num_bits || source.pitch != info.pitch ||
             source.mips_layout[0].pitch != info.mips_layout[0].pitch ||
@@ -33,16 +73,7 @@ ImageCache::Image* ImageCache::FindPresentation(const VideoCore::ImageInfo& info
         if (first.address != second.address || first.physical != second.physical)
             continue;
         const auto format = image->Native()->GetDesc().Format;
-        const bool compatible = info.num_bits == 64
-                                    ? format == DXGI_FORMAT_R16G16B16A16_FLOAT
-                                    : format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                                          format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                                          format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
-                                          format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-                                          format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-                                          format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
-                                          format == DXGI_FORMAT_R10G10B10A2_UNORM ||
-                                          format == DXGI_FORMAT_R10G10B10A2_TYPELESS;
+        const bool compatible = CompatibleTypelessView(format, ConvertFormat(info.pixel_format));
         if (compatible &&
             (!result ||
              (image->written != result->written ? image->written : image->age > result->age)))
@@ -238,9 +269,9 @@ void ImageCache::Synchronize(Image& image) {
         return;
     if (!synchronize)
         throw std::runtime_error("Dirty D3D12 image requires a synchronization callback");
-    if (image.info.guest_address)
+    if (image.has_depth && image.info.guest_address)
         synchronize(image.info.guest_address, image.info.guest_size);
-    if (image.info.stencil_addr)
+    if (image.has_stencil && image.info.stencil_addr)
         synchronize(image.info.stencil_addr, image.info.stencil_size);
 }
 std::vector<ImageCache::Watch> ImageCache::Watches() const {
@@ -343,7 +374,9 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         logic_mask = 0;
     const bool has_stencil =
         info.props.is_depth && info.props.has_stencil && info.stencil_addr != 0;
-    const bool has_depth = !info.props.is_depth || info.guest_address != 0;
+    // ImageInfo aliases the stencil backing into guest_address when Z is invalid and marks it
+    // as an 8-bit image; do not interpret that same byte range as a depth plane.
+    const bool has_depth = !info.props.is_depth || (info.guest_address != 0 && info.num_bits != 8);
     if (!info.props.is_depth && (info.stencil_addr || info.stencil_size)) {
         throw std::runtime_error(
             "D3D12 guest image requires unsupported metadata, samples or layout");
@@ -391,6 +424,12 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     }
     const bool promoted_depth = has_stencil && info.pixel_format == vk::Format::eD16UnormS8Uint;
     DXGI_FORMAT dsv_format = view_format;
+    if (info.props.is_depth && !has_stencil) {
+        if (view_format == DXGI_FORMAT_D16_UNORM)
+            format = DXGI_FORMAT_R16_TYPELESS;
+        else if (view_format == DXGI_FORMAT_D32_FLOAT)
+            format = DXGI_FORMAT_R32_TYPELESS;
+    }
     DXGI_FORMAT resource_format = format;
     DXGI_FORMAT depth_footprint = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT stencil_footprint = DXGI_FORMAT_UNKNOWN;
@@ -443,6 +482,7 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         key.push_back(u64(info.pixel_format));
     key.insert(key.end(), {info.size.depth, u64(info.type), info.props.is_volume});
     key.insert(key.end(), {info.num_samples, u64(view_format)});
+    const size_t view_format_key = key.size() - 1;
     key.push_back(identity.physical);
     key.insert(key.end(), {stencil_identity.address, u64(info.stencil_size)});
     key.push_back(stencil_identity.physical);
@@ -453,6 +493,7 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         const auto& layout = info.mips_layout[mip];
         key.insert(key.end(), {layout.size, layout.pitch, layout.height, layout.offset});
     }
+    key.push_back(u64(info.micro_tiled_mips));
     auto found = images.find(key);
     if (persistent) {
         const auto priority = [](const Image& image) {
@@ -462,13 +503,20 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
         };
         auto compatible = key;
         compatible[7] = compatible[8] = 0;
+        compatible[view_format_key] = 0;
         for (auto candidate = images.begin(); candidate != images.end(); ++candidate) {
             auto other = candidate->first;
             other[7] = other[8] = 0;
+            other[view_format_key] = 0;
             const auto description = candidate->second->Native()->GetDesc();
-            if (other == compatible && (description.Flags & flags) == flags &&
-                (description.Format == format || description.Format == view_format ||
-                 format == view_format) &&
+            const DXGI_FORMAT candidate_view_format =
+                candidate->second->logic_op ? DXGI_FORMAT_R32G32B32A32_UINT
+                                            : ConvertFormat(candidate->second->info.pixel_format);
+            const bool format_compatible =
+                CompatibleImageViews(description.Format, candidate_view_format, view_format);
+            if (other == compatible &&
+                candidate->second->info.props.is_depth == info.props.is_depth &&
+                (description.Flags & flags) == flags && format_compatible &&
                 (found == images.end() ||
                  priority(*candidate->second) > priority(*found->second))) {
                 found = candidate;
@@ -515,6 +563,8 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     result->depth_footprint_format = depth_footprint;
     result->stencil_footprint_format = stencil_footprint;
     D3D12_RESOURCE_DESC staging = desc;
+    if (info.props.is_depth && !has_stencil)
+        staging.Format = view_format;
     D3D12_RESOURCE_DESC stencil_planes_desc{};
     if (multisampled) {
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
@@ -1409,24 +1459,54 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
     }
 }
 void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands) {
-    if (!source.msaa || destination.msaa || source.info.props.is_depth ||
-        destination.info.props.is_depth || source.info.size.width != destination.info.size.width ||
+    const bool multisampled = bool(source.msaa);
+    if (destination.msaa || (multisampled && destination.info.props.is_volume) ||
+        source.info.props.is_depth || destination.info.props.is_depth ||
+        source.info.size.width != destination.info.size.width ||
         source.info.size.height != destination.info.size.height ||
         source.native_layers != destination.native_layers ||
         source.info.pixel_format != destination.info.pixel_format)
-        throw std::runtime_error("Invalid D3D12 color resolve source or destination");
+        throw std::runtime_error("Invalid D3D12 color resolve or copy source or destination");
     const DXGI_FORMAT format = ConvertFormat(source.info.pixel_format);
-    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-    winrt::check_hresult(device->Device()->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
-                                                               &support, sizeof(support)));
-    if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE))
-        throw std::runtime_error("D3D12 format does not support multisample color resolve");
+    if (multisampled) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+        winrt::check_hresult(device->Device()->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                                                   &support, sizeof(support)));
+        if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE))
+            throw std::runtime_error("D3D12 format does not support multisample color resolve");
+    }
     Upload(source, commands);
     Upload(destination, commands);
-    Barrier(source, commands, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-    Barrier(destination, commands, D3D12_RESOURCE_STATE_RESOLVE_DEST);
-    for (u32 layer = 0; layer < source.native_layers; ++layer)
-        commands->ResolveSubresource(destination.Native(), layer, source.Native(), layer, format);
+    if (multisampled) {
+        Barrier(source, commands, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        Barrier(destination, commands, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        for (u32 layer = 0; layer < source.native_layers; ++layer) {
+            commands->ResolveSubresource(
+                destination.Native(), DepthSubresource(0, layer, destination.info.resources.levels),
+                source.Native(), DepthSubresource(0, layer, source.info.resources.levels), format);
+        }
+    } else {
+        Barrier(source, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(destination, commands, D3D12_RESOURCE_STATE_COPY_DEST);
+        const D3D12_BOX volume_slice{0, 0, 0, source.info.size.width, source.info.size.height, 1};
+        const D3D12_BOX* source_box =
+            source.info.props.is_volume || destination.info.props.is_volume ? &volume_slice
+                                                                            : nullptr;
+        for (u32 layer = 0; layer < source.native_layers; ++layer) {
+            D3D12_TEXTURE_COPY_LOCATION source_location{};
+            source_location.pResource = source.Native();
+            source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            source_location.SubresourceIndex =
+                DepthSubresource(0, layer, source.info.resources.levels);
+            D3D12_TEXTURE_COPY_LOCATION destination_location{};
+            destination_location.pResource = destination.Native();
+            destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination_location.SubresourceIndex =
+                DepthSubresource(0, layer, destination.info.resources.levels);
+            commands->CopyTextureRegion(&destination_location, 0, 0, 0, &source_location,
+                                        source_box);
+        }
+    }
     destination.written = true;
 }
 void ImageCache::RetireUploads(u64 fence) {

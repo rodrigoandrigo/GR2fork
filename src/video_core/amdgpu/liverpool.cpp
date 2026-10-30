@@ -93,6 +93,17 @@ static inline std::span<const u32> NextPacket(std::span<const u32> span, size_t 
     UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}", opcode, count);
 }
 
+static SHAD_NO_INLINE void RejectGetLodStats(u32 count) {
+    const auto message =
+        fmt::format("Unimplemented PM4 type 3 opcode IT_GET_LOD_STATS ({:#x}) with count {}",
+                    static_cast<u32>(PM4ItOpcode::GetLodStats), count);
+#ifdef SHADPS4_UWP
+    Core::Uwp::FailGuestSession(message);
+#else
+    throw std::runtime_error(message);
+#endif
+}
+
 // Must be the first statement of every draw arm, above the rasterizer guard, so
 // the counts and the stamp flush are identical with and without a rasterizer.
 // There is no central opcode list any more: a new draw opcode needs its own
@@ -1464,8 +1475,8 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             break;
         }
         case PM4ItOpcode::GetLodStats: {
-            LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
-            break;
+            RejectGetLodStats(count);
+            return {};
         }
         case PM4ItOpcode::CondExec: {
             const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
@@ -1644,6 +1655,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
             break;
+        }
+        case PM4ItOpcode::GetLodStats: {
+            RejectGetLodStats(header->type3.NumWords());
+            co_return;
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);

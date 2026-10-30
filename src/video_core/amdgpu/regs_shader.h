@@ -85,6 +85,11 @@ struct ShaderProgram {
         // Each increment allocates 4 registers, where 0 = 4 registers.
         return (settings.num_vgprs + 1) * 4;
     }
+
+    [[nodiscard]] u32 NumSgprs() const {
+        // SGPR allocation is encoded in blocks of 8 registers, where 0 = 8.
+        return (settings.num_sgprs + 1) * 8;
+    }
 };
 
 struct VsOutputConfig {
@@ -212,6 +217,11 @@ struct ComputeProgram {
     template <typename T = u8*>
     const T Address() const {
         return std::bit_cast<T>(address << 8);
+    }
+
+    [[nodiscard]] u32 NumSgprs() const {
+        // SGPR allocation is encoded in blocks of 8 registers, where 0 = 8.
+        return (settings.num_sgprs + 1) * 8;
     }
 
     u32 SharedMemSize() const noexcept {
