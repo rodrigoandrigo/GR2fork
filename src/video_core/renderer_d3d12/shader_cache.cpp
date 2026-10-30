@@ -113,7 +113,7 @@ bool SameRanges(std::span<const ShaderResourceRange> first,
     });
 }
 std::vector<u8> ShaderDiskKey(std::span<const u32> key) {
-    std::vector<u8> result{1};
+    std::vector<u8> result{2};
     const auto* bytes = reinterpret_cast<const u8*>(key.data());
     result.insert(result.end(), bytes, bytes + key.size_bytes());
     return result;

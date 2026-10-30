@@ -1599,6 +1599,7 @@ dzn_descriptor_heap_raw_image(struct dzn_descriptor_heap *heap, uint32_t offset,
    uint32_t layer = image->vk.image_type == VK_IMAGE_TYPE_3D ? 0 : view->vk.base_array_layer;
    struct dzn_raw_image_metadata *metadata = &heap->raw_metadata[offset];
    metadata->format = format;
+   metadata->texel_bytes = util_format_get_blocksize(vk_format_to_pipe_format(view->vk.format));
    metadata->dirty_offset = image->raw->dirty_offset;
    metadata->mip_count = MIN2(writeable ? 1 : view->vk.level_count, DZN_RAW_IMAGE_MIP_COUNT);
    metadata->mapping = writeable ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING : view->srv_desc.Shader4ComponentMapping;
@@ -1693,8 +1694,11 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
    D3D12_CPU_DESCRIPTOR_HANDLE view_handle =
       dzn_descriptor_heap_get_cpu_handle(heap, desc_offset);
    struct dzn_image *image = container_of(iview->vk.image, struct dzn_image, vk);
+   bool raw_only = device->raw_image_lowering && image->raw && dzn_raw_image_format(iview->vk.format) &&
+      !dzn_image_formats_are_compatible(device, image->vk.format, iview->vk.format,
+         writeable ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
 
-   if (!null_resource && !writeable && heap->feedback &&
+   if (!null_resource && !raw_only && !writeable && heap->feedback &&
        (image->vk.usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) {
       heap->feedback[desc_offset] = (struct dzn_feedback_descriptor) {
          .image_id = image->feedback_id,
@@ -1708,7 +1712,7 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
       if (iview->uav_desc.ViewDimension == D3D12_UAV_DIMENSION_UNKNOWN)
          _debug_printf("Dozen storage image view lacks UAV: format=%u view_usage=0x%x image_usage=0x%x type=%u\n",
                        iview->vk.format, iview->vk.usage, image->vk.usage, iview->vk.view_type);
-      ID3D12Device1_CreateUnorderedAccessView(device->dev, null_resource ? NULL : image->res, NULL, &iview->uav_desc, view_handle);
+      ID3D12Device1_CreateUnorderedAccessView(device->dev, (null_resource || raw_only) ? NULL : image->res, NULL, &iview->uav_desc, view_handle);
    } else if (cube_as_2darray &&
               (iview->srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY ||
                iview->srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE)) {
@@ -1736,9 +1740,9 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
 
       if (heap->feedback)
          heap->feedback[desc_offset].desc = srv_desc;
-      ID3D12Device1_CreateShaderResourceView(device->dev, null_resource ? NULL : image->res, &srv_desc, view_handle);
+      ID3D12Device1_CreateShaderResourceView(device->dev, (null_resource || raw_only) ? NULL : image->res, &srv_desc, view_handle);
    } else {
-      ID3D12Device1_CreateShaderResourceView(device->dev, null_resource ? NULL : image->res, &iview->srv_desc, view_handle);
+      ID3D12Device1_CreateShaderResourceView(device->dev, (null_resource || raw_only) ? NULL : image->res, &iview->srv_desc, view_handle);
    }
    dzn_descriptor_heap_notify(heap, desc_offset, 1);
    mtx_unlock(&device->descriptor_update_lock);

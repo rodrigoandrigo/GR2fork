@@ -361,7 +361,7 @@ void D3D12Presenter::Initialize(const ShadPS4Config& config) {
     DXGI_SWAP_CHAIN_DESC1 description{};
     description.Width = width;
     description.Height = height;
-    description.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     format = description.Format;
     description.SampleDesc.Count = 1;
     description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -374,12 +374,10 @@ void D3D12Presenter::Initialize(const ShadPS4Config& config) {
                                                                 nullptr, &chain));
     winrt::check_hresult(chain.As(&swapchain));
     UINT support{};
-    winrt::check_hresult(swapchain->CheckColorSpaceSupport(
-        DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support));
-    float_supported = (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0;
-    if (!float_supported)
-        throw std::runtime_error("D3D12 VideoOut scRGB presentation is not supported");
-    winrt::check_hresult(swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709));
+    float_supported = SUCCEEDED(swapchain->CheckColorSpaceSupport(
+                          DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support)) &&
+                      (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0;
+    winrt::check_hresult(swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709));
     GetBuffers();
     context.CreateDirectCommands(commands_allocator, commands);
     winrt::check_hresult(commands->Close());

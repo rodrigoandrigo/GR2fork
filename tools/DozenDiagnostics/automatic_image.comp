@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) coherent uniform image2D img;
+layout(set = 0, binding = 2) uniform sampler2D tex;
+layout(std430, set = 0, binding = 1) buffer Result { vec4 values[]; }
+result;
+layout(push_constant) uniform Parameters {
+  uint row_pitch;
+  uint phase;
+  uint offset;
+  uint base;
+  uint width;
+  uint height;
+}
+data;
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= data.width || p.y >= data.height)
+    return;
+  uint index = uint(p.y * 16 + p.x);
+  vec4 value = imageLoad(img, p);
+  result.values[data.base + index + data.phase * 256] = value;
+  if (data.phase == 0) {
+#if RAW_FORMAT < 4
+    imageStore(img, p, value.yxzw);
+#else
+    imageStore(img, p, value.zxyw);
+#endif
+    memoryBarrierImage();
+    vec4 stored = imageLoad(img, p);
+    vec4 fetched = texelFetch(tex, p, 0);
+    vec4 filtered =
+        textureLod(tex, (vec2(p) + .5) / vec2(data.width, data.height), 0);
+    bvec4 sameFetch;
+    bvec4 sameFilter;
+    for (int i = 0; i < 4; i++) {
+      sameFetch[i] =
+          stored[i] == fetched[i] || (isnan(stored[i]) && isnan(fetched[i]));
+      sameFilter[i] =
+          stored[i] == filtered[i] || (isnan(stored[i]) && isnan(filtered[i]));
+    }
+    if (!all(sameFetch) || !all(sameFilter))
+      result.values[data.base + index] = vec4(-12345);
+  }
+}

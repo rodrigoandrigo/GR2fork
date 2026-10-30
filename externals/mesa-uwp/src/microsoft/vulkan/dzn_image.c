@@ -941,6 +941,13 @@ dzn_BindImageMemory2(VkDevice dev,
       if (bind_result == VK_SUCCESS) {
          image->bound_memory = mem;
          image->bound_memory_offset = bind_info->memoryOffset;
+         if (device->raw_image_lowering) {
+            VkImageMemoryRequirementsInfo2 info = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+               .image = bind_info->image};
+            VkMemoryRequirements2 requirements = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+            device->vk.dispatch_table.GetImageMemoryRequirements2(dev, &info, &requirements);
+            image->bound_memory_size = requirements.memoryRequirements.size;
+         }
          if (device->raw_image_lowering && dzn_raw_image_format(image->vk.format) &&
              (image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) && image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
              image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
@@ -1879,6 +1886,17 @@ dzn_raw_image_format(VkFormat format)
    case VK_FORMAT_R32G32_SFLOAT: return 4;
    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return 5;
    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return 6;
+   case VK_FORMAT_R16_SNORM: return 7;
+   case VK_FORMAT_R8G8_UINT: return 8;
+   case VK_FORMAT_R8G8_SINT: return 9;
+   case VK_FORMAT_R16G16_UNORM: return 10;
+   case VK_FORMAT_R16G16_SNORM: return 11;
+   case VK_FORMAT_R16G16_UINT: return 12;
+   case VK_FORMAT_R16G16_SINT: return 13;
+   case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 14;
+   case VK_FORMAT_R32G32_UINT: return 15;
+   case VK_FORMAT_R32G32_SINT: return 16;
+   case VK_FORMAT_R16G16B16A16_SNORM: return 17;
    default: return 0;
    }
 }
@@ -1909,13 +1927,8 @@ mesa_uwp_get_raw_image(VkDevice device_handle, VkImage image_handle, uint32_t su
        !(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
        (image->vk.create_flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_PROTECTED_BIT)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   switch (image->vk.format) {
-   case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM:
-   case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32G32_SFLOAT:
-   case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-      break;
-   default: return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   }
+   if (!dzn_raw_image_format(image->vk.format))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
    uint32_t count = image->desc.MipLevels *
       (image->vk.image_type == VK_IMAGE_TYPE_3D ? 1 : image->vk.array_layers);
    if (subresource >= count)

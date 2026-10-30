@@ -1,0 +1,96 @@
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(std430,set=0,binding=0) coherent buffer Raw { uint words[]; } raw;
+layout(std430,set=0,binding=1) buffer Result { vec4 values[]; } result;
+layout(push_constant) uniform Parameters { uint row_pitch; uint phase; uint offset; uint base; uint width; uint height; } data;
+uint round_shift(uint value, uint shift) {
+    if (shift >= 32) return 0;
+    uint truncated = value >> shift;
+    uint remainder = value & ((1u << shift) - 1);
+    uint halfway = 1u << (shift - 1);
+    return truncated + uint(remainder > halfway || (remainder == halfway && ((truncated & 1) != 0)));
+}
+uint pack_ufloat(float value, uint mantissa_bits) {
+    uint bits = floatBitsToUint(value);
+    uint exponent = (bits >> 23) & 255;
+    uint mantissa = bits & 0x7fffff;
+    if (exponent == 255 && mantissa != 0) return (31u << mantissa_bits) | (1u << (mantissa_bits - 1));
+    if ((bits & 0x80000000) != 0) return 0;
+    if (exponent == 255) return 31u << mantissa_bits;
+    int unbiased = int(exponent) - 127;
+    if (unbiased > 15) return 31u << mantissa_bits;
+    uint significant = mantissa | 0x800000;
+    if (unbiased < -14) return round_shift(significant, uint(-14 - unbiased) + 23 - mantissa_bits);
+    return (uint(unbiased + 14) << mantissa_bits) + round_shift(significant, 23 - mantissa_bits);
+}
+float unpack_ufloat(uint value, uint mantissa_bits) {
+    uint exponent = value >> mantissa_bits;
+    uint mantissa = value & ((1u << mantissa_bits) - 1);
+    if (exponent == 31) return uintBitsToFloat(mantissa == 0 ? 0x7f800000u : 0x7fc00000u);
+    if (exponent == 0) return ldexp(float(mantissa), -14 - int(mantissa_bits));
+    return ldexp(1 + float(mantissa) / float(1u << mantissa_bits), int(exponent) - 15);
+}
+vec4 load_pixel(uint address) {
+#if RAW_FORMAT == 0 || RAW_FORMAT == 1
+    uint bits = raw.words[(address & ~3u) / 4] >> ((address & 2) * 8);
+#if RAW_FORMAT == 0
+    return vec4(vec2(bits & 255, (bits >> 8) & 255) / 255.0, 0, 1);
+#else
+    return vec4(max(vec2(int(bits << 24) >> 24, int(bits << 16) >> 24) / 127.0, -1.0), 0, 1);
+#endif
+#elif RAW_FORMAT == 2
+    uint bits = raw.words[address / 4];
+    return vec4(unpackHalf2x16(bits).x, unpackHalf2x16(bits).y, 0, 1);
+#elif RAW_FORMAT == 3
+    return vec4(vec2(uintBitsToFloat(raw.words[address / 4]), uintBitsToFloat(raw.words[address / 4 + 1])), 0, 1);
+#elif RAW_FORMAT == 4
+    uint bits = raw.words[address / 4];
+    return vec4(vec3(bits & 1023, (bits >> 10) & 1023, (bits >> 20) & 1023) / 1023.0, float(bits >> 30) / 3.0);
+#else
+    uint bits = raw.words[address / 4];
+    return vec4(unpack_ufloat(bits & 2047, 6), unpack_ufloat((bits >> 11) & 2047, 6), unpack_ufloat(bits >> 22, 5), 1);
+#endif
+}
+void store_pixel(uint address, vec4 value) {
+#if RAW_FORMAT == 0 || RAW_FORMAT == 1
+#if RAW_FORMAT == 0
+    uvec2 parts = uvec2(roundEven(clamp(value.xy, 0, 1) * 255));
+#else
+    uvec2 parts = uvec2(ivec2(roundEven(clamp(value.xy, -1, 1) * 127))) & 255;
+#endif
+    uint bits = parts.x | (parts.y << 8);
+    uint shift = (address & 2) * 8;
+    uint aligned = address & ~3u;
+    uint old = raw.words[aligned / 4], observed;
+    while (true) {
+        uint next = (old & ~(65535u << shift)) | (bits << shift);
+        observed = atomicCompSwap(raw.words[aligned / 4], old, next);
+        if (observed == old) break;
+        old = observed;
+    }
+#elif RAW_FORMAT == 2
+    raw.words[address / 4] = packHalf2x16(value.xy);
+#elif RAW_FORMAT == 3
+    raw.words[address / 4] = floatBitsToUint(value.x); raw.words[address / 4 + 1] = floatBitsToUint(value.y);
+#elif RAW_FORMAT == 4
+    uvec4 parts = uvec4(roundEven(clamp(value, 0, 1) * vec4(1023, 1023, 1023, 3)));
+    raw.words[address / 4] = parts.x | (parts.y << 10) | (parts.z << 20) | (parts.w << 30);
+#else
+    raw.words[address / 4] = pack_ufloat(value.x, 6) | (pack_ufloat(value.y, 6) << 11) | (pack_ufloat(value.z, 5) << 22);
+#endif
+}
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= data.width || id.y >= data.height) return;
+    uint index = id.y * 16 + id.x;
+    uint address = data.offset + id.y * data.row_pitch + id.x * RAW_BYTES;
+    vec4 value = load_pixel(address);
+    result.values[data.base + index + data.phase * 256] = value;
+    if (data.phase == 0) {
+#if RAW_FORMAT < 4
+        store_pixel(address, value.yxzw);
+#else
+        store_pixel(address, value.zxyw);
+#endif
+    }
+}

@@ -661,7 +661,17 @@ dzn_nir_descriptor_depends_on(nir_def *value, nir_def *resource, unsigned depth)
 }
 
 static bool
-dzn_nir_raw_resource_written(nir_shader *nir, nir_def *resource)
+dzn_nir_raw_resource_written(const struct util_dynarray *writes, nir_def *resource)
+{
+   util_dynarray_foreach(writes, nir_def *, descriptor) {
+      if (dzn_nir_descriptor_depends_on(*descriptor, resource, 16))
+         return true;
+   }
+   return false;
+}
+
+static void
+dzn_nir_collect_raw_writes(nir_shader *nir, struct util_dynarray *writes)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -675,18 +685,19 @@ dzn_nir_raw_resource_written(nir_shader *nir, nir_def *resource)
             else if (intr->intrinsic == nir_intrinsic_ssbo_atomic ||
                      intr->intrinsic == nir_intrinsic_ssbo_atomic_swap)
                descriptor = intr->src[0].ssa;
-            if (descriptor && dzn_nir_descriptor_depends_on(descriptor, resource, 16))
-               return true;
+            if (descriptor)
+               util_dynarray_append(writes, descriptor);
          }
       }
    }
-   return false;
 }
 
 static void
 dzn_pipeline_collect_raw_images(struct dzn_pipeline *pipeline, nir_shader *nir,
                                  const struct dzn_pipeline_layout *layout)
 {
+   struct util_dynarray writes = UTIL_DYNARRAY_INIT;
+   bool writes_collected = false;
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -704,8 +715,12 @@ dzn_pipeline_collect_raw_images(struct dzn_pipeline *pipeline, nir_shader *nir,
             use.binding = binding;
             const struct dzn_descriptor_set_layout *set_layout = container_of(
                layout->vk.set_layouts[use.set], struct dzn_descriptor_set_layout, vk);
+            if (!writes_collected && set_layout->bindings[binding].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+               dzn_nir_collect_raw_writes(nir, &writes);
+               writes_collected = true;
+            }
             use.write = set_layout->bindings[binding].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
-                        dzn_nir_raw_resource_written(nir, &intr->def);
+                        dzn_nir_raw_resource_written(&writes, &intr->def);
             use.count = set_layout->bindings[binding].descriptor_count *
                         set_layout->bindings[binding].descriptor_stride;
             if (nir_src_is_const(intr->src[0])) {
@@ -726,6 +741,7 @@ dzn_pipeline_collect_raw_images(struct dzn_pipeline *pipeline, nir_shader *nir,
          }
       }
    }
+   util_dynarray_fini(&writes);
 }
 
 static VkResult

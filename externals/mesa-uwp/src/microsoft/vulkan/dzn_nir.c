@@ -1718,6 +1718,17 @@ dzn_nir_integer_image_deref(nir_builder *b, nir_deref_instr *deref)
 static const enum pipe_format dzn_raw_pipe_formats[] = {
    PIPE_FORMAT_R8G8_UNORM, PIPE_FORMAT_R8G8_SNORM, PIPE_FORMAT_R16G16_FLOAT,
    PIPE_FORMAT_R32G32_FLOAT, PIPE_FORMAT_R10G10B10A2_UNORM, PIPE_FORMAT_R11G11B10_FLOAT,
+   PIPE_FORMAT_R16_SNORM,
+   PIPE_FORMAT_R8G8_UINT,
+   PIPE_FORMAT_R8G8_SINT,
+   PIPE_FORMAT_R16G16_UNORM,
+   PIPE_FORMAT_R16G16_SNORM,
+   PIPE_FORMAT_R16G16_UINT,
+   PIPE_FORMAT_R16G16_SINT,
+   PIPE_FORMAT_R10G10B10A2_UINT,
+   PIPE_FORMAT_R32G32_UINT,
+   PIPE_FORMAT_R32G32_SINT,
+   PIPE_FORMAT_R16G16B16A16_SNORM,
 };
 
 static nir_def *
@@ -1789,11 +1800,13 @@ dzn_nir_pack_unsigned_float(nir_builder *b, nir_def *value, unsigned mantissa_bi
 }
 
 static nir_def *
-dzn_nir_raw_decode(nir_builder *b, nir_def *code, nir_def *words)
+dzn_nir_raw_decode(nir_builder *b, nir_def *code, nir_def *words, bool integer)
 {
    nir_def *value = nir_imm_vec4(b, 0, 0, 0, 1);
    for (unsigned i = 0; i < ARRAY_SIZE(dzn_raw_pipe_formats); i++) {
-      nir_def *packed = i == 3 ? words : nir_channel(b, words, 0);
+      if (util_format_is_pure_integer(dzn_raw_pipe_formats[i]) != integer)
+         continue;
+      nir_def *packed = util_format_get_blocksize(dzn_raw_pipe_formats[i]) > 4 ? words : nir_channel(b, words, 0);
       nir_def *decoded = nir_format_unpack_rgba(b, packed, dzn_raw_pipe_formats[i]);
       value = nir_bcsel(b, nir_ieq_imm(b, code, i + 1), decoded, value);
    }
@@ -1801,10 +1814,12 @@ dzn_nir_raw_decode(nir_builder *b, nir_def *code, nir_def *words)
 }
 
 static nir_def *
-dzn_nir_raw_encode(nir_builder *b, nir_def *code, nir_def *value)
+dzn_nir_raw_encode(nir_builder *b, nir_def *code, nir_def *value, bool integer)
 {
    nir_def *words = nir_imm_ivec2(b, 0, 0);
    for (unsigned i = 0; i < ARRAY_SIZE(dzn_raw_pipe_formats); i++) {
+      if (util_format_is_pure_integer(dzn_raw_pipe_formats[i]) != integer)
+         continue;
       nir_def *packed;
       if (i == 5) {
          packed = nir_ior(b, dzn_nir_pack_unsigned_float(b, nir_channel(b, value, 0), 6),
@@ -1813,7 +1828,7 @@ dzn_nir_raw_encode(nir_builder *b, nir_def *code, nir_def *value)
       } else {
          packed = nir_format_pack_rgba(b, dzn_raw_pipe_formats[i], value);
       }
-      nir_def *pair = i == 3 ? packed : nir_vec2(b, nir_channel(b, packed, 0), nir_imm_int(b, 0));
+      nir_def *pair = util_format_get_blocksize(dzn_raw_pipe_formats[i]) > 4 ? packed : nir_vec2(b, nir_channel(b, packed, 0), nir_imm_int(b, 0));
       words = nir_bcsel(b, nir_ieq_imm(b, code, i + 1), pair, words);
    }
    return words;
@@ -1821,10 +1836,10 @@ dzn_nir_raw_encode(nir_builder *b, nir_def *code, nir_def *value)
 
 static void
 dzn_nir_raw_store(nir_builder *b, nir_def *descriptor, nir_def *address,
-                   nir_def *code, nir_def *value, unsigned access)
+                   nir_def *code, nir_def *value, nir_def *bytes, bool integer, unsigned access)
 {
-   nir_def *words = dzn_nir_raw_encode(b, code, value);
-   nir_push_if(b, nir_ult(b, code, nir_imm_int(b, 3)));
+   nir_def *words = dzn_nir_raw_encode(b, code, value, integer);
+   nir_push_if(b, nir_ieq_imm(b, bytes, 2));
    nir_def *aligned = nir_iand_imm(b, address, ~3u);
    nir_def *shift = nir_imul_imm(b, nir_iand_imm(b, address, 3), 8);
    nir_def *mask = nir_ishl(b, nir_imm_int(b, 0xffff), shift);
@@ -1843,7 +1858,7 @@ dzn_nir_raw_store(nir_builder *b, nir_def *descriptor, nir_def *address,
    nir_store_var(b, expected, observed, 1);
    nir_pop_loop(b, NULL);
    nir_push_else(b, NULL);
-   nir_push_if(b, nir_ieq_imm(b, code, 4));
+   nir_push_if(b, nir_ieq_imm(b, bytes, 8));
    nir_store_ssbo(b, words, descriptor, address, .write_mask = 3, .align_mul = 4, .access = access);
    nir_push_else(b, NULL);
    nir_store_ssbo(b, nir_channel(b, words, 0), descriptor, address, .write_mask = 1, .align_mul = 4, .access = access);
@@ -1869,8 +1884,7 @@ dzn_nir_raw_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_variable *var = nir_deref_instr_get_variable(deref);
    const struct glsl_type *type = glsl_without_array(var->type);
    enum glsl_sampler_dim dim = glsl_get_sampler_dim(type);
-   if (glsl_get_sampler_result_type(type) != GLSL_TYPE_FLOAT ||
-       dim == GLSL_SAMPLER_DIM_BUF || dim == GLSL_SAMPLER_DIM_MS)
+   if (dim == GLSL_SAMPLER_DIM_BUF || dim == GLSL_SAMPLER_DIM_MS)
       return false;
    if (var->data.image.format != PIPE_FORMAT_NONE) {
       bool raw_format = false;
@@ -1899,8 +1913,10 @@ dzn_nir_raw_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          nir_channel(b, coords, 2) : nir_imm_int(b, 0));
    nir_def *valid = nir_iand(b, nir_ult(b, x, nir_channel(b, shape, 0)),
       nir_iand(b, nir_ult(b, y, nir_channel(b, shape, 1)), nir_ult(b, z, nir_channel(b, shape, 2))));
-   nir_def *bytes = nir_bcsel(b, nir_ult(b, code, nir_imm_int(b, 3)), nir_imm_int(b, 2),
-      nir_bcsel(b, nir_ieq_imm(b, code, 4), nir_imm_int(b, 8), nir_imm_int(b, 4)));
+   nir_def *bytes = nir_load_ssbo(b, 1, 32, metadata,
+      nir_iadd_imm(b, base, offsetof(struct dzn_raw_image_metadata, texel_bytes)),
+      .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   bool integer = glsl_get_sampler_result_type(type) != GLSL_TYPE_FLOAT;
    nir_def *address = nir_iadd(b, nir_channel(b, first, 1),
       nir_iadd(b, nir_imul(b, x, bytes), nir_iadd(b,
          nir_imul(b, y, nir_channel(b, first, 2)), nir_imul(b, z, nir_channel(b, first, 3)))));
@@ -1910,7 +1926,7 @@ dzn_nir_raw_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_def *result = NULL;
    nir_push_if(b, valid);
    if (store) {
-      dzn_nir_raw_store(b, descriptor, address, code, intr->src[3].ssa, access);
+      dzn_nir_raw_store(b, descriptor, address, code, intr->src[3].ssa, bytes, integer, access);
       nir_def *bit = nir_iand_imm(b, nir_ushr_imm(b, address, 1), 31);
       nir_def *bits = nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), nir_ushr_imm(b, bytes, 1)), -1);
       nir_def *dirty_address = nir_iadd(b, nir_channel(b, shape, 3),
@@ -1922,14 +1938,14 @@ dzn_nir_raw_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          .align_mul = 4, .access = access);
       nir_def *shift = nir_imul_imm(b, nir_iand_imm(b, address, 3), 8);
       word = nir_ushr(b, word, shift);
-      nir_push_if(b, nir_ieq_imm(b, code, 4));
+      nir_push_if(b, nir_ieq_imm(b, bytes, 8));
       nir_def *second = nir_load_ssbo(b, 1, 32, descriptor, nir_iadd_imm(b, address, 4),
          .align_mul = 4, .access = access);
       nir_push_else(b, NULL);
       nir_def *zero = nir_imm_int(b, 0);
       nir_pop_if(b, NULL);
       second = nir_if_phi(b, second, zero);
-      result = dzn_nir_raw_decode(b, code, nir_vec2(b, word, second));
+      result = dzn_nir_raw_decode(b, code, nir_vec2(b, word, second), integer);
    }
    nir_push_else(b, NULL);
    nir_def *invalid = store ? NULL : nir_imm_zero(b, 4, 32);
@@ -1956,10 +1972,12 @@ dzn_nir_lower_raw_images(nir_shader *nir, const struct dzn_pipeline_layout *layo
 
 struct dzn_raw_texture_state {
    nir_def *metadata, *base, *code, *buffer, *levels, *mapping, *min_lod;
+   unsigned dimensions;
+   bool cube, integer;
 };
 
 struct dzn_raw_sampler_state {
-   nir_def *filter, *u, *v, *unnormalized, *anisotropy, *bias, *min_lod, *max_lod, *border;
+   nir_def *filter, *u, *v, *w, *unnormalized, *anisotropy, *bias, *min_lod, *max_lod, *border;
 };
 
 static nir_def *
@@ -1987,7 +2005,7 @@ dzn_raw_texture_mapping(nir_builder *b, const struct dzn_raw_texture_state *t, n
    nir_def *components[4];
    for (unsigned c = 0; c < 4; c++) {
       nir_def *source = nir_iand_imm(b, nir_ushr_imm(b, t->mapping, c * 3), 7);
-      components[c] = nir_bcsel(b, nir_ieq_imm(b, source, 5), nir_imm_float(b, 1), nir_imm_float(b, 0));
+      components[c] = nir_bcsel(b, nir_ieq_imm(b, source, 5), t->integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1), nir_imm_int(b, 0));
       for (unsigned s = 0; s < 4; s++)
          components[c] = nir_bcsel(b, nir_ieq_imm(b, source, s), nir_channel(b, color, s), components[c]);
    }
@@ -2005,22 +2023,21 @@ dzn_raw_texture_fetch(nir_builder *b, const struct dzn_raw_texture_state *t, nir
          nir_iand(b, nir_ult(b, y, nir_channel(b, shape, 0)), nir_ult(b, layer, nir_channel(b, shape, 1)))));
    valid = nir_iand(b, valid, nir_uge(b, level, nir_f2u32(b, nir_ffloor(b, t->min_lod))));
    nir_push_if(b, valid);
-   nir_def *bytes = nir_bcsel(b, nir_ult(b, t->code, nir_imm_int(b, 3)), nir_imm_int(b, 2),
-      nir_bcsel(b, nir_ieq_imm(b, t->code, 4), nir_imm_int(b, 8), nir_imm_int(b, 4)));
+   nir_def *bytes = dzn_raw_metadata_load(b, t, offsetof(struct dzn_raw_image_metadata, texel_bytes), 1);
    nir_def *address = nir_iadd(b, nir_channel(b, layout, 0), nir_iadd(b,
       nir_imul(b, x, bytes), nir_iadd(b, nir_imul(b, y, nir_channel(b, layout, 1)),
          nir_imul(b, layer, nir_channel(b, layout, 2)))));
    nir_def *lo = nir_load_ssbo(b, 1, 32, t->buffer, nir_iand_imm(b, address, ~3u),
       .align_mul = 4, .access = ACCESS_COHERENT);
    lo = nir_ushr(b, lo, nir_imul_imm(b, nir_iand_imm(b, address, 3), 8));
-   nir_push_if(b, nir_ieq_imm(b, t->code, 4));
+   nir_push_if(b, nir_ieq_imm(b, bytes, 8));
    nir_def *hi = nir_load_ssbo(b, 1, 32, t->buffer, nir_iadd_imm(b, address, 4),
       .align_mul = 4, .access = ACCESS_COHERENT);
    nir_push_else(b, NULL);
    nir_def *zero = nir_imm_int(b, 0);
    nir_pop_if(b, NULL);
    hi = nir_if_phi(b, hi, zero);
-   nir_def *color = dzn_raw_texture_mapping(b, t, dzn_nir_raw_decode(b, t->code, nir_vec2(b, lo, hi)));
+   nir_def *color = dzn_raw_texture_mapping(b, t, dzn_nir_raw_decode(b, t->code, nir_vec2(b, lo, hi), t->integer));
    nir_push_else(b, NULL);
    nir_def *invalid = nir_imm_zero(b, 4, 32);
    nir_pop_if(b, NULL);
@@ -2057,36 +2074,144 @@ dzn_raw_reduce(nir_builder *b, nir_def *previous, nir_def *value, nir_def *weigh
 }
 
 static nir_def *
+dzn_raw_cube_plane(nir_builder *b, nir_def *direction, nir_def *face)
+{
+   nir_def *x = nir_channel(b, direction, 0), *y = nir_channel(b, direction, 1), *z = nir_channel(b, direction, 2);
+   nir_def *planes[] = {
+      nir_vec3(b, nir_fneg(b, z), nir_fneg(b, y), x),
+      nir_vec3(b, z, nir_fneg(b, y), nir_fneg(b, x)),
+      nir_vec3(b, x, z, y),
+      nir_vec3(b, x, nir_fneg(b, z), nir_fneg(b, y)),
+      nir_vec3(b, x, nir_fneg(b, y), z),
+      nir_vec3(b, nir_fneg(b, x), nir_fneg(b, y), nir_fneg(b, z)),
+   };
+   nir_def *result = planes[5];
+   for (unsigned i = 0; i < 5; i++)
+      result = nir_bcsel(b, nir_ieq_imm(b, face, i), planes[i], result);
+   return result;
+}
+
+static nir_def *
+dzn_raw_cube_project(nir_builder *b, nir_def *direction, nir_def **face)
+{
+   nir_def *x = nir_channel(b, direction, 0), *y = nir_channel(b, direction, 1), *z = nir_channel(b, direction, 2);
+   nir_def *ax = nir_fabs(b, x), *ay = nir_fabs(b, y), *az = nir_fabs(b, z);
+   nir_def *fx = nir_bcsel(b, nir_fge(b, x, nir_imm_float(b, 0)), nir_imm_int(b, 0), nir_imm_int(b, 1));
+   nir_def *fy = nir_bcsel(b, nir_fge(b, y, nir_imm_float(b, 0)), nir_imm_int(b, 2), nir_imm_int(b, 3));
+   nir_def *fz = nir_bcsel(b, nir_fge(b, z, nir_imm_float(b, 0)), nir_imm_int(b, 4), nir_imm_int(b, 5));
+   *face = nir_bcsel(b, nir_iand(b, nir_fge(b, ax, ay), nir_fge(b, ax, az)), fx,
+      nir_bcsel(b, nir_fge(b, ay, az), fy, fz));
+   nir_def *plane = dzn_raw_cube_plane(b, direction, *face);
+   nir_def *uv = nir_fdiv(b, nir_trim_vector(b, plane, 2), nir_channel(b, plane, 2));
+   return nir_fadd_imm(b, nir_fmul_imm(b, uv, .5), .5);
+}
+
+static nir_def *
+dzn_raw_cube_direction(nir_builder *b, nir_def *uv, nir_def *face)
+{
+   nir_def *s = nir_fadd_imm(b, nir_fmul_imm(b, nir_channel(b, uv, 0), 2), -1);
+   nir_def *t = nir_fadd_imm(b, nir_fmul_imm(b, nir_channel(b, uv, 1), 2), -1);
+   nir_def *one = nir_imm_float(b, 1), *minus = nir_imm_float(b, -1);
+   nir_def *directions[] = {
+      nir_vec3(b, one, nir_fneg(b, t), nir_fneg(b, s)),
+      nir_vec3(b, minus, nir_fneg(b, t), s), nir_vec3(b, s, one, t),
+      nir_vec3(b, s, minus, nir_fneg(b, t)), nir_vec3(b, s, nir_fneg(b, t), one),
+      nir_vec3(b, nir_fneg(b, s), nir_fneg(b, t), minus),
+   };
+   nir_def *result = directions[5];
+   for (unsigned i = 0; i < 5; i++)
+      result = nir_bcsel(b, nir_ieq_imm(b, face, i), directions[i], result);
+   return result;
+}
+
+static nir_def *
+dzn_raw_cube_fetch(nir_builder *b, const struct dzn_raw_texture_state *t, nir_def *level,
+                   nir_def *x, nir_def *y, nir_def *layer, nir_def *size, nir_def *linear)
+{
+   nir_def *cx = nir_imin(b, nir_imax(b, x, nir_imm_int(b, 0)), nir_iadd_imm(b, nir_channel(b, size, 0), -1));
+   nir_def *cy = nir_imin(b, nir_imax(b, y, nir_imm_int(b, 0)), nir_iadd_imm(b, nir_channel(b, size, 1), -1));
+   nir_def *corner = nir_iand(b, linear, nir_iand(b, nir_ine(b, cx, x), nir_ine(b, cy, y)));
+   nir_def *count = nir_bcsel(b, corner, nir_imm_int(b, 3), nir_imm_int(b, 1));
+   nir_variable *sum = nir_local_variable_create(b->impl, glsl_vec4_type(), "cube_sum");
+   nir_variable *cursor = nir_local_variable_create(b->impl, glsl_uint_type(), "cube_tap");
+   nir_store_var(b, sum, nir_imm_zero(b, 4, 32), 15);
+   nir_store_var(b, cursor, nir_imm_int(b, 0), 1);
+   nir_push_loop(b);
+   nir_def *i = nir_load_var(b, cursor);
+   nir_break_if(b, nir_uge(b, i, count));
+   nir_def *px = nir_bcsel(b, nir_iand(b, corner, nir_ine_imm(b, i, 1)), cx, x);
+   nir_def *py = nir_bcsel(b, nir_iand(b, corner, nir_ine_imm(b, i, 2)), cy, y);
+   nir_def *outside = nir_ior(b, nir_uge(b, px, nir_channel(b, size, 0)), nir_uge(b, py, nir_channel(b, size, 1)));
+   nir_push_if(b, nir_iand(b, linear, outside));
+   nir_def *face = nir_umod(b, layer, nir_imm_int(b, 6));
+   nir_def *uv = nir_fdiv(b, nir_fadd_imm(b, nir_i2f32(b, nir_vec2(b, px, py)), .5), nir_u2f32(b, size));
+   nir_def *next_face;
+   uv = dzn_raw_cube_project(b, dzn_raw_cube_direction(b, uv, face), &next_face);
+   nir_def *projected = nir_imin(b, nir_imax(b, nir_f2i32(b, nir_ffloor(b, nir_fmul(b, uv, nir_u2f32(b, size)))),
+      nir_imm_ivec2(b, 0, 0)), nir_iadd_imm(b, size, -1));
+   nir_def *next_layer = nir_iadd(b, nir_isub(b, layer, face), next_face);
+   nir_push_else(b, NULL);
+   nir_def *clamped = nir_vec2(b, cx, cy);
+   nir_pop_if(b, NULL);
+   nir_def *point = nir_if_phi(b, projected, clamped);
+   nir_def *sample_layer = nir_if_phi(b, next_layer, layer);
+   nir_def *value = dzn_raw_texture_fetch(b, t, level, nir_channel(b, point, 0), nir_channel(b, point, 1), sample_layer);
+   nir_store_var(b, sum, nir_bcsel(b, nir_ieq_imm(b, i, 0), value, nir_fadd(b, nir_load_var(b, sum), value)), 15);
+   nir_store_var(b, cursor, nir_iadd_imm(b, i, 1), 1);
+   nir_pop_loop(b, NULL);
+   return nir_fdiv(b, nir_load_var(b, sum), nir_u2f32(b, count));
+}
+
+static nir_def *
 dzn_raw_filtered_level(nir_builder *b, const struct dzn_raw_texture_state *t,
                         const struct dzn_raw_sampler_state *s, nir_def *coords, nir_def *layer,
                         nir_def *level, nir_def *linear, nir_def *offset, nir_def *reduction)
 {
    nir_def *layout, *shape;
    dzn_raw_texture_mip(b, t, level, &layout, &shape);
-   nir_def *size = nir_vec2(b, nir_channel(b, layout, 3), nir_channel(b, shape, 0));
+   nir_def *size = nir_vec3(b, nir_channel(b, layout, 3), nir_channel(b, shape, 0),
+      t->dimensions == 3 ? nir_channel(b, shape, 1) : nir_imm_int(b, 1));
    nir_def *scaled = nir_bcsel(b, nir_ine_imm(b, s->unnormalized, 0), coords, nir_fmul(b, coords, nir_u2f32(b, size)));
    nir_def *position = nir_fsub(b, scaled, nir_bcsel(b, linear, nir_imm_float(b, .5), nir_imm_float(b, 0)));
    nir_def *base = nir_iadd(b, nir_f2i32(b, nir_ffloor(b, position)), offset);
-   nir_def *fraction = nir_bcsel(b, linear, nir_ffract(b, position), nir_imm_zero(b, 2, 32));
+   nir_def *fraction = nir_bcsel(b, linear, nir_ffract(b, position), nir_imm_zero(b, 3, 32));
    nir_variable *sum = nir_local_variable_create(nir_shader_get_entrypoint(b->shader), glsl_vec4_type(), "filtered");
    nir_variable *initialized = nir_local_variable_create(nir_shader_get_entrypoint(b->shader), glsl_bool_type(), "filtered_valid");
    nir_store_var(b, sum, nir_imm_zero(b, 4, 32), 15);
    nir_store_var(b, initialized, nir_imm_false(b), 1);
-   for (unsigned i = 0; i < 4; i++) {
-      unsigned ix = i & 1, iy = i >> 1;
-      nir_def *wx = ix ? nir_channel(b, fraction, 0) : nir_fsub(b, nir_imm_float(b, 1), nir_channel(b, fraction, 0));
-      nir_def *wy = iy ? nir_channel(b, fraction, 1) : nir_fsub(b, nir_imm_float(b, 1), nir_channel(b, fraction, 1));
-      nir_def *weight = nir_fmul(b, wx, wy);
+   for (unsigned i = 0; i < (1u << t->dimensions); i++) {
+      nir_def *weight = nir_imm_float(b, 1);
+      for (unsigned axis = 0; axis < t->dimensions; axis++) {
+         nir_def *f = nir_channel(b, fraction, axis);
+         weight = nir_fmul(b, weight, i & (1u << axis) ? f : nir_fsub(b, nir_imm_float(b, 1), f));
+      }
       nir_push_if(b, nir_flt(b, nir_imm_float(b, 0), weight));
-      nir_def *valid_x, *valid_y;
-      nir_def *x = dzn_raw_address(b, nir_iadd_imm(b, nir_channel(b, base, 0), ix), nir_channel(b, size, 0), s->u, &valid_x);
-      nir_def *y = dzn_raw_address(b, nir_iadd_imm(b, nir_channel(b, base, 1), iy), nir_channel(b, size, 1), s->v, &valid_y);
-      nir_push_if(b, nir_iand(b, valid_x, valid_y));
-      nir_def *value = dzn_raw_texture_fetch(b, t, level, x, y, layer);
-      nir_push_else(b, NULL);
-      nir_def *border = dzn_raw_texture_mapping(b, t, s->border);
-      nir_pop_if(b, NULL);
-      value = nir_if_phi(b, value, border);
+      nir_def *x, *y = nir_imm_int(b, 0), *z = layer, *valid = nir_imm_true(b);
+      nir_def *p[3];
+      for (unsigned axis = 0; axis < t->dimensions; axis++)
+         p[axis] = nir_iadd_imm(b, nir_channel(b, base, axis), (i >> axis) & 1);
+      nir_def *value;
+      if (t->cube) {
+         value = dzn_raw_cube_fetch(b, t, level, p[0], p[1], layer, nir_trim_vector(b, size, 2), linear);
+      } else {
+         nir_def *v;
+         x = dzn_raw_address(b, p[0], nir_channel(b, size, 0), s->u, &v);
+         valid = nir_iand(b, valid, v);
+         if (t->dimensions > 1) {
+            y = dzn_raw_address(b, p[1], nir_channel(b, size, 1), s->v, &v);
+            valid = nir_iand(b, valid, v);
+         }
+         if (t->dimensions > 2) {
+            z = dzn_raw_address(b, p[2], nir_channel(b, size, 2), s->w, &v);
+            valid = nir_iand(b, valid, v);
+         }
+         nir_push_if(b, valid);
+         value = dzn_raw_texture_fetch(b, t, level, x, y, z);
+         nir_push_else(b, NULL);
+         nir_def *border = dzn_raw_texture_mapping(b, t, s->border);
+         nir_pop_if(b, NULL);
+         value = nir_if_phi(b, value, border);
+      }
       nir_store_var(b, sum, dzn_raw_reduce(b, nir_load_var(b, sum), value, weight, reduction, nir_load_var(b, initialized)), 15);
       nir_store_var(b, initialized, nir_imm_true(b), 1);
       nir_pop_if(b, NULL);
@@ -2122,19 +2247,34 @@ dzn_raw_filtered(nir_builder *b, const struct dzn_raw_texture_state *t,
    return nir_if_phi(b, combined, first);
 }
 
+static nir_def *
+dzn_raw_spatial(nir_builder *b, nir_def *value, unsigned dimensions)
+{
+   nir_def *zero = nir_imm_int(b, 0);
+   return nir_vec3(b, nir_channel(b, value, 0), dimensions > 1 ? nir_channel(b, value, 1) : zero,
+      dimensions > 2 ? nir_channel(b, value, 2) : zero);
+}
+
 static bool
 dzn_nir_raw_texture_instr(nir_builder *b, nir_instr *instr, void *data)
 {
    if (instr->type != nir_instr_type_tex)
       return false;
    nir_tex_instr *tex = nir_instr_as_tex(instr);
-   if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_shadow || tex->is_sparse ||
+   if ((tex->sampler_dim != GLSL_SAMPLER_DIM_1D && tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
+        tex->sampler_dim != GLSL_SAMPLER_DIM_3D && tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE) ||
+       tex->is_shadow || tex->is_sparse ||
        tex->def.bit_size != 32 || (tex->op != nir_texop_txs && tex->op != nir_texop_query_levels &&
-       nir_alu_type_get_base_type(tex->dest_type) != nir_type_float))
+       (nir_alu_type_get_base_type(tex->dest_type) != nir_type_float &&
+        nir_alu_type_get_base_type(tex->dest_type) != nir_type_int &&
+        nir_alu_type_get_base_type(tex->dest_type) != nir_type_uint)))
       return false;
    if (tex->op != nir_texop_txf && tex->op != nir_texop_txs && tex->op != nir_texop_query_levels &&
        tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl &&
        tex->op != nir_texop_txd && tex->op != nir_texop_lod && tex->op != nir_texop_tg4)
+      return false;
+   if (nir_alu_type_get_base_type(tex->dest_type) != nir_type_float &&
+       tex->op != nir_texop_txf && tex->op != nir_texop_txs && tex->op != nir_texop_query_levels)
       return false;
    int texture_src = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
    int sampler_src = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
@@ -2146,7 +2286,12 @@ dzn_nir_raw_texture_instr(nir_builder *b, nir_instr *instr, void *data)
    nir_deref_instr *texture = nir_src_as_deref(tex->src[texture_src].src);
    const struct dzn_pipeline_layout *layout = data;
    b->cursor = nir_before_instr(instr);
-   struct dzn_raw_texture_state t = {.metadata = dzn_nir_image_metadata_descriptor(b)};
+   bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   unsigned dimensions = tex->sampler_dim == GLSL_SAMPLER_DIM_1D ? 1 :
+      tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 2;
+   struct dzn_raw_texture_state t = {.metadata = dzn_nir_image_metadata_descriptor(b),
+      .dimensions = dimensions, .cube = cube,
+      .integer = nir_alu_type_get_base_type(tex->dest_type) != nir_type_float};
    nir_def *index = dzn_nir_image_metadata_index(b, texture, layout);
    t.base = nir_iadd_imm(b, nir_imul_imm(b, index, sizeof(struct dzn_raw_image_metadata)),
       layout->image_metadata_offset * sizeof(uint32_t));
@@ -2157,38 +2302,57 @@ dzn_nir_raw_texture_instr(nir_builder *b, nir_instr *instr, void *data)
    int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    int lod_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
    int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
-   nir_def *coord = coord_src >= 0 ? tex->src[coord_src].src.ssa : nir_imm_zero(b, 2, 32);
-   nir_def *xy = nir_trim_vector(b, coord, 2);
+   nir_def *coord = coord_src >= 0 ? tex->src[coord_src].src.ssa : nir_imm_zero(b, 4, 32);
+   nir_def *xy = dzn_raw_spatial(b, coord, cube ? 3 : dimensions);
    int projector = nir_tex_instr_src_index(tex, nir_tex_src_projector);
    if (projector >= 0)
       xy = nir_fdiv(b, xy, tex->src[projector].src.ssa);
-   nir_def *dx = nir_imm_zero(b, 2, 32), *dy = dx;
+   nir_def *dx = nir_imm_zero(b, 3, 32), *dy = dx;
    if (sampling && tex->op != nir_texop_txl && tex->op != nir_texop_tg4) {
       int ddx = nir_tex_instr_src_index(tex, nir_tex_src_ddx);
       int ddy = nir_tex_instr_src_index(tex, nir_tex_src_ddy);
       if (ddx >= 0 && ddy >= 0) {
-         dx = nir_trim_vector(b, tex->src[ddx].src.ssa, 2);
-         dy = nir_trim_vector(b, tex->src[ddy].src.ssa, 2);
+         dx = dzn_raw_spatial(b, tex->src[ddx].src.ssa, cube ? 3 : dimensions);
+         dy = dzn_raw_spatial(b, tex->src[ddy].src.ssa, cube ? 3 : dimensions);
       } else if (b->shader->info.stage == MESA_SHADER_FRAGMENT) {
          dx = nir_ddx(b, xy);
          dy = nir_ddy(b, xy);
       }
    }
+   nir_def *cube_face = nir_imm_int(b, 0);
+   if (cube && sampling) {
+      nir_def *direction = xy;
+      nir_def *uv = dzn_raw_cube_project(b, direction, &cube_face);
+      nir_def *plane = dzn_raw_cube_plane(b, direction, cube_face);
+      nir_def *ratio = nir_fdiv(b, nir_trim_vector(b, plane, 2), nir_channel(b, plane, 2));
+      nir_def *gradients[2] = {dx, dy};
+      for (unsigned i = 0; i < 2; i++) {
+         nir_def *g = dzn_raw_cube_plane(b, gradients[i], cube_face);
+         gradients[i] = dzn_raw_spatial(b, nir_fmul_imm(b, nir_fdiv(b,
+            nir_fsub(b, nir_trim_vector(b, g, 2), nir_fmul(b, ratio, nir_channel(b, g, 2))),
+            nir_channel(b, plane, 2)), .5), 2);
+      }
+      dx = gradients[0]; dy = gradients[1];
+      xy = dzn_raw_spatial(b, uv, 2);
+   }
    nir_push_if(b, nir_ine_imm(b, t.code, 0));
    t.buffer = dzn_nir_raw_buffer(b, texture, false);
    nir_def *result = NULL;
    nir_def *level = lod_src >= 0 ? tex->src[lod_src].src.ssa : nir_imm_int(b, 0);
-   nir_def *offset = offset_src >= 0 ? tex->src[offset_src].src.ssa : nir_imm_ivec2(b, 0, 0);
-   nir_def *layer = tex->is_array && coord_src >= 0 ? nir_channel(b, coord, 2) : nir_imm_int(b, 0);
+   nir_def *offset = offset_src >= 0 ? dzn_raw_spatial(b, tex->src[offset_src].src.ssa, dimensions) : nir_imm_zero(b, 3, 32);
+   nir_def *layer = tex->is_array && coord_src >= 0 ? nir_channel(b, coord, cube ? 3 : dimensions) : nir_imm_int(b, 0);
    if (tex->op == nir_texop_query_levels) {
       result = t.levels;
    } else if (tex->op == nir_texop_txs) {
       nir_def *mip, *shape;
       dzn_raw_texture_mip(b, &t, level, &mip, &shape);
-      result = nir_vec3(b, nir_channel(b, mip, 3), nir_channel(b, shape, 0), nir_channel(b, shape, 1));
+      nir_def *depth = nir_channel(b, shape, 1);
+      if (cube) depth = nir_udiv(b, depth, nir_imm_int(b, 6));
+      result = dimensions == 1 ? nir_vec2(b, nir_channel(b, mip, 3), depth) :
+         nir_vec3(b, nir_channel(b, mip, 3), nir_channel(b, shape, 0), depth);
    } else if (tex->op == nir_texop_txf) {
       xy = nir_iadd(b, xy, offset);
-      result = dzn_raw_texture_fetch(b, &t, level, nir_channel(b, xy, 0), nir_channel(b, xy, 1), layer);
+      result = dzn_raw_texture_fetch(b, &t, level, nir_channel(b, xy, 0), nir_channel(b, xy, 1), dimensions == 3 ? nir_channel(b, xy, 2) : layer);
    } else {
       nir_deref_instr *sampler = nir_src_as_deref(tex->src[sampler_src].src);
       struct dzn_raw_texture_state sm = t;
@@ -2199,26 +2363,34 @@ dzn_nir_raw_texture_instr(nir_builder *b, nir_instr *instr, void *data)
       nir_def *properties = dzn_raw_metadata_load(b, &sm, 16, 3);
       nir_def *lods = dzn_raw_metadata_load(b, &sm, 28, 3);
       struct dzn_raw_sampler_state sam = {.filter = nir_channel(b, address, 0),
-         .u = nir_channel(b, address, 1), .v = nir_channel(b, address, 2),
+         .u = nir_channel(b, address, 1), .v = nir_channel(b, address, 2), .w = nir_channel(b, address, 3),
          .unnormalized = nir_channel(b, properties, 0), .anisotropy = nir_channel(b, properties, 2),
          .bias = nir_channel(b, lods, 0), .min_lod = nir_channel(b, lods, 1), .max_lod = nir_channel(b, lods, 2),
          .border = dzn_raw_metadata_load(b, &sm, 40, 4)};
       if (tex->is_array) {
          nir_def *mip, *shape;
          dzn_raw_texture_mip(b, &t, nir_imm_int(b, 0), &mip, &shape);
-         layer = nir_umin(b, nir_iadd_imm(b, nir_channel(b, shape, 1), -1),
+         nir_def *layers = nir_channel(b, shape, 1);
+         if (cube) layers = nir_udiv(b, layers, nir_imm_int(b, 6));
+         layer = nir_umin(b, nir_iadd_imm(b, layers, -1),
             nir_f2u32(b, nir_fmax(b, nir_ffloor(b, nir_fadd_imm(b, layer, .5)), nir_imm_float(b, 0))));
       }
+      if (cube) layer = nir_iadd(b, nir_imul_imm(b, layer, 6), cube_face);
       if (tex->op == nir_texop_tg4) {
          nir_def *mip, *shape;
          dzn_raw_texture_mip(b, &t, nir_imm_int(b, 0), &mip, &shape);
          nir_def *size = nir_vec2(b, nir_channel(b, mip, 3), nir_channel(b, shape, 0));
-         nir_def *scaled = nir_bcsel(b, nir_ine_imm(b, sam.unnormalized, 0), xy, nir_fmul(b, xy, nir_u2f32(b, size)));
+         nir_def *scaled = nir_bcsel(b, nir_ine_imm(b, sam.unnormalized, 0), nir_trim_vector(b, xy, 2), nir_fmul(b, nir_trim_vector(b, xy, 2), nir_u2f32(b, size)));
          nir_def *base = nir_f2i32(b, nir_ffloor(b, nir_fadd_imm(b, scaled, -.5)));
          nir_def *components[4];
          for (unsigned c = 0; c < 4; c++) {
-            nir_def *p = nir_iadd(b, base, offset);
+            nir_def *p = nir_iadd(b, base, nir_trim_vector(b, offset, 2));
             p = nir_iadd(b, p, nir_imm_ivec2(b, tex->tg4_offsets[c][0], tex->tg4_offsets[c][1]));
+            if (cube) {
+               components[c] = nir_channel(b, dzn_raw_cube_fetch(b, &t, nir_imm_int(b, 0),
+                  nir_channel(b, p, 0), nir_channel(b, p, 1), layer, size, nir_imm_true(b)), tex->component);
+               continue;
+            }
             nir_def *vx, *vy;
             nir_def *x = dzn_raw_address(b, nir_channel(b, p, 0), nir_channel(b, size, 0), sam.u, &vx);
             nir_def *y = dzn_raw_address(b, nir_channel(b, p, 1), nir_channel(b, size, 1), sam.v, &vy);
@@ -2233,7 +2405,9 @@ dzn_nir_raw_texture_instr(nir_builder *b, nir_instr *instr, void *data)
       } else {
          nir_def *mip, *shape;
          dzn_raw_texture_mip(b, &t, nir_imm_int(b, 0), &mip, &shape);
-         nir_def *size = nir_u2f32(b, nir_vec2(b, nir_channel(b, mip, 3), nir_channel(b, shape, 0)));
+         nir_def *size = nir_u2f32(b, nir_vec3(b, nir_channel(b, mip, 3),
+            dimensions > 1 ? nir_channel(b, shape, 0) : nir_imm_int(b, 1),
+            dimensions > 2 ? nir_channel(b, shape, 1) : nir_imm_int(b, 1)));
          nir_def *gx = nir_fmul(b, dx, size), *gy = nir_fmul(b, dy, size);
          nir_def *lx = nir_fsqrt(b, nir_fdot(b, gx, gx)), *ly = nir_fsqrt(b, nir_fdot(b, gy, gy));
          nir_def *major = nir_fmax(b, lx, ly), *minor = nir_fmin(b, lx, ly);

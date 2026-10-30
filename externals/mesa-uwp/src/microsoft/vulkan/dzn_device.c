@@ -69,7 +69,7 @@
 
 static unsigned dzn_shader_model_limit = UINT32_MAX;
 static unsigned dzn_force_legacy_barriers;
-static unsigned dzn_raw_image_lowering;
+static unsigned dzn_raw_image_lowering = 1;
 
 MESA_UWP_EXPORT void
 mesa_uwp_set_raw_image_lowering(int enabled)
@@ -81,6 +81,12 @@ bool
 dzn_raw_image_lowering_enabled(void)
 {
    return p_atomic_read(&dzn_raw_image_lowering) != 0;
+}
+
+MESA_UWP_EXPORT int
+mesa_uwp_get_raw_image_lowering(void)
+{
+   return dzn_raw_image_lowering_enabled();
 }
 
 MESA_UWP_EXPORT void
@@ -732,7 +738,7 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &pdev->shader_model,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
                      offsetof(struct dzn_physical_device, shader_model));
-   const uint32_t runtime_layout_version = 28;
+   const uint32_t runtime_layout_version = 31;
    _mesa_blake3_update(&blake3_ctx, &runtime_layout_version, sizeof(runtime_layout_version));
    bool raw_lowering = dzn_raw_image_lowering_enabled();
    _mesa_blake3_update(&blake3_ctx, &raw_lowering, sizeof(raw_lowering));
@@ -3511,6 +3517,9 @@ dzn_device_create(struct dzn_physical_device *pdev,
 
    IUnknown_QueryInterface(device->dev, &IID_ID3D12DeviceConfiguration, (void **)&device->dev_config);
 
+   device->integer_image_loads = dzn_integer_image_loads_supported(pdev);
+   device->raw_image_lowering = dzn_raw_image_lowering_enabled() && device->integer_image_loads &&
+      !dzn_bindless_supported(pdev);
    result = dzn_meta_init(device);
    if (result != VK_SUCCESS) {
       dzn_device_destroy(device, pAllocator);
@@ -3563,8 +3572,6 @@ dzn_device_create(struct dzn_physical_device *pdev,
       device->need_swapchain_blits = true;
    }
 
-   device->integer_image_loads = dzn_integer_image_loads_supported(pdev);
-   device->raw_image_lowering = dzn_raw_image_lowering_enabled() && device->integer_image_loads && !device->bindless;
    _debug_printf("Dozen device shader_model=0x%x integer_image_loads=%u resource_binding_tier=%u enhanced_barriers=%u\n",
                  pdev->shader_model, device->integer_image_loads, pdev->options.ResourceBindingTier,
                  pdev->options12.EnhancedBarriersSupported);

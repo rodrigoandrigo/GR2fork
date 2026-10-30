@@ -1025,7 +1025,7 @@ dzn_meta_init(struct dzn_device *device)
    if (result != VK_SUCCESS)
       goto out;
 
-   if (dzn_raw_image_lowering_enabled()) {
+   if (device->raw_image_lowering) {
       result = dzn_meta_raw_image_merge_init(device);
       if (result != VK_SUCCESS)
          goto out;

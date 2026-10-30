@@ -319,7 +319,7 @@ struct dzn_raw_mip_metadata {
 
 struct dzn_raw_image_metadata {
    uint32_t format, offset, row_pitch, slice_pitch, width, height, depth, dirty_offset;
-   uint32_t mip_count, mapping;
+   uint32_t mip_count, mapping, texel_bytes;
    float min_lod;
    struct dzn_raw_mip_metadata mips[DZN_RAW_IMAGE_MIP_COUNT];
    struct dzn_raw_sampler_metadata sampler;
@@ -1424,7 +1424,7 @@ struct dzn_image {
    struct vk_image vk;
    uint64_t feedback_id;
    struct dzn_device_memory *bound_memory;
-   VkDeviceSize bound_memory_offset;
+   VkDeviceSize bound_memory_offset, bound_memory_size;
    struct dzn_raw_image_backing *raw;
 
    struct {

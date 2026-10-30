@@ -762,6 +762,7 @@ struct dzn_raw_image_state {
    struct dzn_raw_subresource_state *subresources;
    D3D12_RESOURCE_STATES buffer_state;
    bool dirty_initialized;
+   bool prepared;
 };
 
 static struct dzn_raw_image_state *
@@ -909,6 +910,31 @@ dzn_raw_image_copy(struct dzn_cmd_buffer *cmdbuf, struct dzn_raw_image_state *st
    mtx_unlock(&container_of(image->vk.base.device, struct dzn_device, vk)->descriptor_update_lock);
 }
 
+static bool
+dzn_raw_images_overlap(const struct dzn_image *a, const struct dzn_image *b)
+{
+   if (!a->bound_memory || a->bound_memory != b->bound_memory || a->raw == b->raw)
+      return false;
+   return a->bound_memory_offset <= b->bound_memory_offset ?
+      b->bound_memory_offset - a->bound_memory_offset < a->bound_memory_size :
+      a->bound_memory_offset - b->bound_memory_offset < b->bound_memory_size;
+}
+
+static void
+dzn_raw_invalidate_aliases(struct dzn_cmd_buffer *cmdbuf, struct dzn_image *image)
+{
+   util_dynarray_foreach(&cmdbuf->raw_images, struct dzn_raw_image_state, state) {
+      if (!dzn_raw_images_overlap(state->image, image))
+         continue;
+      for (uint32_t i = 0; i < state->image->raw->subresource_count; i++) {
+         struct dzn_raw_subresource_state *sub = &state->subresources[i];
+         if (sub->authority == DZN_RAW_AUTHORITY_BUFFER)
+            dzn_raw_image_copy(cmdbuf, state, i, true);
+         sub->authority = DZN_RAW_AUTHORITY_TEXTURE;
+      }
+   }
+}
+
 static void
 dzn_raw_image_barriers(struct dzn_cmd_buffer *cmdbuf, const VkDependencyInfo *info, bool before)
 {
@@ -931,6 +957,15 @@ dzn_raw_image_barriers(struct dzn_cmd_buffer *cmdbuf, const VkDependencyInfo *in
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       const VkImageMemoryBarrier2 *barrier = &info->pImageMemoryBarriers[i];
       struct dzn_image *image = dzn_image_from_handle(barrier->image);
+      if (before && barrier->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+         dzn_raw_invalidate_aliases(cmdbuf, image);
+         if (image->bound_memory_size && image->bound_memory && image->bound_memory->heap &&
+             !image->bound_memory->dedicated_res && !cmdbuf->enhanced_barriers) {
+            D3D12_RESOURCE_BARRIER activation = {.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+               .Aliasing = {.pResourceBefore = NULL, .pResourceAfter = image->res}};
+            ID3D12GraphicsCommandList1_ResourceBarrier(cmdbuf->cmdlist, 1, &activation);
+         }
+      }
       struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
       if (!before && device->raw_image_lowering && image->raw && !dzn_cmd_buffer_raw_state(cmdbuf, image))
          return;
@@ -966,6 +1001,8 @@ static void
 dzn_raw_image_native_access(struct dzn_cmd_buffer *cmdbuf, struct dzn_image *image,
                             VkImageLayout layout, const VkImageSubresourceRange *range, bool write)
 {
+   if (image && write)
+      dzn_raw_invalidate_aliases(cmdbuf, image);
    if (!image || !image->raw || !(range->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT))
       return;
    util_dynarray_foreach(&cmdbuf->raw_images, struct dzn_raw_image_state, state) {
@@ -1016,10 +1053,13 @@ dzn_cmd_buffer_prepare_raw_range(struct dzn_cmd_buffer *cmdbuf, struct dzn_image
        cmdbuf->type == D3D12_COMMAND_LIST_TYPE_COPY || !image->raw || !image->raw->buffer ||
        image->vk.base.device != cmdbuf->vk.base.device)
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   if (write)
+      dzn_raw_invalidate_aliases(cmdbuf, image);
    struct dzn_raw_image_state *state = dzn_cmd_buffer_raw_state(cmdbuf, image);
    if (!state)
       return vk_command_buffer_get_record_result(&cmdbuf->vk);
-   if (!state->dirty_initialized && image->raw->dirty_size) {
+   state->prepared = true;
+   if (write && !state->dirty_initialized && image->raw->dirty_size) {
       dzn_raw_image_meta(cmdbuf, state, true, 0, image->raw->dirty_size,
          image->raw->dirty_offset, NULL, 0);
       state->dirty_initialized = true;
@@ -1071,7 +1111,7 @@ dzn_cmd_buffer_prepare_raw_bindings(struct dzn_cmd_buffer *cmdbuf, VkPipelineBin
    if (!device->raw_image_lowering)
       return;
    const struct dzn_pipeline *pipeline = cmdbuf->state.bindpoint[bindpoint].pipeline;
-   if (!pipeline)
+   if (!pipeline || !pipeline->raw_image_bindings.size)
       return;
    const struct dzn_descriptor_state *descriptors = &cmdbuf->state.bindpoint[bindpoint].desc_state;
    mtx_lock(&device->descriptor_update_lock);
@@ -1166,7 +1206,7 @@ dzn_cmd_buffer_finish_raw_attachments(struct dzn_cmd_buffer *cmdbuf)
    if (!device->raw_image_lowering)
       return;
    util_dynarray_foreach(&cmdbuf->raw_images, struct dzn_raw_image_state, state) {
-      if (!state->dirty_initialized)
+      if (!state->prepared || !state->image->raw->dirty_size)
          continue;
       for (uint32_t a = 0; a < cmdbuf->state.render.attachments.color_count; a++) {
          const struct dzn_rendering_attachment *att = &cmdbuf->state.render.attachments.colors[a];
