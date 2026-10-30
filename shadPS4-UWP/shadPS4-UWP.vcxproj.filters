@@ -48,11 +48,22 @@
   <ItemGroup>
     <ClCompile Include="ShadPS4Host.cpp" />
     <ClCompile Include="pch.cpp" />
+    <ClCompile Include="FrontendRenderer.cpp" />
+    <ClCompile Include="ImGuiFrontend.cpp" />
+    <ClCompile Include="third_party\imgui\imgui.cpp" />
+    <ClCompile Include="third_party\imgui\imgui_draw.cpp" />
+    <ClCompile Include="third_party\imgui\imgui_tables.cpp" />
+    <ClCompile Include="third_party\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_dx12.cpp" />
+    <ClCompile Include="$(D3D12Source)\platform\xbox_uwp\d3d12_device_context.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ShadPS4Host.h" />
     <ClInclude Include="shadPS4_UWPMain.h" />
     <ClInclude Include="pch.h" />
+    <ClInclude Include="UwpDiagnostics.h" />
+    <ClInclude Include="FrontendRenderer.h" />
+    <ClInclude Include="ImGuiFrontend.h" />
   </ItemGroup>
   <ItemGroup>
     <AppxManifest Include="Package.appxmanifest" />
@@ -213,6 +224,33 @@
     </Image>
     <Image Include="Assets\StoreLogo.scale-400.png">
       <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\Launcher\*.png">
+      <Filter>Ativos</Filter>
+    </Image>
+    <Image Include="Assets\Launcher\*.png">
+      <Filter>Ativos</Filter>
+    </Image>
+    <Image Include="Assets\Launcher\*.png">
+      <Filter>Ativos</Filter>
+    </Image>
+    <Image Include="Assets\Launcher\*.png">
+      <Filter>Ativos</Filter>
+    </Image>
+    <Image Include="Assets\Launcher\*.png">
+      <Filter>Ativos</Filter>
+    </Image>
+    <Image Include="Assets\Launcher\*.png">
+      <Filter>Ativos</Filter>
+    </Image>
+    <Image Include="Assets\Launcher\*.png">
+      <Filter>Ativos</Filter>
+    </Image>
+    <Image Include="Assets\Launcher\*.png">
+      <Filter>Ativos</Filter>
+    </Image>
+    <Image Include="Assets\Launcher\*.png">
+      <Filter>Ativos</Filter>
     </Image>
   </ItemGroup>
 </Project>
