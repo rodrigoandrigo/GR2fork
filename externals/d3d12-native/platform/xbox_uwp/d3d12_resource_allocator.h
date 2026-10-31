@@ -35,7 +35,9 @@ public:
 
   [[nodiscard]] ID3D12Resource *Get() const noexcept { return resource_.Get(); }
   [[nodiscard]] ID3D12Resource *operator->() const noexcept { return Get(); }
-  [[nodiscard]] UINT64 AllocationBytes() const noexcept { return allocation_bytes_; }
+  [[nodiscard]] UINT64 AllocationBytes() const noexcept {
+    return allocation_bytes_;
+  }
   void Reset() noexcept;
 
 private:
@@ -54,6 +56,10 @@ public:
   void Initialize(ID3D12Device *device, UINT64 budget_bytes);
   [[nodiscard]] HRESULT CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap_type,
                                      D3D12_RESOURCE_STATES initial_state,
+                                     D3D12Resource &output) noexcept;
+  [[nodiscard]] HRESULT CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap_type,
+                                     D3D12_RESOURCE_STATES initial_state,
+                                     D3D12_RESOURCE_FLAGS resource_flags,
                                      D3D12Resource &output) noexcept;
   [[nodiscard]] HRESULT CreateTexture2D(const D3D12_RESOURCE_DESC &description,
                                         D3D12_RESOURCE_STATES initial_state,

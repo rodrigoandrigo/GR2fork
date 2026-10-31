@@ -16,6 +16,8 @@ public:
   D3D12DeviceContext &operator=(const D3D12DeviceContext &) = delete;
 
   // Passing an adapter is used by the native D3D12/WARP CI test.
+  static void EnableDiagnostics();
+  void CheckResult(HRESULT result, const wchar_t *operation) const;
   void Initialize(IUnknown *adapter = nullptr);
   [[nodiscard]] ID3D12Device *Device() const noexcept { return device_.Get(); }
   [[nodiscard]] ID3D12CommandQueue *DirectQueue() const noexcept {
@@ -27,8 +29,10 @@ public:
   // The caller owns the list/allocator/resources until this ticket completes.
   // Calls are serialized by the host's UI thread; this is not a multi-queue API.
   [[nodiscard]] UINT64 Submit(ID3D12CommandList *list);
+  [[nodiscard]] UINT64 SubmitBatch(ID3D12CommandList *const *lists, UINT count);
   void Wait(UINT64 ticket);
   void WaitForGpu();
+  [[nodiscard]] bool DrainAfterFailure() noexcept;
   [[nodiscard]] UINT64 CompletedValue() const;
   [[nodiscard]] UINT64 LastSignaledValue() const noexcept { return fence_value_; }
   [[nodiscard]] UINT64 SubmittedLists() const noexcept { return submitted_lists_; }

@@ -52,7 +52,8 @@ void D3D12Resource::Reset() noexcept {
   allocation_bytes_ = 0U;
 }
 
-void D3D12ResourceAllocator::Initialize(ID3D12Device *device, UINT64 budget_bytes) {
+void D3D12ResourceAllocator::Initialize(ID3D12Device *device,
+                                        UINT64 budget_bytes) {
   if (device == nullptr || budget_bytes == 0U) {
     winrt::throw_hresult(E_INVALIDARG);
   }
@@ -72,11 +73,20 @@ HRESULT D3D12ResourceAllocator::Reject(HRESULT error) noexcept {
   return error;
 }
 
+HRESULT
+D3D12ResourceAllocator::CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap_type,
+                                     D3D12_RESOURCE_STATES initial_state,
+                                     D3D12Resource &output) noexcept {
+  return CreateBuffer(size, heap_type, initial_state, D3D12_RESOURCE_FLAG_NONE,
+                      output);
+}
+
 HRESULT D3D12ResourceAllocator::CreateBuffer(
-    UINT64 size, D3D12_HEAP_TYPE heap_type,
-    D3D12_RESOURCE_STATES initial_state, D3D12Resource &output) noexcept {
+    UINT64 size, D3D12_HEAP_TYPE heap_type, D3D12_RESOURCE_STATES initial_state,
+    D3D12_RESOURCE_FLAGS resource_flags, D3D12Resource &output) noexcept {
   if (size == 0U ||
-      (heap_type != D3D12_HEAP_TYPE_DEFAULT && heap_type != D3D12_HEAP_TYPE_UPLOAD &&
+      (heap_type != D3D12_HEAP_TYPE_DEFAULT &&
+       heap_type != D3D12_HEAP_TYPE_UPLOAD &&
        heap_type != D3D12_HEAP_TYPE_READBACK) ||
       (heap_type == D3D12_HEAP_TYPE_UPLOAD &&
        initial_state != D3D12_RESOURCE_STATE_GENERIC_READ) ||
@@ -92,12 +102,14 @@ HRESULT D3D12ResourceAllocator::CreateBuffer(
   description.MipLevels = 1;
   description.SampleDesc.Count = 1;
   description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  description.Flags = resource_flags;
   return Create(description, heap_type, initial_state, output);
 }
 
-HRESULT D3D12ResourceAllocator::CreateTexture2D(
-    const D3D12_RESOURCE_DESC &description,
-    D3D12_RESOURCE_STATES initial_state, D3D12Resource &output) noexcept {
+HRESULT
+D3D12ResourceAllocator::CreateTexture2D(const D3D12_RESOURCE_DESC &description,
+                                        D3D12_RESOURCE_STATES initial_state,
+                                        D3D12Resource &output) noexcept {
   if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
       description.Width == 0U || description.Height == 0U ||
       description.DepthOrArraySize == 0U || description.MipLevels == 0U ||
@@ -109,9 +121,10 @@ HRESULT D3D12ResourceAllocator::CreateTexture2D(
   return Create(description, D3D12_HEAP_TYPE_DEFAULT, initial_state, output);
 }
 
-HRESULT D3D12ResourceAllocator::Create(
-    const D3D12_RESOURCE_DESC &description, D3D12_HEAP_TYPE heap_type,
-    D3D12_RESOURCE_STATES initial_state, D3D12Resource &output) noexcept {
+HRESULT D3D12ResourceAllocator::Create(const D3D12_RESOURCE_DESC &description,
+                                       D3D12_HEAP_TYPE heap_type,
+                                       D3D12_RESOURCE_STATES initial_state,
+                                       D3D12Resource &output) noexcept {
   if (!accounting_) {
     return E_UNEXPECTED;
   }

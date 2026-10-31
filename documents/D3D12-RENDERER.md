@@ -18,6 +18,67 @@ habilitado.** O usuário confirmou anteriormente a tela inicial no Xbox Series S
 isso não comprova gameplay prolongado, precisão gráfica ou todos os recursos.
 Não permanece válida a afirmação antiga de que o boot estava desabilitado.
 
+## Integração de GR2fork-UWP — 30/10/2026
+
+A origem contém uma seleção de arquivos alterados, sem repositório Git ou build
+completo. As diferenças de produção foram integradas e revisadas contra este
+checkout; arquivos ausentes na origem não foram removidos.
+
+- Shaders: operações escalares B64, WQM/QUADMASK, scans, CMOV, MOVREL, variantes
+  SAVEEXEC e SCC global; alocação SGPR passa a integrar o runtime de Vulkan e
+  D3D12. FORK/JOIN, VSKIP e demais operações sem implementação continuam pendentes.
+- Recursos: separação das identidades host/guest, overflow de ranges e endereços,
+  aliases dos planos depth/stencil, compatibilidade de views typeless, BC4/BC5,
+  tiling PRT, formatos MSAA de 16 bits e resolve/cópia de subrecursos.
+- Draws: índices parcialmente disponíveis são preenchidos com zero preservando
+  a contagem, clears sem invocações de shaders, depth/stencil readonly e RectList
+  point/wireframe nos estados suportados. Modos independentes por face e captura
+  com GS guest deste checkout foram preservados.
+- Submissões: PSOs e root signatures permanecem vivos até a fence, inclusive em
+  compute e draws sem captura. A criação de PSO não força fila ociosa. A validade
+  do mapeamento é registrada separadamente da lease de objetos GPU.
+- Apresentação: dois conjuntos de allocator/lista, descritores e FSR, reutilizados
+  após sua fence; frames usados pela GPU permanecem retidos. Resize, trim e drain
+  aguardam a fila antes de liberar recursos.
+- Falhas: drenagem informa se a conclusão ou remoção do dispositivo foi comprovada.
+  Se não for possível comprová-la, o rasterizer retém o runtime para evitar liberar
+  recursos em uso. Isso pode reter memória até o encerramento do processo.
+  GET_LOD_STATS sem implementação encerra a sessão UWP com diagnóstico, sem tratá-lo
+  como sucesso ou introduzir um abort deliberado.
+- Plataforma: o perfil UWP consulta o modelo Xbox, aceita Series S/X e bloqueia
+  Xbox One e modelos desconhecidos para o renderer nativo enquanto o host não
+  consegue confirmar o modo de recursos necessário. Isso não comprova capacidades
+  reais do dispositivo; as consultas D3D12 continuam obrigatórias.
+
+Foram preservados os diagnósticos DRED/orçamento e a detecção de device loss nas
+esperas; a origem os removia. A aproximação automática FP64→FP32 da origem não foi
+ativada no D3D12: ausência de FP64 real continua sendo rejeitada. O conversor legado
+compartilhado recebeu correções de expoente/subnormais/NaN, sem equivalência FP64
+nem arredondamento completo. FMASK sem remapeamento real é rejeitado no perfil
+D3D12, inclusive resolve/decompressão que dependeriam desse mapa. Clear CMASK
+não-DCC usa código zero; DCC/TC-compatible são rejeitados antes de ler metadata.
+
+Testes automatizados da pasta `tests` da origem não foram importados, conforme
+AGENTS.md. As fontes OpenOrbis de referência foram atualizadas; a extensão
+[SCALAR64](hardware/ir-gcn/main.cpp) cobre novas operações e preservação de SCC.
+A documentação de aproveitamento de pt-pc-main permanece inalterada. As evidências
+de build e diagnóstico desta integração são registradas abaixo quando concluídas;
+a documentação e os resultados históricos da origem não contam como novas execuções.
+
+Validação local desta integração: `Build/uwp-import-final-build.log` registra o
+core UWP Release x64. `Build/uwp-import-scalar-validation.log` registra 1.284 casos
+escalares em SM6.4 (1.200 anteriores e 84 SCALAR64), com zero erros D3D12.
+`Build/uwp-import-views-validation.log` registra 55 casos de aliases, views e
+storage MSAA; `Build/uwp-import-geometry-validation.log` registra 34 verificações
+de polígonos/faces/bias/tessellation, ambos sem erros D3D12.
+`Build/uwp-import-recovery-validation.log` confirma recuperação conservadora,
+leases, apresentação residente, cancelamento assíncrono e recusa de replay após
+submissão, também sem erros D3D12. A falha de alocação registrada no cenário 2 é
+a rejeição esperada do replay inseguro, não uma recuperação bem-sucedida.
+`Build/uwp-import-homebrew-syntax.log` confere somente sintaxe da fonte SCALAR64
+com declarações locais, sem link OpenOrbis. Esses diagnósticos PC não validam
+visualmente a swapchain UWP, gameplay, desempenho comparativo ou Xbox.
+
 ## Escopo da revisão
 
 Foram confrontados os módulos de `src/video_core/renderer_d3d12`, apresentação
@@ -68,12 +129,12 @@ explicitados neste documento; não significa cobertura de todos os jogos.
 | Escritas subword | Texels/componentes de 8/16 bits usam extração e compare-and-swap de 32 bits para preservar os vizinhos nas escritas compartilhadas. | [lowering](../src/video_core/renderer_d3d12/image_buffer_alias.cpp) |
 | Atômicos em aliases | Add, min/max signed/unsigned, and/or/xor, exchange, compare-swap inteiro/float, inc/dec e min/max float para componente de 32 bits. Não devem voltar à lista genérica de “atômicos restantes” já resolvidos. | `Atomic` em [image_buffer_alias.cpp](../src/video_core/renderer_d3d12/image_buffer_alias.cpp) |
 | Coerência | Leases CPU/GPU, resolução física, callbacks de memória, map/unmap/protect e invalidação; imagens podem continuar residentes/dirty entre comandos e sincronizar por intervalo quando a CPU ou outro uso exige. | [runtime](../src/video_core/renderer_d3d12/command_runtime.cpp), [memória](../src/core/memory.cpp) |
-| Metadata e clear | CMASK misto por tile 8×8 para códigos 0/F e estados MSAA com FMASK descomprimido (1→D, 2→E, 3→F), clear tipado, swizzle/quantização e preservação de tiles/padding; modos alternate/Neo e bank swizzle nos layouts suportados. | [clear](../src/video_core/renderer_d3d12/color_clear.h), [CMASK](../src/video_core/renderer_d3d12/cmask_address.h) |
+| Metadata e clear | CMASK misto por tile 8×8 para códigos 0/F e estados MSAA com FMASK descomprimido (clear 0; expanded D/E/F para 2×/4×/8×), clear tipado, swizzle/quantização e preservação de tiles/padding; modos alternate/Neo e bank swizzle nos layouts suportados. | [clear](../src/video_core/renderer_d3d12/color_clear.h), [CMASK](../src/video_core/renderer_d3d12/cmask_address.h) |
 | Rasterização | Culling, winding, máscaras, depth clip/bias, até 16 viewports/scissors, flips X/Y, clip/cull distances, conversões de primitivas, provoking vertex first/last; expansões de point/line e passes por face com restrições. | [rasterizer](../src/video_core/renderer_d3d12/d3d12_rasterizer.cpp), [primitivas](../src/video_core/renderer_d3d12/primitive_conversion.h) |
 | Cor/depth/stencil | MRTs com gaps/subviews, blend/dual source, MIN/MAX ZERO/ONE, blend bypass, alpha constante com consulta de capacidade, testes/clears de depth/stencil, depth bounds e gate de cor por depth com restrições. | [draw](../src/video_core/renderer_d3d12/draw_runtime.cpp), [rasterizer](../src/video_core/renderer_d3d12/d3d12_rasterizer.cpp) |
 | Logic ops | 16 ROPs; alvos não inteiros são expandidos para componentes inteiros temporários e recompostos, com máscaras, padding e transferência MSAA. | [formatos](../src/video_core/renderer_d3d12/logic_op_format.h), [imagens](../src/video_core/renderer_d3d12/image_cache.cpp) |
 | MSAA | Cor e depth/stencil, máscaras, alpha-to-coverage, leitura e resolve; posições guest dependem do tier do dispositivo. | [MSAA](../src/video_core/renderer_d3d12/msaa_transfer.cpp) |
-| Stream-out | Captura shader-side de stream 0 com GS off-chip; buffers resolvidos por descritores do user data e filled-size calculado na CPU. É uma implementação parcial. | [draw](../src/video_core/renderer_d3d12/draw_runtime.cpp), [rasterizer](../src/video_core/renderer_d3d12/d3d12_rasterizer.cpp) |
+| Stream-out | Captura shader-side de stream 0 com GS off-chip; buffers resolvidos por descritores do user data e filled-size e contagem obtidos após a fence da GPU. A captura/layout de streams ainda é parcial. | [draw](../src/video_core/renderer_d3d12/draw_runtime.cpp), [rasterizer](../src/video_core/renderer_d3d12/d3d12_rasterizer.cpp) |
 | Memória | Meta agregada de retenção para contextos e apresentação, ajustada por RAM disponível, DXGI e limite/nível UWP; trim seguro por fences, eventos de pressão e segundo plano. | [orçamento](../src/video_core/renderer_d3d12/memory_budget.cpp), [coordenação](../src/video_core/renderer_d3d12/command_scheduler.cpp) |
 | Caches | Variantes antes da tradução GCN, DXIL em memória/disco, PSO em memória e blob de driver em disco quando permitido; entradas limitadas. | [shaders](../src/video_core/renderer_d3d12/shader_cache.cpp), [persistência](../src/video_core/renderer_d3d12/persistent_cache.cpp), [PSO](../src/video_core/renderer_d3d12/pipeline_cache.cpp) |
 | Transferências | Pool de upload/readback aposentado por fences, heaps persistentes por contexto, staging liberado e cache de pipelines do tiler limitado após fences. | [pool](../src/video_core/renderer_d3d12/transfer_pool.cpp), [tiling](../src/video_core/renderer_d3d12/tiling_runtime.cpp) |
@@ -366,7 +427,7 @@ jogo depende de cada item.
 | --- | --- | --- |
 | F01 | Feedback de attachments com escrita simultânea, preservando ordem e efeitos laterais sem replay incorreto. | `ValidateTargetRange` em [resource_bindings.cpp](../src/video_core/renderer_d3d12/resource_bindings.cpp) permite leituras simultâneas de attachments imutáveis: color com máscara zero e planos depth/stencil sem escrita/clear, inclusive aliases físicos. Usa o conteúdo sincronizado antes de um único draw; rejeita sobreposição quando shader ou attachment escreve. Escrita ordenada permanece pendente. |
 | F02 | Completar fetch coerente de índices com conversão de primitivas/restart e descritores de fetch modificados durante o draw. | Fetch shaders são traduzidos inline no VS e usam storage compartilhado com buffers/imagens, sem snapshot de dados da IA; aliases físicos, formatos, offsets e divisores seguem o tradutor GCN. Índices 16/32 bits com escrita no mesmo backing usam leitura programável no VS, com swaps, base e instâncias; indiretos com escrita passam pelo fallback de argumentos. Conversão/restart nesse feedback continua rejeitado. Código e descritores ainda são resolvidos na tradução CPU. |
-| F04 | CMASK além de 0/F, metadata comprimida/TC-compatible, DCC e HTILE com semântica real; FMASK com remapeamento/compressão guest em vez de valores constantes. | `MaterializeColorClearImpl` aceita 0/F sem compressão e separa clear/cor expandida de FMASK descomprimido em MSAA 2×/4×/8×, preservando seus bits; ainda rejeita EQAA, FMASK comprimido, DCC e TC-compatible quando requerem materialização. HTILE permanece sem decodificação; [resource_patching_pass.cpp](../src/shader_recompiler/ir/passes/resource_patching_pass.cpp) substitui leituras FMASK por constantes e não aceita storage FMASK. |
+| F04 | CMASK além de 0/F, metadata comprimida/TC-compatible, DCC e HTILE com semântica real; FMASK com remapeamento/compressão guest em vez de valores constantes. | `MaterializeColorClearImpl` usa clear 0 e expanded D/E/F em MSAA 2×/4×/8× não-DCC. Rejeita DCC/TC-compatible antes de ler metadata. HTILE e remapeamento FMASK continuam pendentes; o perfil D3D12 rejeita leitura/storage FMASK aproximados, resolve e decompressão dependentes do mapa guest. Essa rejeição não implementa compressão. |
 | F05 | EQAA verdadeiro, em que samples e fragments diferem, e equivalência da frequência parcial de shading por sample. | `MAX_ANCHOR_SAMPLES` corrigido para três bits; `PS_ITER_SAMPLE` respeitado e contagem de iterações preservada. [draw_runtime.cpp](../src/video_core/renderer_d3d12/draw_runtime.cpp) rejeita EQAA e frequência parcial antes de traduzir/executar o draw, evitando multiplicar efeitos laterais. Falta o fallback de cobertura→fragment/anchor e shading agrupado com interpolação, depth/stencil, blend e FMASK coerentes. |
 | F06 | Completar amostragem de storage compartilhado: LOD implícito com cadeia de mips, filtragem entre mips, anisotropia, seleção min/mag/LOD/reduction fiel e cálculo geral de gradientes. | [Sample](../src/video_core/renderer_d3d12/image_buffer_alias.cpp) calcula derivadas implícitas no PS e gradientes 1D/2D/3D, seleciona mip point/linear, min/mag, bias/clamps e reduction; anisotropia por footprint até 16 taps e borda float tipada. Samplers entram nas dependências do cache de variantes. Ainda faltam equivalência GCN de precisão/controles secundários (aniso threshold/bias, bias secundário, trunc/ceil e seleção coarse por quad); o filtro anisotrópico 3D difere do volume nativo usado como referência no PC. [Homebrew](hardware/shared-sampling/README.md). |
 | F10 | Completar stream-out sem GS, múltiplos streams/rast stream, layout/seleção exata dos descritores e compactação ordenada da emissão entre invocações. | A contagem já vem da GPU, com filled-size e eventos sincronizados; a captura de dados ainda cobre stream 0, escolhe descritores por heurística e usa índice de escrita local por invocação. |
@@ -378,7 +439,7 @@ jogo depende de cada item.
 | F16 | Parcial: reset/estado/acumulacao entre segmentos e packets; metricas major/full-length, fractional/diamond; cobertura guest completa e W degenerado. | REPEAT_COUNT agora repete cada bit (valor + 1), o padrao volta ciclicamente e o recorte preserva a fase para endpoint inicial com W positivo. Batches dimensionados pelo viewport/escala substituem o corte silencioso em 4.096 janelas; limites de memoria/endereco geram erro explicito. A continuidade dos registradores SU/SC ainda nao esta implementada. |
 | F17 | Parcial: ampliar o fallback de constantes RGB/alpha para MRT e slots diferentes de zero, e combinações com dual-source guest. | Um RT no slot 0 usa saída secundária do PS para alpha constante, mantendo as constantes RGB no output merger e o alpha original do fragmento. MIN/MAX RGB ficam nativos porque ignoram fatores. Configurações incompatíveis continuam rejeitadas explicitamente. |
 | F18 | Parcial: FP64 por software e demais operações/modos; arredondamentos direcionados, denorm híbrido/FP16/FP64 e semântica completa de NaN; cross-lane sem wave64 garantido. | O perfil nativo preserva FP64 no IR, consulta DoublePrecisionFloatShaderOps e rejeita a ausência de suporte em vez de reduzir para FP32. Bitcasts uint2/double usam asdouble/asuint no HLSL. FP32 flush/preserve seguem ExecutionMode e opções -denorm do DXC, também nos helpers derivados. As guardas de wave64 continuam ativas. |
-| F19 | Parcial: demais opcodes GCN, DPP, SDWA em caminhos de 16/64 bits, append/consume com semântica geral por wave e validação dos demais estágios até DXIL/SM6.4. | SDWA de 32 bits agora aplica seletores, extensão, modificadores e preservação do destino. ORN2/NOR/XNOR B32, CMOV B32 e SEXT I8/I16 implementados, incluindo SCC. DPP sem lowering validado é rejeitado explicitamente. Emissores unreachable isolados não medem a cobertura. |
+| F19 | Parcial: demais opcodes GCN, DPP, SDWA em caminhos de 16/64 bits, append/consume com semântica geral por wave e validação dos demais estágios até DXIL/SM6.4. | SDWA de 32 bits agora aplica seletores, extensão, modificadores e preservação do destino. ORN2/NOR/XNOR B32, CMOV B32/B64, SEXT I8/I16, scans, WQM/QUADMASK, MOVREL e SAVEEXEC implementados; SCC das operações lógicas B64 compara o resultado completo. BFE preserva SCC conforme a tabela-resumo da ISA usada pela origem; a divergência com sua descrição detalhada permanece sem confirmação independente. DPP sem lowering validado é rejeitado explicitamente. Emissores unreachable isolados não medem a cobertura. |
 | F20 | Parcial: demais comandos PM4 válidos, estatísticas/controles guest e fidelidade das consultas nas expansões. | Oclusão D3D12 mede samples aprovados por depth/stencil e resolve resultados após fence, também em contextos assíncronos. SET_PREDICATION aplica ZPASS/PRIMCOUNT/BOOL32/64, polaridade, continuação e espera/no-wait aos pacotes marcados. COPY_DATA gráfico implementa memória/GDS/registradores/imediato/clock, 32/64 bits e confirmação. Restam GET_LOD_STATS, seletores atômicos de COPY_DATA, geração de estatísticas PRIMCOUNT/pipeline, distribuição/controle por RB e SGPR de draw index. |
 | F21 | Parcial: combinações que excedem o lowering raw, orçamento de tabelas ou dependem das semânticas pendentes de F01/F04/F05/F06/F07. | Storage MSAA escrito/atômico/feedback e views MSAA de um sample usam storage compartilhado. Aliases escritos com a mesma base também são lowerados, independentemente do formato/layout. A seleção consulta suporte real de dimensão, load/sample/gather/comparison, UAV typed load/store e sample count; views sem suporte nativo usam o lowering existente. Permanecem as guardas para operações sem representação, formatos/layouts não implementados, metadata comprimida e feedback de attachments com escrita. |
 | F22 | Parcial: continuidade após perda de trabalho já submetido ou de estado GPU sem cópia CPU, e recuperação conjunta do presenter/swapchain. | Modo opcional SHADPS4_D3D12_RECOVERY=1 faz checkpoints sincronizados, desabilita batching assíncrono e permite uma recuperação por sessão na thread PM4. Recria o runtime e restaura GDS, oclusão, filled-size e registradores, recarregando recursos da memória guest. Recusa replay após submissão, escrita CPU, operação já concluída ou checkpoint inválido; erros determinísticos continuam encerrando a sessão. |

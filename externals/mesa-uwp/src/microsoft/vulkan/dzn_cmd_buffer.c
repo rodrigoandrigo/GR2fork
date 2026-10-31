@@ -2472,8 +2472,7 @@ dzn_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          continue;
       }
 
-      /* UAV are used only for storage buffers, skip all other buffers. */
-      if (!(buf->usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT))
+      if (!(buf->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
          continue;
 
       barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
