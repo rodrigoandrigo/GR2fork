@@ -212,6 +212,12 @@ struct AddressSpace::Impl {
 #ifdef SHADPS4_UWP
         std::vector<VAddr> reserved_regions;
         auto rollback = ::detail::MakeScopeGuard([&] {
+            for (auto page : ram_pages)
+                if (page)
+                    CloseHandle(page);
+            for (auto file : swap_files)
+                if (file != INVALID_HANDLE_VALUE)
+                    CloseHandle(file);
             if (backing_base) {
                 VirtualFreeEx(process, backing_base, BackingSize,
                               MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
@@ -398,11 +404,22 @@ struct AddressSpace::Impl {
     u64 pager_store_copies{};
     u64 pager_second_chances{};
     u64 pager_last_emergency{};
+    u64 pager_last_byte_pressure{};
     u64 preferred_view_size{GuestViewSize};
     u64 mapping_pressure_at{};
+    u64 mapping_views{};
+    u64 mapping_sections{};
+    u64 mapping_view_failures{};
+    u64 mapping_view_evictions{};
     std::atomic_bool mapping_recovery_requested{};
+    std::atomic_bool section_recovery_requested{};
     std::atomic<u64> mapping_recovery_epoch{};
+    std::atomic<u64> mapping_recovery_waits{};
+    std::atomic<u64> mapping_recovery_wait_us{};
+    std::atomic<u64> section_flushes{};
+    std::atomic<u64> section_flush_us{};
     u64 mapping_failures{};
+    u64 mapping_snapshot_at{};
     u64 recovery_reports{};
     std::atomic<u64> pager_ticks{};
     std::atomic<u64> pager_lock_skips{};
@@ -451,6 +468,16 @@ struct AddressSpace::Impl {
                      pager_budget_errors.load(), mapping_failures, pager_budget, pager_evictions,
                      pager_emergencies, pager_second_chances, pager_store_copies,
                      pager_last_emergency);
+            LOG_INFO(Core,
+                     "[MemDiag] {} mapping_views={} view_admission=system sections={} "
+                     "section_admission=system view_failures={} view_evictions={}",
+                     reason, mapping_views, mapping_sections, mapping_view_failures,
+                     mapping_view_evictions);
+            LOG_INFO(Core,
+                     "[MemDiag] {} recovery_waits={} recovery_wait_us={} section_flushes={} "
+                     "section_flush_us={}",
+                     reason, mapping_recovery_waits.load(), mapping_recovery_wait_us.load(),
+                     section_flushes.load(), section_flush_us.load());
             u64 usage{}, limit{};
             s32 budget_error{};
             try {
@@ -478,6 +505,20 @@ struct AddressSpace::Impl {
                         DWORD flags = 0) noexcept {
         const auto failure = ++mapping_failures;
         try {
+            if (IsMappingResourceError(error)) {
+                const std::string_view kind{operation};
+                const bool view_failure =
+                    size <= MinimumGuestViewSize &&
+                    (kind == "guest_alias_map_from_app" || kind == "guest_alias_map_native" ||
+                     kind == "backing_view_map" || kind == "store_view_map");
+                if (kind == "ram_section_create") {
+                    section_recovery_requested.store(true, std::memory_order_release);
+                    RequestMappingRecovery();
+                } else if (view_failure) {
+                    ++mapping_view_failures;
+                    RequestMappingRecovery();
+                }
+            }
             if (failure <= 32 || failure % 64 == 0) {
                 MEMORY_BASIC_INFORMATION target{};
                 const auto queried =
@@ -494,8 +535,11 @@ struct AddressSpace::Impl {
                           failure, queried != 0, target.State, target.Type, target.Protect,
                           target.AllocationProtect, reinterpret_cast<VAddr>(target.AllocationBase),
                           reinterpret_cast<VAddr>(target.BaseAddress), target.RegionSize);
-                if (failure <= 8 || failure % 64 == 0)
-                    MemorySnapshot(operation);
+            }
+            const auto now = GetTickCount64();
+            if (failure == 1 || now - mapping_snapshot_at >= 5000) {
+                mapping_snapshot_at = now;
+                MemorySnapshot(operation);
             }
         } catch (...) {
         }
@@ -570,16 +614,19 @@ struct AddressSpace::Impl {
         }
         auto apartment = ::detail::MakeScopeGuard([] { winrt::uninit_apartment(); });
         u64 last_report{};
+        auto next_recovery = std::chrono::steady_clock::now();
         while (!stop.stop_requested()) {
             {
                 std::unique_lock wait_lock{pager_wait_mutex};
                 pager_wait.wait_for(wait_lock, stop, std::chrono::milliseconds(100), [&] {
                     return mapping_recovery_requested.load(std::memory_order_acquire);
                 });
+                pager_wait.wait_until(wait_lock, stop, next_recovery, [] { return false; });
             }
             if (stop.stop_requested())
                 break;
             ++pager_ticks;
+            next_recovery = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
             try {
                 const u64 limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
                 const u64 usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
@@ -620,10 +667,14 @@ struct AddressSpace::Impl {
                     }
                 const bool mapping_pressure =
                     mapping_recovery_requested.exchange(false, std::memory_order_acq_rel);
-                if (mapping_pressure) {
+                const bool storage_pressure =
+                    section_recovery_requested.exchange(false, std::memory_order_acq_rel);
+                mapping_views = views;
+                if (mapping_pressure || storage_pressure) {
                     ReleaseIdleGuestViews(nullptr);
-                    TrimResidentViews(8_MB, true);
+                    TrimResidentViews(8_MB);
                 }
+                const auto now = GetTickCount64();
                 CoalesceDormantViews();
                 if (preferred_view_size < GuestViewSize &&
                     GetTickCount64() - mapping_pressure_at >= 30000) {
@@ -638,13 +689,17 @@ struct AddressSpace::Impl {
                 const u64 available =
                     limit > other && limit - other > headroom ? limit - other - headroom : 0;
                 const u64 target = limit ? std::max<u64>(512_MB, available) : 2_GB;
-                if (!pager_budget || pager_budget > target)
+                if (!pager_budget || pager_budget > target) {
+                    if (pager_budget > target)
+                        pager_last_byte_pressure = now;
                     pager_budget = target;
-                else if (GetTickCount64() - pager_last_emergency >= 30000)
+                } else if (now - pager_last_byte_pressure >= 30000)
                     pager_budget = std::min(target, pager_budget + 8_MB / 10);
                 const bool tight = limit && (usage >= limit || limit - usage < 384_MB);
-                if (tight || resident > pager_budget || views > 6000)
-                    TrimResidentViews(tight ? 64_MB : 8_MB, views > 6000);
+                if (tight || resident > pager_budget) {
+                    pager_last_byte_pressure = now;
+                    TrimResidentViews(tight ? 64_MB : 8_MB);
+                }
                 if (GetTickCount64() - last_report >= 5000) {
                     last_report = GetTickCount64();
                     LOG_INFO(Core,
@@ -654,11 +709,14 @@ struct AddressSpace::Impl {
                     MemorySnapshot("pager_sample");
                 }
                 const bool release_sections =
-                    mapping_pressure || tight || resident > pager_budget || views > 6000;
+                    mapping_pressure || storage_pressure || tight || resident > pager_budget;
                 lock.unlock();
-                if (release_sections)
-                    ReleaseUnusedSwapSections();
                 if (mapping_pressure) {
+                    mapping_recovery_epoch.fetch_add(1, std::memory_order_release);
+                    pager_wait.notify_all();
+                }
+                if (release_sections) {
+                    ReleaseUnusedSwapSections();
                     mapping_recovery_epoch.fetch_add(1, std::memory_order_release);
                     pager_wait.notify_all();
                 }
@@ -675,7 +733,7 @@ struct AddressSpace::Impl {
         }
     }
 
-    void TrimResidentViews(u64 bytes, bool) {
+    void TrimResidentViews(u64 bytes) {
         const auto now = GetTickCount64();
         u64 released{};
         u64 scheduled{};
@@ -694,6 +752,7 @@ struct AddressSpace::Impl {
                 UnmapRegion(&region);
                 released += size;
                 ++pager_evictions;
+                ++mapping_view_evictions;
             }
             scheduled += size;
             if (scheduled >= bytes)
@@ -717,9 +776,11 @@ struct AddressSpace::Impl {
             if (!UnmapViewOfFile2(process, backing_base + offset, MEM_PRESERVE_PLACEHOLDER))
                 continue;
             view.is_resident = false;
+            --mapping_views;
             view.swept = false;
             released += view.size;
             ++pager_evictions;
+            ++mapping_view_evictions;
             if (released >= bytes)
                 break;
         }
@@ -737,6 +798,21 @@ struct AddressSpace::Impl {
         mapping_pressure_at = GetTickCount64();
         mapping_recovery_requested.store(true, std::memory_order_release);
         pager_wait.notify_all();
+    }
+
+    bool WaitForMappingRecovery(u64 epoch) {
+        std::unique_lock lock{pager_wait_mutex};
+        const auto started = std::chrono::steady_clock::now();
+        const bool recovered = pager_wait.wait_for(lock, std::chrono::milliseconds(10), [&] {
+            return mapping_recovery_epoch.load(std::memory_order_acquire) != epoch;
+        });
+        mapping_recovery_waits.fetch_add(1, std::memory_order_relaxed);
+        mapping_recovery_wait_us.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started)
+                .count(),
+            std::memory_order_relaxed);
+        return recovered;
     }
 
     void ReleaseUnusedSwapSections() {
@@ -772,7 +848,14 @@ struct AddressSpace::Impl {
         }
         for (size_t i = 0; i < count; ++i) {
             const auto &candidate = candidates[i];
+            const auto started = std::chrono::steady_clock::now();
             const bool flushed = FlushFileBuffers(candidate.file);
+            section_flush_us.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started)
+                    .count(),
+                std::memory_order_relaxed);
+            section_flushes.fetch_add(1, std::memory_order_relaxed);
             CloseHandle(candidate.file);
             if (!flushed)
                 continue;
@@ -784,6 +867,7 @@ struct AddressSpace::Impl {
                 continue;
             if (CloseHandle(candidate.section)) {
                 ram_pages[candidate.index] = nullptr;
+                --mapping_sections;
                 ++pager_emergencies;
                 pager_last_emergency = GetTickCount64();
             }
@@ -808,6 +892,7 @@ struct AddressSpace::Impl {
                 if (now - region->residency_order < 100)
                     continue;
                 UnmapRegion(region);
+                ++mapping_view_evictions;
                 if (++released == 16)
                     break;
             } else {
@@ -907,7 +992,7 @@ struct AddressSpace::Impl {
             const auto next = std::next(it);
             if (next == regions.end())
                 break;
-            if (MergeGuestViews(it, next, GuestViewSize))
+            if (MergeGuestViews(it, next, preferred_view_size))
                 ++merged;
             else
                 ++it;
@@ -918,7 +1003,7 @@ struct AddressSpace::Impl {
             const auto next = std::next(it);
             if (next == backing_views.end())
                 break;
-            if (MergeBackingViews(it, next, GuestViewSize))
+            if (MergeBackingViews(it, next, preferred_view_size))
                 ++merged;
             else
                 ++it;
@@ -1006,12 +1091,14 @@ struct AddressSpace::Impl {
             if (recover && IsMappingResourceError(error))
                 RequestMappingRecovery();
             SetLastError(error);
-            LOG_ERROR(Core, "Unable to map physical backing view at {:#x}: {}", view_offset,
-                      Common::GetLastErrorMsg());
+            if (!IsMappingResourceError(error))
+                LOG_ERROR(Core, "Unable to map physical backing view at {:#x}: {}", view_offset,
+                          Common::GetLastErrorMsg());
             SetLastError(error);
             return false;
         }
         it->second.is_resident = true;
+        ++mapping_views;
         it->second.swept = false;
         it->second.last_access = GetTickCount64();
         ++pager_page_ins;
@@ -1226,6 +1313,8 @@ struct AddressSpace::Impl {
         ram_pages[index] =
             CreateFileMapping2(file, nullptr, FILE_MAP_ALL_ACCESS, PAGE_EXECUTE_READWRITE,
                                swap_enabled ? SEC_COMMIT : SEC_RESERVE, size, nullptr, nullptr, 0);
+        if (ram_pages[index])
+            ++mapping_sections;
         if (!ram_pages[index]) {
             const auto error = GetLastError();
             MappingFailure("ram_section_create", error, 0, index * BackingViewSize, size,
@@ -1443,6 +1532,10 @@ struct AddressSpace::Impl {
                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
         }
         ASSERT_MSG(ptr, "{}", Common::GetLastErrorMsg());
+#ifdef SHADPS4_UWP
+        if (!region->is_resident && fd == -1 && phys_addr != PAddr(-1))
+            ++mapping_views;
+#endif
         region->is_resident = true;
 
         for (const auto& info : protections) {
@@ -1515,6 +1608,10 @@ struct AddressSpace::Impl {
         }
         ASSERT_MSG(ret, "Unmap on virtual_addr {:#x}, size {:#x} failed: {}", virtual_addr, size,
                    Common::GetLastErrorMsg());
+#ifdef SHADPS4_UWP
+        if (fd == -1 && phys_base != PAddr(-1))
+            --mapping_views;
+#endif
         region->is_resident = false;
     }
 
@@ -2140,15 +2237,12 @@ bool AddressSpace::HandleBackingFault(void* address, u64 access_type, bool* mapp
             SetLastError(error);
             return false;
         }
+        if (GetTickCount64() - started >= 1000)
+            backing->section_recovery_requested.store(true, std::memory_order_release);
         backing->mapping_recovery_requested.store(true, std::memory_order_release);
         backing->pager_wait.notify_all();
-        std::unique_lock recovery_lock{backing->pager_wait_mutex};
-        if (backing->pager_wait.wait_for(recovery_lock, std::chrono::milliseconds(100), [&] {
-                return backing->mapping_recovery_epoch.load(std::memory_order_acquire) != epoch;
-            }))
+        if (backing->WaitForMappingRecovery(epoch))
             ++recoveries;
-        recovery_lock.unlock();
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
 }
 
@@ -2263,64 +2357,73 @@ bool AddressSpace::CopyBacking(void* destination, const void* source, u64 size) 
             chunk = std::min(chunk,
                              Impl::MinimumGuestViewSize - (reinterpret_cast<VAddr>(output) - base) %
                                                               Impl::MinimumGuestViewSize);
-        std::scoped_lock lock{backing->mutex};
-        auto read = AcquireHostAccess(input, chunk, false);
-        auto write = AcquireHostAccess(output, chunk, false);
-        std::array<void*, 2> scratch{};
-        auto cleanup = ::detail::MakeScopeGuard([&] {
-            for (auto* view : scratch)
-                if (view)
-                    UnmapViewOfFile2(backing->process, view, 0);
-        });
-        const auto access = [&](const void* pointer, u32 slot) -> void* {
-            const auto offset = reinterpret_cast<VAddr>(pointer) - base;
-            if (offset >= BackingSize)
-                return const_cast<void*>(pointer);
-            const auto view = std::prev(backing->backing_views.upper_bound(offset));
-            if (view->second.is_resident) {
-                if (!backing->MapBackingView(const_cast<void*>(pointer)))
-                    throw std::runtime_error("Unable to restore physical copy protection");
-                return const_cast<void*>(pointer);
+        auto read = AcquireHostAccess(input, chunk, src >= BackingSize);
+        auto write = AcquireHostAccess(output, chunk, dst >= BackingSize);
+        const auto started = GetTickCount64();
+        for (;;) {
+            const auto epoch = backing->mapping_recovery_epoch.load(std::memory_order_acquire);
+            std::unique_lock lock{backing->mutex};
+            DWORD error{};
+            {
+                std::array<void*, 2> scratch{};
+                auto cleanup = ::detail::MakeScopeGuard([&] {
+                    for (auto* view : scratch)
+                        if (view)
+                            UnmapViewOfFile2(backing->process, view, 0);
+                });
+                const auto access = [&](const void* pointer, u32 slot) -> void* {
+                    const auto offset = reinterpret_cast<VAddr>(pointer) - base;
+                    if (offset >= BackingSize)
+                        return const_cast<void*>(pointer);
+                    const auto view = std::prev(backing->backing_views.upper_bound(offset));
+                    if (view->second.is_resident || !backing->swap_enabled) {
+                        if (!backing->MapBackingView(const_cast<void*>(pointer), true,
+                                                     Impl::MinimumGuestViewSize)) {
+                            error = GetLastError();
+                            return nullptr;
+                        }
+                        if (!backing->swap_enabled)
+                            backing->CommitPhysical(offset);
+                        return const_cast<void*>(pointer);
+                    }
+                    if (backing->MapBackingView(const_cast<void*>(pointer), false,
+                                                Impl::MinimumGuestViewSize))
+                        return const_cast<void*>(pointer);
+                    const auto aligned = Common::AlignDown(offset, Impl::MinimumGuestViewSize);
+                    const auto length = std::min(Impl::MinimumGuestViewSize, BackingSize - aligned);
+                    const auto handle = backing->GetRamPage(offset / Impl::BackingViewSize);
+                    scratch[slot] = handle ? MapHostView(handle, backing->process, nullptr,
+                                                         aligned % Impl::BackingViewSize, length, 0,
+                                                         PAGE_READWRITE, nullptr, 0)
+                                           : nullptr;
+                    if (!scratch[slot]) {
+                        error = GetLastError();
+                        backing->MappingFailure(
+                            "store_view_map", error, reinterpret_cast<VAddr>(pointer), offset,
+                            length, PAGE_READWRITE, aligned % Impl::BackingViewSize, handle, 0);
+                        return nullptr;
+                    }
+                    ++backing->pager_store_copies;
+                    return static_cast<u8*>(scratch[slot]) + offset - aligned;
+                };
+                const auto* from = access(input, 0);
+                auto* to = from ? access(output, 1) : nullptr;
+                if (from && to) {
+                    std::memcpy(to, from, chunk);
+                    break;
+                }
             }
-            if (!backing->swap_enabled) {
-                if (!backing->MapBackingView(const_cast<void*>(pointer), true,
-                                             Impl::MinimumGuestViewSize))
-                    throw std::runtime_error("Unable to populate physical copy");
-                backing->CommitPhysical(offset);
-                return const_cast<void*>(pointer);
-            }
-            if (backing->MapBackingView(const_cast<void*>(pointer), false,
-                                        Impl::MinimumGuestViewSize))
-                return const_cast<void*>(pointer);
-            const auto index = offset / Impl::BackingViewSize;
-            const auto aligned = Common::AlignDown(offset, Impl::MinimumGuestViewSize);
-            const auto length = std::min(Impl::MinimumGuestViewSize, BackingSize - aligned);
-            const auto map = [&] {
-                const auto handle = backing->GetRamPage(index);
-                return handle ? MapHostView(handle, backing->process, nullptr,
-                                            aligned % Impl::BackingViewSize, length, 0,
-                                            PAGE_READWRITE, nullptr, 0)
-                              : nullptr;
-            };
-            scratch[slot] = map();
-            if (!scratch[slot] && Impl::IsMappingResourceError(GetLastError())) {
-                backing->ReleaseIdleGuestViews(nullptr);
-                backing->RequestMappingRecovery();
-                scratch[slot] = map();
-            }
-            if (!scratch[slot])
-                backing->MappingFailure("store_view_map", GetLastError(),
-                                        reinterpret_cast<VAddr>(pointer), offset, length,
-                                        PAGE_READWRITE, aligned % Impl::BackingViewSize);
-            if (!scratch[slot])
+            if (!Impl::IsMappingResourceError(error) || GetTickCount64() - started >= 30000) {
+                SetLastError(error);
                 throw std::runtime_error("Unable to access memory store: " +
                                          Common::GetLastErrorMsg());
-            ++backing->pager_store_copies;
-            return static_cast<u8*>(scratch[slot]) + offset - aligned;
-        };
-        const auto* from = access(input, 0);
-        auto* to = access(output, 1);
-        std::memcpy(to, from, chunk);
+            }
+            if (GetTickCount64() - started >= 1000)
+                backing->section_recovery_requested.store(true, std::memory_order_release);
+            backing->RequestMappingRecovery();
+            lock.unlock();
+            backing->WaitForMappingRecovery(epoch);
+        }
         output += chunk;
         input += chunk;
         size -= chunk;

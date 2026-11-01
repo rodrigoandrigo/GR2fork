@@ -373,8 +373,7 @@ void BlitHelper::CreateColorToMSDepthPipeline(const MsPipelineKey& key) {
         .layout = *single_texture_pl_layout,
     };
 
-    auto [pipeline_result, pipeline] =
-        instance.GetDevice().createGraphicsPipelineUnique(VK_NULL_HANDLE, pipeline_info);
+    auto [pipeline_result, pipeline] = instance.CreateHostGraphicsPipeline(pipeline_info);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     Vulkan::SetObjectName(instance.GetDevice(), *pipeline, "Color to MS Depth {}", key.num_samples);
@@ -458,8 +457,7 @@ void BlitHelper::CreateMsCopyPipeline(const MsPipelineKey& key) {
         .layout = *single_texture_pl_layout,
     };
 
-    auto [pipeline_result, pipeline] =
-        instance.GetDevice().createGraphicsPipelineUnique(VK_NULL_HANDLE, pipeline_info);
+    auto [pipeline_result, pipeline] = instance.CreateHostGraphicsPipeline(pipeline_info);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     Vulkan::SetObjectName(instance.GetDevice(), *pipeline, "Non MS Image to MS Image {}",

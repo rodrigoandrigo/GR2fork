@@ -4,10 +4,14 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#include <chrono>
+#include <fstream>
 #include <stdexcept>
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/path_util.h"
+#include "common/scope_exit.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
@@ -182,10 +186,101 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 }
 
 Instance::~Instance() {
+    SaveHostPipelineCache();
 #ifndef SHADPS4_UWP
     ImGui::Core::Shutdown(GetDevice());
 #endif
     vmaDestroyAllocator(allocator);
+}
+
+void Instance::LoadHostPipelineCache() const {
+    std::vector<u8> data;
+    if (EmulatorSettings.IsPipelineCacheEnabled()) {
+        try {
+            std::string uuid;
+            for (const auto byte : properties.pipelineCacheUUID)
+                uuid += fmt::format("{:02x}", byte);
+            const auto directory =
+                Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "vulkan-host";
+            std::filesystem::create_directories(directory);
+            host_cache_path = directory / fmt::format("{}-{}-{}.bin", properties.vendorID,
+                                                      properties.deviceID, uuid);
+            std::ifstream file(host_cache_path, std::ios::binary | std::ios::ate);
+            if (file && file.tellg() >= sizeof(VkPipelineCacheHeaderVersionOne) &&
+                file.tellg() <= 64 * 1024 * 1024) {
+                data.resize(static_cast<size_t>(file.tellg()));
+                file.seekg(0);
+                if (!file.read(reinterpret_cast<char*>(data.data()), data.size()))
+                    data.clear();
+            }
+            if (!data.empty()) {
+                VkPipelineCacheHeaderVersionOne header{};
+                std::memcpy(&header, data.data(), sizeof(header));
+                if (header.headerSize < sizeof(header) || header.headerSize > data.size() ||
+                    header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+                    header.vendorID != properties.vendorID ||
+                    header.deviceID != properties.deviceID ||
+                    std::memcmp(header.pipelineCacheUUID, properties.pipelineCacheUUID.data(),
+                                VK_UUID_SIZE))
+                    data.clear();
+            }
+        } catch (const std::exception& error) {
+            LOG_WARNING(Render_Vulkan, "Host pipeline cache load: {}", error.what());
+            data.clear();
+        }
+    }
+    auto result = GetDevice().createPipelineCacheUnique(
+        {.initialDataSize = data.size(), .pInitialData = data.data()});
+    if (result.result != vk::Result::eSuccess && !data.empty()) {
+        data.clear();
+        result = GetDevice().createPipelineCacheUnique({});
+    }
+    host_pipeline_cache = Check<"create host pipeline cache">(std::move(result));
+    LOG_INFO(Render_Vulkan, "Host pipeline cache loaded {} bytes", data.size());
+}
+
+void Instance::SaveHostPipelineCache() {
+    if (!device || !host_pipeline_cache || host_cache_path.empty() || !host_cache_dirty)
+        return;
+    try {
+        std::scoped_lock lock{host_cache_mutex};
+        size_t size{};
+        if (GetDevice().getPipelineCacheData(*host_pipeline_cache, &size, nullptr) !=
+                vk::Result::eSuccess ||
+            !size || size > 64 * 1024 * 1024)
+            return;
+        std::vector<u8> data(size);
+        if (GetDevice().getPipelineCacheData(*host_pipeline_cache, &size, data.data()) !=
+            vk::Result::eSuccess)
+            return;
+        auto temporary = host_cache_path;
+        temporary +=
+            fmt::format(".{}.tmp", std::chrono::steady_clock::now().time_since_epoch().count());
+        SCOPE_EXIT {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+        };
+        std::ofstream file(temporary, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(data.data()), size);
+        file.close();
+        if (file.fail())
+            throw std::runtime_error("Unable to save host pipeline cache");
+#ifdef SHADPS4_UWP
+        if (!(std::filesystem::exists(host_cache_path)
+                  ? ReplaceFileFromAppW(host_cache_path.c_str(), temporary.c_str(), nullptr, 0,
+                                        nullptr, nullptr)
+                  : MoveFileFromAppW(temporary.c_str(), host_cache_path.c_str())))
+            throw std::runtime_error("Unable to replace host pipeline cache");
+#elif defined(_WIN32)
+        if (!MoveFileExW(temporary.c_str(), host_cache_path.c_str(), MOVEFILE_REPLACE_EXISTING))
+            throw std::runtime_error("Unable to replace host pipeline cache");
+#else
+        std::filesystem::rename(temporary, host_cache_path);
+#endif
+        LOG_INFO(Render_Vulkan, "Host pipeline cache saved {} bytes", size);
+    } catch (const std::exception& error) {
+        LOG_WARNING(Render_Vulkan, "Host pipeline cache save: {}", error.what());
+    }
 }
 
 std::string Instance::GetDriverVersionName() {

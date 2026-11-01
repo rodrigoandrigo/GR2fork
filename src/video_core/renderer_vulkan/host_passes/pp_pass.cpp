@@ -16,7 +16,8 @@
 
 namespace Vulkan::HostPasses {
 
-void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
+void PostProcessingPass::Create(const Instance& instance, const vk::Format surface_format) {
+    const auto device = instance.GetDevice();
     boost::container::static_vector<vk::DescriptorSetLayoutBinding, 2> bindings{
         {
             .binding = 0,
@@ -164,8 +165,8 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
         .layout = *pipeline_layout,
     };
 
-    pipeline = Check<"create post process pipeline">(device.createGraphicsPipelineUnique(
-        /*pipeline_cache*/ {}, pipeline_info));
+    pipeline =
+        Check<"create post process pipeline">(instance.CreateHostGraphicsPipeline(pipeline_info));
 
     // Once pipeline is compiled, we don't need the shader module anymore
     device.destroyShaderModule(vs_module);

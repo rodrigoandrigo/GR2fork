@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <windows.h>
 #include <windowsstoragecom.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -239,14 +241,24 @@ s64 BrokeredFile::Transfer(void* data, u64 size, bool write) {
             winrt::throw_hresult(E_INVALIDARG);
         }
     }
-    std::vector<u8> staging;
-    if (!stream)
-        staging.resize(static_cast<size_t>(std::min<u64>(size, 1024 * 1024)));
+    auto& chunk_size = write ? write_chunk_size : read_chunk_size;
+    std::unique_ptr<u8[]> staging;
+    size_t staging_capacity{};
+    if (!stream && size && !transfer_event) {
+        transfer_event.attach(
+            CreateEventExW(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS));
+        winrt::check_bool(static_cast<bool>(transfer_event));
+    }
     u64 total{};
     while (total < size) {
-        const auto count = static_cast<uint32_t>(std::min<u64>(size - total, 1024 * 1024));
+        const auto count = static_cast<uint32_t>(std::min<u64>(size - total, chunk_size));
+        if (!stream && staging_capacity < count) {
+            staging = std::make_unique_for_overwrite<u8[]>(count);
+            staging_capacity = count;
+        }
         auto* bytes = static_cast<uint8_t*>(data) + total;
         const auto residency = AddressSpace::AcquireHostAccess(bytes, count);
+        const auto started = std::chrono::steady_clock::now();
         DWORD transferred{};
         if (stream) {
             if (write) {
@@ -264,17 +276,15 @@ s64 BrokeredFile::Transfer(void* data, u64 size, bool write) {
             }
         } else {
             if (write)
-                std::memcpy(staging.data(), bytes, count);
+                std::memcpy(staging.get(), bytes, count);
             OVERLAPPED overlapped{};
             overlapped.Offset = static_cast<DWORD>(position);
             overlapped.OffsetHigh = static_cast<DWORD>(position >> 32);
-            winrt::handle event{
-                CreateEventExW(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS)};
-            winrt::check_bool(static_cast<bool>(event));
-            overlapped.hEvent = event.get();
-            const bool succeeded = write
-                                       ? WriteFile(handle, staging.data(), count, &transferred, &overlapped)
-                                       : ReadFile(handle, staging.data(), count, &transferred, &overlapped);
+            winrt::check_bool(ResetEvent(transfer_event.get()));
+            overlapped.hEvent = transfer_event.get();
+            const bool succeeded =
+                write ? WriteFile(handle, staging.get(), count, &transferred, &overlapped)
+                      : ReadFile(handle, staging.get(), count, &transferred, &overlapped);
             if (!succeeded) {
                 const auto error = GetLastError();
                 if (!write && error == ERROR_HANDLE_EOF) {
@@ -292,7 +302,15 @@ s64 BrokeredFile::Transfer(void* data, u64 size, bool write) {
                 }
             }
             if (!write)
-                std::memcpy(bytes, staging.data(), transferred);
+                std::memcpy(bytes, staging.get(), transferred);
+        }
+        if (transferred == count && count == chunk_size) {
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+            if (elapsed > std::chrono::milliseconds{8}) {
+                chunk_size = std::max<uint32_t>(64 * 1024, chunk_size / 2);
+            } else if (elapsed < std::chrono::milliseconds{2}) {
+                chunk_size = std::min<uint32_t>(1024 * 1024, chunk_size * 2);
+            }
         }
         total += transferred;
         position += transferred;

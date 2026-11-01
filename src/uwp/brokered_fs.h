@@ -32,9 +32,12 @@ private:
     s64 Transfer(void* data, u64 size, bool write);
     winrt::Windows::Storage::Streams::IRandomAccessStream stream{nullptr};
     void* handle{};
+    winrt::handle transfer_event;
     uint32_t mode{};
     u64 position{};
     u32 inode{};
+    uint32_t read_chunk_size{1024 * 1024};
+    uint32_t write_chunk_size{1024 * 1024};
     mutable std::recursive_mutex mutex;
 };
 

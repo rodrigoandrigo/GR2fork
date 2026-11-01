@@ -184,8 +184,7 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
         .layout = *pl_layout,
     };
 
-    auto [result, pipeline] =
-        device.createComputePipelineUnique(VK_NULL_HANDLE, compute_pipeline_ci);
+    auto [result, pipeline] = instance.CreateHostComputePipeline(compute_pipeline_ci);
     ASSERT_MSG(result == vk::Result::eSuccess, "Detiler pipeline creation failed {}",
                vk::to_string(result));
     const auto handle = *pipeline;

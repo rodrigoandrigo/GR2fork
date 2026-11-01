@@ -9,6 +9,7 @@
 
 namespace Vulkan {
 class Frame;
+class Instance;
 }
 
 namespace Vulkan::HostPasses {
@@ -21,7 +22,7 @@ public:
         u32 srgb_input = 0;
     };
 
-    void Create(vk::Device device, vk::Format surface_format);
+    void Create(const Instance& instance, vk::Format surface_format);
 
     void Render(const CommandRecorder& cmdbuf, vk::ImageView input, vk::Extent2D input_size,
                 Frame& output, Settings settings);

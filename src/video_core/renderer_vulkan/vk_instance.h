@@ -4,6 +4,8 @@
 #pragma once
 
 #include <span>
+#include <filesystem>
+#include <mutex>
 #include <unordered_map>
 
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -25,6 +27,22 @@ public:
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
     ~Instance();
+
+    auto CreateHostComputePipeline(const vk::ComputePipelineCreateInfo& info) const {
+        std::scoped_lock lock{host_cache_mutex};
+        if (!host_pipeline_cache)
+            LoadHostPipelineCache();
+        host_cache_dirty = true;
+        return GetDevice().createComputePipelineUnique(*host_pipeline_cache, info);
+    }
+
+    auto CreateHostGraphicsPipeline(const vk::GraphicsPipelineCreateInfo& info) const {
+        std::scoped_lock lock{host_cache_mutex};
+        if (!host_pipeline_cache)
+            LoadHostPipelineCache();
+        host_cache_dirty = true;
+        return GetDevice().createGraphicsPipelineUnique(*host_pipeline_cache, info);
+    }
 
     /// Returns a formatted string for the driver version
     std::string GetDriverVersionName();
@@ -496,6 +514,8 @@ public:
 private:
     /// Creates the logical device opportunistically enabling extensions
     bool CreateDevice();
+    void LoadHostPipelineCache() const;
+    void SaveHostPipelineCache();
 
     /// Creates the VMA allocator handle
     void CreateAllocator();
@@ -513,6 +533,10 @@ private:
     vk::UniqueInstance instance;
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;
+    mutable vk::UniquePipelineCache host_pipeline_cache;
+    mutable std::mutex host_cache_mutex;
+    mutable bool host_cache_dirty{};
+    mutable std::filesystem::path host_cache_path;
     vk::PhysicalDeviceProperties properties;
     vk::PhysicalDeviceMemoryProperties memory_properties;
     vk::PhysicalDeviceVulkan11Properties vk11_props;

@@ -9,6 +9,7 @@
 #include "video_core/host_shaders/fsr_rcas_fp32_comp.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/skipcache/skipcache.h"
 
@@ -29,10 +30,22 @@ struct FSRConstants {
 
 namespace Vulkan::HostPasses {
 
-void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images, bool use_fp16) {
-    this->device = device;
+void FsrPass::Create(const Instance& instance, u32 num_images, bool use_fp16) {
+    this->instance = &instance;
+    this->device = instance.GetDevice();
+    this->use_fp16 = use_fp16;
+    const auto allocator = instance.GetAllocator();
+    available_imgs.resize(num_images);
+    for (u32 i = 0; i < num_images; ++i) {
+        auto& img = available_imgs[i];
+        img.id = i;
+        img.intermediary_image = VideoCore::UniqueImage(device, allocator);
+        img.output_image = VideoCore::UniqueImage(device, allocator);
+    }
     this->num_images = num_images;
+}
 
+void FsrPass::CreatePipelines() {
     sampler = Check<"create upscaling sampler">(device.createSamplerUnique(vk::SamplerCreateInfo{
         .magFilter = vk::Filter::eLinear,
         .minFilter = vk::Filter::eLinear,
@@ -107,7 +120,7 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images, 
         .layout = pipeline_layout.get(),
     };
     easu_pipeline =
-        Check<"fsp easu compute pipelines">(device.createComputePipelineUnique({}, easu_pinfo));
+        Check<"fsp easu compute pipelines">(instance->CreateHostComputePipeline(easu_pinfo));
     SetObjectName(device, easu_pipeline.get(), "fsr easu pipeline");
 
     const vk::ComputePipelineCreateInfo rcas_pinfo{
@@ -119,19 +132,11 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images, 
         .layout = pipeline_layout.get(),
     };
     rcas_pipeline =
-        Check<"fsp rcas compute pipelines">(device.createComputePipelineUnique({}, rcas_pinfo));
+        Check<"fsp rcas compute pipelines">(instance->CreateHostComputePipeline(rcas_pinfo));
     SetObjectName(device, rcas_pipeline.get(), "fsr rcas pipeline");
 
     device.destroyShaderModule(cs_easu_module);
     device.destroyShaderModule(cs_rcas_module);
-
-    available_imgs.resize(num_images);
-    for (int i = 0; i < num_images; ++i) {
-        auto& img = available_imgs[i];
-        img.id = i;
-        img.intermediary_image = VideoCore::UniqueImage(device, allocator);
-        img.output_image = VideoCore::UniqueImage(device, allocator);
-    }
 }
 
 vk::ImageView FsrPass::Render(const CommandRecorder& cmdbuf, vk::ImageView input,
@@ -145,6 +150,9 @@ vk::ImageView FsrPass::Render(const CommandRecorder& cmdbuf, vk::ImageView input
         DebugState.is_using_fsr = false;
         return input;
     }
+
+    if (!easu_pipeline || !rcas_pipeline)
+        CreatePipelines();
 
     DebugState.is_using_fsr = true;
 

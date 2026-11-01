@@ -81,7 +81,7 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
         .layout = *fault_process_pipeline_layout,
     };
     fault_process_pipeline = Vulkan::Check<"create fault buffer compute pipeline">(
-        device.createComputePipelineUnique({}, pipeline_info));
+        instance.CreateHostComputePipeline(pipeline_info));
     Vulkan::SetObjectName(device, *fault_process_pipeline, "Fault Buffer Parser Pipeline");
 
     device.destroyShaderModule(module);

@@ -8,6 +8,10 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
 
+namespace Vulkan {
+class Instance;
+}
+
 namespace Vulkan::HostPasses {
 
 class FsrPass {
@@ -18,7 +22,7 @@ public:
         float rcas_attenuation{0.25f};
     };
 
-    void Create(vk::Device device, VmaAllocator allocator, u32 num_images, bool use_fp16);
+    void Create(const Instance& instance, u32 num_images, bool use_fp16);
 
     vk::ImageView Render(const CommandRecorder& cmdbuf, vk::ImageView input,
                          vk::Extent2D input_size, vk::Extent2D output_size, Settings settings,
@@ -36,10 +40,13 @@ private:
         vk::UniqueImageView output_image_view;
     };
 
+    void CreatePipelines();
     void ResizeAndInvalidate(u32 width, u32 height);
     void CreateImages(Img& img) const;
 
+    const Instance* instance{};
     vk::Device device{};
+    bool use_fp16{};
     u32 num_images{};
 
     vk::UniqueDescriptorSetLayout descriptor_set_layout{};
