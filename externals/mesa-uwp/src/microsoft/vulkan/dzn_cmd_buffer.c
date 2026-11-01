@@ -3618,7 +3618,8 @@ dzn_cmd_buffer_clear_attachment(struct dzn_cmd_buffer *cmdbuf,
                                 uint32_t base_layer,
                                 uint32_t layer_count,
                                 uint32_t rect_count,
-                                D3D12_RECT *rects)
+                                D3D12_RECT *rects,
+                                bool conditional)
 {
    struct dzn_image *image =
       container_of(view->vk.image, struct dzn_image, vk);
@@ -3633,6 +3634,14 @@ dzn_cmd_buffer_clear_attachment(struct dzn_cmd_buffer *cmdbuf,
       .layerCount = layer_count == VK_REMAINING_ARRAY_LAYERS ?
                     view->vk.layer_count - base_layer : layer_count,
    };
+
+   VkImageSubresourceRange raw_range = range;
+   if (image->vk.image_type == VK_IMAGE_TYPE_3D) {
+      raw_range.baseArrayLayer = 0;
+      raw_range.layerCount = 1;
+   }
+   dzn_raw_image_native_access(cmdbuf, image, layout, &raw_range, true);
+   dzn_cmd_buffer_set_conditional(cmdbuf, conditional);
 
    layer_count = vk_image_subresource_layer_count(&image->vk, &range);
    D3D12_BARRIER_LAYOUT restore_layout = D3D12_BARRIER_LAYOUT_COMMON;
@@ -6906,7 +6915,7 @@ dzn_CmdClearAttachments(VkCommandBuffer commandBuffer,
                                                pAttachments[i].aspectMask,
                                                pRects[j].baseArrayLayer + layer,
                                                pRects[j].layerCount,
-                                               1, &rect);
+                                               1, &rect, true);
             }
          } else {
             dzn_cmd_buffer_clear_attachment(cmdbuf, view, layout,
@@ -6914,7 +6923,7 @@ dzn_CmdClearAttachments(VkCommandBuffer commandBuffer,
                                             pAttachments[i].aspectMask,
                                             pRects[j].baseArrayLayer,
                                             pRects[j].layerCount,
-                                            1, &rect);
+                                            1, &rect, true);
          }
       }
    }
@@ -7375,14 +7384,14 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
                dzn_cmd_buffer_clear_attachment(cmdbuf, iview, att->imageLayout,
                                                &att->clearValue,
                                                VK_IMAGE_ASPECT_COLOR_BIT, layer,
-                                               1, 1, &cmdbuf->state.render.area);
+                                               1, 1, &cmdbuf->state.render.area, false);
             }
          } else {
             dzn_cmd_buffer_clear_attachment(cmdbuf, iview, att->imageLayout,
                                             &att->clearValue,
                                             VK_IMAGE_ASPECT_COLOR_BIT, 0,
                                             pRenderingInfo->layerCount, 1,
-                                            &cmdbuf->state.render.area);
+                                            &cmdbuf->state.render.area, false);
          }
       }
    }
@@ -7428,13 +7437,13 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
             u_foreach_bit(layer, pRenderingInfo->viewMask) {
                dzn_cmd_buffer_clear_attachment(cmdbuf, iview, clear_layouts[i],
                                                &clear_val, clear_aspects[i], layer,
-                                               1, 1, &cmdbuf->state.render.area);
+                                               1, 1, &cmdbuf->state.render.area, false);
             }
          } else {
             dzn_cmd_buffer_clear_attachment(cmdbuf, iview, clear_layouts[i],
                                             &clear_val, clear_aspects[i], 0,
                                             VK_REMAINING_ARRAY_LAYERS, 1,
-                                            &cmdbuf->state.render.area);
+                                            &cmdbuf->state.render.area, false);
          }
       }
    }

@@ -381,6 +381,7 @@ vk_pipeline_cache_lookup_object(struct vk_pipeline_cache *cache,
             if (object != NULL) {
                return vk_pipeline_cache_insert_object(cache, object);
             }
+            disk_cache_remove(disk_cache, cache_key);
          }
       }
 

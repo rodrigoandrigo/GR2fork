@@ -500,7 +500,7 @@ dzn_pso_lib_init(struct dzn_device *device)
 
 #ifdef _XBOX_UWP
    if (!uwp_is_desktop_device()) {
-      mesa_logi("dzn: pipeline libraries disabled on non-desktop UWP devices; using normal PSO creation");
+      mesa_logi("dzn: D3D12 pipeline libraries disabled on non-desktop UWP; using normal PSO creation");
       return;
    }
 #endif

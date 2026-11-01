@@ -1,4 +1,5 @@
 #include "uwp/gamepad_input.h"
+#include "uwp/shadps4_api.h"
 
 #include <algorithm>
 #include <chrono>
@@ -86,6 +87,7 @@ void StartGamepadInput() {
         bool started{};
         std::array<Gamepad, 4> slots{nullptr, nullptr, nullptr, nullptr};
         std::array<uint16_t, 4> vibration{};
+        std::array<bool, 4> capture_pressed{};
         std::array<GamepadTouchpadMapper, 4> touchpads;
         std::vector<SyntheticEvent> synthetic;
         if (const char* schedule = std::getenv("GAME_SYNTH_PAD"); schedule && *schedule)
@@ -112,6 +114,7 @@ void StartGamepadInput() {
                         }
                         slots[slot] = nullptr;
                         vibration[slot] = 0;
+                        capture_pressed[slot] = false;
                         touchpads[slot].Reset();
                         (*controllers)[slot]->UpdateNativeState({});
                     }
@@ -148,6 +151,17 @@ void StartGamepadInput() {
                         const bool intercept = captured.load();
                         const auto reading =
                             intercept ? GamepadReading{} : slots[slot].GetCurrentReading();
+                        if (reading.LeftTrigger <= 0.25 || reading.RightTrigger <= 0.25)
+                            capture_pressed[slot] = false;
+                        if (!capture_pressed[slot] && reading.LeftTrigger >= 0.75 &&
+                            reading.RightTrigger >= 0.75) {
+                            capture_pressed[slot] = true;
+                            if (shadps4_request_presentation_capture() == 0)
+                                LOG_INFO(
+                                    Input,
+                                    "Presentation capture requested by LT + RT on controller {}",
+                                    slot + 1);
+                        }
                         auto state = intercept ? Input::State{} : MapGamepadReading(reading);
                         state.connected = true;
                         state.time = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -177,6 +191,7 @@ void StartGamepadInput() {
                         controller->UpdateNativeState({});
                         slots[slot] = nullptr;
                         vibration[slot] = 0;
+                        capture_pressed[slot] = false;
                         LOG_WARNING(Input, "Windows.Gaming.Input HRESULT {:#x}: {}",
                                     static_cast<uint32_t>(error.code().value),
                                     winrt::to_string(error.message()));

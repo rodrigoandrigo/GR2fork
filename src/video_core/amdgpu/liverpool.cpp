@@ -11,6 +11,7 @@
 #include "common/polyfill_thread.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
+#include "core/address_space.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -492,6 +493,10 @@ void Liverpool::Process(std::stop_token stoken) {
 }
 
 Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
+#ifdef SHADPS4_UWP
+    const auto command_mapping =
+        Core::AddressSpace::AcquireHostAccess(ccb.data(), ccb.size_bytes(), false);
+#endif
     FIBER_ENTER(ccb_task_name);
 
     while (!ccb.empty()) {
@@ -1500,6 +1505,10 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
 }
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
+#ifdef SHADPS4_UWP
+    const auto command_mapping =
+        Core::AddressSpace::AcquireHostAccess(dcb.data(), dcb.size_bytes(), false);
+#endif
     FIBER_ENTER(dcb_task_name);
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
@@ -1595,6 +1604,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
 
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+#ifdef SHADPS4_UWP
+    const auto command_mapping =
+        Core::AddressSpace::AcquireHostAccess(acb.data(), acb.size_bytes(), false);
+#endif
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
 

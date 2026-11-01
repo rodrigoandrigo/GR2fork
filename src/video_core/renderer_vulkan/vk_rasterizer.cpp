@@ -28,6 +28,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/skipcache/skipcache.h"
+#include "video_core/renderdoc.h"
+#include <nlohmann/json.hpp>
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -580,6 +582,71 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+void Rasterizer::TraceCommand(const Pipeline* pipeline, const char* command, const char* result,
+                              std::array<u64, 4> arguments) {
+    if (!VideoCore::IsPresentationTraceActive())
+        return;
+    try {
+        const auto& regs = liverpool->regs;
+        nlohmann::json event{{"command", command},
+                             {"result", result},
+                             {"tick", scheduler.CurrentTick()},
+                             {"arguments", arguments},
+                             {"index_count", regs.num_indices},
+                             {"instances", regs.num_instances.NumInstances()},
+                             {"index_address", regs.index_base_address.Address<VAddr>()},
+                             {"index_capacity", regs.max_index_size},
+                             {"primitive", u32(regs.primitive_type)},
+                             {"depth_control", std::bit_cast<u32>(regs.depth_control)},
+                             {"color_control", std::bit_cast<u32>(regs.color_control)}};
+        const std::string_view kind{command};
+        if (kind == "draw")
+            event["arguments"] = {{"indexed", bool(arguments[0])}, {"index_offset", arguments[1]}};
+        else if (kind == "draw_indirect")
+            event["arguments"] = {{"address", arguments[0]},
+                                  {"max_count", arguments[1]},
+                                  {"stride", arguments[2]},
+                                  {"count_address", arguments[3]}};
+        else if (kind == "dispatch")
+            event["arguments"] = {{"x", arguments[0]}, {"y", arguments[1]}, {"z", arguments[2]}};
+        else if (kind == "dispatch_indirect")
+            event["arguments"] = {{"address", arguments[0]}, {"bytes", arguments[1]}};
+        if (pipeline) {
+            for (const auto* info : pipeline->GetStages()) {
+                if (!info)
+                    continue;
+                event["shaders"].push_back({{"stage", u32(info->sw_stage)},
+                                            {"hash", info->pgm_hash},
+                                            {"address", info->pgm_base},
+                                            {"user_data", std::vector<u32>(info->user_data.begin(),
+                                                                           info->user_data.end())},
+                                            {"buffer_count", info->buffers.size()},
+                                            {"image_count", info->images.size()}});
+            }
+        }
+        if (std::string_view{result} == "emitted") {
+            for (const auto id : bound_images) {
+                const auto& image = texture_cache.GetImage(id);
+                event["images"].push_back({{"uid", image.image_uid},
+                                           {"address", image.info.guest_address},
+                                           {"width", image.info.size.width},
+                                           {"height", image.info.size.height},
+                                           {"format", u32(image.info.pixel_format)},
+                                           {"samples", image.info.num_samples},
+                                           {"target", bool(image.binding.is_target)}});
+            }
+            for (const auto& [buffer, offset, size, access] : bound_buffers)
+                event["buffers"].push_back({{"address", buffer->CpuAddr()},
+                                            {"offset", offset},
+                                            {"size", size},
+                                            {"access", VkAccessFlags2(access)}});
+        }
+        VideoCore::RecordPresentationEvent(event.dump());
+    } catch (const std::exception& error) {
+        LOG_WARNING(Render_Vulkan, "Presentation command trace: {}", error.what());
+    }
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -587,12 +654,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     scheduler.PopPendingOperations();
 
     if (!FilterDraw()) {
+        TraceCommand(nullptr, "draw", "filtered", {u64(is_indexed), index_offset});
         return;
     }
 
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
+        TraceCommand(nullptr, "draw", "pipeline_unavailable", {u64(is_indexed), index_offset});
         return;
     }
 
@@ -635,6 +704,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             u64(std::min(regs.num_indices, regs.max_index_size)) * index_size);
     }
     if (!BindResources(pipeline)) {
+        TraceCommand(pipeline, "draw", "resource_bind_failed", {u64(is_indexed), index_offset});
         return;
     }
     // Post-bind term, read after BindResources: it can flush, register an
@@ -710,7 +780,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
-
+    TraceCommand(pipeline, "draw", "emitted", {u64(is_indexed), index_offset});
     ResetBindings(false);
     // The flushes submit; they must not run under the guest-copy shared lock.
     copy_scope.reset();
@@ -928,6 +998,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         DebugState.IncDrawCall();
     }
 
+    TraceCommand(pipeline, "draw_indirect", "emitted",
+                 {arg_address + offset, max_count, stride, count_address});
     ResetBindings(false);
 }
 
@@ -944,6 +1016,8 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+        TraceCommand(pipeline, "dispatch", "shader_hle",
+                     {cs_program.dim_x, cs_program.dim_y, cs_program.dim_z});
         return;
     }
 
@@ -972,6 +1046,8 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
 
+    TraceCommand(pipeline, "dispatch", "emitted",
+                 {cs_program.dim_x, cs_program.dim_y, cs_program.dim_z});
     ResetBindings(true);
     // The flushes submit; they must not run under the guest-copy shared lock.
     copy_scope.reset();
@@ -1017,6 +1093,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
 
+    TraceCommand(pipeline, "dispatch_indirect", "emitted", {address + offset, size});
     ResetBindings(true);
 }
 
@@ -1699,8 +1776,19 @@ void Rasterizer::BuildBindWritePlan(const Pipeline* pipeline) {
 // The shortcuts keep their own compute guards: the gate at the bind site
 // makes them redundant today, and they protect any future direct caller.
 bool Rasterizer::TakeComputeShortcut(const Pipeline* pipeline) {
-    return IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-           IsComputeImageClear(pipeline);
+    if (IsComputeImageCopy(pipeline)) {
+        TraceCommand(pipeline, "dispatch", "image_copy_shortcut");
+        return true;
+    }
+    if (IsComputeMetaClear(pipeline)) {
+        TraceCommand(pipeline, "dispatch", "metadata_clear_shortcut");
+        return true;
+    }
+    if (IsComputeImageClear(pipeline)) {
+        TraceCommand(pipeline, "dispatch", "image_clear_shortcut");
+        return true;
+    }
+    return false;
 }
 
 void Rasterizer::ReadVertexLayout(const GraphicsPipeline* pipeline,

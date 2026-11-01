@@ -153,47 +153,49 @@ public:
 #endif
 
 private:
-    // Returns whether the memo it consumed or refilled may certify the next
-    // draw's glue (draw_glue_memo); false whenever the glue is off.
-    bool PrepareRenderState(const GraphicsPipeline* pipeline);
-    const RenderState& BeginRendering(const GraphicsPipeline* pipeline);
-    void Resolve();
-    void DepthStencilCopy(bool is_depth, bool is_stencil);
-    void EliminateFastClear();
+  void TraceCommand(const Pipeline* pipeline, const char* command, const char* result,
+                    std::array<u64, 4> arguments = {});
+  // Returns whether the memo it consumed or refilled may certify the next
+  // draw's glue (draw_glue_memo); false whenever the glue is off.
+  bool PrepareRenderState(const GraphicsPipeline* pipeline);
+  const RenderState& BeginRendering(const GraphicsPipeline* pipeline);
+  void Resolve();
+  void DepthStencilCopy(bool is_depth, bool is_stencil);
+  void EliminateFastClear();
 
-    bool UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed);
-    void UpdateViewportScissorState() const;
-    void UpdateDepthStencilState() const;
-    void UpdatePrimitiveState(bool is_indexed) const;
-    void UpdateRasterizationState() const;
-    void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
+  bool UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed);
+  void UpdateViewportScissorState() const;
+  void UpdateDepthStencilState() const;
+  void UpdatePrimitiveState(bool is_indexed) const;
+  void UpdateRasterizationState() const;
+  void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
-    bool FilterDraw();
-    bool FilterDrawSlow();
+  bool FilterDraw();
+  bool FilterDrawSlow();
 
-    void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                     Shader::PushData& push_data);
-    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
-    bool BindResources(const Pipeline* pipeline);
+  void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                   Shader::PushData& push_data);
+  void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+  bool BindResources(const Pipeline* pipeline);
 
-    void BindVertexBuffers(const GraphicsPipeline* pipeline);
-    void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
+  void BindVertexBuffers(const GraphicsPipeline* pipeline);
+  void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
 
-    /// Stamps the arena writes of the packet being bound with the open batch's tick. If mark is
-    /// true, their pages are marked GPU modified again as well.
-    void StampBoundWrites(bool mark);
-    void ResetBindings(bool is_compute);
+  /// Stamps the arena writes of the packet being bound with the open batch's tick. If mark is
+  /// true, their pages are marked GPU modified again as well.
+  void StampBoundWrites(bool mark);
+  void ResetBindings(bool is_compute);
 
-    bool IsComputeMetaClear(const Pipeline* pipeline);
-    bool IsComputeImageCopy(const Pipeline* pipeline);
-    bool IsComputeImageClear(const Pipeline* pipeline);
-    /// The three compute shortcuts, out of the graphics bind path's lines.
-    SHAD_NO_INLINE bool TakeComputeShortcut(const Pipeline* pipeline);
-    /// Builds a pipeline's descriptor write plan from the list this bind just emitted.
-    SHAD_NO_INLINE void BuildBindWritePlan(const Pipeline* pipeline);
+  bool IsComputeMetaClear(const Pipeline* pipeline);
+  bool IsComputeImageCopy(const Pipeline* pipeline);
+  bool IsComputeImageClear(const Pipeline* pipeline);
+  /// The three compute shortcuts, out of the graphics bind path's lines.
+  SHAD_NO_INLINE bool TakeComputeShortcut(const Pipeline* pipeline);
+  /// Builds a pipeline's descriptor write plan from the list this bind just emitted.
+  SHAD_NO_INLINE void BuildBindWritePlan(const Pipeline* pipeline);
 
-    /// The once-per-300-frames [SkipCache] telemetry block, out of OnSubmit's lines.
-    void EmitSkipcacheTelemetry(VideoCore::Skipcache::Framework& skipcache);
+  /// The once-per-300-frames [SkipCache] telemetry block, out of OnSubmit's lines.
+  void EmitSkipcacheTelemetry(VideoCore::Skipcache::Framework& skipcache);
 
 private:
     // BeginRendering skip cache (verify contract in skipcache.h). The snapshot

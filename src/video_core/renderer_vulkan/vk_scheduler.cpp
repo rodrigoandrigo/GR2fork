@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderdoc.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 
 #include "common/assert.h"
@@ -107,6 +109,28 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
+    if (VideoCore::IsPresentationTraceActive()) {
+        nlohmann::json event{{"command", "begin_rendering"},
+                             {"tick", CurrentTick()},
+                             {"width", render_state.width},
+                             {"height", render_state.height},
+                             {"layers", render_state.num_layers}};
+        for (const auto& attachment :
+             std::span{render_state.color_attachments}.first(render_state.num_color_attachments))
+            event["colors"].push_back(
+                {{"view",
+                  reinterpret_cast<uintptr_t>(static_cast<VkImageView>(attachment.image_view))},
+                 {"layout", u32(attachment.image_layout)},
+                 {"clear", bool(attachment.is_clear)},
+                 {"clear_value", attachment.clear_value}});
+        const auto& ds = render_state.depth_stencil_attachment;
+        event["depth_stencil"] = {
+            {"view", reinterpret_cast<uintptr_t>(static_cast<VkImageView>(ds.image_view))},
+            {"depth_clear", bool(ds.depth_clear)},
+            {"stencil_clear", bool(ds.stencil_clear)},
+            {"clear_value", ds.clear_value}};
+        VideoCore::RecordPresentationEvent(event.dump());
+    }
     CommandBuffer().beginRendering(rendering_info);
 }
 
@@ -115,6 +139,9 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
+    if (VideoCore::IsPresentationTraceActive())
+        VideoCore::RecordPresentationEvent(
+            nlohmann::json{{"command", "end_rendering"}, {"tick", CurrentTick()}}.dump());
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }
 

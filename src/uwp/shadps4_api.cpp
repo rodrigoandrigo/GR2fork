@@ -30,6 +30,7 @@
 #include "uwp/text_input.h"
 #include "uwp/xaudio2_output.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
+#include "video_core/renderdoc.h"
 
 namespace {
 std::atomic<uint32_t> state{SHADPS4_UNINITIALIZED};
@@ -306,6 +307,7 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
         Common::FS::InitializeUserPaths(config->user_directory);
         Common::Log::Setup("shadps4.log");
         stop_requested.store(false);
+        VideoCore::CompletePresentationCapture();
         pause_requested.store(false);
         user_paused = false;
         host_active = true;
@@ -342,6 +344,13 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
     } catch (const std::exception& exception) {
         return Fail(exception.what());
     }
+}
+
+int32_t shadps4_request_presentation_capture() {
+    if (state.load() != SHADPS4_RUNNING || stop_requested.load() ||
+        Core::Uwp::NativeGraphicsSelected())
+        return -1;
+    return VideoCore::RequestPresentationCapture() ? 0 : 1;
 }
 
 int32_t shadps4_set_host_state(int32_t active, int32_t input_captured) {

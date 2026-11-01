@@ -50,4 +50,12 @@ u32 ConsumeWithOverlaysScreenshotRequests();
 /// Atomically consumes and returns pending screenshot request counters.
 ScreenshotRequests ConsumeScreenshotRequests();
 
+bool RequestPresentationCapture();
+bool ConsumePresentationCaptureRequest();
+void CompletePresentationCapture();
+void CancelPresentationCaptureRequest();
+bool IsPresentationTraceActive();
+void RecordPresentationEvent(std::string event);
+std::string PresentationTraceSnapshot();
+
 } // namespace VideoCore

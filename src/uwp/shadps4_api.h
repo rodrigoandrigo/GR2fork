@@ -79,6 +79,7 @@ SHADPS4_API int32_t __cdecl shadps4_get_native_temporal_jitter(
     ShadPS4TemporalJitterSample* sample, int32_t completed_frame);
 
 SHADPS4_API uint64_t __cdecl shadps4_get_game_frame_count(void);
+SHADPS4_API int32_t __cdecl shadps4_request_presentation_capture(void);
 SHADPS4_API int32_t __cdecl shadps4_cheats_request(const char* request, char* response,
                                                 uint32_t capacity);
 SHADPS4_API uint32_t __cdecl shadps4_get_api_version(void);

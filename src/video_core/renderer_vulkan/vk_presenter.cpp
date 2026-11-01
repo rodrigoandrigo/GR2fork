@@ -43,6 +43,7 @@
 #include <system_error>
 #include <vector>
 #include <imgui.h>
+#include <nlohmann/json.hpp>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
 #ifdef SHADPS4_UWP
@@ -264,7 +265,8 @@ static const std::array<u8, 1024>& GetUnorm10ToU8Lut() {
     return lut;
 }
 
-static void CopyImageToReadback(const vk::CommandBuffer& cmdbuf, const vk::Image image,
+template <typename Commands>
+static void CopyImageToReadback(const Commands& cmdbuf, const vk::Image image,
                                 const vk::ImageLayout layout, ScreenshotReadback& readback) {
     const vk::BufferImageCopy copy_region = {
         .bufferOffset = 0,
@@ -413,6 +415,139 @@ static bool WritePng(const std::filesystem::path& path, const std::span<const u8
     return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
 }
 
+#ifdef SHADPS4_UWP
+struct PresentationCapture {
+    std::array<std::unique_ptr<ScreenshotReadback>, 3> stages;
+    std::array<bool, 3> recorded{};
+    std::filesystem::path directory;
+    nlohmann::json manifest;
+
+    ~PresentationCapture() { VideoCore::CompletePresentationCapture(); }
+};
+
+static constexpr std::array capture_stage_names{"videoout", "processed", "backbuffer"};
+
+static std::shared_ptr<PresentationCapture>
+CreatePresentationCapture(const Instance& instance, const Frame& frame,
+                          const vk::Extent2D source_size, const vk::Format source_format,
+                          const bool source_hdr, const vk::Format frame_format,
+                          const vk::Extent2D output_size, const vk::Format output_format,
+                          const bool output_hdr, const VAddr address) {
+    static std::atomic<u64> sequence{};
+    const auto pixels = u64{source_size.width} * source_size.height +
+                        u64{frame.width} * frame.height +
+                        u64{output_size.width} * output_size.height;
+    if (pixels > (256ull << 20) / 4)
+        throw std::runtime_error("Presentation capture exceeds 256 MiB");
+    const auto id = ++sequence;
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    const auto directory = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir) /
+                           "presentation" / fmt::format("{}-{}", stamp, id);
+    std::filesystem::create_directories(directory);
+    const std::array sizes{source_size, vk::Extent2D{frame.width, frame.height}, output_size};
+    const std::array formats{source_format, frame_format, output_format};
+    const std::array hdr{source_hdr, output_hdr, output_hdr};
+    std::array<std::unique_ptr<ScreenshotReadback>, 3> stages;
+    for (size_t i = 0; i < 2; ++i)
+        stages[i] = std::make_unique<ScreenshotReadback>(
+            instance, ScreenshotKind::GameOnly, std::vector<std::filesystem::path>{},
+            sizes[i].width, sizes[i].height, formats[i], hdr[i]);
+    nlohmann::json manifest{{"version", 2},
+                            {"capture_id", id},
+                            {"timestamp_ms", stamp},
+                            {"backend", "Vulkan / Dozen"},
+                            {"frame_slot", frame.id},
+                            {"frame_id", frame.capture_frame_id},
+                            {"videoout_address", address},
+                            {"serial", std::string(Common::ElfInfo::Instance().GameSerial())},
+                            {"readback_changes_timing", true}};
+    for (size_t i = 0; i < stages.size(); ++i)
+        manifest["stages"][capture_stage_names[i]] = {{"width", sizes[i].width},
+                                                      {"height", sizes[i].height},
+                                                      {"format", vk::to_string(formats[i])},
+                                                      {"hdr_encoded", hdr[i]},
+                                                      {"row_bytes", u64{sizes[i].width} * 4},
+                                                      {"status", "not_recorded"}};
+    manifest["render_trace"] = nlohmann::json::parse(VideoCore::PresentationTraceSnapshot());
+    const auto properties = instance.GetPhysicalDevice().getProperties();
+    manifest["device"] = {{"name", std::string(properties.deviceName.data())},
+                          {"vendor_id", properties.vendorID},
+                          {"device_id", properties.deviceID},
+                          {"driver_version", properties.driverVersion},
+                          {"api_version", properties.apiVersion}};
+    manifest["renderer_profile"] = {
+        {"subgroup_size", instance.SubgroupSize()},
+        {"wave64_compute", instance.IsSubgroupSize64Supported()},
+        {"float16", instance.IsShaderFloat16Supported()},
+        {"int16", instance.IsShaderInt16Supported()},
+        {"skipcache_mode", EmulatorSettings.GetAdaptiveSkipCachesMode()}};
+    auto capture = std::make_shared<PresentationCapture>();
+    capture->stages = std::move(stages);
+    capture->directory = directory;
+    capture->manifest = std::move(manifest);
+    LOG_INFO(Render_Vulkan, "[Presentation capture] id={} requested path={}", id,
+             directory.string());
+    return capture;
+}
+
+static void CapturePresentationImage(const CommandRecorder& commands, const vk::Image image,
+                                     ScreenshotReadback& readback) {
+    vk::ImageMemoryBarrier2 barrier{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite |
+                                                     vk::AccessFlagBits2::eMemoryRead,
+                                    .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                                    .oldLayout = vk::ImageLayout::eGeneral,
+                                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .image = image,
+                                    .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+    commands.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    CopyImageToReadback(commands, image, vk::ImageLayout::eTransferSrcOptimal, readback);
+    std::swap(barrier.srcStageMask, barrier.dstStageMask);
+    std::swap(barrier.srcAccessMask, barrier.dstAccessMask);
+    std::swap(barrier.oldLayout, barrier.newLayout);
+    commands.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+}
+
+static void SavePresentationCapture(const std::shared_ptr<PresentationCapture>& capture) {
+    try {
+        for (size_t i = 0; i < capture->stages.size(); ++i) {
+            if (!capture->recorded[i])
+                continue;
+            auto& readback = *capture->stages[i];
+            readback.buffer.Invalidate(0, readback.buffer.SizeBytes());
+            auto& metadata = capture->manifest["stages"][capture_stage_names[i]];
+            const auto raw_path =
+                capture->directory / fmt::format("{}.bin", capture_stage_names[i]);
+            std::ofstream raw(raw_path, std::ios::binary);
+            raw.write(reinterpret_cast<const char*>(readback.buffer.mapped_data.data()),
+                      readback.buffer.SizeBytes());
+            raw.close();
+            metadata["raw_saved"] = !raw.fail();
+            std::vector<u8> rgba;
+            metadata["png_saved"] =
+                ConvertReadbackToRgba8(readback, rgba) &&
+                WritePng(capture->directory / fmt::format("{}.png", capture_stage_names[i]), rgba,
+                         readback.width, readback.height);
+            metadata["status"] = metadata["raw_saved"].get<bool>() ? "completed" : "write_failed";
+        }
+        std::ofstream manifest(capture->directory / "manifest.json", std::ios::binary);
+        manifest << capture->manifest.dump(2);
+        manifest.close();
+        if (manifest.fail())
+            throw std::runtime_error("Unable to write presentation capture manifest");
+        LOG_INFO(Render_Vulkan, "[Presentation capture] id={} completed path={}",
+                 capture->manifest["capture_id"].get<u64>(), capture->directory.string());
+    } catch (const std::exception& error) {
+        LOG_ERROR(Render_Vulkan, "[Presentation capture] save failed: {}", error.what());
+    }
+}
+#endif
+
 static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     if (readback.paths.empty()) {
         return;
@@ -514,6 +649,7 @@ Presenter::~Presenter() {
 #endif
 
 #ifdef SHADPS4_UWP
+    bool capture_ready{};
     try {
 #endif
     draw_scheduler.Finish();
@@ -522,6 +658,9 @@ Presenter::~Presenter() {
     draw_scheduler.DrainPriorityOperations();
     present_scheduler.DrainPriorityOperations();
     flip_scheduler.DrainPriorityOperations();
+#ifdef SHADPS4_UWP
+    capture_ready = true;
+#endif
     draw_scheduler.ResetCommandBuffer();
     Check(present_scheduler.RawCommandBuffer().reset());
     Check(flip_scheduler.RawCommandBuffer().reset());
@@ -532,8 +671,19 @@ Presenter::~Presenter() {
     }
 #endif
 
+#ifdef SHADPS4_UWP
+    VideoCore::CancelPresentationCaptureRequest();
+#endif
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
+#ifdef SHADPS4_UWP
+        if (frame.capture && capture_ready) {
+            frame.capture->manifest["present_succeeded"] = false;
+            frame.capture->manifest["status"] = "not_presented_before_shutdown";
+            SavePresentationCapture(frame.capture);
+        }
+        frame.capture.reset();
+#endif
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
@@ -731,6 +881,32 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     vk::ImageView image_view = image.FindViewHandle(view_info);
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+#ifdef SHADPS4_UWP
+    frame->capture_frame_id = ++prepared_frame_count;
+    frame->capture.reset();
+    if (VideoCore::ConsumePresentationCaptureRequest()) {
+        try {
+            frame->capture = CreatePresentationCapture(
+                instance, *frame, image_size, view_info.format,
+                attribute.attrib.pixel_format ==
+                    Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq,
+                swapchain.GetSurfaceFormat().format, swapchain.GetExtent(),
+                swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                                   : swapchain.GetSurfaceFormat().format,
+                swapchain.GetHDR(), cpu_address);
+        } catch (const std::exception& error) {
+            VideoCore::CompletePresentationCapture();
+            LOG_ERROR(Render_Vulkan, "[Presentation capture] allocation failed: {}", error.what());
+        }
+    }
+    if (frame->capture) {
+        auto& readback = *frame->capture->stages[0];
+        const vk::BufferImageCopy copy{.imageSubresource{vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                       .imageExtent{readback.width, readback.height, 1}};
+        runtime.DownloadImage(&image, &readback.buffer, std::span{&copy, 1});
+        frame->capture->recorded[0] = true;
+    }
+#endif
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
@@ -773,6 +949,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+#ifdef SHADPS4_UWP
+    if (frame->capture) {
+        CapturePresentationImage(cmdbuf, frame->image, *frame->capture->stages[1]);
+        frame->capture->recorded[1] = true;
+        frame->capture->manifest["draw_tick"] = draw_scheduler.CurrentTick();
+        frame->capture->manifest["draw_semaphore"] = reinterpret_cast<uintptr_t>(
+            static_cast<VkSemaphore>(draw_scheduler.GetWorkSemaphore()->Handle()));
+    }
+#endif
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -1190,6 +1375,7 @@ void Presenter::SetExpectedGameSize(s32 width, s32 height) {
 #ifdef SHADPS4_UWP
 void Presenter::PresentEmbedded(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
     std::scoped_lock lock{embedded_present_mutex};
+    auto capture = frame->capture;
     bool sampled = is_reusing_frame;
     for (;;) {
         if (Core::Uwp::StopRequested())
@@ -1233,7 +1419,41 @@ void Presenter::PresentEmbedded(Frame* frame, bool is_reusing_frame, bool is_gam
         output.image_view = swapchain.ImageView();
         output.width = swapchain.GetExtent().width;
         output.height = swapchain.GetExtent().height;
-        pp_pass.Render(cmdbuf, frame->image_view, {frame->width, frame->height}, output, {});
+        pp_pass.Render(cmdbuf, frame->image_view, {frame->width, frame->height}, output,
+                       {.bypass_gamma = 1});
+        if (capture) {
+            const auto format = swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                                                   : swapchain.GetSurfaceFormat().format;
+            try {
+                const u64 bytes = capture->stages[0]->buffer.SizeBytes() +
+                                  capture->stages[1]->buffer.SizeBytes() +
+                                  u64{output.width} * output.height * 4;
+                if (bytes > (256ull << 20))
+                    throw std::runtime_error("Presentation capture exceeds 256 MiB");
+                capture->stages[2] = std::make_unique<ScreenshotReadback>(
+                    instance, ScreenshotKind::GameOnly, std::vector<std::filesystem::path>{},
+                    output.width, output.height, format, swapchain.GetHDR());
+                auto& metadata = capture->manifest["stages"]["backbuffer"];
+                metadata["width"] = output.width;
+                metadata["height"] = output.height;
+                metadata["format"] = vk::to_string(format);
+                metadata["hdr_encoded"] = swapchain.GetHDR();
+                metadata["row_bytes"] = u64{output.width} * 4;
+                CapturePresentationImage(cmdbuf, output.image, *capture->stages[2]);
+                capture->recorded[2] = true;
+            } catch (const std::exception& error) {
+                capture->manifest["stages"]["backbuffer"]["status"] = "allocation_failed";
+                LOG_ERROR(Render_Vulkan, "[Presentation capture] backbuffer failed: {}",
+                          error.what());
+            }
+            capture->manifest["present_tick"] = present_scheduler.CurrentTick();
+            capture->manifest["present_semaphore"] = reinterpret_cast<uintptr_t>(
+                static_cast<VkSemaphore>(present_scheduler.GetWorkSemaphore()->Handle()));
+            capture->manifest["present_fence"] =
+                reinterpret_cast<uintptr_t>(static_cast<VkFence>(frame->present_done));
+            capture->manifest["game_frame"] = is_game_frame;
+            capture->manifest["reused_frame"] = is_reusing_frame;
+        }
         const vk::ImageMemoryBarrier to_present{
             .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
             .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::ePresentSrcKHR,
@@ -1258,6 +1478,13 @@ void Presenter::PresentEmbedded(Frame* frame, bool is_reusing_frame, bool is_gam
         {
             std::scoped_lock submit_lock{Scheduler::submit_mutex};
             presented = swapchain.Present();
+        }
+        if (capture) {
+            capture->manifest["present_succeeded"] = presented;
+            const auto tick = capture->manifest["present_tick"].get<u64>();
+            present_scheduler.DeferPriorityOperationAt(
+                tick, [capture = std::move(capture)] { SavePresentationCapture(capture); });
+            frame->capture.reset();
         }
         if (presented)
             break;

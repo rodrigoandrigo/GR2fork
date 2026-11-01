@@ -738,7 +738,7 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &pdev->shader_model,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
                      offsetof(struct dzn_physical_device, shader_model));
-   const uint32_t runtime_layout_version = 31;
+   const uint32_t runtime_layout_version = 34;
    _mesa_blake3_update(&blake3_ctx, &runtime_layout_version, sizeof(runtime_layout_version));
    bool raw_lowering = dzn_raw_image_lowering_enabled();
    _mesa_blake3_update(&blake3_ctx, &raw_lowering, sizeof(raw_lowering));

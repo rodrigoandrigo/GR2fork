@@ -2971,6 +2971,7 @@ emit_alu(struct ntd_context *ctx, nir_alu_instr *alu)
 
    switch (alu->op) {
    case nir_op_iadd:
+   case nir_op_fadd_rtne:
    case nir_op_fadd: return emit_binop(ctx, alu, DXIL_BINOP_ADD, src[0], src[1]);
 
    case nir_op_isub:
@@ -5852,6 +5853,8 @@ emit_tex(struct ntd_context *ctx, nir_tex_instr *instr)
          break;
 
       case nir_tex_src_texture_offset:
+         if (instr->input_attachment_index)
+            break;
          params.tex = emit_createhandle_call_dynamic(ctx, DXIL_RESOURCE_CLASS_SRV,
             0, instr->texture_index,
             dxil_emit_binop(&ctx->mod, DXIL_BINOP_ADD,

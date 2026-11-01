@@ -15,7 +15,7 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 21u;
 static constexpr u32 ShaderMetaVersion = 13u;
-static constexpr u32 PipelineKeyVersion = 4u;
+static constexpr u32 PipelineKeyVersion = 5u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -192,6 +192,7 @@ void GraphicsPipeline::SerializationSupport::Serialize(Serialization::Archive& a
     sdata.Write(&vertex_bindings, sizeof(vertex_bindings));
     sdata.Write(&divisors, sizeof(divisors));
     sdata.Write(multisampling);
+    sdata.Write(geometry);
     sdata.Write(tcs);
     sdata.Write(tes);
 }
@@ -203,6 +204,7 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     sdata.Read(&vertex_bindings, sizeof(vertex_bindings));
     sdata.Read(&divisors, sizeof(divisors));
     sdata.Read(multisampling);
+    sdata.Read(geometry);
     sdata.Read(tcs);
     sdata.Read(tes);
     return true;

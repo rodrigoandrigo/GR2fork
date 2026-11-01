@@ -536,10 +536,8 @@ vk_pipeline_shader_deserialize(struct vk_device *device,
    struct vk_shader *shader;
    VkResult result = ops->deserialize(device, blob, version,
                                       &device->alloc, &shader);
-   if (result != VK_SUCCESS) {
-      assert(result == VK_ERROR_OUT_OF_HOST_MEMORY);
+   if (result != VK_SUCCESS)
       return NULL;
-   }
 
    vk_shader_init_cache_obj(device, shader, key_data, key_size);
 

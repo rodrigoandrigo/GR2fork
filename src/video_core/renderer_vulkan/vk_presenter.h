@@ -25,6 +25,8 @@ struct Liverpool;
 
 namespace Vulkan {
 
+struct PresentationCapture;
+
 struct Frame {
     u32 width;
     u32 height;
@@ -38,6 +40,10 @@ struct Frame {
     u8 id{};
 
     ImTextureID imgui_texture;
+#ifdef SHADPS4_UWP
+    std::shared_ptr<PresentationCapture> capture;
+    u64 capture_frame_id{};
+#endif
 };
 
 enum SchedulerType {
@@ -78,7 +84,7 @@ public:
             return;
         }
         swapchain.SetHDR(enable);
-        pp_settings.hdr = enable ? 1 : 0;
+        pp_settings.bypass_gamma = enable ? 1 : 0;
     }
 
     VideoCore::Image& RegisterVideoOutSurface(
@@ -106,6 +112,7 @@ private:
     void PresentEmbedded(Frame* frame, bool is_reusing_frame, bool is_game_frame);
     std::mutex embedded_present_mutex;
     u64 embedded_present_count{};
+    u64 prepared_frame_count{};
 #endif
     Frame* GetRenderFrame();
 

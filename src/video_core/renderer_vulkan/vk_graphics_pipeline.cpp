@@ -73,13 +73,23 @@ GraphicsPipeline::GraphicsPipeline(
         .pVertexAttributeDescriptions = sdata.vertex_attributes.data(),
     };
 
-    const auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
+    const bool is_rect_list = key.prim_type == AmdGpu::PrimitiveType::RectList;
+    const bool is_quad_list = key.prim_type == AmdGpu::PrimitiveType::QuadList;
+    bool geometry_primitive = false;
+#ifdef SHADPS4_UWP
+    geometry_primitive = (is_rect_list || is_quad_list) && instance.IsGeometryStageSupported() &&
+                         !infos[u32(Shader::SwStage::Geometry)] &&
+                         !infos[u32(Shader::SwStage::TessellationControl)] &&
+                         !infos[u32(Shader::SwStage::TessellationEval)];
+#endif
+    const auto topology = geometry_primitive
+                              ? (is_rect_list ? vk::PrimitiveTopology::eTriangleList
+                                              : vk::PrimitiveTopology::eLineListWithAdjacency)
+                              : LiverpoolToVK::PrimitiveType(key.prim_type);
     const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
         .topology = topology,
     };
 
-    const bool is_rect_list = key.prim_type == AmdGpu::PrimitiveType::RectList;
-    const bool is_quad_list = key.prim_type == AmdGpu::PrimitiveType::QuadList;
     const vk::PipelineTessellationStateCreateInfo tessellation_state = {
         .patchControlPoints = is_rect_list ? 3U : (is_quad_list ? 4U : key.patch_control_points),
     };
@@ -201,6 +211,20 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
+    vk::ShaderModule geometry_module{};
+    if (geometry_primitive) {
+        if (!preloading) {
+            const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+            sdata.geometry = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
+                is_rect_list ? AuxShaderType::RectListGS : AuxShaderType::QuadListGS, fs_info);
+        }
+        geometry_module = CompileSPV(sdata.geometry, instance.GetDevice());
+        shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eGeometry,
+            .module = geometry_module,
+            .pName = "main",
+        });
+    }
     stage = u32(Shader::SwStage::TessellationControl);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
@@ -208,7 +232,7 @@ GraphicsPipeline::GraphicsPipeline(
             .module = modules[stage],
             .pName = "main",
         });
-    } else if (is_rect_list || is_quad_list) {
+    } else if (!geometry_primitive && (is_rect_list || is_quad_list)) {
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
@@ -227,7 +251,7 @@ GraphicsPipeline::GraphicsPipeline(
             .module = modules[stage],
             .pName = "main",
         });
-    } else if (is_rect_list || is_quad_list) {
+    } else if (!geometry_primitive && (is_rect_list || is_quad_list)) {
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
@@ -425,7 +449,7 @@ GraphicsPipeline::GraphicsPipeline(
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
         .pInputAssemblyState = &input_assembly,
-        .pTessellationState = &tessellation_state,
+        .pTessellationState = geometry_primitive ? nullptr : &tessellation_state,
         .pViewportState = &viewport_info,
         .pRasterizationState = &raster_chain.get(),
         .pMultisampleState = &sdata.multisampling,
@@ -440,6 +464,9 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    if (geometry_module) {
+        device.destroyShaderModule(geometry_module);
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

@@ -412,6 +412,7 @@ void ImGuiFrontend::ResolveApi() {
 #define RESOLVE(member, name) member = core->GetApi<decltype(member)>(name)
     RESOLVE(get_settings, "shadps4_get_settings");
     RESOLVE(get_game_frame_count, "shadps4_get_game_frame_count");
+    RESOLVE(request_presentation_capture, "shadps4_request_presentation_capture");
     RESOLVE(cheats_request, "shadps4_cheats_request");
     RESOLVE(set_host_state, "shadps4_set_host_state");
     RESOLVE(get_text_input, "shadps4_get_text_input");
@@ -1341,6 +1342,15 @@ void ImGuiFrontend::Draw() {
         if (ImGui::BeginMenu("Exibir")) {
             ImGui::MenuItem("Lista de jogos", nullptr, &show_game_list);
             ImGui::MenuItem("Log do jogo", nullptr, &show_game_log);
+            if (ImGui::MenuItem("Capturar diagnóstico da imagem", nullptr, false,
+                                game_running &&
+                                    core->GraphicsBackend() == SHADPS4_GRAPHICS_VULKAN_DOZEN)) {
+                const auto result = request_presentation_capture();
+                status = result == 0 ? "Captura solicitada para um frame completo. Arquivos em "
+                                       "screenshots/presentation."
+                         : result == 1 ? "Já existe uma captura pendente ou em andamento."
+                                       : "A captura requer uma sessão ativa com Dozen.";
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Modo lista", nullptr, !grid_view))
                 grid_view = false;

@@ -179,6 +179,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     float ui_scale{1.0f};
     bool show_fps{true};
     decltype(&shadps4_get_game_frame_count) get_game_frame_count{};
+    decltype(&shadps4_request_presentation_capture) request_presentation_capture{};
     decltype(&shadps4_cheats_request) cheats_request{};
     bool cheats_open{}, cheats_busy{};
     std::string cheats_serial, cheats_version, cheats_title, cheats_error;

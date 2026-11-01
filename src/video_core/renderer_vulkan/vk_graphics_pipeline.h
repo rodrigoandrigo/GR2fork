@@ -87,6 +87,7 @@ public:
         VertexInputs<vk::VertexInputBindingDescription> vertex_bindings{};
         VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors{};
         vk::PipelineMultisampleStateCreateInfo multisampling{};
+        std::vector<u32> geometry{};
         std::vector<u32> tcs{};
         std::vector<u32> tes{};
         std::vector<u32> fragment{};

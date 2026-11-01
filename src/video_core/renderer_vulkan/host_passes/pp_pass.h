@@ -17,7 +17,7 @@ class PostProcessingPass {
 public:
     struct Settings {
         float gamma = 1.0f;
-        u32 hdr = 0;
+        u32 bypass_gamma = 0;
         u32 srgb_input = 0;
     };
 

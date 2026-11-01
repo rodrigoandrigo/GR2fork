@@ -399,6 +399,9 @@ struct AddressSpace::Impl {
     u64 pager_second_chances{};
     u64 pager_last_emergency{};
     u64 preferred_view_size{GuestViewSize};
+    u64 mapping_pressure_at{};
+    std::atomic_bool mapping_recovery_requested{};
+    std::atomic<u64> mapping_recovery_epoch{};
     u64 mapping_failures{};
     u64 recovery_reports{};
     std::atomic<u64> pager_ticks{};
@@ -570,8 +573,9 @@ struct AddressSpace::Impl {
         while (!stop.stop_requested()) {
             {
                 std::unique_lock wait_lock{pager_wait_mutex};
-                pager_wait.wait_for(wait_lock, stop, std::chrono::milliseconds(100),
-                                    [] { return false; });
+                pager_wait.wait_for(wait_lock, stop, std::chrono::milliseconds(100), [&] {
+                    return mapping_recovery_requested.load(std::memory_order_acquire);
+                });
             }
             if (stop.stop_requested())
                 break;
@@ -579,14 +583,19 @@ struct AddressSpace::Impl {
             try {
                 const u64 limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
                 const u64 usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
-                std::unique_lock lock{mutex, std::try_to_lock};
-                if (!lock) {
+                std::unique_lock lock{mutex, std::defer_lock};
+                const bool recovery_pending =
+                    mapping_recovery_requested.load(std::memory_order_acquire);
+                if (recovery_pending)
+                    lock.lock();
+                if (!recovery_pending && !lock.try_lock()) {
                     ++pager_lock_skips;
                     if (GetTickCount64() - last_report >= 5000) {
                         last_report = GetTickCount64();
                         LOG_INFO(Core, "[MemDiag] pager_lock_busy tick={} lock_skips={}",
                                  pager_ticks.load(), pager_lock_skips.load());
                     }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     continue;
                 }
                 u64 resident{};
@@ -609,6 +618,20 @@ struct AddressSpace::Impl {
                         count_pages(region.phys_base, region.size);
                         ++views;
                     }
+                const bool mapping_pressure =
+                    mapping_recovery_requested.exchange(false, std::memory_order_acq_rel);
+                if (mapping_pressure) {
+                    ReleaseIdleGuestViews(nullptr);
+                    TrimResidentViews(8_MB, true);
+                }
+                CoalesceDormantViews();
+                if (preferred_view_size < GuestViewSize &&
+                    GetTickCount64() - mapping_pressure_at >= 30000) {
+                    preferred_view_size = std::min(GuestViewSize, preferred_view_size * 2);
+                    mapping_pressure_at = GetTickCount64();
+                    LOG_INFO(Core, "[MemDiag] mapping_window_restored size={:#x}",
+                             preferred_view_size);
+                }
                 resident = std::ranges::count(pages, true) * MinimumGuestViewSize;
                 constexpr u64 headroom = 768_MB;
                 const u64 other = usage > resident ? usage - resident : 0;
@@ -630,6 +653,15 @@ struct AddressSpace::Impl {
                              usage, limit, resident, other, target, pager_budget, views, tight);
                     MemorySnapshot("pager_sample");
                 }
+                const bool release_sections =
+                    mapping_pressure || tight || resident > pager_budget || views > 6000;
+                lock.unlock();
+                if (release_sections)
+                    ReleaseUnusedSwapSections();
+                if (mapping_pressure) {
+                    mapping_recovery_epoch.fetch_add(1, std::memory_order_release);
+                    pager_wait.notify_all();
+                }
             } catch (const winrt::hresult_error& error) {
                 const auto errors = ++pager_budget_errors;
                 if (errors == 1 || GetTickCount64() - last_report >= 5000) {
@@ -643,7 +675,7 @@ struct AddressSpace::Impl {
         }
     }
 
-    void TrimResidentViews(u64 bytes, bool view_pressure) {
+    void TrimResidentViews(u64 bytes, bool) {
         const auto now = GetTickCount64();
         u64 released{};
         u64 scheduled{};
@@ -651,10 +683,10 @@ struct AddressSpace::Impl {
             if (!region.is_resident || region.fd != -1 || region.phys_base == PAddr(-1) ||
                 IsPinnedRegion(region) ||
                 NeedsExecutableView(region.prot, region.saved_protections) ||
-                (!view_pressure && now - region.residency_order < (region.swept ? 100 : 1000)))
+                now - region.residency_order < (region.swept ? 100 : 1000))
                 continue;
             const auto size = region.size;
-            if (!view_pressure && !region.swept) {
+            if (!region.swept) {
                 ApplyCommittedProtection(base, size, PAGE_NOACCESS);
                 region.swept = true;
                 region.residency_order = now;
@@ -670,9 +702,9 @@ struct AddressSpace::Impl {
         scheduled = 0;
         for (auto& [offset, view] : backing_views) {
             if (!view.is_resident || IsPinnedPhysical(offset, view.size) ||
-                (!view_pressure && now - view.last_access < (view.swept ? 100 : 1000)))
+                now - view.last_access < (view.swept ? 100 : 1000))
                 continue;
-            if (!view_pressure && !view.swept) {
+            if (!view.swept) {
                 ApplyCommittedProtection(reinterpret_cast<VAddr>(backing_base + offset), view.size,
                                          PAGE_NOACCESS);
                 view.swept = true;
@@ -691,20 +723,6 @@ struct AddressSpace::Impl {
             if (released >= bytes)
                 break;
         }
-        std::vector<bool> active(ram_pages.size());
-        for (const auto& [base, region] : regions)
-            if (region.is_resident && region.fd == -1 && region.phys_base != PAddr(-1))
-                active[region.phys_base / BackingViewSize] = true;
-        for (const auto& [offset, view] : backing_views)
-            if (view.is_resident)
-                active[offset / BackingViewSize] = true;
-        for (u64 index = 0; index < ram_pages.size(); ++index) {
-            if (!ram_pages[index] || IsPinnedPhysical(index * BackingViewSize, BackingViewSize))
-                continue;
-            if (!active[index] && FlushFileBuffers(swap_files[index]) &&
-                CloseHandle(ram_pages[index]))
-                ram_pages[index] = nullptr;
-        }
     }
 
     bool IsPinnedRegion(const MemoryRegion& region) const {
@@ -715,94 +733,61 @@ struct AddressSpace::Impl {
         });
     }
 
-    bool ReleaseSwapSections(u64 requested_index) {
+    void RequestMappingRecovery() {
+        mapping_pressure_at = GetTickCount64();
+        mapping_recovery_requested.store(true, std::memory_order_release);
+        pager_wait.notify_all();
+    }
+
+    void ReleaseUnusedSwapSections() {
         if (!swap_enabled)
-            return false;
-        std::scoped_lock lock{backing_mutex, ram_pages_mutex};
-        const auto started = GetTickCount64();
-        u64 skipped_pinned{}, io_failures{};
-        DWORD first_error{};
-        const auto failed_io = [&] {
-            if (!io_failures)
-                first_error = GetLastError();
-            ++io_failures;
+            return;
+        struct Candidate {
+            u64 index;
+            u64 access;
+            HANDLE section;
+            HANDLE file;
         };
-        std::vector<u64> candidates;
-        for (u64 index = 0; index < ram_pages.size(); ++index) {
-            if (index != requested_index && ram_pages[index])
-                candidates.push_back(index);
-        }
-        std::ranges::sort(candidates, [&](u64 lhs, u64 rhs) {
-            return section_accesses[lhs] < section_accesses[rhs];
-        });
-        u32 released{};
-        for (const auto index : candidates) {
-            if (released == 4)
-                break;
-            if (IsPinnedPhysical(index * BackingViewSize, BackingViewSize)) {
-                ++skipped_pinned;
-                continue;
-            }
-            const bool pinned = std::ranges::any_of(regions, [&](const auto& entry) {
-                const auto& region = entry.second;
-                return region.is_mapped && region.fd == -1 && region.phys_base != PAddr(-1) &&
-                       region.phys_base / BackingViewSize == index &&
-                       (IsPinnedRegion(region) ||
-                        NeedsExecutableView(region.prot, region.saved_protections));
-            });
-            if (pinned) {
-                ++skipped_pinned;
-                continue;
-            }
-            bool flushed = true;
-            for (auto& [base, region] : regions) {
-                if (!region.is_resident || region.fd != -1 || region.phys_base == PAddr(-1) ||
-                    region.phys_base / BackingViewSize != index)
+        std::array<Candidate, 4> candidates{};
+        size_t count{};
+        {
+            std::scoped_lock lock{mutex};
+            std::vector<bool> active(ram_pages.size());
+            for (const auto &[base, region] : regions)
+                if (region.is_resident && region.fd == -1 && region.phys_base != PAddr(-1))
+                    active[region.phys_base / BackingViewSize] = true;
+            for (const auto &[offset, view] : backing_views)
+                if (view.is_resident)
+                    active[offset / BackingViewSize] = true;
+            std::scoped_lock pages_lock{ram_pages_mutex};
+            for (u64 index = 0; index < ram_pages.size() && count < candidates.size(); ++index) {
+                if (!ram_pages[index] || active[index] ||
+                    IsPinnedPhysical(index * BackingViewSize, BackingViewSize))
                     continue;
-                if (!FlushViewOfFile(reinterpret_cast<void*>(base), region.size)) {
-                    failed_io();
-                    flushed = false;
-                    break;
-                }
-                UnmapRegion(&region);
+                HANDLE file{};
+                if (DuplicateHandle(process, swap_files[index], process, &file, 0, FALSE,
+                                    DUPLICATE_SAME_ACCESS))
+                    candidates[count++] = {index, section_accesses[index], ram_pages[index], file};
             }
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const auto &candidate = candidates[i];
+            const bool flushed = FlushFileBuffers(candidate.file);
+            CloseHandle(candidate.file);
             if (!flushed)
                 continue;
-            for (auto& [offset, view] : backing_views) {
-                if (offset / BackingViewSize != index || !view.is_resident)
-                    continue;
-                auto* base = backing_base + offset;
-                if (!FlushViewOfFile(base, view.size) ||
-                    !UnmapViewOfFile2(process, base, MEM_PRESERVE_PLACEHOLDER)) {
-                    failed_io();
-                    flushed = false;
-                    break;
-                }
-                view.is_resident = false;
-            }
-            if (!flushed)
+            std::scoped_lock lock{mutex};
+            std::scoped_lock pages_lock{ram_pages_mutex};
+            if (ram_pages[candidate.index] != candidate.section ||
+                section_accesses[candidate.index] != candidate.access ||
+                IsPinnedPhysical(candidate.index * BackingViewSize, BackingViewSize))
                 continue;
-            if (!FlushFileBuffers(swap_files[index])) {
-                failed_io();
-                continue;
+            if (CloseHandle(candidate.section)) {
+                ram_pages[candidate.index] = nullptr;
+                ++pager_emergencies;
+                pager_last_emergency = GetTickCount64();
             }
-            if (CloseHandle(ram_pages[index])) {
-                ram_pages[index] = nullptr;
-                ++released;
-            } else
-                failed_io();
         }
-        if (released)
-            LOG_INFO(Core, "Released {} swap sections ({} MiB), retaining file contents", released,
-                     released * BackingViewSize / 1_MB);
-        pager_emergencies += released != 0;
-        if (released)
-            pager_last_emergency = GetTickCount64();
-        if (released && pager_budget)
-            pager_budget = std::max<u64>(512_MB, pager_budget > 256_MB ? pager_budget - 256_MB : 0);
-        RecoveryReport("swap_sections", candidates.size(), skipped_pinned, released, io_failures,
-                       first_error, GetTickCount64() - started);
-        return released != 0;
     }
 
     bool ReleaseIdleGuestViews(const MemoryRegion* requested) {
@@ -810,40 +795,52 @@ struct AddressSpace::Impl {
         for (auto& [base, region] : regions) {
             if (&region == requested || !region.is_resident || region.fd != -1 ||
                 region.phys_base == PAddr(-1) ||
-                NeedsExecutableView(region.prot, region.saved_protections))
+                NeedsExecutableView(region.prot, region.saved_protections) ||
+                IsPinnedRegion(region))
                 continue;
-            if (!IsPinnedRegion(region))
-                candidates.push_back(&region);
+            candidates.push_back(&region);
         }
         std::ranges::sort(candidates, {}, &MemoryRegion::residency_order);
-        const auto count = std::min<size_t>(16, candidates.size());
-        u64 bytes{};
-        for (size_t i = 0; i < count; ++i) {
-            bytes += candidates[i]->size;
-            UnmapRegion(candidates[i]);
+        const auto now = GetTickCount64();
+        u64 released{}, swept{};
+        for (auto *region : candidates) {
+            if (region->swept) {
+                if (now - region->residency_order < 100)
+                    continue;
+                UnmapRegion(region);
+                if (++released == 16)
+                    break;
+            } else {
+                ApplyCommittedProtection(region->base, region->size, PAGE_NOACCESS);
+                region->swept = true;
+                region->residency_order = now;
+                if (++swept == 32)
+                    break;
+            }
         }
-        if (count)
-            LOG_INFO(Core, "Released {} idle RAM alias views ({} KiB) under mapping pressure",
-                     count, bytes / 1_KB);
-        RecoveryReport("guest_alias_views", candidates.size(), 0, count, 0, 0, 0);
-        return count != 0;
+        RecoveryReport("guest_alias_views", candidates.size(), 0, released, 0, 0, 0);
+        return released != 0;
     }
 
     void* PopulateGuestView(MemoryRegion* region) {
         auto* result = MapRegion(region, {}, true);
-        if (!result && IsMappingResourceError(GetLastError()) && ReleaseIdleGuestViews(region))
-            result = MapRegion(region, {}, true);
         if (!result) {
             const auto error = GetLastError();
-            if (IsMappingResourceError(error) &&
-                ReleaseSwapSections(region->phys_base / BackingViewSize))
+            if (IsMappingResourceError(error) && ReleaseIdleGuestViews(region))
                 result = MapRegion(region, {}, true);
             else
                 SetLastError(error);
         }
+        if (!result) {
+            const auto error = GetLastError();
+            if (IsMappingResourceError(error))
+                RequestMappingRecovery();
+            SetLastError(error);
+        }
         if (!result && IsMappingResourceError(GetLastError()) &&
             region->size > MinimumGuestViewSize) {
             const auto error = GetLastError();
+            mapping_pressure_at = GetTickCount64();
             if (preferred_view_size != MinimumGuestViewSize) {
                 preferred_view_size = MinimumGuestViewSize;
                 LOG_WARNING(Core, "[MemDiag] mapping_window_reduced size={:#x} win32={} va={:#x}",
@@ -852,30 +849,93 @@ struct AddressSpace::Impl {
             SetLastError(error);
             return nullptr;
         }
-        if (!result && region->size <= MinimumGuestViewSize &&
-            IsMappingResourceError(GetLastError())) {
-            const auto started = GetTickCount64();
-            for (u32 attempt = 0; attempt < 8 && GetTickCount64() - started < 250; ++attempt) {
-                ReleaseIdleGuestViews(region);
-                if (!(attempt % 2))
-                    ReleaseSwapSections(region->phys_base / BackingViewSize);
-                Sleep(std::min<DWORD>(16, 1u << attempt));
-                result = MapRegion(region, {}, true);
-                if (result) {
-                    LOG_INFO(Core,
-                             "[MemDiag] guest_map_recovered va={:#x} attempts={} elapsed_ms={}",
-                             region->base, attempt + 1, GetTickCount64() - started);
-                    break;
-                }
-                if (!IsMappingResourceError(GetLastError()))
-                    break;
-            }
-        }
         return result;
+    }
+
+    bool MergeGuestViews(std::map<VAddr, MemoryRegion>::iterator left,
+                         std::map<VAddr, MemoryRegion>::iterator right, u64 maximum_size) {
+        auto &first = left->second;
+        const auto &second = right->second;
+        if (first.is_resident || second.is_resident || !first.is_mapped || !second.is_mapped ||
+            first.fd != -1 || second.fd != -1 || first.phys_base == PAddr(-1) ||
+            first.base + first.size != second.base ||
+            first.phys_base + first.size != second.phys_base || first.prot != second.prot ||
+            IsPinnedRegion(first) || IsPinnedRegion(second) ||
+            NeedsExecutableView(first.prot, first.saved_protections) ||
+            NeedsExecutableView(second.prot, second.saved_protections))
+            return false;
+        const auto size = first.size + second.size;
+        if (size > maximum_size || size > BackingViewSize - first.phys_base % BackingViewSize ||
+            Common::AlignDown(first.base, maximum_size) !=
+                Common::AlignDown(second.base + second.size - 1, maximum_size))
+            return false;
+        auto protections = first.saved_protections;
+        protections.insert(protections.end(), second.saved_protections.begin(),
+                           second.saved_protections.end());
+        if (!VirtualFreeEx(process, reinterpret_cast<void *>(first.base), size,
+                           MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
+            return false;
+        first.size = size;
+        first.saved_protections = std::move(protections);
+        first.residency_order = std::max(first.residency_order, second.residency_order);
+        regions.erase(right);
+        return true;
+    }
+
+    bool MergeBackingViews(std::map<u64, BackingView>::iterator left,
+                           std::map<u64, BackingView>::iterator right, u64 maximum_size) {
+        const auto size = left->second.size + right->second.size;
+        if (left->second.is_resident || right->second.is_resident ||
+            left->first + left->second.size != right->first || size > maximum_size ||
+            size > BackingViewSize - left->first % BackingViewSize ||
+            Common::AlignDown(left->first, maximum_size) !=
+                Common::AlignDown(right->first + right->second.size - 1, maximum_size) ||
+            IsPinnedPhysical(left->first, size))
+            return false;
+        if (!VirtualFreeEx(process, backing_base + left->first, size,
+                           MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
+            return false;
+        left->second.size = size;
+        left->second.last_access = std::max(left->second.last_access, right->second.last_access);
+        backing_views.erase(right);
+        return true;
+    }
+
+    void CoalesceDormantViews() {
+        u32 merged{};
+        for (auto it = regions.begin(); it != regions.end() && merged < 32;) {
+            const auto next = std::next(it);
+            if (next == regions.end())
+                break;
+            if (MergeGuestViews(it, next, GuestViewSize))
+                ++merged;
+            else
+                ++it;
+        }
+        std::scoped_lock backing_lock{backing_mutex};
+        merged = 0;
+        for (auto it = backing_views.begin(); it != backing_views.end() && merged < 32;) {
+            const auto next = std::next(it);
+            if (next == backing_views.end())
+                break;
+            if (MergeBackingViews(it, next, GuestViewSize))
+                ++merged;
+            else
+                ++it;
+        }
     }
 
     std::map<u64, BackingView>::iterator SelectBackingView(u64 offset, u64 maximum_size) {
         auto it = std::prev(backing_views.upper_bound(offset));
+        while (it != backing_views.begin()) {
+            const auto previous = std::prev(it);
+            if (!MergeBackingViews(previous, it, maximum_size))
+                break;
+            it = previous;
+        }
+        while (std::next(it) != backing_views.end() &&
+               MergeBackingViews(it, std::next(it), maximum_size)) {
+        }
         const auto begin = std::max(it->first, Common::AlignDown(offset, maximum_size));
         if (begin != it->first) {
             const auto prefix_size = begin - it->first;
@@ -943,11 +1003,12 @@ struct AddressSpace::Impl {
                             error);
                 return MapBackingView(address, recover, MinimumGuestViewSize);
             }
-            if (recover && IsMappingResourceError(error) && ReleaseSwapSections(index))
-                return MapBackingView(address, false, maximum_size);
+            if (recover && IsMappingResourceError(error))
+                RequestMappingRecovery();
             SetLastError(error);
             LOG_ERROR(Core, "Unable to map physical backing view at {:#x}: {}", view_offset,
                       Common::GetLastErrorMsg());
+            SetLastError(error);
             return false;
         }
         it->second.is_resident = true;
@@ -965,7 +1026,17 @@ struct AddressSpace::Impl {
         auto it = regions.upper_bound(addr);
         if (it == regions.begin())
             return false;
-        auto* region = &std::prev(it)->second;
+        auto selected = std::prev(it);
+        while (selected != regions.begin()) {
+            const auto previous = std::prev(selected);
+            if (!MergeGuestViews(previous, selected, preferred_view_size))
+                break;
+            selected = previous;
+        }
+        while (std::next(selected) != regions.end() &&
+               MergeGuestViews(selected, std::next(selected), preferred_view_size)) {
+        }
+        auto* region = &selected->second;
         if (!region->is_mapped || region->fd != -1 || region->phys_base == PAddr(-1) ||
             addr - region->base >= region->size)
             return false;
@@ -984,11 +1055,7 @@ struct AddressSpace::Impl {
                 if (!IsMappingResourceError(error) || region->size <= MinimumGuestViewSize) {
                     if (mapping_failed)
                         *mapping_failed = true;
-                    MemorySnapshot("guest_mapping_terminal");
-                    LOG_ERROR(Core,
-                              "Unable to map RAM alias at {:#x}, physical {:#x}, size {:#x}: "
-                              "Win32 {}",
-                              region->base, region->phys_base, region->size, error);
+                    SetLastError(error);
                     return false;
                 }
                 LOG_WARNING(Core, "Reducing RAM alias view at {:#x} after Win32 {}", addr, error);
@@ -996,11 +1063,8 @@ struct AddressSpace::Impl {
                 if (!PopulateGuestView(region)) {
                     if (mapping_failed)
                         *mapping_failed = true;
-                    MemorySnapshot("minimum_guest_mapping_terminal");
-                    LOG_ERROR(Core,
-                              "Unable to map minimum RAM alias at {:#x}, physical {:#x}, "
-                              "size {:#x}: Win32 {}",
-                              region->base, region->phys_base, region->size, GetLastError());
+                    const auto error = GetLastError();
+                    SetLastError(error);
                     return false;
                 }
             }
@@ -1162,10 +1226,13 @@ struct AddressSpace::Impl {
         ram_pages[index] =
             CreateFileMapping2(file, nullptr, FILE_MAP_ALL_ACCESS, PAGE_EXECUTE_READWRITE,
                                swap_enabled ? SEC_COMMIT : SEC_RESERVE, size, nullptr, nullptr, 0);
-        if (!ram_pages[index])
-            MappingFailure("ram_section_create", GetLastError(), 0, index * BackingViewSize, size,
+        if (!ram_pages[index]) {
+            const auto error = GetLastError();
+            MappingFailure("ram_section_create", error, 0, index * BackingViewSize, size,
                            PAGE_EXECUTE_READWRITE, 0, file,
                            swap_enabled ? SEC_COMMIT : SEC_RESERVE);
+            SetLastError(error);
+        }
         return ram_pages[index];
     }
 
@@ -2039,20 +2106,50 @@ bool AddressSpace::HandleBackingFault(void* address, u64 access_type, bool* mapp
         return false;
     const auto offset =
         reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(backing->backing_base);
-    if (offset < BackingSize) {
-        std::scoped_lock lock{backing->mutex};
-        if (!backing->MapBackingView(address)) {
-            MEMORY_BASIC_INFORMATION info{};
-            if (!VirtualQuery(address, &info, sizeof(info)) || info.Type != MEM_MAPPED) {
-                if (mapping_failed)
-                    *mapping_failed = true;
-                return false;
+    const auto started = GetTickCount64();
+    u32 recoveries{};
+    for (;;) {
+        const auto epoch = backing->mapping_recovery_epoch.load(std::memory_order_acquire);
+        bool failed{};
+        bool handled{};
+        DWORD error{};
+        if (offset < BackingSize) {
+            std::scoped_lock lock{backing->mutex};
+            handled = backing->MapBackingView(address);
+            error = GetLastError();
+            if (!handled) {
+                MEMORY_BASIC_INFORMATION info{};
+                handled = VirtualQuery(address, &info, sizeof(info)) && info.Type == MEM_MAPPED;
+                failed = !handled;
             }
+            if (handled)
+                backing->CommitPhysical(offset);
+        } else {
+            handled = backing->MapGuestView(address, access_type, &failed);
+            error = GetLastError();
         }
-        backing->CommitPhysical(offset);
-        return true;
+        if (handled)
+            return true;
+        if (!failed || !Impl::IsMappingResourceError(error) ||
+            GetTickCount64() - started >= 30000) {
+            if (mapping_failed)
+                *mapping_failed = failed;
+            if (failed)
+                LOG_ERROR(Core, "Unable to recover RAM mapping at {} after {} retries: Win32 {}",
+                          address, recoveries, error);
+            SetLastError(error);
+            return false;
+        }
+        backing->mapping_recovery_requested.store(true, std::memory_order_release);
+        backing->pager_wait.notify_all();
+        std::unique_lock recovery_lock{backing->pager_wait_mutex};
+        if (backing->pager_wait.wait_for(recovery_lock, std::chrono::milliseconds(100), [&] {
+                return backing->mapping_recovery_epoch.load(std::memory_order_acquire) != epoch;
+            }))
+            ++recoveries;
+        recovery_lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
-    return backing->MapGuestView(address, access_type, mapping_failed);
 }
 
 void AddressSpace::PinMappings(VAddr address, u64 size, bool protect) {
@@ -2078,7 +2175,7 @@ std::shared_ptr<void> AddressSpace::AcquireHostAccess(const void* address, u64 s
     auto* backing = Impl::active_backing.load(std::memory_order_acquire);
     if (!backing)
         return {};
-    std::scoped_lock lock{backing->mutex};
+    std::unique_lock lock{backing->mutex};
     const auto physical = begin - reinterpret_cast<VAddr>(backing->backing_base);
     if (physical < BackingSize) {
         if (size > BackingSize - physical)
@@ -2092,12 +2189,12 @@ std::shared_ptr<void> AddressSpace::AcquireHostAccess(const void* address, u64 s
                                                if (--backing->pinned_physical[key] == 0)
                                                    backing->pinned_physical.erase(key);
                                            }};
+        lock.unlock();
         for (auto offset = physical; populate && offset < physical + size;) {
-            if (!backing->MapBackingView(backing->backing_base + offset, true,
-                                         Impl::MinimumGuestViewSize))
+            bool failed{};
+            if (!HandleBackingFault(backing->backing_base + offset, 0, &failed))
                 throw std::runtime_error("Unable to populate host physical buffer: " +
                                          Common::GetLastErrorMsg());
-            backing->CommitPhysical(offset);
             offset =
                 std::min(physical + size, Common::AlignDown(offset, Impl::MinimumGuestViewSize) +
                                               Impl::MinimumGuestViewSize);
@@ -2119,6 +2216,8 @@ std::shared_ptr<void> AddressSpace::AcquireHostAccess(const void* address, u64 s
                                            if (--backing->pinned_ranges[key] == 0)
                                                backing->pinned_ranges.erase(key);
                                        }};
+    if (!populate)
+        return lease;
     for (auto cursor = begin; cursor < begin + size;) {
         auto next = backing->regions.upper_bound(cursor);
         if (next == backing->regions.begin())
@@ -2126,13 +2225,15 @@ std::shared_ptr<void> AddressSpace::AcquireHostAccess(const void* address, u64 s
         const auto& part = std::prev(next)->second;
         if (!part.is_mapped || cursor - part.base >= part.size)
             throw std::runtime_error("Host guest buffer contains an unmapped gap");
-        if (part.fd == -1 && part.phys_base != PAddr(-1)) {
+        const bool ram = part.fd == -1 && part.phys_base != PAddr(-1);
+        lock.unlock();
+        if (ram) {
             bool failed{};
-            backing->MapGuestView(reinterpret_cast<void*>(cursor), 0, &failed);
-            if (failed)
+            if (!HandleBackingFault(reinterpret_cast<void*>(cursor), 0, &failed))
                 throw std::runtime_error("Unable to populate host guest buffer");
         }
         cursor = std::min(begin + size, Common::AlignDown(cursor, u64{4096}) + 4096);
+        lock.lock();
     }
     return lease;
 }
@@ -2204,7 +2305,7 @@ bool AddressSpace::CopyBacking(void* destination, const void* source, u64 size) 
             scratch[slot] = map();
             if (!scratch[slot] && Impl::IsMappingResourceError(GetLastError())) {
                 backing->ReleaseIdleGuestViews(nullptr);
-                backing->ReleaseSwapSections(index);
+                backing->RequestMappingRecovery();
                 scratch[slot] = map();
             }
             if (!scratch[slot])

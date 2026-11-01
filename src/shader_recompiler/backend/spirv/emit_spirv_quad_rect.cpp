@@ -198,6 +198,66 @@ struct QuadRectListEmitter : public Sirit::Module {
         OpFunctionEnd();
     }
 
+    void EmitGeometry(bool rectangle) {
+        geometry_input_count = rectangle ? 3 : 4;
+        DefineEntry(spv::ExecutionModel::Geometry);
+        const Id input_vec4{TypePointer(spv::StorageClass::Input, vec4_id)};
+        const Id output_vec4{TypePointer(spv::StorageClass::Output, vec4_id)};
+        std::array<Id, 3> positions;
+        std::array<Id, 3> weights;
+        Id corner = Int(0);
+        if (rectangle) {
+            for (u32 i = 0; i < 3; ++i) {
+                positions[i] = OpLoad(vec4_id, OpAccessChain(input_vec4, gl_in, Int(i), int_zero));
+            }
+            for (u32 i = 0; i < 3; ++i) {
+                const Id xy = OpVectorShuffle(vec2_id, positions[i], positions[i], 0, 1);
+                const Id next =
+                    OpVectorShuffle(vec2_id, positions[(i + 1) % 3], positions[(i + 1) % 3], 0, 1);
+                const Id previous =
+                    OpVectorShuffle(vec2_id, positions[(i + 2) % 3], positions[(i + 2) % 3], 0, 1);
+                const Id a = OpFOrdEqual(bvec2_id, xy, next);
+                const Id b = OpFOrdEqual(bvec2_id, xy, previous);
+                const Id edge = OpLogicalOr(bool_id,
+                                            OpLogicalAnd(bool_id, OpCompositeExtract(bool_id, a, 0),
+                                                         OpCompositeExtract(bool_id, b, 1)),
+                                            OpLogicalAnd(bool_id, OpCompositeExtract(bool_id, a, 1),
+                                                         OpCompositeExtract(bool_id, b, 0)));
+                weights[i] = OpSelect(float_id, edge, float_min_one, float_one);
+                corner = OpSelect(int_id, edge, Int(i), corner);
+            }
+        }
+        const auto interpolate = [&](Id a, Id b, Id c) {
+            return OpFAdd(vec4_id, OpVectorTimesScalar(vec4_id, a, weights[0]),
+                          OpFAdd(vec4_id, OpVectorTimesScalar(vec4_id, b, weights[1]),
+                                 OpVectorTimesScalar(vec4_id, c, weights[2])));
+        };
+        constexpr std::array quad_indices{1, 2, 0, 3};
+        for (u32 i = 0; i < 4; ++i) {
+            const Id index = rectangle ? OpSMod(int_id, OpIAdd(int_id, corner, Int(i)), Int(3))
+                                       : Int(quad_indices[i]);
+            const Id position =
+                rectangle && i == 3
+                    ? interpolate(positions[0], positions[1], positions[2])
+                    : OpLoad(vec4_id, OpAccessChain(input_vec4, gl_in, index, int_zero));
+            OpStore(OpAccessChain(output_vec4, gl_per_vertex, int_zero), position);
+            for (u32 j = 0; j < inputs.size(); ++j) {
+                const Id value =
+                    rectangle && i == 3
+                        ? interpolate(OpLoad(vec4_id, OpAccessChain(input_vec4, inputs[j], Int(0))),
+                                      OpLoad(vec4_id, OpAccessChain(input_vec4, inputs[j], Int(1))),
+                                      OpLoad(vec4_id, OpAccessChain(input_vec4, inputs[j], Int(2))))
+                        : OpLoad(vec4_id, OpAccessChain(input_vec4, inputs[j], index));
+                OpStore(outputs[j], value);
+            }
+            OpStore(primitive_id_out, OpLoad(int_id, primitive_id_in));
+            OpEmitVertex();
+        }
+        OpEndPrimitive();
+        OpReturn();
+        OpFunctionEnd();
+    }
+
 private:
     Id Int(s32 value) {
         return Constant(int_id, value);
@@ -219,11 +279,19 @@ private:
 
     void DefineEntry(spv::ExecutionModel model) {
         AddCapability(spv::Capability::Shader);
-        AddCapability(spv::Capability::Tessellation);
+        AddCapability(model == spv::ExecutionModel::Geometry ? spv::Capability::Geometry
+                                                             : spv::Capability::Tessellation);
         const Id void_function{TypeFunction(void_id)};
         main = OpFunction(void_id, spv::FunctionControlMask::MaskNone, void_function);
         if (model == spv::ExecutionModel::TessellationControl) {
             AddExecutionMode(main, spv::ExecutionMode::OutputVertices, 4U);
+        } else if (model == spv::ExecutionModel::Geometry) {
+            AddExecutionMode(main, geometry_input_count == 3
+                                       ? spv::ExecutionMode::Triangles
+                                       : spv::ExecutionMode::InputLinesAdjacency);
+            AddExecutionMode(main, spv::ExecutionMode::OutputTriangleStrip);
+            AddExecutionMode(main, spv::ExecutionMode::OutputVertices, 4U);
+            AddExecutionMode(main, spv::ExecutionMode::Invocations, 1U);
         } else {
             AddExecutionMode(main, spv::ExecutionMode::Quads);
             AddExecutionMode(main, spv::ExecutionMode::SpacingEqual);
@@ -251,6 +319,10 @@ private:
             Decorate(gl_tess_level_outer, spv::Decoration::Patch);
         } else {
             gl_per_vertex = AddOutput(gl_per_vertex_type);
+            if (model == spv::ExecutionModel::Geometry) {
+                primitive_id_out = AddOutput(int_id);
+                Decorate(primitive_id_out, spv::Decoration::BuiltIn, spv::BuiltIn::PrimitiveId);
+            }
         }
         outputs.reserve(fs_info.num_inputs);
         for (int i = 0; i < fs_info.num_inputs; i++) {
@@ -269,13 +341,19 @@ private:
         if (model == spv::ExecutionModel::TessellationEvaluation) {
             gl_tess_coord = AddInput(vec3_id);
             Decorate(gl_tess_coord, spv::Decoration::BuiltIn, spv::BuiltIn::TessCoord);
+        } else if (model == spv::ExecutionModel::Geometry) {
+            primitive_id_in = AddInput(int_id);
+            Decorate(primitive_id_in, spv::Decoration::BuiltIn, spv::BuiltIn::PrimitiveId);
         } else {
             gl_invocation_id = AddInput(int_id);
             Decorate(gl_invocation_id, spv::Decoration::BuiltIn, spv::BuiltIn::InvocationId);
         }
-        const Id gl_per_vertex_array{TypeArray(gl_per_vertex_type, Constant(uint_id, 32U))};
+        const Id gl_per_vertex_array{
+            TypeArray(gl_per_vertex_type,
+                      Constant(uint_id, geometry_input_count ? geometry_input_count : 32U))};
         gl_in = AddInput(gl_per_vertex_array);
-        const Id float_arr{TypeArray(vec4_id, Int(32))};
+        const Id float_arr{
+            TypeArray(vec4_id, Int(geometry_input_count ? geometry_input_count : 32))};
         inputs.reserve(fs_info.num_inputs);
         for (int i = 0; i < fs_info.num_inputs; i++) {
             const auto& input = fs_info.inputs[i];
@@ -289,6 +367,9 @@ private:
 
 private:
     HwFragmentRuntimeInfo fs_info;
+    u32 geometry_input_count{};
+    Id primitive_id_in;
+    Id primitive_id_out;
     Id main;
     Id void_id;
     Id bool_id;
@@ -327,6 +408,12 @@ std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, const HwFragmentRunt
         break;
     case AuxShaderType::QuadListTCS:
         ctx.EmitQuadListTCS();
+        break;
+    case AuxShaderType::RectListGS:
+        ctx.EmitGeometry(true);
+        break;
+    case AuxShaderType::QuadListGS:
+        ctx.EmitGeometry(false);
         break;
     case AuxShaderType::PassthroughTES:
         ctx.EmitPassthroughTES();

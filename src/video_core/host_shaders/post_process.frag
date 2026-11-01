@@ -10,7 +10,7 @@ layout (binding = 0) uniform sampler2D texSampler;
 
 layout (push_constant) uniform settings {
     float gamma;
-    bool hdr;
+    bool bypass_gamma;
     bool srgb_input;
 } pp;
 
@@ -35,7 +35,7 @@ vec3 degamma(vec3 rgb) {
 
 void main() {
     vec4 color_linear = texture(texSampler, uv);
-    if (pp.hdr) {
+    if (pp.bypass_gamma) {
         color = color_linear;
     } else {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);

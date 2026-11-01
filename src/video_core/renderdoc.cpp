@@ -7,6 +7,9 @@
 #include "video_core/renderdoc.h"
 
 #include <atomic>
+#include <mutex>
+#include <vector>
+#include <nlohmann/json.hpp>
 #include <renderdoc_app.h>
 
 #ifdef _WIN32
@@ -27,6 +30,80 @@ enum class CaptureState {
 static CaptureState capture_state{CaptureState::Idle};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
+
+static std::atomic<u32> presentation_capture_state{};
+static std::atomic_bool presentation_trace_active{};
+static std::mutex presentation_trace_mutex;
+static std::vector<std::string> presentation_trace;
+static u32 presentation_trace_dropped{};
+static size_t presentation_trace_bytes{};
+
+bool RequestPresentationCapture() {
+    u32 expected{};
+    return presentation_capture_state.compare_exchange_strong(expected, 1);
+}
+
+bool ConsumePresentationCaptureRequest() {
+    std::scoped_lock lock{presentation_trace_mutex};
+    if (presentation_capture_state.load() != 1)
+        return false;
+    if (!presentation_trace_active.load()) {
+        presentation_trace.clear();
+        presentation_trace.reserve(4096);
+        presentation_trace_dropped = 0;
+        presentation_trace_bytes = 0;
+        presentation_trace_active.store(true);
+        return false;
+    }
+    presentation_trace_active.store(false);
+    u32 expected{1};
+    return presentation_capture_state.compare_exchange_strong(expected, 2);
+}
+
+void CompletePresentationCapture() {
+    std::scoped_lock lock{presentation_trace_mutex};
+    presentation_trace_active.store(false);
+    presentation_trace.clear();
+    presentation_trace_dropped = 0;
+    presentation_trace_bytes = 0;
+    presentation_capture_state.store(0);
+}
+
+void CancelPresentationCaptureRequest() {
+    std::scoped_lock lock{presentation_trace_mutex};
+    u32 expected{1};
+    if (presentation_capture_state.compare_exchange_strong(expected, 0)) {
+        presentation_trace_active.store(false);
+        presentation_trace.clear();
+    }
+}
+
+bool IsPresentationTraceActive() { return presentation_trace_active.load(); }
+
+void RecordPresentationEvent(std::string event) {
+    std::scoped_lock lock{presentation_trace_mutex};
+    if (!presentation_trace_active.load())
+        return;
+    if (presentation_trace.size() < 4096 &&
+        event.size() <= (4ull << 20) - presentation_trace_bytes) {
+        presentation_trace_bytes += event.size();
+        presentation_trace.push_back(std::move(event));
+    } else
+        ++presentation_trace_dropped;
+}
+
+std::string PresentationTraceSnapshot() {
+    std::scoped_lock lock{presentation_trace_mutex};
+    nlohmann::json events = nlohmann::json::array();
+    for (const auto& event : presentation_trace)
+        events.push_back(nlohmann::json::parse(event));
+    return nlohmann::json{{"events", std::move(events)},
+                          {"dropped_events", presentation_trace_dropped},
+                          {"full_videoout_interval", true},
+                          {"event_order", "host_recording"},
+                          {"truncated", presentation_trace_dropped != 0}}
+        .dump();
+}
 
 RENDERDOC_API_1_6_0* rdoc_api{};
 

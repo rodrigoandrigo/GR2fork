@@ -40,11 +40,14 @@ $sdlIntermediate = Join-Path $buildDirectory 'SDL3-obj\'
 & $msbuild (Join-Path $SDL3Source 'VisualC-WinRT\SDL-UWP.vcxproj') /m /t:Build "/p:Configuration=$Configuration" /p:Platform=x64 "/p:OutDir=$sdlOutput" "/p:IntDir=$sdlIntermediate" "/p:SolutionDir=$SDL3Source\VisualC-WinRT\" /p:WindowsTargetPlatformVersion=10.0.26100.0 /v:minimal /nologo
 if ($LASTEXITCODE) { throw "SDL3 UWP build failed: $LASTEXITCODE" }
 $sdlOutput = Join-Path $sdlOutput 'SDL3-UWP'
-& (Join-Path $PSScriptRoot 'build-dozen.ps1') -PythonExecutable $PythonExecutable -Jobs $Jobs
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-dozen.ps1') -PythonExecutable $PythonExecutable -Jobs $Jobs
+if ($LASTEXITCODE) { throw "Dozen build failed: $LASTEXITCODE" }
+$dxcRuntime = & (Join-Path $PSScriptRoot 'fetch-dxc.ps1')
+Copy-Item -LiteralPath (Join-Path $dxcRuntime 'dxcompiler.dll'),(Join-Path $dxcRuntime 'dxil.dll') -Destination $runtimeDirectory
 $dozenRuntime = Join-Path $repository 'Build\Dozen-UWP\src\microsoft\vulkan\vulkan_dzn.dll'
 Copy-Item -LiteralPath $dozenRuntime -Destination $runtimeDirectory
 Copy-Item -LiteralPath (Join-Path $repository 'Build\Dozen-UWP\src\microsoft\spirv_to_dxil\spirv_to_dxil.dll') -Destination $runtimeDirectory
-& cmake -S $repository -B $buildDirectory -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" "-DCMAKE_C_COMPILER=$clang" "-DCMAKE_CXX_COMPILER=$clang" "-DCMAKE_BUILD_TYPE=$Configuration" "-DPython3_EXECUTABLE=$PythonExecutable" -DSHADPS4_UWP=ON "-DSHADPS4_D3D12_SOURCE_DIR=$D3D12Source" "-DSHADPS4_SDL3_SOURCE_DIR=$SDL3Source" "-DSHADPS4_SDL3_LIBRARY=$sdlOutput\SDL3.lib" "-DSHADPS4_SDL3_RUNTIME=$sdlOutput\SDL3.dll" "-DSHADPS4_UWP_OUTPUT_DIR=$runtimeDirectory" -DENABLE_TESTS=OFF
+& cmake -S $repository -B $buildDirectory -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" "-DCMAKE_C_COMPILER=$clang" "-DCMAKE_CXX_COMPILER=$clang" "-DCMAKE_BUILD_TYPE=$Configuration" "-DPython3_EXECUTABLE=$PythonExecutable" -DSHADPS4_UWP=ON "-DSHADPS4_D3D12_SOURCE_DIR=$D3D12Source" "-DSHADPS4_SDL3_SOURCE_DIR=$SDL3Source" "-DSHADPS4_SDL3_LIBRARY=$sdlOutput\SDL3.lib" "-DSHADPS4_SDL3_RUNTIME=$sdlOutput\SDL3.dll" "-DSHADPS4_UWP_OUTPUT_DIR=$runtimeDirectory" "-DSHADPS4_DXC_RUNTIME_DIR=$dxcRuntime" -DENABLE_TESTS=OFF
 if ($LASTEXITCODE) { throw "Core configuration failed: $LASTEXITCODE" }
 & cmake --build $buildDirectory --target shadps4 --parallel $Jobs
 if ($LASTEXITCODE) { throw "Core build failed: $LASTEXITCODE" }

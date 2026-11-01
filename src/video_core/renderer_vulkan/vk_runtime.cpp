@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderdoc.h"
+#include <nlohmann/json.hpp>
 #include "common/alignment.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -680,6 +682,19 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     cmdbuf.clearColorImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
                            vk_range);
 
+    if (VideoCore::IsPresentationTraceActive())
+        VideoCore::RecordPresentationEvent(nlohmann::json{
+            {"command", "clear_image"},
+            {"tick", scheduler.CurrentTick()},
+            {"address", dst->info.guest_address},
+            {"uid", dst->image_uid},
+            {"format", u32(dst->info.pixel_format)},
+            {"mip", range.base.level},
+            {"mips", range.extent.levels},
+            {"layer", range.base.layer},
+            {"layers", range.extent.layers},
+            {"value",
+             clear_value.color.uint32}}.dump());
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
