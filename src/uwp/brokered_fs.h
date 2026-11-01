@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mutex>
+#include <windowsstoragecom.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Storage.h>
 #include "core/file_sys/ifile.h"
@@ -61,9 +62,12 @@ public:
     std::shared_ptr<BrokeredFsBackend> GameDirectory(std::string_view relative) const;
 
 private:
+    std::unique_ptr<BrokeredFile> OpenReadHandle(std::string_view relative) const;
     winrt::Windows::Storage::StorageFolder Folder(std::string_view relative) const;
     winrt::Windows::Storage::IStorageItem Item(std::string_view relative) const;
     winrt::Windows::Storage::StorageFolder root{nullptr};
+    winrt::com_ptr<IStorageFolderHandleAccess> folder_access;
+    std::filesystem::path direct_root;
     std::shared_ptr<BrokeredFsBackend> metadata;
     bool read_only;
 };

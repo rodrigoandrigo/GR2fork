@@ -20,6 +20,17 @@ using namespace winrt::Windows::Storage;
 using namespace winrt::Windows::Storage::Streams;
 
 namespace {
+u32 HandleInode(HANDLE handle) {
+    FILE_ID_INFO id{};
+    if (!GetFileInformationByHandleEx(handle, FileIdInfo, &id, sizeof(id)))
+        return 0;
+    Common::FS::FileIdentity identity{};
+    identity.device = id.VolumeSerialNumber;
+    std::memcpy(&identity.file_lo, id.FileId.Identifier, sizeof(u64));
+    std::memcpy(&identity.file_hi, id.FileId.Identifier + sizeof(u64), sizeof(u64));
+    return FileSys::GetGuestInode(FileSys::FileIdentity{.host = identity}).value_or(0);
+}
+
 std::string RelativePath(std::string_view path) {
     if (path.find_first_of("\\:\0", 0, 3) != std::string_view::npos || path.starts_with('/')) {
         winrt::throw_hresult(E_INVALIDARG);
@@ -453,7 +464,8 @@ std::unique_ptr<BrokeredFile> OpenStorageFile(void* object, uint32_t mode) {
                                      HSO_SHARE_READ | HSO_SHARE_WRITE | HSO_SHARE_DELETE,
                                      HO_OVERLAPPED, nullptr, handle.put()))) {
             auto result = std::make_unique<BrokeredFile>(handle.get(), mode);
-            result->SetInode(inode);
+            const auto native_inode = HandleInode(handle.get());
+            result->SetInode(native_inode ? native_inode : inode);
             return result;
         }
     }
@@ -473,6 +485,57 @@ BrokeredFsBackend::BrokeredFsBackend(void* folder, bool read_only) : read_only{r
     winrt::Windows::Foundation::IInspectable object{nullptr};
     winrt::copy_from_abi(object, folder);
     root = object.as<StorageFolder>();
+    folder_access = root.try_as<IStorageFolderHandleAccess>();
+    try {
+        const std::filesystem::path path{root.Path().c_str()};
+        if (!path.empty()) {
+            CREATEFILE2_EXTENDED_PARAMETERS parameters{sizeof(parameters)};
+            parameters.dwFileFlags = FILE_FLAG_BACKUP_SEMANTICS;
+            const auto handle = CreateFile2FromAppW(
+                path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                OPEN_EXISTING, &parameters);
+            if (handle != INVALID_HANDLE_VALUE) {
+                CloseHandle(handle);
+                direct_root = path;
+            }
+        }
+    } catch (const winrt::hresult_error&) {
+    }
+}
+
+std::unique_ptr<BrokeredFile> BrokeredFsBackend::OpenReadHandle(std::string_view relative) const {
+    auto path = RelativePath(relative);
+    if ((!folder_access && direct_root.empty()) || path.empty())
+        return nullptr;
+    std::ranges::replace(path, '/', '\\');
+    winrt::handle handle;
+    if (!direct_root.empty()) {
+        const auto absolute = direct_root / winrt::to_hstring(path).c_str();
+        CREATEFILE2_EXTENDED_PARAMETERS parameters{sizeof(parameters)};
+        parameters.dwFileFlags = FILE_FLAG_OVERLAPPED;
+        const auto native = CreateFile2FromAppW(
+            absolute.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            OPEN_EXISTING, &parameters);
+        if (native != INVALID_HANDLE_VALUE)
+            handle.attach(native);
+    }
+    if (!handle) {
+        if (!folder_access ||
+            FAILED(folder_access->Create(winrt::to_hstring(path).c_str(), HCO_OPEN_EXISTING, HAO_READ,
+                                          HSO_SHARE_READ | HSO_SHARE_WRITE | HSO_SHARE_DELETE,
+                                          HO_OVERLAPPED, nullptr, handle.put())))
+            return nullptr;
+    }
+    FILE_STANDARD_INFO info{};
+    if (!GetFileInformationByHandleEx(handle.get(), FileStandardInfo, &info, sizeof(info)) ||
+        info.Directory)
+        return nullptr;
+    const auto inode = HandleInode(handle.get());
+    if (!inode)
+        return nullptr;
+    auto result = std::make_unique<BrokeredFile>(handle.get(), SHADPS4_FILE_READ);
+    result->SetInode(inode);
+    return result;
 }
 StorageFolder BrokeredFsBackend::Folder(std::string_view relative) const {
     const auto path = RelativePath(relative);
@@ -540,6 +603,8 @@ IStorageItem BrokeredFsBackend::Item(std::string_view relative) const {
 }
 bool BrokeredFsBackend::Exists(std::string_view relative) {
     try {
+        if (OpenReadHandle(relative))
+            return true;
         return static_cast<bool>(Item(relative));
     } catch (const winrt::hresult_error& error) {
         if (Missing(error)) {
@@ -550,6 +615,8 @@ bool BrokeredFsBackend::Exists(std::string_view relative) {
 }
 bool BrokeredFsBackend::IsDirectory(std::string_view relative) {
     try {
+        if (OpenReadHandle(relative))
+            return false;
         return Item(relative).IsOfType(StorageItemTypes::Folder);
     } catch (const winrt::hresult_error& error) {
         if (Missing(error)) {
@@ -566,6 +633,10 @@ std::unique_ptr<FileSys::IFile> BrokeredFsBackend::Open(std::string_view relativ
         winrt::throw_hresult(E_ACCESSDENIED);
     }
     const auto [parent, name] = ParentAndName(relative);
+    if (!writable) {
+        if (auto file = OpenReadHandle(relative))
+            return file;
+    }
     StorageFile file{nullptr};
     uint32_t public_mode = writable ? SHADPS4_FILE_READ_WRITE : SHADPS4_FILE_READ;
     if (mode == Common::FS::FileAccessMode::Create) {
@@ -606,8 +677,11 @@ std::filesystem::path BrokeredFsBackend::RootPath() const {
     return {};
 }
 std::optional<std::vector<u8>> BrokeredFsBackend::ReadFile(std::string_view relative) const {
-    const auto item = Item(relative).as<StorageFile>();
-    auto file = OpenStorageFile(winrt::get_abi(item), SHADPS4_FILE_READ);
+    auto file = OpenReadHandle(relative);
+    if (!file) {
+        const auto item = Item(relative).as<StorageFile>();
+        file = OpenStorageFile(winrt::get_abi(item), SHADPS4_FILE_READ);
+    }
     const auto length = file->Size();
     if (length > std::vector<u8>{}.max_size()) {
         winrt::throw_hresult(E_OUTOFMEMORY);
@@ -619,6 +693,11 @@ std::optional<std::vector<u8>> BrokeredFsBackend::ReadFile(std::string_view rela
     return result;
 }
 FileSys::FileStat BrokeredFsBackend::Stat(std::string_view relative) const {
+    if (auto file = OpenReadHandle(relative)) {
+        FileSys::FileStat result{};
+        file->Stat(result);
+        return result;
+    }
     const auto item = Item(relative);
     const auto properties = item.GetBasicPropertiesAsync().get();
     FileSys::FileStat result{};
@@ -626,6 +705,17 @@ FileSys::FileStat BrokeredFsBackend::Stat(std::string_view relative) const {
         .kind = FileSys::FileIdentity::Kind::VirtualFile,
         .path = winrt::to_string(item.Path())}).value_or(0);
     result.is_directory = item.IsOfType(StorageItemTypes::Folder);
+    if (!result.is_directory) {
+        if (const auto access = item.try_as<IStorageItemHandleAccess>()) {
+            winrt::handle handle;
+            if (SUCCEEDED(access->Create(HAO_READ,
+                                         HSO_SHARE_READ | HSO_SHARE_WRITE | HSO_SHARE_DELETE,
+                                         HO_OVERLAPPED, nullptr, handle.put()))) {
+                if (const auto inode = HandleInode(handle.get()))
+                    result.inode = inode;
+            }
+        }
+    }
     result.size = result.is_directory ? 0 : properties.Size();
     result.mtime_sec =
         properties.DateModified().time_since_epoch().count() / 10000000 - 11644473600LL;

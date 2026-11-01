@@ -2269,6 +2269,14 @@ std::shared_ptr<void> AddressSpace::AcquireHostAccess(const void* address, u64 s
     auto* backing = Impl::active_backing.load(std::memory_order_acquire);
     if (!backing)
         return {};
+    const auto accessible_end = [](VAddr cursor, VAddr end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) &&
+            info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            return std::min(end, reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize);
+        }
+        return std::min(end, Common::AlignDown(cursor, u64{4096}) + 4096);
+    };
     std::unique_lock lock{backing->mutex};
     const auto physical = begin - reinterpret_cast<VAddr>(backing->backing_base);
     if (physical < BackingSize) {
@@ -2289,9 +2297,9 @@ std::shared_ptr<void> AddressSpace::AcquireHostAccess(const void* address, u64 s
             if (!HandleBackingFault(backing->backing_base + offset, 0, &failed))
                 throw std::runtime_error("Unable to populate host physical buffer: " +
                                          Common::GetLastErrorMsg());
-            offset =
-                std::min(physical + size, Common::AlignDown(offset, Impl::MinimumGuestViewSize) +
-                                              Impl::MinimumGuestViewSize);
+            offset = accessible_end(reinterpret_cast<VAddr>(backing->backing_base + offset),
+                                    begin + size) -
+                     reinterpret_cast<VAddr>(backing->backing_base);
         }
         return lease;
     }
@@ -2320,14 +2328,15 @@ std::shared_ptr<void> AddressSpace::AcquireHostAccess(const void* address, u64 s
         if (!part.is_mapped || cursor - part.base >= part.size)
             throw std::runtime_error("Host guest buffer contains an unmapped gap");
         const bool ram = part.fd == -1 && part.phys_base != PAddr(-1);
+        const auto end = std::min(begin + size, part.base + part.size);
         lock.unlock();
         if (ram) {
             bool failed{};
             if (!HandleBackingFault(reinterpret_cast<void*>(cursor), 0, &failed))
                 throw std::runtime_error("Unable to populate host guest buffer");
         }
-        cursor = std::min(begin + size, Common::AlignDown(cursor, u64{4096}) + 4096);
         lock.lock();
+        cursor = ram ? accessible_end(cursor, end) : end;
     }
     return lease;
 }
@@ -2377,8 +2386,7 @@ bool AddressSpace::CopyBacking(void* destination, const void* source, u64 size) 
                         return const_cast<void*>(pointer);
                     const auto view = std::prev(backing->backing_views.upper_bound(offset));
                     if (view->second.is_resident || !backing->swap_enabled) {
-                        if (!backing->MapBackingView(const_cast<void*>(pointer), true,
-                                                     Impl::MinimumGuestViewSize)) {
+                        if (!backing->MapBackingView(const_cast<void*>(pointer), true)) {
                             error = GetLastError();
                             return nullptr;
                         }
@@ -2386,8 +2394,7 @@ bool AddressSpace::CopyBacking(void* destination, const void* source, u64 size) 
                             backing->CommitPhysical(offset);
                         return const_cast<void*>(pointer);
                     }
-                    if (backing->MapBackingView(const_cast<void*>(pointer), false,
-                                                Impl::MinimumGuestViewSize))
+                    if (backing->MapBackingView(const_cast<void*>(pointer), false))
                         return const_cast<void*>(pointer);
                     const auto aligned = Common::AlignDown(offset, Impl::MinimumGuestViewSize);
                     const auto length = std::min(Impl::MinimumGuestViewSize, BackingSize - aligned);
