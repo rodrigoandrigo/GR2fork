@@ -184,12 +184,11 @@ public:
     }
 
     struct AscQueueInfo {
-        static constexpr size_t Pm4BufferSize = 1024;
         VAddr map_addr;
         u32* read_addr;
         u32 ring_size_dw;
         u32 pipe_id;
-        std::array<u32, Pm4BufferSize> tmp_packet;
+        std::vector<u32> tmp_packet;
         u32 tmp_dwords;
     };
     Common::SlotVector<AscQueueInfo> asc_queues{64};
@@ -261,6 +260,7 @@ private:
     // The two hottest packet arms, shared by the pre-dispatch fast path and
     // their switch cases so the routes cannot drift. The hot bodies inline into
     // the caller; the assert-carrying tails stay cold and out of line.
+    void WriteType0Registers(std::span<const u32> packet, u32 queue_id);
     SHAD_FORCE_INLINE void SetContextRegHot(const union PM4Header* header, u32 count);
     SHAD_NO_INLINE void SetContextRegExtentTail(u32 reg_addr, const union PM4Header* header,
                                                 const u32* payload);

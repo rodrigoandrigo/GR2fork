@@ -5,6 +5,9 @@
 #include <bit>
 
 #include "common/alignment.h"
+#ifdef SHADPS4_UWP
+#include "core/address_space.h"
+#endif
 #include "common/assert.h"
 #include "common/types.h"
 #include "core/devtools/widget/gpu_memory.h"
@@ -145,6 +148,11 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     ++frame;
+#ifdef SHADPS4_UWP
+    const auto epoch = Core::AddressSpace::MemoryPressureEpoch();
+    trim_pressure = epoch != pressure_epoch || Core::AddressSpace::MemoryHeadroom() < 400_MB;
+    pressure_epoch = epoch;
+#endif
     for (Ring& ring : rings) {
         TrimRing(ring);
     }
@@ -158,7 +166,7 @@ void StagingBufferPool::TrimRing(Ring& ring) {
     auto& blocks = ring.blocks;
     for (size_t i = blocks.size(); i-- > 0;) {
         const Block& block = blocks[i];
-        if (frame - block.last_used_frame < RING_IDLE_FRAMES ||
+        if ((!trim_pressure && frame - block.last_used_frame < RING_IDLE_FRAMES) ||
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }
@@ -176,7 +184,8 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
     std::erase_if(cache, [this](const LargeBuffer& entry) {
-        return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
+        return !entry.held &&
+               (trim_pressure || frame - entry.last_used_frame >= LARGE_IDLE_FRAMES) &&
                scheduler.IsFree(entry.tick);
     });
 }

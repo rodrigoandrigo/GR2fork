@@ -3325,7 +3325,7 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
       hres = dzn_create_pso(device, stream_desc, &pipeline->base.state, false);
       if (FAILED(hres)) {
 #ifdef _XBOX_UWP
-         if (!dzn_uwp_pso_diagnostic_reported) {
+         if (hres == E_INVALIDARG && !dzn_uwp_pso_diagnostic_reported) {
             dzn_uwp_pso_diagnostic_reported = true;
             debug_printf("DZN: graphics PSO rejected hr=0x%08x stages=%u "
                          "rt=%u depth=%u stream=%zu\n",
@@ -3409,7 +3409,12 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
                    "depth-format=%u)\n",
                    (unsigned)hres, pCreateInfo->stageCount, color_count,
                    (unsigned)zs_fmt);
-         ret = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+         HRESULT removed = ID3D12Device_GetDeviceRemovedReason(device->dev);
+         ret = vk_error(device,
+                        FAILED(removed) || hres == DXGI_ERROR_DEVICE_REMOVED ||
+                        hres == DXGI_ERROR_DEVICE_RESET ? VK_ERROR_DEVICE_LOST :
+                        hres == E_OUTOFMEMORY ? VK_ERROR_OUT_OF_DEVICE_MEMORY :
+                        VK_ERROR_UNKNOWN);
          goto out;
       }
 

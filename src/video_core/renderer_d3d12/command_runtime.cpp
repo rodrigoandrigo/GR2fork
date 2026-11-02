@@ -1,3 +1,4 @@
+#include "core/uwp/memory_pressure.h"
 #include "video_core/renderer_d3d12/command_runtime.h"
 #include "video_core/renderer_d3d12/image_buffer_alias.h"
 
@@ -211,9 +212,11 @@ std::shared_ptr<VideoCore::ResidentFrame> CommandRuntime::CapturePresentation(
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     Microsoft::WRL::ComPtr<ID3D12Resource> snapshot;
-    winrt::check_hresult(device.Device()->CreateCommittedResource(
-        &heap, D3D12_HEAP_FLAG_SHARED, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-        IID_PPV_ARGS(&snapshot)));
+    winrt::check_hresult(Core::Uwp::AllocateMemory([&] {
+        return device.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &buffer,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&snapshot));
+    }));
     auto frame = std::make_shared<VideoCore::ResidentFrame>();
     HANDLE handle{};
     winrt::check_hresult(device.Device()->CreateSharedHandle(snapshot.Get(), nullptr, GENERIC_ALL,
@@ -319,9 +322,11 @@ void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write w
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_READBACK;
         if (FAILED(device.Device()->CreateQueryHeap(&query, IID_PPV_ARGS(&timestamp_heap))) ||
-            FAILED(device.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &readback,
-                                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                            IID_PPV_ARGS(&timestamp_readback)))) {
+            FAILED(Core::Uwp::AllocateMemory([&] {
+                return device.Device()->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &readback, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(&timestamp_readback));
+            }))) {
             timestamp_heap.Reset();
             timestamp_readback.Reset();
             gpu_timing.frequency = 0;

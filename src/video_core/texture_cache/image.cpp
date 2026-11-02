@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <memory>
 #include "common/assert.h"
+#ifdef SHADPS4_UWP
+#include "core/address_space.h"
+#endif
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -149,6 +152,16 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+#ifdef SHADPS4_UWP
+    for (unsigned attempt = 0; attempt < 3 && (result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+                                               result == VK_ERROR_OUT_OF_HOST_MEMORY);
+         ++attempt) {
+        if (!Core::AddressSpace::ReclaimMemory(32_MB))
+            break;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
+#endif
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
         alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         LOG_WARNING(Render_Vulkan, "Allocating image of size {} bytes over budget.",

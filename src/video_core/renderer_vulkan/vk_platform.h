@@ -4,6 +4,7 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <stdexcept>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -56,22 +57,24 @@ void SetObjectName(vk::Device device, const HandleType& handle, const char* form
 
 template <StringLiteral msg = "">
 static void Check(vk::Result r) {
+#ifdef SHADPS4_UWP
+    if (r != vk::Result::eSuccess) {
+        throw std::runtime_error(fmt::format("Vulkan operation '{}' failed: {}", msg.value,
+                                             vk::to_string(r)));
+    }
+#else
     if constexpr (msg.len <= 1) {
         ASSERT_MSG(r == vk::Result::eSuccess, "vk::Result={}", vk::to_string(r));
     } else {
         ASSERT_MSG(r == vk::Result::eSuccess, "Failed to {}: vk::Result={}", msg.value,
                    vk::to_string(r));
     }
+#endif
 }
 
 template <StringLiteral msg = "", typename T>
 static T Check(vk::ResultValue<T> r) {
-    if constexpr (msg.len <= 1) {
-        ASSERT_MSG(r.result == vk::Result::eSuccess, "vk::Result={}", vk::to_string(r.result));
-    } else {
-        ASSERT_MSG(r.result == vk::Result::eSuccess, "Failed to {}: vk::Result={}", msg.value,
-                   vk::to_string(r.result));
-    }
+    Check<msg>(r.result);
     return std::move(r.value);
 }
 

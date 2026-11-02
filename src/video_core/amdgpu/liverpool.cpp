@@ -83,11 +83,20 @@ static inline std::span<const u32> NextPacket(std::span<const u32> span, size_t 
 // arguments by reference, and an address-exposed local in a coroutine is pinned
 // to the frame and written through a spilled pointer on every packet.
 [[noreturn]] static SHAD_NO_INLINE void UnhandledPm4Type(const PM4Header* header) {
-    if (header->type == 0) {
-        UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                        header->type0.base.Value(), header->type0.NumWords());
-    }
     UNREACHABLE_MSG("Wrong PM4 type {}", header->type.Value());
+}
+
+static u32 PacketDwords(const PM4Header* header) {
+    switch (header->type.Value()) {
+    case 0:
+        return header->type0.NumWords() + 1;
+    case 2:
+        return 1;
+    case 3:
+        return header->type3.NumWords() + 1;
+    default:
+        UnhandledPm4Type(header);
+    }
 }
 
 [[noreturn]] static SHAD_NO_INLINE void UnknownPm4Opcode(u32 opcode, u32 count) {
@@ -504,6 +513,13 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
         const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
         const u32 type = header->type;
+        if (type == 0 || type == 2) {
+            if (type == 0) {
+                WriteType0Registers(ccb, GfxQueueId);
+            }
+            ccb = NextPacket(ccb, PacketDwords(header));
+            continue;
+        }
         if (type != 3) {
             // No other types of packets were spotted so far
             UNREACHABLE_MSG("Invalid PM4 type {}", type);
@@ -563,6 +579,52 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     }
 
     FIBER_EXIT;
+}
+
+void Liverpool::WriteType0Registers(std::span<const u32> packet, u32 queue_id) {
+    const auto* header = reinterpret_cast<const PM4Header*>(packet.data());
+    const u32 base = header->type0.base;
+    const u32 count = header->type0.NumWords();
+    if (packet.size() <= count || base >= Regs::NumRegs || count > Regs::NumRegs - base) {
+        throw std::runtime_error(
+            fmt::format("Invalid PM4 type 0: header={:#x}, base={:#x}, count={}, available={}",
+                        header->raw, base, count, packet.size()));
+    }
+    constexpr u32 compute_base = Regs::ShRegWordOffset + 0x200;
+    constexpr u32 compute_end = compute_base + sizeof(ComputeProgram) / sizeof(u32);
+    for (u32 offset = 0; offset < count;) {
+        const u32 word = base + offset;
+        const u32* source = packet.data() + 1 + offset;
+        u32 words = count - offset;
+        if (word >= compute_base && word < compute_end) {
+            words = std::min(words, compute_end - word);
+            auto* target = reinterpret_cast<u32*>(&mapped_queues[queue_id].cs_state);
+            std::memcpy(target + word - compute_base, source, words * sizeof(u32));
+        } else {
+            if (word < compute_base) {
+                words = std::min(words, compute_base - word);
+            }
+            if (queue_id == GfxQueueId) {
+                gfx_stamp.WriteRegs(&regs.reg_array[word], source, words * sizeof(u32), word);
+            } else {
+                gfx_stamp.WriteRegsImmediate(&regs.reg_array[word], source, words * sizeof(u32),
+                                             word);
+            }
+        }
+        offset += words;
+    }
+    const auto reset_extent = [&](u32 word, auto& extent) {
+        if (base <= word && word - base < count && extent.raw != 0) {
+            extent.raw = 0;
+            gfx_stamp.MarkDirty();
+        }
+    };
+    for (u32 color = 0; color < NUM_COLOR_BUFFERS; ++color) {
+        const u32 stride = ContextRegs::CbColor1Base - ContextRegs::CbColor0Base;
+        reset_extent(ContextRegs::CbColor0Base + color * stride, last_cb_extent[color]);
+        reset_extent(ContextRegs::CbColor0Cmask + color * stride, last_cb_extent[color]);
+    }
+    reset_extent(ContextRegs::DbZInfo, last_db_extent);
 }
 
 void Liverpool::SetContextRegExtentTail(u32 reg_addr, const PM4Header* header, const u32* payload) {
@@ -828,6 +890,12 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         if (header->type != 3) [[unlikely]] {
+            if (header->type == 0) {
+                WriteType0Registers(dcb, GfxQueueId);
+                ++run_stats.outer_packets;
+                dcb = NextPacket(dcb, PacketDwords(header));
+                continue;
+            }
             // Type-2 packets are used for padding purposes.
             if (header->type != 2) {
                 UnhandledPm4Type(header);
@@ -1622,20 +1690,37 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     while (!acb.empty()) {
         ProcessCommands();
 
-        auto* header = reinterpret_cast<const PM4Header*>(acb.data());
-        u32 next_dw_off = header->type3.NumWords() + 1;
+        const auto* header = reinterpret_cast<const PM4Header*>(
+            queue.tmp_dwords > 0 ? queue.tmp_packet.data() : acb.data());
+        u32 next_dw_off = PacketDwords(header);
 
         // If we have a buffered packet, use it.
         if (queue.tmp_dwords > 0) [[unlikely]] {
             header = reinterpret_cast<const PM4Header*>(queue.tmp_packet.data());
-            next_dw_off = header->type3.NumWords() + 1 - queue.tmp_dwords;
+            const u32 packet_words = PacketDwords(header);
+            if (packet_words > queue.tmp_packet.size() || queue.tmp_dwords >= packet_words) {
+                throw std::runtime_error("Invalid buffered PM4 packet size");
+            }
+            const u32 remaining = packet_words - queue.tmp_dwords;
+            next_dw_off = std::min(remaining, static_cast<u32>(acb.size()));
             std::memcpy(queue.tmp_packet.data() + queue.tmp_dwords, acb.data(),
                         next_dw_off * sizeof(u32));
+            if (next_dw_off < remaining) {
+                queue.tmp_dwords += next_dw_off;
+                if constexpr (!is_indirect) {
+                    *queue.read_addr = (*queue.read_addr + next_dw_off) % queue.ring_size_dw;
+                }
+                break;
+            }
             queue.tmp_dwords = 0;
         }
 
         // If the packet is split across ring boundary, buffer until next submission
         if (next_dw_off > acb.size()) [[unlikely]] {
+            if (is_indirect) {
+                throw std::runtime_error("Truncated or oversized PM4 compute packet");
+            }
+            queue.tmp_packet.resize(next_dw_off);
             std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
@@ -1645,9 +1730,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
 
-        if (header->type == 2) {
-            // Type-2 packet are used for padding purposes
-            next_dw_off = 1;
+        if (header->type == 0 || header->type == 2) {
+            if (header->type == 0) {
+                WriteType0Registers({reinterpret_cast<const u32*>(header), PacketDwords(header)},
+                                    vqid + 1);
+            }
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
                 *queue.read_addr += next_dw_off;

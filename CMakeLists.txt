@@ -1621,6 +1621,7 @@ cmrc_add_resource_library(embedded-resources
         src/resources/amd_rsqrt_index_table.bin.zstd)
 target_link_libraries(shadps4 PRIVATE res::embedded)
 if(SHADPS4_UWP)
+    target_sources(shadps4 PRIVATE src/core/uwp/guest_memory.c)
     add_custom_command(TARGET shadps4 POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADPS4_UWP_OUTPUT_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:shadps4>" "${SHADPS4_UWP_OUTPUT_DIR}"

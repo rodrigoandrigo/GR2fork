@@ -72,6 +72,14 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                 reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]),
                 pExp->ExceptionRecord->ExceptionInformation[0], &mapping_failed))
             return EXCEPTION_CONTINUE_EXECUTION;
+        if (mapping_failed) {
+            const auto error = GetLastError();
+            Uwp::FailGuestMemory(error, pExp->ExceptionRecord->ExceptionInformation[1],
+                                pExp->ExceptionRecord->ExceptionInformation[0]);
+            if (g_curthread)
+                ExitGuestThread();
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
 #endif
         guest_info._si_signo = POSIX_SIGSEGV;
         guest_info._si_code = POSIX_SEGV_MAPERR;

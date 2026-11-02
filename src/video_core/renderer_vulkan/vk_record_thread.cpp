@@ -9,6 +9,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_record_thread.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#ifdef SHADPS4_UWP
+#include "uwp/session.h"
+#endif
 
 namespace Vulkan {
 
@@ -20,11 +23,21 @@ RecordThread::RecordThread(const Instance& instance_, Semaphore& work_semaphore_
         try {
             Run(stop);
         } catch (...) {
+            const auto error = std::current_exception();
             {
                 std::scoped_lock lock{mutex};
-                failure = std::current_exception();
+                failure = error;
             }
             done_cv.notify_all();
+#ifdef SHADPS4_UWP
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception& exception) {
+                Core::Uwp::FailGuestSession(exception.what());
+            } catch (...) {
+                Core::Uwp::FailGuestSession("Vulkan recording failed with an unknown exception");
+            }
+#endif
         }
     });
 }

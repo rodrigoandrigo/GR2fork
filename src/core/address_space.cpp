@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <map>
 #include <span>
+#include <source_location>
 #include <thread>
 #include <vector>
 #include <fmt/format.h>
@@ -15,12 +16,14 @@
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/error.h"
-#ifdef SHADPS4_UWP
-#include "core/libraries/kernel/threads/pthread.h"
-#endif
 #include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "core/address_space.h"
+#ifdef SHADPS4_UWP
+#include <winrt/Windows.System.h>
+#include "core/libraries/kernel/threads/pthread.h"
+#include "core/uwp/guest_memory.h"
+#endif
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/memory.h"
@@ -28,9 +31,6 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#ifdef SHADPS4_UWP
-#include <winrt/Windows.System.h>
-#endif
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -113,58 +113,6 @@ static u64 BackingSize = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO + ORBIS_KERNEL_FLEXIBLE_
 static void* MapHostView(HANDLE backing, HANDLE process, void* address, u64 offset, u64 size,
                          ULONG flags, ULONG protection, MEM_EXTENDED_PARAMETER* parameters,
                          ULONG count) {
-#ifdef SHADPS4_UWP
-    if (protection != PAGE_EXECUTE && protection != PAGE_EXECUTE_READ &&
-        protection != PAGE_EXECUTE_READWRITE) {
-        static std::atomic_bool native_data_views{};
-        if (native_data_views.load(std::memory_order_relaxed)) {
-            auto* native = MapViewOfFile3(backing, process, address, offset, size, flags,
-                                          protection, parameters, count);
-            if (native)
-                return native;
-            const auto error = GetLastError();
-            auto* app = MapViewOfFile3FromApp(backing, process, address, offset, size, flags,
-                                              protection, parameters, count);
-            if (app) {
-                native_data_views.store(false, std::memory_order_relaxed);
-                return app;
-            }
-            SetLastError(error);
-            return nullptr;
-        }
-        auto* result = MapViewOfFile3FromApp(backing, process, address, offset, size, flags,
-                                             protection, parameters, count);
-        if (result)
-            return result;
-        const auto error = GetLastError();
-        if (error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY ||
-            error == ERROR_NO_SYSTEM_RESOURCES || error == ERROR_COMMITMENT_LIMIT ||
-            error == ERROR_NOT_ENOUGH_QUOTA) {
-            result = MapViewOfFile3(backing, process, address, offset, size, flags, protection,
-                                    parameters, count);
-            if (result) {
-                native_data_views.store(true, std::memory_order_relaxed);
-                LOG_WARNING(Core,
-                            "[MemDiag] native_map_recovered from_app_win32={} va={:#x} size={:#x} "
-                            "offset={:#x} protection={:#x}",
-                            error, reinterpret_cast<VAddr>(address), size, offset, protection);
-                return result;
-            }
-            const auto native_error = GetLastError();
-            static std::atomic<u64> failures{};
-            const auto failure = ++failures;
-            if (failure <= 8 || failure % 64 == 0)
-                LOG_ERROR(Core,
-                          "[MemDiag] native_map_retry_failed from_app_win32={} native_win32={} "
-                          "va={:#x} size={:#x}",
-                          error, native_error, reinterpret_cast<VAddr>(address), size);
-            SetLastError(error);
-            return nullptr;
-        }
-        SetLastError(error);
-        return nullptr;
-    }
-#endif
     return MapViewOfFile3(backing, process, address, offset, size, flags, protection, parameters,
                           count);
 }
@@ -174,7 +122,7 @@ struct MemoryRegion {
     PAddr phys_base;
     u64 size;
     u32 prot;
-    s32 fd;
+    s64 fd;
     bool is_mapped;
     bool is_resident{};
     std::vector<MEMORY_BASIC_INFORMATION> saved_protections;
@@ -182,59 +130,17 @@ struct MemoryRegion {
     bool swept{};
 };
 
+using MemoryMutex = std::recursive_mutex;
+using MemoryLock = std::unique_lock<MemoryMutex>;
+
 #ifdef SHADPS4_UWP
-class MemoryCriticalScope {
-public:
-    MemoryCriticalScope() : thread{Libraries::Kernel::g_curthread} {
-        if (thread)
-            thread->critical_count.fetch_add(1, std::memory_order_acq_rel);
-    }
-    ~MemoryCriticalScope() {
-        if (thread)
-            thread->critical_count.fetch_sub(1, std::memory_order_acq_rel);
-    }
-
-private:
-    Libraries::Kernel::Pthread* thread;
-};
-#endif
-
+#include "core/uwp/address_space.inc"
+#else
 struct AddressSpace::Impl {
-#ifdef SHADPS4_UWP
-    struct BackingView {
-        u64 size;
-        bool is_resident{};
-        u64 last_access{};
-        bool swept{};
-    };
-#endif
     Impl() : process{GetCurrentProcess()} {
-#ifdef SHADPS4_UWP
-        std::vector<VAddr> reserved_regions;
-        auto rollback = ::detail::MakeScopeGuard([&] {
-            for (auto page : ram_pages)
-                if (page)
-                    CloseHandle(page);
-            for (auto file : swap_files)
-                if (file != INVALID_HANDLE_VALUE)
-                    CloseHandle(file);
-            if (backing_base) {
-                VirtualFreeEx(process, backing_base, BackingSize,
-                              MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
-                VirtualFreeEx(process, backing_base, 0, MEM_RELEASE);
-            }
-            if (backing_handle)
-                CloseHandle(backing_handle);
-            for (const auto address : reserved_regions)
-                VirtualFreeEx(process, reinterpret_cast<void*>(address), 0, MEM_RELEASE);
-        });
-#endif
         // Determine the system's page alignment
         SYSTEM_INFO sys_info{};
         GetSystemInfo(&sys_info);
-#ifdef SHADPS4_UWP
-        commit_size = sys_info.dwPageSize;
-#endif
         u64 alignment = sys_info.dwAllocationGranularity;
 
         // Older Windows builds have a severe performance issue with VirtualAlloc2.
@@ -298,9 +204,6 @@ struct AddressSpace::Impl {
         }
 
         // Reserve all detected free regions.
-#ifdef SHADPS4_UWP
-        reserved_regions.reserve(regions.size());
-#endif
         for (auto region : regions) {
             auto addr = static_cast<u8*>(VirtualAlloc2(
                 process, reinterpret_cast<PVOID>(region.second.base), region.second.size,
@@ -308,9 +211,6 @@ struct AddressSpace::Impl {
             // All marked regions should reserve fine since they're free.
             ASSERT_MSG(addr, "Unable to reserve virtual address space: {}",
                        Common::GetLastErrorMsg());
-#ifdef SHADPS4_UWP
-            reserved_regions.push_back(region.second.base);
-#endif
         }
 
         // Set these constants to ensure code relying on them works.
@@ -327,1098 +227,39 @@ struct AddressSpace::Impl {
                        EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
 
         // Allocate backing file that represents the total physical memory.
-#ifndef SHADPS4_UWP
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
                                             PAGE_EXECUTE_READWRITE, SEC_COMMIT, BackingSize,
                                             nullptr, nullptr, 0);
-#endif
 
-#ifndef SHADPS4_UWP
         ASSERT_MSG(backing_handle, "{}", Common::GetLastErrorMsg());
-#endif
         // Allocate a virtual memory for the backing file map as placeholder
         backing_base = static_cast<u8*>(VirtualAlloc2(process, nullptr, BackingSize,
                                                       MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
                                                       PAGE_NOACCESS, nullptr, 0));
         ASSERT_MSG(backing_base, "{}", Common::GetLastErrorMsg());
 
-#ifdef SHADPS4_UWP
-        ram_pages.resize((BackingSize + BackingViewSize - 1) / BackingViewSize);
-        swap_files.resize(ram_pages.size(), INVALID_HANDLE_VALUE);
-        section_accesses.resize(ram_pages.size());
-        swap_enabled = EmulatorSettings.IsMemorySwapEnabled();
-        if (swap_enabled) {
-            swap_directory = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "swap";
-            std::filesystem::create_directories(swap_directory);
-        }
-        for (u64 offset = 0; offset + BackingViewSize < BackingSize; offset += BackingViewSize) {
-            ASSERT_MSG(VirtualFreeEx(process, backing_base + offset, BackingViewSize,
-                                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
-                       "Unable to split physical backing placeholder: {}",
-                       Common::GetLastErrorMsg());
-        }
-        for (u64 offset = 0; offset < BackingSize; offset += BackingViewSize)
-            backing_views.emplace(offset,
-                                  BackingView{std::min(BackingViewSize, BackingSize - offset)});
-        active_backing.store(this);
-        rollback.Cancel();
-        LOG_INFO(Core, "UWP memory: {} MiB reserved, {} KiB minimum demand commitment, swap {}",
-                 BackingSize / 1_MB, commit_size / 1_KB, swap_enabled ? "enabled" : "disabled");
-        StartPager();
-#else
         void* const ret =
             MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
                            MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0);
         ASSERT_MSG(ret == backing_base, "{}", Common::GetLastErrorMsg());
-#endif
     }
 
-#ifdef SHADPS4_UWP
-    static constexpr u64 HostMemoryReserve = 256_MB;
-    static constexpr u64 BackingViewSize = 16_MB;
-    static constexpr u64 GuestViewSize = 1_MB;
-    static constexpr u64 MinimumGuestViewSize = 64_KB;
-    u64 commit_size{};
-    inline static std::atomic<Impl*> active_backing{};
-    std::mutex backing_mutex;
-    std::map<u64, BackingView> backing_views;
-    std::vector<HANDLE> ram_pages;
-    std::vector<HANDLE> swap_files;
-    std::vector<u64> section_accesses;
-    u64 section_access_clock{};
-    std::mutex ram_pages_mutex;
-    bool swap_enabled{};
-    std::filesystem::path swap_directory;
-    u64 committed_bytes{};
-    struct CommitSequence {
-        u64 end{~u64{0}};
-        u32 length{};
-    };
-    std::map<DWORD, CommitSequence> commit_sequences;
-    std::map<std::pair<VAddr, u64>, u32> pinned_ranges;
-    std::map<std::pair<PAddr, u64>, u32> pinned_physical;
-    u64 pager_budget{};
-    u64 pager_evictions{};
-    u64 pager_page_ins{};
-    u64 pager_emergencies{};
-    u64 pager_store_copies{};
-    u64 pager_second_chances{};
-    u64 pager_last_emergency{};
-    u64 pager_last_byte_pressure{};
-    u64 preferred_view_size{GuestViewSize};
-    u64 mapping_pressure_at{};
-    u64 mapping_views{};
-    u64 mapping_sections{};
-    u64 mapping_view_failures{};
-    u64 mapping_view_evictions{};
-    std::atomic_bool mapping_recovery_requested{};
-    std::atomic_bool section_recovery_requested{};
-    std::atomic<u64> mapping_recovery_epoch{};
-    std::atomic<u64> mapping_recovery_waits{};
-    std::atomic<u64> mapping_recovery_wait_us{};
-    std::atomic<u64> section_flushes{};
-    std::atomic<u64> section_flush_us{};
-    u64 mapping_failures{};
-    u64 mapping_snapshot_at{};
-    u64 recovery_reports{};
-    std::atomic<u64> pager_ticks{};
-    std::atomic<u64> pager_lock_skips{};
-    std::atomic<u64> pager_budget_errors{};
-    std::mutex pager_wait_mutex;
-    std::condition_variable_any pager_wait;
-    std::jthread pager;
 
-    void MemorySnapshot(const char* reason) noexcept {
-        const auto saved_error = GetLastError();
-        try {
-            u64 guest_views{}, guest_bytes{}, backing_count{}, backing_bytes{}, pinned_views{};
-            u64 executable_views{}, swept_views{}, sections{}, files{};
-            for (const auto& [base, region] : regions) {
-                if (!region.is_resident || region.fd != -1 || region.phys_base == PAddr(-1))
-                    continue;
-                ++guest_views;
-                guest_bytes += region.size;
-                pinned_views += IsPinnedRegion(region);
-                executable_views += NeedsExecutableView(region.prot, region.saved_protections);
-                swept_views += region.swept;
-            }
-            for (const auto& [offset, view] : backing_views)
-                if (view.is_resident) {
-                    ++backing_count;
-                    backing_bytes += view.size;
-                    swept_views += view.swept;
-                }
-            for (auto handle : ram_pages)
-                sections += handle != nullptr;
-            for (auto handle : swap_files)
-                files += handle != INVALID_HANDLE_VALUE;
-            LOG_INFO(Core,
-                     "[MemDiag] {} guest_views={} guest_alias_bytes={:#x} backing_views={} "
-                     "backing_bytes={:#x} "
-                     "sections={} files={} region_nodes={} backing_nodes={} pinned_ranges={} "
-                     "physical_pins={} pinned_views={} executable_views={} swept_views={}",
-                     reason, guest_views, guest_bytes, backing_count, backing_bytes, sections,
-                     files, regions.size(), backing_views.size(), pinned_ranges.size(),
-                     pinned_physical.size(), pinned_views, executable_views, swept_views);
-            LOG_INFO(Core,
-                     "[MemDiag] {} tick={} lock_skips={} budget_errors={} failures={} "
-                     "budget={:#x} evictions={} emergency={} second_chances={} "
-                     "store_copies={} last_emergency_ms={}",
-                     reason, pager_ticks.load(), pager_lock_skips.load(),
-                     pager_budget_errors.load(), mapping_failures, pager_budget, pager_evictions,
-                     pager_emergencies, pager_second_chances, pager_store_copies,
-                     pager_last_emergency);
-            LOG_INFO(Core,
-                     "[MemDiag] {} mapping_views={} view_admission=system sections={} "
-                     "section_admission=system view_failures={} view_evictions={}",
-                     reason, mapping_views, mapping_sections, mapping_view_failures,
-                     mapping_view_evictions);
-            LOG_INFO(Core,
-                     "[MemDiag] {} recovery_waits={} recovery_wait_us={} section_flushes={} "
-                     "section_flush_us={}",
-                     reason, mapping_recovery_waits.load(), mapping_recovery_wait_us.load(),
-                     section_flushes.load(), section_flush_us.load());
-            u64 usage{}, limit{};
-            s32 budget_error{};
-            try {
-                usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
-                limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
-            } catch (const winrt::hresult_error& error) {
-                budget_error = error.code().value;
-            }
-            MEMORYSTATUSEX system{sizeof(system)};
-            const bool queried = GlobalMemoryStatusEx(&system);
-            LOG_INFO(Core,
-                     "[MemDiag] {} app_usage={:#x} app_limit={:#x} budget_hresult={:#x} "
-                     "system_ok={} system_win32={} available_physical={:#x} total_physical={:#x} "
-                     "available_pagefile={:#x} total_pagefile={:#x} available_virtual={:#x}",
-                     reason, usage, limit, u32(budget_error), queried, queried ? 0 : GetLastError(),
-                     system.ullAvailPhys, system.ullTotalPhys, system.ullAvailPageFile,
-                     system.ullTotalPageFile, system.ullAvailVirtual);
-        } catch (...) {
-        }
-        SetLastError(saved_error);
-    }
-
-    void MappingFailure(const char* operation, DWORD error, VAddr address, PAddr physical, u64 size,
-                        DWORD protection, u64 offset = 0, HANDLE handle = nullptr,
-                        DWORD flags = 0) noexcept {
-        const auto failure = ++mapping_failures;
-        try {
-            if (IsMappingResourceError(error)) {
-                const std::string_view kind{operation};
-                const bool view_failure =
-                    size <= MinimumGuestViewSize &&
-                    (kind == "guest_alias_map_from_app" || kind == "guest_alias_map_native" ||
-                     kind == "backing_view_map" || kind == "store_view_map");
-                if (kind == "ram_section_create") {
-                    section_recovery_requested.store(true, std::memory_order_release);
-                    RequestMappingRecovery();
-                } else if (view_failure) {
-                    ++mapping_view_failures;
-                    RequestMappingRecovery();
-                }
-            }
-            if (failure <= 32 || failure % 64 == 0) {
-                MEMORY_BASIC_INFORMATION target{};
-                const auto queried =
-                    VirtualQuery(reinterpret_cast<void*>(address), &target, sizeof(target));
-                LOG_ERROR(Core,
-                          "[MemDiag] failure={} operation={} win32={} tid={} va={:#x} phys={:#x} "
-                          "size={:#x} protection={:#x} offset={:#x} handle={:#x} flags={:#x}",
-                          failure, operation, error, GetCurrentThreadId(), address, physical, size,
-                          protection, offset, reinterpret_cast<uintptr_t>(handle), flags);
-                LOG_ERROR(Core,
-                          "[MemDiag] failure={} query_ok={} state={:#x} "
-                          "type={:#x} current_protection={:#x} allocation_protection={:#x} "
-                          "allocation_base={:#x} region_base={:#x} region_size={:#x}",
-                          failure, queried != 0, target.State, target.Type, target.Protect,
-                          target.AllocationProtect, reinterpret_cast<VAddr>(target.AllocationBase),
-                          reinterpret_cast<VAddr>(target.BaseAddress), target.RegionSize);
-            }
-            const auto now = GetTickCount64();
-            if (failure == 1 || now - mapping_snapshot_at >= 5000) {
-                mapping_snapshot_at = now;
-                MemorySnapshot(operation);
-            }
-        } catch (...) {
-        }
-        SetLastError(error);
-    }
-
-    void RecoveryReport(const char* operation, u64 candidates, u64 pinned, u64 released,
-                        u64 failures, DWORD error, u64 duration) noexcept {
-        const auto saved_error = GetLastError();
-        const auto report = ++recovery_reports;
-        try {
-            if (report <= 32 || report % 64 == 0)
-                LOG_INFO(Core,
-                         "[MemDiag] recovery={} operation={} candidates={} skipped_pinned={} "
-                         "released={} io_failures={} first_win32={} duration_ms={}",
-                         report, operation, candidates, pinned, released, failures, error,
-                         duration);
-        } catch (...) {
-        }
-        SetLastError(saved_error);
-    }
-
-    void StartPager() {
-        if (swap_enabled && !pager.joinable())
-            pager = std::jthread([this](std::stop_token stop) { RunPager(stop); });
-    }
-
-    void StopPager() {
-        if (!pager.joinable())
-            return;
-        pager.request_stop();
-        pager_wait.notify_all();
-        pager.join();
-        std::scoped_lock lock{mutex};
-        MemorySnapshot("pager_stop");
-        LOG_INFO(Core, "Memory pager: {} page-ins, {} evictions, {} emergency recoveries",
-                 pager_page_ins, pager_evictions, pager_emergencies);
-        LOG_INFO(Core, "Memory pager: {} direct store copies, {} second chances",
-                 pager_store_copies, pager_second_chances);
-    }
-
-    bool IsPinnedPhysical(PAddr address, u64 size) const {
-        for (const auto& [range, count] : pinned_physical)
-            if (address < range.first + range.second && range.first < address + size)
-                return true;
-        for (const auto& [range, count] : pinned_ranges) {
-            auto it = regions.upper_bound(range.first);
-            if (it != regions.begin())
-                --it;
-            for (; it != regions.end() && it->first < range.first + range.second; ++it) {
-                const auto& region = it->second;
-                if (!region.is_mapped || region.fd != -1 || region.phys_base == PAddr(-1))
-                    continue;
-                const auto begin = std::max(region.base, range.first);
-                const auto end = std::min(region.base + region.size, range.first + range.second);
-                if (begin >= end)
-                    continue;
-                const auto physical = region.phys_base + begin - region.base;
-                if (address < physical + end - begin && physical < address + size)
-                    return true;
-            }
-        }
-        return false;
-    }
-
-    void RunPager(std::stop_token stop) {
-        try {
-            winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        } catch (const winrt::hresult_error& error) {
-            LOG_ERROR(Core, "Unable to initialize memory pager: {:#x}", u32(error.code().value));
-            return;
-        }
-        auto apartment = ::detail::MakeScopeGuard([] { winrt::uninit_apartment(); });
-        u64 last_report{};
-        auto next_recovery = std::chrono::steady_clock::now();
-        while (!stop.stop_requested()) {
-            {
-                std::unique_lock wait_lock{pager_wait_mutex};
-                pager_wait.wait_for(wait_lock, stop, std::chrono::milliseconds(100), [&] {
-                    return mapping_recovery_requested.load(std::memory_order_acquire);
-                });
-                pager_wait.wait_until(wait_lock, stop, next_recovery, [] { return false; });
-            }
-            if (stop.stop_requested())
-                break;
-            ++pager_ticks;
-            next_recovery = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
-            try {
-                const u64 limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
-                const u64 usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
-                std::unique_lock lock{mutex, std::defer_lock};
-                const bool recovery_pending =
-                    mapping_recovery_requested.load(std::memory_order_acquire);
-                if (recovery_pending)
-                    lock.lock();
-                if (!recovery_pending && !lock.try_lock()) {
-                    ++pager_lock_skips;
-                    if (GetTickCount64() - last_report >= 5000) {
-                        last_report = GetTickCount64();
-                        LOG_INFO(Core, "[MemDiag] pager_lock_busy tick={} lock_skips={}",
-                                 pager_ticks.load(), pager_lock_skips.load());
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
-                u64 resident{};
-                u64 views{};
-                std::vector<bool> pages((BackingSize + MinimumGuestViewSize - 1) /
-                                        MinimumGuestViewSize);
-                const auto count_pages = [&](u64 address, u64 size) {
-                    const auto end =
-                        (address + size + MinimumGuestViewSize - 1) / MinimumGuestViewSize;
-                    for (auto page = address / MinimumGuestViewSize; page < end; ++page)
-                        pages[page] = true;
-                };
-                for (const auto& [offset, view] : backing_views)
-                    if (view.is_resident) {
-                        count_pages(offset, view.size);
-                        ++views;
-                    }
-                for (const auto& [base, region] : regions)
-                    if (region.is_resident && region.fd == -1 && region.phys_base != PAddr(-1)) {
-                        count_pages(region.phys_base, region.size);
-                        ++views;
-                    }
-                const bool mapping_pressure =
-                    mapping_recovery_requested.exchange(false, std::memory_order_acq_rel);
-                const bool storage_pressure =
-                    section_recovery_requested.exchange(false, std::memory_order_acq_rel);
-                mapping_views = views;
-                if (mapping_pressure || storage_pressure) {
-                    ReleaseIdleGuestViews(nullptr);
-                    TrimResidentViews(8_MB);
-                }
-                const auto now = GetTickCount64();
-                CoalesceDormantViews();
-                if (preferred_view_size < GuestViewSize &&
-                    GetTickCount64() - mapping_pressure_at >= 30000) {
-                    preferred_view_size = std::min(GuestViewSize, preferred_view_size * 2);
-                    mapping_pressure_at = GetTickCount64();
-                    LOG_INFO(Core, "[MemDiag] mapping_window_restored size={:#x}",
-                             preferred_view_size);
-                }
-                resident = std::ranges::count(pages, true) * MinimumGuestViewSize;
-                constexpr u64 headroom = 768_MB;
-                const u64 other = usage > resident ? usage - resident : 0;
-                const u64 available =
-                    limit > other && limit - other > headroom ? limit - other - headroom : 0;
-                const u64 target = limit ? std::max<u64>(512_MB, available) : 2_GB;
-                if (!pager_budget || pager_budget > target) {
-                    if (pager_budget > target)
-                        pager_last_byte_pressure = now;
-                    pager_budget = target;
-                } else if (now - pager_last_byte_pressure >= 30000)
-                    pager_budget = std::min(target, pager_budget + 8_MB / 10);
-                const bool tight = limit && (usage >= limit || limit - usage < 384_MB);
-                if (tight || resident > pager_budget) {
-                    pager_last_byte_pressure = now;
-                    TrimResidentViews(tight ? 64_MB : 8_MB);
-                }
-                if (GetTickCount64() - last_report >= 5000) {
-                    last_report = GetTickCount64();
-                    LOG_INFO(Core,
-                             "[MemDiag] pager_policy usage={:#x} limit={:#x} resident={:#x} "
-                             "other={:#x} target={:#x} budget={:#x} views={} tight={}",
-                             usage, limit, resident, other, target, pager_budget, views, tight);
-                    MemorySnapshot("pager_sample");
-                }
-                const bool release_sections =
-                    mapping_pressure || storage_pressure || tight || resident > pager_budget;
-                lock.unlock();
-                if (mapping_pressure) {
-                    mapping_recovery_epoch.fetch_add(1, std::memory_order_release);
-                    pager_wait.notify_all();
-                }
-                if (release_sections) {
-                    ReleaseUnusedSwapSections();
-                    mapping_recovery_epoch.fetch_add(1, std::memory_order_release);
-                    pager_wait.notify_all();
-                }
-            } catch (const winrt::hresult_error& error) {
-                const auto errors = ++pager_budget_errors;
-                if (errors == 1 || GetTickCount64() - last_report >= 5000) {
-                    last_report = GetTickCount64();
-                    LOG_ERROR(Core, "[MemDiag] pager_budget_failed hresult={:#x} count={} tick={}",
-                              u32(error.code().value), errors, pager_ticks.load());
-                }
-            } catch (const std::exception& error) {
-                LOG_ERROR(Core, "Memory pager: {}", error.what());
-            }
-        }
-    }
-
-    void TrimResidentViews(u64 bytes) {
-        const auto now = GetTickCount64();
-        u64 released{};
-        u64 scheduled{};
-        for (auto& [base, region] : regions) {
-            if (!region.is_resident || region.fd != -1 || region.phys_base == PAddr(-1) ||
-                IsPinnedRegion(region) ||
-                NeedsExecutableView(region.prot, region.saved_protections) ||
-                now - region.residency_order < (region.swept ? 100 : 1000))
-                continue;
-            const auto size = region.size;
-            if (!region.swept) {
-                ApplyCommittedProtection(base, size, PAGE_NOACCESS);
-                region.swept = true;
-                region.residency_order = now;
-            } else {
-                UnmapRegion(&region);
-                released += size;
-                ++pager_evictions;
-                ++mapping_view_evictions;
-            }
-            scheduled += size;
-            if (scheduled >= bytes)
-                break;
-        }
-        scheduled = 0;
-        for (auto& [offset, view] : backing_views) {
-            if (!view.is_resident || IsPinnedPhysical(offset, view.size) ||
-                now - view.last_access < (view.swept ? 100 : 1000))
-                continue;
-            if (!view.swept) {
-                ApplyCommittedProtection(reinterpret_cast<VAddr>(backing_base + offset), view.size,
-                                         PAGE_NOACCESS);
-                view.swept = true;
-                view.last_access = now;
-                scheduled += view.size;
-                if (scheduled >= bytes)
-                    break;
-                continue;
-            }
-            if (!UnmapViewOfFile2(process, backing_base + offset, MEM_PRESERVE_PLACEHOLDER))
-                continue;
-            view.is_resident = false;
-            --mapping_views;
-            view.swept = false;
-            released += view.size;
-            ++pager_evictions;
-            ++mapping_view_evictions;
-            if (released >= bytes)
-                break;
-        }
-    }
-
-    bool IsPinnedRegion(const MemoryRegion& region) const {
-        return std::ranges::any_of(pinned_ranges, [&](const auto& entry) {
-            const auto& [range, count] = entry;
-            return region.base < range.first + range.second &&
-                   range.first < region.base + region.size;
-        });
-    }
-
-    void RequestMappingRecovery() {
-        mapping_pressure_at = GetTickCount64();
-        mapping_recovery_requested.store(true, std::memory_order_release);
-        pager_wait.notify_all();
-    }
-
-    bool WaitForMappingRecovery(u64 epoch) {
-        std::unique_lock lock{pager_wait_mutex};
-        const auto started = std::chrono::steady_clock::now();
-        const bool recovered = pager_wait.wait_for(lock, std::chrono::milliseconds(10), [&] {
-            return mapping_recovery_epoch.load(std::memory_order_acquire) != epoch;
-        });
-        mapping_recovery_waits.fetch_add(1, std::memory_order_relaxed);
-        mapping_recovery_wait_us.fetch_add(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - started)
-                .count(),
-            std::memory_order_relaxed);
-        return recovered;
-    }
-
-    void ReleaseUnusedSwapSections() {
-        if (!swap_enabled)
-            return;
-        struct Candidate {
-            u64 index;
-            u64 access;
-            HANDLE section;
-            HANDLE file;
-        };
-        std::array<Candidate, 4> candidates{};
-        size_t count{};
-        {
-            std::scoped_lock lock{mutex};
-            std::vector<bool> active(ram_pages.size());
-            for (const auto &[base, region] : regions)
-                if (region.is_resident && region.fd == -1 && region.phys_base != PAddr(-1))
-                    active[region.phys_base / BackingViewSize] = true;
-            for (const auto &[offset, view] : backing_views)
-                if (view.is_resident)
-                    active[offset / BackingViewSize] = true;
-            std::scoped_lock pages_lock{ram_pages_mutex};
-            for (u64 index = 0; index < ram_pages.size() && count < candidates.size(); ++index) {
-                if (!ram_pages[index] || active[index] ||
-                    IsPinnedPhysical(index * BackingViewSize, BackingViewSize))
-                    continue;
-                HANDLE file{};
-                if (DuplicateHandle(process, swap_files[index], process, &file, 0, FALSE,
-                                    DUPLICATE_SAME_ACCESS))
-                    candidates[count++] = {index, section_accesses[index], ram_pages[index], file};
-            }
-        }
-        for (size_t i = 0; i < count; ++i) {
-            const auto &candidate = candidates[i];
-            const auto started = std::chrono::steady_clock::now();
-            const bool flushed = FlushFileBuffers(candidate.file);
-            section_flush_us.fetch_add(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - started)
-                    .count(),
-                std::memory_order_relaxed);
-            section_flushes.fetch_add(1, std::memory_order_relaxed);
-            CloseHandle(candidate.file);
-            if (!flushed)
-                continue;
-            std::scoped_lock lock{mutex};
-            std::scoped_lock pages_lock{ram_pages_mutex};
-            if (ram_pages[candidate.index] != candidate.section ||
-                section_accesses[candidate.index] != candidate.access ||
-                IsPinnedPhysical(candidate.index * BackingViewSize, BackingViewSize))
-                continue;
-            if (CloseHandle(candidate.section)) {
-                ram_pages[candidate.index] = nullptr;
-                --mapping_sections;
-                ++pager_emergencies;
-                pager_last_emergency = GetTickCount64();
-            }
-        }
-    }
-
-    bool ReleaseIdleGuestViews(const MemoryRegion* requested) {
-        std::vector<MemoryRegion*> candidates;
-        for (auto& [base, region] : regions) {
-            if (&region == requested || !region.is_resident || region.fd != -1 ||
-                region.phys_base == PAddr(-1) ||
-                NeedsExecutableView(region.prot, region.saved_protections) ||
-                IsPinnedRegion(region))
-                continue;
-            candidates.push_back(&region);
-        }
-        std::ranges::sort(candidates, {}, &MemoryRegion::residency_order);
-        const auto now = GetTickCount64();
-        u64 released{}, swept{};
-        for (auto *region : candidates) {
-            if (region->swept) {
-                if (now - region->residency_order < 100)
-                    continue;
-                UnmapRegion(region);
-                ++mapping_view_evictions;
-                if (++released == 16)
-                    break;
-            } else {
-                ApplyCommittedProtection(region->base, region->size, PAGE_NOACCESS);
-                region->swept = true;
-                region->residency_order = now;
-                if (++swept == 32)
-                    break;
-            }
-        }
-        RecoveryReport("guest_alias_views", candidates.size(), 0, released, 0, 0, 0);
-        return released != 0;
-    }
-
-    void* PopulateGuestView(MemoryRegion* region) {
-        auto* result = MapRegion(region, {}, true);
-        if (!result) {
-            const auto error = GetLastError();
-            if (IsMappingResourceError(error) && ReleaseIdleGuestViews(region))
-                result = MapRegion(region, {}, true);
-            else
-                SetLastError(error);
-        }
-        if (!result) {
-            const auto error = GetLastError();
-            if (IsMappingResourceError(error))
-                RequestMappingRecovery();
-            SetLastError(error);
-        }
-        if (!result && IsMappingResourceError(GetLastError()) &&
-            region->size > MinimumGuestViewSize) {
-            const auto error = GetLastError();
-            mapping_pressure_at = GetTickCount64();
-            if (preferred_view_size != MinimumGuestViewSize) {
-                preferred_view_size = MinimumGuestViewSize;
-                LOG_WARNING(Core, "[MemDiag] mapping_window_reduced size={:#x} win32={} va={:#x}",
-                            preferred_view_size, error, region->base);
-            }
-            SetLastError(error);
-            return nullptr;
-        }
-        return result;
-    }
-
-    bool MergeGuestViews(std::map<VAddr, MemoryRegion>::iterator left,
-                         std::map<VAddr, MemoryRegion>::iterator right, u64 maximum_size) {
-        auto &first = left->second;
-        const auto &second = right->second;
-        if (first.is_resident || second.is_resident || !first.is_mapped || !second.is_mapped ||
-            first.fd != -1 || second.fd != -1 || first.phys_base == PAddr(-1) ||
-            first.base + first.size != second.base ||
-            first.phys_base + first.size != second.phys_base || first.prot != second.prot ||
-            IsPinnedRegion(first) || IsPinnedRegion(second) ||
-            NeedsExecutableView(first.prot, first.saved_protections) ||
-            NeedsExecutableView(second.prot, second.saved_protections))
-            return false;
-        const auto size = first.size + second.size;
-        if (size > maximum_size || size > BackingViewSize - first.phys_base % BackingViewSize ||
-            Common::AlignDown(first.base, maximum_size) !=
-                Common::AlignDown(second.base + second.size - 1, maximum_size))
-            return false;
-        auto protections = first.saved_protections;
-        protections.insert(protections.end(), second.saved_protections.begin(),
-                           second.saved_protections.end());
-        if (!VirtualFreeEx(process, reinterpret_cast<void *>(first.base), size,
-                           MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
-            return false;
-        first.size = size;
-        first.saved_protections = std::move(protections);
-        first.residency_order = std::max(first.residency_order, second.residency_order);
-        regions.erase(right);
-        return true;
-    }
-
-    bool MergeBackingViews(std::map<u64, BackingView>::iterator left,
-                           std::map<u64, BackingView>::iterator right, u64 maximum_size) {
-        const auto size = left->second.size + right->second.size;
-        if (left->second.is_resident || right->second.is_resident ||
-            left->first + left->second.size != right->first || size > maximum_size ||
-            size > BackingViewSize - left->first % BackingViewSize ||
-            Common::AlignDown(left->first, maximum_size) !=
-                Common::AlignDown(right->first + right->second.size - 1, maximum_size) ||
-            IsPinnedPhysical(left->first, size))
-            return false;
-        if (!VirtualFreeEx(process, backing_base + left->first, size,
-                           MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
-            return false;
-        left->second.size = size;
-        left->second.last_access = std::max(left->second.last_access, right->second.last_access);
-        backing_views.erase(right);
-        return true;
-    }
-
-    void CoalesceDormantViews() {
-        u32 merged{};
-        for (auto it = regions.begin(); it != regions.end() && merged < 32;) {
-            const auto next = std::next(it);
-            if (next == regions.end())
-                break;
-            if (MergeGuestViews(it, next, preferred_view_size))
-                ++merged;
-            else
-                ++it;
-        }
-        std::scoped_lock backing_lock{backing_mutex};
-        merged = 0;
-        for (auto it = backing_views.begin(); it != backing_views.end() && merged < 32;) {
-            const auto next = std::next(it);
-            if (next == backing_views.end())
-                break;
-            if (MergeBackingViews(it, next, preferred_view_size))
-                ++merged;
-            else
-                ++it;
-        }
-    }
-
-    std::map<u64, BackingView>::iterator SelectBackingView(u64 offset, u64 maximum_size) {
-        auto it = std::prev(backing_views.upper_bound(offset));
-        while (it != backing_views.begin()) {
-            const auto previous = std::prev(it);
-            if (!MergeBackingViews(previous, it, maximum_size))
-                break;
-            it = previous;
-        }
-        while (std::next(it) != backing_views.end() &&
-               MergeBackingViews(it, std::next(it), maximum_size)) {
-        }
-        const auto begin = std::max(it->first, Common::AlignDown(offset, maximum_size));
-        if (begin != it->first) {
-            const auto prefix_size = begin - it->first;
-            if (!VirtualFreeEx(process, backing_base + it->first, prefix_size,
-                               MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-                return backing_views.end();
-            const auto remaining_size = it->second.size - prefix_size;
-            it->second.size = prefix_size;
-            it = backing_views.emplace(begin, BackingView{remaining_size}).first;
-        }
-        const auto size = std::min(maximum_size, it->second.size);
-        if (size != it->second.size) {
-            if (!VirtualFreeEx(process, backing_base + begin, size,
-                               MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-                return backing_views.end();
-            backing_views.emplace(begin + size, BackingView{it->second.size - size});
-            it->second.size = size;
-        }
-        return it;
-    }
-
-    bool MapBackingView(void* address, bool recover = true, u64 maximum_size = GuestViewSize) {
-        maximum_size = std::min(maximum_size, preferred_view_size);
-        const auto offset =
-            reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(backing_base);
-        if (offset >= BackingSize)
-            return false;
-        const u64 index = offset / BackingViewSize;
-        std::unique_lock lock{backing_mutex};
-        auto it = std::prev(backing_views.upper_bound(offset));
-        if (it->second.is_resident) {
-            if (it->second.swept) {
-                ApplyCommittedProtection(reinterpret_cast<VAddr>(backing_base + it->first),
-                                         it->second.size, PAGE_READWRITE);
-                it->second.swept = false;
-                ++pager_second_chances;
-            }
-            it->second.last_access = GetTickCount64();
-            return true;
-        }
-        it = SelectBackingView(offset, maximum_size);
-        if (it == backing_views.end()) {
-            MappingFailure("backing_placeholder_split", GetLastError(),
-                           reinterpret_cast<VAddr>(address), offset, maximum_size, PAGE_NOACCESS);
-            LOG_ERROR(Core, "Unable to split physical backing view at {:#x}: {}", offset,
-                      Common::GetLastErrorMsg());
-            return false;
-        }
-        const u64 view_offset = it->first;
-        const u64 view_size = it->second.size;
-        auto* base = backing_base + view_offset;
-        const auto handle = GetRamPage(index);
-        const u64 map_offset = view_offset % BackingViewSize;
-        if (!handle || MapHostView(handle, process, base, map_offset, view_size,
-                                   MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != base) {
-            const auto error = GetLastError();
-            if (handle)
-                MappingFailure("backing_view_map", error, reinterpret_cast<VAddr>(base),
-                               view_offset, view_size, PAGE_READWRITE, map_offset, handle,
-                               MEM_REPLACE_PLACEHOLDER);
-            lock.unlock();
-            if (IsMappingResourceError(error) && view_size > MinimumGuestViewSize) {
-                preferred_view_size = MinimumGuestViewSize;
-                LOG_WARNING(Core, "Reducing physical backing view at {:#x} after Win32 {}", offset,
-                            error);
-                return MapBackingView(address, recover, MinimumGuestViewSize);
-            }
-            if (recover && IsMappingResourceError(error))
-                RequestMappingRecovery();
-            SetLastError(error);
-            if (!IsMappingResourceError(error))
-                LOG_ERROR(Core, "Unable to map physical backing view at {:#x}: {}", view_offset,
-                          Common::GetLastErrorMsg());
-            SetLastError(error);
-            return false;
-        }
-        it->second.is_resident = true;
-        ++mapping_views;
-        it->second.swept = false;
-        it->second.last_access = GetTickCount64();
-        ++pager_page_ins;
-        return true;
-    }
-#endif
-
-#ifdef SHADPS4_UWP
-    bool MapGuestView(void* address, u64 access_type, bool* mapping_failed) {
-        const auto addr = reinterpret_cast<VAddr>(address);
-        std::scoped_lock lock{mutex};
-        auto it = regions.upper_bound(addr);
-        if (it == regions.begin())
-            return false;
-        auto selected = std::prev(it);
-        while (selected != regions.begin()) {
-            const auto previous = std::prev(selected);
-            if (!MergeGuestViews(previous, selected, preferred_view_size))
-                break;
-            selected = previous;
-        }
-        while (std::next(selected) != regions.end() &&
-               MergeGuestViews(selected, std::next(selected), preferred_view_size)) {
-        }
-        auto* region = &selected->second;
-        if (!region->is_mapped || region->fd != -1 || region->phys_base == PAddr(-1) ||
-            addr - region->base >= region->size)
-            return false;
-        RestoreSweptRegion(*region);
-        if (!region->is_resident) {
-            const auto select_view = [&](u64 view_size) {
-                const auto begin = std::max(region->base, Common::AlignDown(addr, view_size));
-                const auto size = std::min(view_size, region->base + region->size - begin);
-                SplitRegion(begin, size);
-                region = &std::prev(regions.upper_bound(addr))->second;
-            };
-            if (region->size > preferred_view_size)
-                select_view(preferred_view_size);
-            if (!PopulateGuestView(region)) {
-                const auto error = GetLastError();
-                if (!IsMappingResourceError(error) || region->size <= MinimumGuestViewSize) {
-                    if (mapping_failed)
-                        *mapping_failed = true;
-                    SetLastError(error);
-                    return false;
-                }
-                LOG_WARNING(Core, "Reducing RAM alias view at {:#x} after Win32 {}", addr, error);
-                select_view(MinimumGuestViewSize);
-                if (!PopulateGuestView(region)) {
-                    if (mapping_failed)
-                        *mapping_failed = true;
-                    const auto error = GetLastError();
-                    SetLastError(error);
-                    return false;
-                }
-            }
-        }
-        region->residency_order = GetTickCount64();
-        CommitPhysical(region->phys_base + addr - region->base);
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT ||
-            (info.Protect & PAGE_GUARD))
-            return false;
-        const auto prot = info.Protect & 0xff;
-        if (access_type == 1)
-            return prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE;
-        if (access_type == 8)
-            return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
-                   prot == PAGE_EXECUTE_READWRITE;
-        return prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READ ||
-               prot == PAGE_EXECUTE_READWRITE;
-    }
-
-    void ApplyCommittedProtection(VAddr address, u64 size, DWORD protection) {
-        const auto end = address + size;
-        while (address < end) {
-            MEMORY_BASIC_INFORMATION info{};
-            ASSERT_MSG(VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)),
-                       "Unable to query lazy memory protection");
-            const auto next =
-                std::min(end, reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize);
-            if (info.State == MEM_COMMIT) {
-                DWORD previous{};
-                ASSERT_MSG(VirtualProtect(reinterpret_cast<void*>(address), next - address,
-                                          protection, &previous),
-                           "Unable to protect lazy memory at {:#x}, size {:#x}, protection {:#x}, "
-                           "previous {:#x}, allocation {}: {}",
-                           address, next - address, protection, info.Protect, info.AllocationBase,
-                           Common::GetLastErrorMsg());
-            }
-            address = next;
-        }
-    }
-
-    void RestoreSweptRegion(MemoryRegion& region) {
-        if (!region.swept)
-            return;
-        region.swept = false;
-        if (!region.is_resident)
-            return;
-        ApplyCommittedProtection(region.base, region.size, region.prot);
-        for (const auto& info : region.saved_protections)
-            ApplyCommittedProtection(reinterpret_cast<VAddr>(info.BaseAddress), info.RegionSize,
-                                     info.Protect);
-        region.residency_order = GetTickCount64();
-        ++pager_second_chances;
-    }
-
-    void CommitPhysical(u64 offset) {
-        if (swap_enabled)
-            return;
-        const auto begin = Common::AlignDown(offset, commit_size);
-        auto* address = backing_base + begin;
-        ASSERT_MSG(MapBackingView(address), "Unable to map lazy physical memory");
-        MEMORY_BASIC_INFORMATION info{};
-        ASSERT_MSG(VirtualQuery(address, &info, sizeof(info)),
-                   "Unable to query lazy physical memory");
-        if (info.State == MEM_COMMIT)
-            return;
-        auto& sequence = commit_sequences[GetCurrentThreadId()];
-        const bool sequential = begin == sequence.end;
-        const u64 window =
-            sequential ? std::max(commit_size, sequence.length ? 64_KB : 16_KB) : commit_size;
-        u64 size = std::min({window, BackingSize - begin, BackingViewSize - begin % BackingViewSize,
-                             reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize -
-                                 reinterpret_cast<u64>(address)});
-        try {
-            const u64 limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
-            const u64 usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
-            if (limit && (usage >= limit || size > limit - usage ||
-                          HostMemoryReserve > limit - usage - size))
-                throw std::runtime_error(fmt::format(
-                    "UWP RAM budget exhausted: usage {} MiB, limit {} MiB, request {} MiB; "
-                    "demand commitment",
-                    usage / 1_MB, limit / 1_MB, size / 1_MB));
-        } catch (const winrt::hresult_error&) {
-        }
-        auto* committed = VirtualAllocFromApp(address, size, MEM_COMMIT, PAGE_READWRITE);
-        if (committed != address && size > commit_size) {
-            const auto error = GetLastError();
-            if (error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY ||
-                error == ERROR_COMMITMENT_LIMIT) {
-                size = commit_size;
-                committed = VirtualAllocFromApp(address, size, MEM_COMMIT, PAGE_READWRITE);
-            }
-        }
-        if (committed != address) {
-            const auto error = GetLastError();
-            u64 usage{}, limit{};
-            try {
-                usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
-                limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
-            } catch (const winrt::hresult_error&) {
-            }
-            throw std::runtime_error(
-                fmt::format("Unable to commit physical memory at {:#x}, size {:#x}: Win32 {}; "
-                            "committed {} MiB, app usage {} MiB, limit {} MiB: {}",
-                            begin, size, error, committed_bytes / 1_MB, usage / 1_MB, limit / 1_MB,
-                            Common::NativeErrorToString(error)));
-        }
-        committed_bytes += size;
-        sequence.end = begin + size;
-        sequence.length = sequential ? std::min(sequence.length + 1, 2u) : 0;
-        for (auto& [base, region] : regions) {
-            if (!region.is_resident || region.fd != -1 || region.phys_base == PAddr(-1))
-                continue;
-            const auto first = std::max(begin, region.phys_base);
-            const auto last = std::min(begin + size, region.phys_base + region.size);
-            if (first >= last)
-                continue;
-            const auto virtual_first = base + first - region.phys_base;
-            const auto virtual_last = base + last - region.phys_base;
-            ApplyCommittedProtection(virtual_first, last - first, region.prot);
-            for (const auto& protection : region.saved_protections) {
-                const auto protect_first =
-                    std::max(virtual_first, reinterpret_cast<VAddr>(protection.BaseAddress));
-                const auto protect_last =
-                    std::min(virtual_last, reinterpret_cast<VAddr>(protection.BaseAddress) +
-                                               protection.RegionSize);
-                if (protect_first < protect_last)
-                    ApplyCommittedProtection(protect_first, protect_last - protect_first,
-                                             protection.Protect);
-            }
-        }
-    }
-
-    HANDLE GetRamPage(u64 index) {
-        std::scoped_lock lock{ram_pages_mutex};
-        section_accesses[index] = ++section_access_clock;
-        if (ram_pages[index])
-            return ram_pages[index];
-        const u64 size = std::min(BackingViewSize, BackingSize - index * BackingViewSize);
-        HANDLE file = swap_files[index];
-        if (swap_enabled && file == INVALID_HANDLE_VALUE) {
-            const auto path =
-                swap_directory / fmt::format("{}-{}-{}.swap", GetCurrentProcessId(),
-                                             reinterpret_cast<uintptr_t>(this), index);
-            CREATEFILE2_EXTENDED_PARAMETERS parameters{sizeof(parameters)};
-            parameters.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-            parameters.dwFileFlags = FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_RANDOM_ACCESS;
-            file = CreateFile2FromAppW(
-                path.c_str(), GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, CREATE_ALWAYS, &parameters);
-            if (file == INVALID_HANDLE_VALUE) {
-                MappingFailure("swap_file_create", GetLastError(), 0, index * BackingViewSize, size,
-                               PAGE_EXECUTE_READWRITE);
-                throw std::runtime_error("Unable to create memory swap: " +
-                                         Common::GetLastErrorMsg());
-            }
-            swap_files[index] = file;
-        }
-        ram_pages[index] =
-            CreateFileMapping2(file, nullptr, FILE_MAP_ALL_ACCESS, PAGE_EXECUTE_READWRITE,
-                               swap_enabled ? SEC_COMMIT : SEC_RESERVE, size, nullptr, nullptr, 0);
-        if (ram_pages[index])
-            ++mapping_sections;
-        if (!ram_pages[index]) {
-            const auto error = GetLastError();
-            MappingFailure("ram_section_create", error, 0, index * BackingViewSize, size,
-                           PAGE_EXECUTE_READWRITE, 0, file,
-                           swap_enabled ? SEC_COMMIT : SEC_RESERVE);
-            SetLastError(error);
-        }
-        return ram_pages[index];
-    }
-
-    static bool IsMappingResourceError(DWORD error) {
-        return error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY ||
-               error == ERROR_COMMITMENT_LIMIT || error == ERROR_NO_SYSTEM_RESOURCES ||
-               error == ERROR_WORKING_SET_QUOTA || error == ERROR_PAGEFILE_QUOTA ||
-               error == ERROR_NOT_ENOUGH_QUOTA;
-    }
-
-    static bool IsExecutableProtection(DWORD protection) {
-        return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
-               protection == PAGE_EXECUTE_READWRITE;
-    }
-
-    static bool NeedsExecutableView(DWORD protection,
-                                    std::span<const MEMORY_BASIC_INFORMATION> protections) {
-        if (IsExecutableProtection(protection))
-            return true;
-        return std::ranges::any_of(
-            protections, [](const auto& info) { return IsExecutableProtection(info.Protect); });
-    }
-
-    static void SaveProtections(MemoryRegion* region,
-                                std::span<const MEMORY_BASIC_INFORMATION> protections) {
-        region->saved_protections.clear();
-        for (auto info : protections) {
-            const auto first = std::max(region->base, reinterpret_cast<VAddr>(info.BaseAddress));
-            const auto last = std::min(region->base + region->size,
-                                       reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize);
-            if (first >= last)
-                continue;
-            info.BaseAddress = reinterpret_cast<void*>(first);
-            info.RegionSize = last - first;
-            region->saved_protections.push_back(info);
-        }
-    }
-#endif
 
     ~Impl() {
-#ifdef SHADPS4_UWP
-        StopPager();
-        LOG_INFO(Core, "UWP demand memory: {} KiB committed, swap {}", committed_bytes / 1_KB,
-                 swap_enabled ? "enabled" : "disabled");
-        for (const auto& [address, region] : regions) {
-            if (region.is_mapped && region.is_resident) {
-                if ((region.fd != -1 && region.prot != PAGE_READONLY) ||
-                    (region.fd == -1 && region.phys_base != PAddr(-1))) {
-                    if (!UnmapViewOfFile2(process, reinterpret_cast<void*>(address),
-                                          MEM_PRESERVE_PLACEHOLDER))
-                        LOG_ERROR(Core, "Failed to unmap guest region {:#x}: {}", address,
-                                  GetLastError());
-                } else if (!VirtualFreeEx(process, reinterpret_cast<void*>(address), region.size,
-                                          MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
-                    LOG_ERROR(Core, "Failed to restore guest placeholder {:#x}: {}", address,
-                              GetLastError());
-                }
-            }
-            if (!VirtualFreeEx(process, reinterpret_cast<void*>(address), 0, MEM_RELEASE))
-                LOG_ERROR(Core, "Failed to release guest region {:#x}: {}", address,
-                          GetLastError());
-        }
-#endif
         if (virtual_base) {
             if (!VirtualFree(virtual_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(Core, "Failed to free virtual memory");
             }
         }
         if (backing_base) {
-#ifdef SHADPS4_UWP
-            active_backing.store(nullptr);
-            for (const auto& [offset, view] : backing_views) {
-                if (view.is_resident)
-                    UnmapViewOfFile2(process, backing_base + offset, MEM_PRESERVE_PLACEHOLDER);
-            }
-            VirtualFreeEx(process, backing_base, BackingSize,
-                          MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
-            VirtualFreeEx(process, backing_base, 0, MEM_RELEASE);
-#else
             if (!UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER)) {
                 LOG_CRITICAL(Core, "Failed to unmap backing memory placeholder");
             }
             if (!VirtualFreeEx(process, backing_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(Core, "Failed to free backing memory");
             }
-#endif
         }
-#ifdef SHADPS4_UWP
-        for (auto page : ram_pages) {
-            if (page)
-                CloseHandle(page);
-        }
-        for (auto file : swap_files) {
-            if (file != INVALID_HANDLE_VALUE)
-                CloseHandle(file);
-        }
-#endif
         if (backing_handle && !CloseHandle(backing_handle)) {
             LOG_CRITICAL(Core, "Failed to free backing memory file handle");
         }
@@ -1440,26 +281,6 @@ struct AddressSpace::Impl {
         void* ptr = nullptr;
         if (phys_addr != -1) {
             HANDLE backing = fd != -1 ? reinterpret_cast<HANDLE>(fd) : backing_handle;
-#ifdef SHADPS4_UWP
-            if (fd == -1) {
-                ASSERT_MSG(phys_addr <= BackingSize && size <= BackingSize - phys_addr,
-                           "Physical backing range exceeds reserved memory");
-                if (!populate) {
-                    SaveProtections(region, protections);
-                    return reinterpret_cast<void*>(virtual_addr);
-                }
-                ASSERT_MSG(size <= BackingViewSize - phys_addr % BackingViewSize,
-                           "RAM alias crosses resident page boundary");
-                backing = GetRamPage(phys_addr / BackingViewSize);
-                if (!backing) {
-                    const auto error = GetLastError();
-                    SaveProtections(region, protections);
-                    SetLastError(error);
-                    return nullptr;
-                }
-                map_offset = phys_addr % BackingViewSize;
-            }
-#endif
             if (fd != -1 && prot == PAGE_READONLY) {
                 // Allocate the memory for the mapping
                 DWORD resultvar;
@@ -1486,40 +307,14 @@ struct AddressSpace::Impl {
                 ret = VirtualProtect(ptr, size, prot, &resultvar);
                 ASSERT_MSG(ret, "VirtualProtect failed. {}", Common::GetLastErrorMsg());
             } else {
-#ifdef SHADPS4_UWP
-                if (fd == -1) {
-                    const DWORD view_protection = NeedsExecutableView(prot, protections)
-                                                      ? PAGE_EXECUTE_READWRITE
-                                                      : PAGE_READWRITE;
-                    ptr = MapHostView(backing, process, reinterpret_cast<PVOID>(virtual_addr),
-                                      map_offset, size, MEM_REPLACE_PLACEHOLDER, view_protection,
-                                      nullptr, 0);
-                    if (!ptr) {
-                        const auto error = GetLastError();
-                        MappingFailure(view_protection == PAGE_READWRITE
-                                           ? "guest_alias_map_from_app"
-                                           : "guest_alias_map_native",
-                                       error, virtual_addr, phys_addr, size, view_protection,
-                                       map_offset, backing, MEM_REPLACE_PLACEHOLDER);
-                        SaveProtections(region, protections);
-                        SetLastError(error);
-                        return nullptr;
-                    }
-                    ApplyCommittedProtection(virtual_addr, size, prot);
-                } else
-#endif
                     if (prot == PAGE_NOACCESS) {
                     DWORD resultvar;
                     ptr = MapHostView(backing, process, reinterpret_cast<PVOID>(virtual_addr),
                                       map_offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
                                       nullptr, 0);
                     ASSERT_MSG(ptr, "MapViewOfFile3 failed. {}", Common::GetLastErrorMsg());
-#ifdef SHADPS4_UWP
-                    ApplyCommittedProtection(virtual_addr, size, prot);
-#else
                     bool ret = VirtualProtect(ptr, size, prot, &resultvar);
                     ASSERT_MSG(ret, "VirtualProtect failed. {}", Common::GetLastErrorMsg());
-#endif
                 } else {
                     ptr = MapHostView(backing, process, reinterpret_cast<PVOID>(virtual_addr),
                                       map_offset, size, MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
@@ -1532,10 +327,6 @@ struct AddressSpace::Impl {
                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
         }
         ASSERT_MSG(ptr, "{}", Common::GetLastErrorMsg());
-#ifdef SHADPS4_UWP
-        if (!region->is_resident && fd == -1 && phys_addr != PAddr(-1))
-            ++mapping_views;
-#endif
         region->is_resident = true;
 
         for (const auto& info : protections) {
@@ -1545,30 +336,17 @@ struct AddressSpace::Impl {
             if (begin >= end) {
                 continue;
             }
-#ifdef SHADPS4_UWP
-            ApplyCommittedProtection(begin, end - begin, info.Protect);
-#else
             DWORD old_flags{};
             const bool ret =
                 VirtualProtectEx(process, LPVOID(begin), end - begin, info.Protect, &old_flags);
             ASSERT_MSG(ret, "VirtualProtectEx failed. {}", Common::GetLastErrorMsg());
-#endif
         }
-#ifdef SHADPS4_UWP
-        if (fd == -1 && phys_addr != PAddr(-1)) {
-            SaveProtections(region, protections);
-        }
-#endif
         return ptr;
     }
 
     std::vector<MEMORY_BASIC_INFORMATION> QueryProtections(const MemoryRegion& region,
                                                            VAddr skip_addr, u64 skip_size) {
         std::vector<MEMORY_BASIC_INFORMATION> protections;
-#ifdef SHADPS4_UWP
-        if (!region.is_resident || (region.fd == -1 && region.phys_base != PAddr(-1)))
-            return region.saved_protections;
-#endif
         const VAddr end = region.base + region.size;
         for (VAddr addr = region.base; addr < end;) {
             if (addr >= skip_addr && addr < skip_addr + skip_size) {
@@ -1587,11 +365,6 @@ struct AddressSpace::Impl {
     }
 
     void UnmapRegion(MemoryRegion* region) {
-#ifdef SHADPS4_UWP
-        region->swept = false;
-        if (!region->is_resident)
-            return;
-#endif
         VAddr virtual_addr = region->base;
         PAddr phys_base = region->phys_base;
         u64 size = region->size;
@@ -1608,10 +381,6 @@ struct AddressSpace::Impl {
         }
         ASSERT_MSG(ret, "Unmap on virtual_addr {:#x}, size {:#x} failed: {}", virtual_addr, size,
                    Common::GetLastErrorMsg());
-#ifdef SHADPS4_UWP
-        if (fd == -1 && phys_base != PAddr(-1))
-            --mapping_views;
-#endif
         region->is_resident = false;
     }
 
@@ -1704,28 +473,7 @@ struct AddressSpace::Impl {
     }
 
     void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, ULONG prot, s32 fd = -1) {
-#ifdef SHADPS4_UWP
-        if (fd == -1 && phys_addr != PAddr(-1) &&
-            size > BackingViewSize - phys_addr % BackingViewSize) {
-            const auto first_size = BackingViewSize - phys_addr % BackingViewSize;
-            auto* result = Map(virtual_addr, phys_addr, first_size, prot, fd);
-            Map(virtual_addr + first_size, phys_addr + first_size, size - first_size, prot, fd);
-            return result;
-        }
-        if (fd == -1 && phys_addr != PAddr(-1) && size > BackingViewSize) {
-            void* result{};
-            for (u64 offset = 0; offset < size;) {
-                const auto view_size = std::min(BackingViewSize, size - offset);
-                auto* mapped = Map(virtual_addr + offset, phys_addr + offset, view_size, prot, fd);
-                if (!offset)
-                    result = mapped;
-                offset += view_size;
-            }
-            return result;
-        }
-
-#endif
-        std::scoped_lock lk{mutex};
+        MemoryLock lk{mutex};
         // Get a pointer to the region containing virtual_addr
         auto it = std::prev(regions.upper_bound(virtual_addr));
 
@@ -1794,7 +542,7 @@ struct AddressSpace::Impl {
     }
 
     VAddr Unmap(VAddr virtual_addr, u64* size) {
-        std::scoped_lock lk{mutex};
+        MemoryLock lk{mutex};
         // Loop through all regions in the requested range
         u64 remaining_size = *size;
         VAddr current_addr = virtual_addr;
@@ -1824,9 +572,6 @@ struct AddressSpace::Impl {
             region.fd = -1;
             region.phys_base = -1;
             region.prot = PAGE_NOACCESS;
-#ifdef SHADPS4_UWP
-            region.saved_protections.clear();
-#endif
 
             // Update loop variables
             remaining_size -= size_to_unmap;
@@ -1840,7 +585,7 @@ struct AddressSpace::Impl {
     }
 
     void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
-        std::scoped_lock lk{mutex};
+        MemoryLock lk{mutex};
         DWORD new_flags{};
 
         if (write && !read) {
@@ -1887,49 +632,6 @@ struct AddressSpace::Impl {
             auto& region = it->second;
             const u64 range_addr = std::max(region.base, virtual_addr);
             const u64 range_size = std::min(region.base + region.size, virtual_end) - range_addr;
-#ifdef SHADPS4_UWP
-            if (region.fd == -1 && region.phys_base != PAddr(-1)) {
-                RestoreSweptRegion(region);
-                const bool was_executable =
-                    NeedsExecutableView(region.prot, region.saved_protections);
-                if (range_addr == region.base && range_size == region.size) {
-                    region.prot = new_flags;
-                    region.saved_protections.clear();
-                } else {
-                    MEMORY_BASIC_INFORMATION info{};
-                    info.BaseAddress = reinterpret_cast<void*>(range_addr);
-                    info.RegionSize = range_size;
-                    info.Protect = new_flags;
-                    std::vector<MEMORY_BASIC_INFORMATION> protections;
-                    for (auto previous : region.saved_protections) {
-                        const auto first = reinterpret_cast<VAddr>(previous.BaseAddress);
-                        const auto last = first + previous.RegionSize;
-                        if (first < range_addr) {
-                            auto prefix = previous;
-                            prefix.RegionSize = std::min(last, range_addr) - first;
-                            protections.push_back(prefix);
-                        }
-                        if (last > range_addr + range_size) {
-                            const auto suffix = std::max(first, range_addr + range_size);
-                            previous.BaseAddress = reinterpret_cast<void*>(suffix);
-                            previous.RegionSize = last - suffix;
-                            protections.push_back(previous);
-                        }
-                    }
-                    if (new_flags != region.prot)
-                        protections.push_back(info);
-                    region.saved_protections = std::move(protections);
-                }
-                if (region.is_resident) {
-                    if (was_executable !=
-                        NeedsExecutableView(region.prot, region.saved_protections))
-                        UnmapRegion(&region);
-                    else
-                        ApplyCommittedProtection(range_addr, range_size, new_flags);
-                }
-                continue;
-            }
-#endif
             DWORD old_flags{};
             if (!VirtualProtectEx(process, LPVOID(range_addr), range_size, new_flags, &old_flags)) {
                 UNREACHABLE_MSG(
@@ -1948,7 +650,7 @@ struct AddressSpace::Impl {
         return reserved_regions;
     }
 
-    std::recursive_mutex mutex;
+    MemoryMutex mutex;
     HANDLE process{};
     HANDLE backing_handle{};
     u8* backing_base{};
@@ -1961,6 +663,8 @@ struct AddressSpace::Impl {
     u64 user_size{};
     std::map<VAddr, MemoryRegion> regions;
 };
+#endif
+
 #else
 
 enum PosixPageProtection {
@@ -2178,268 +882,11 @@ AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
 AddressSpace::~AddressSpace() = default;
 
 #ifdef SHADPS4_UWP
-void AddressSpace::StartPager() {
-    if (auto* backing = Impl::active_backing.load(std::memory_order_acquire))
-        backing->StartPager();
-}
-
-void AddressSpace::StopPager() {
-    if (auto* backing = Impl::active_backing.load(std::memory_order_acquire))
-        backing->StopPager();
-}
-
-bool AddressSpace::HandleBackingFault(void* address, u64 access_type, bool* mapping_failed) {
-    if (mapping_failed)
-        *mapping_failed = false;
-    auto* thread = Libraries::Kernel::g_curthread;
-    if (thread)
-        thread->critical_count.fetch_add(1, std::memory_order_acq_rel);
-    auto leave_critical = ::detail::MakeScopeGuard([&] {
-        if (thread)
-            thread->critical_count.fetch_sub(1, std::memory_order_acq_rel);
-    });
-    auto* backing = Impl::active_backing.load();
-    if (!backing)
-        return false;
-    const auto offset =
-        reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(backing->backing_base);
-    const auto started = GetTickCount64();
-    u32 recoveries{};
-    for (;;) {
-        const auto epoch = backing->mapping_recovery_epoch.load(std::memory_order_acquire);
-        bool failed{};
-        bool handled{};
-        DWORD error{};
-        if (offset < BackingSize) {
-            std::scoped_lock lock{backing->mutex};
-            handled = backing->MapBackingView(address);
-            error = GetLastError();
-            if (!handled) {
-                MEMORY_BASIC_INFORMATION info{};
-                handled = VirtualQuery(address, &info, sizeof(info)) && info.Type == MEM_MAPPED;
-                failed = !handled;
-            }
-            if (handled)
-                backing->CommitPhysical(offset);
-        } else {
-            handled = backing->MapGuestView(address, access_type, &failed);
-            error = GetLastError();
-        }
-        if (handled)
-            return true;
-        if (!failed || !Impl::IsMappingResourceError(error) ||
-            GetTickCount64() - started >= 30000) {
-            if (mapping_failed)
-                *mapping_failed = failed;
-            if (failed)
-                LOG_ERROR(Core, "Unable to recover RAM mapping at {} after {} retries: Win32 {}",
-                          address, recoveries, error);
-            SetLastError(error);
-            return false;
-        }
-        if (GetTickCount64() - started >= 1000)
-            backing->section_recovery_requested.store(true, std::memory_order_release);
-        backing->mapping_recovery_requested.store(true, std::memory_order_release);
-        backing->pager_wait.notify_all();
-        if (backing->WaitForMappingRecovery(epoch))
-            ++recoveries;
-    }
-}
-
-void AddressSpace::PinMappings(VAddr address, u64 size, bool protect) {
-    MemoryCriticalScope critical;
-    if (!address || !size || address > UINT64_MAX - size)
-        return;
-    std::scoped_lock lock{impl->mutex};
-    const auto key = std::pair{address, size};
-    if (protect) {
-        ++impl->pinned_ranges[key];
-    } else if (auto it = impl->pinned_ranges.find(key); it != impl->pinned_ranges.end()) {
-        if (--it->second == 0)
-            impl->pinned_ranges.erase(it);
-    }
-}
-
-std::shared_ptr<void> AddressSpace::AcquireHostAccess(const void* address, u64 size,
-                                                      bool populate) {
-    MemoryCriticalScope critical;
-    const auto begin = reinterpret_cast<VAddr>(address);
-    if (!begin || !size || begin > UINT64_MAX - size)
-        return {};
-    auto* backing = Impl::active_backing.load(std::memory_order_acquire);
-    if (!backing)
-        return {};
-    const auto accessible_end = [](VAddr cursor, VAddr end) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) &&
-            info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
-            return std::min(end, reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize);
-        }
-        return std::min(end, Common::AlignDown(cursor, u64{4096}) + 4096);
-    };
-    std::unique_lock lock{backing->mutex};
-    const auto physical = begin - reinterpret_cast<VAddr>(backing->backing_base);
-    if (physical < BackingSize) {
-        if (size > BackingSize - physical)
-            throw std::runtime_error("Host buffer exceeds physical memory");
-        const auto key = std::pair{physical, size};
-        ++backing->pinned_physical[key];
-        auto lease = std::shared_ptr<void>{backing, [key](void* pointer) {
-                                               MemoryCriticalScope critical;
-                                               auto* backing = static_cast<Impl*>(pointer);
-                                               std::scoped_lock lock{backing->mutex};
-                                               if (--backing->pinned_physical[key] == 0)
-                                                   backing->pinned_physical.erase(key);
-                                           }};
-        lock.unlock();
-        for (auto offset = physical; populate && offset < physical + size;) {
-            bool failed{};
-            if (!HandleBackingFault(backing->backing_base + offset, 0, &failed))
-                throw std::runtime_error("Unable to populate host physical buffer: " +
-                                         Common::GetLastErrorMsg());
-            offset = accessible_end(reinterpret_cast<VAddr>(backing->backing_base + offset),
-                                    begin + size) -
-                     reinterpret_cast<VAddr>(backing->backing_base);
-        }
-        return lease;
-    }
-    auto it = backing->regions.upper_bound(begin);
-    if (it == backing->regions.begin())
-        return {};
-    const auto& region = std::prev(it)->second;
-    if (!region.is_mapped || begin - region.base >= region.size)
-        return {};
-    const auto key = std::pair{begin, size};
-    ++backing->pinned_ranges[key];
-    auto lease = std::shared_ptr<void>{backing, [key](void* pointer) {
-                                           MemoryCriticalScope critical;
-                                           auto* backing = static_cast<Impl*>(pointer);
-                                           std::scoped_lock lock{backing->mutex};
-                                           if (--backing->pinned_ranges[key] == 0)
-                                               backing->pinned_ranges.erase(key);
-                                       }};
-    if (!populate)
-        return lease;
-    for (auto cursor = begin; cursor < begin + size;) {
-        auto next = backing->regions.upper_bound(cursor);
-        if (next == backing->regions.begin())
-            throw std::runtime_error("Unmapped host guest buffer");
-        const auto& part = std::prev(next)->second;
-        if (!part.is_mapped || cursor - part.base >= part.size)
-            throw std::runtime_error("Host guest buffer contains an unmapped gap");
-        const bool ram = part.fd == -1 && part.phys_base != PAddr(-1);
-        const auto end = std::min(begin + size, part.base + part.size);
-        lock.unlock();
-        if (ram) {
-            bool failed{};
-            if (!HandleBackingFault(reinterpret_cast<void*>(cursor), 0, &failed))
-                throw std::runtime_error("Unable to populate host guest buffer");
-        }
-        lock.lock();
-        cursor = ram ? accessible_end(cursor, end) : end;
-    }
-    return lease;
-}
-
-bool AddressSpace::CopyBacking(void* destination, const void* source, u64 size) {
-    MemoryCriticalScope critical;
-    auto* backing = Impl::active_backing.load(std::memory_order_acquire);
-    if (!backing || !size)
-        return false;
-    auto* output = static_cast<u8*>(destination);
-    auto* input = static_cast<const u8*>(source);
-    const auto base = reinterpret_cast<VAddr>(backing->backing_base);
-    const auto src = reinterpret_cast<VAddr>(source) - base;
-    const auto dst = reinterpret_cast<VAddr>(destination) - base;
-    if (src >= BackingSize && dst >= BackingSize)
-        return false;
-    if ((src < BackingSize && size > BackingSize - src) ||
-        (dst < BackingSize && size > BackingSize - dst))
-        throw std::runtime_error("Physical memory copy exceeds backing");
-    while (size) {
-        auto chunk = std::min(size, Impl::MinimumGuestViewSize);
-        if (src < BackingSize)
-            chunk = std::min(chunk,
-                             Impl::MinimumGuestViewSize - (reinterpret_cast<VAddr>(input) - base) %
-                                                              Impl::MinimumGuestViewSize);
-        if (dst < BackingSize)
-            chunk = std::min(chunk,
-                             Impl::MinimumGuestViewSize - (reinterpret_cast<VAddr>(output) - base) %
-                                                              Impl::MinimumGuestViewSize);
-        auto read = AcquireHostAccess(input, chunk, src >= BackingSize);
-        auto write = AcquireHostAccess(output, chunk, dst >= BackingSize);
-        const auto started = GetTickCount64();
-        for (;;) {
-            const auto epoch = backing->mapping_recovery_epoch.load(std::memory_order_acquire);
-            std::unique_lock lock{backing->mutex};
-            DWORD error{};
-            {
-                std::array<void*, 2> scratch{};
-                auto cleanup = ::detail::MakeScopeGuard([&] {
-                    for (auto* view : scratch)
-                        if (view)
-                            UnmapViewOfFile2(backing->process, view, 0);
-                });
-                const auto access = [&](const void* pointer, u32 slot) -> void* {
-                    const auto offset = reinterpret_cast<VAddr>(pointer) - base;
-                    if (offset >= BackingSize)
-                        return const_cast<void*>(pointer);
-                    const auto view = std::prev(backing->backing_views.upper_bound(offset));
-                    if (view->second.is_resident || !backing->swap_enabled) {
-                        if (!backing->MapBackingView(const_cast<void*>(pointer), true)) {
-                            error = GetLastError();
-                            return nullptr;
-                        }
-                        if (!backing->swap_enabled)
-                            backing->CommitPhysical(offset);
-                        return const_cast<void*>(pointer);
-                    }
-                    if (backing->MapBackingView(const_cast<void*>(pointer), false))
-                        return const_cast<void*>(pointer);
-                    const auto aligned = Common::AlignDown(offset, Impl::MinimumGuestViewSize);
-                    const auto length = std::min(Impl::MinimumGuestViewSize, BackingSize - aligned);
-                    const auto handle = backing->GetRamPage(offset / Impl::BackingViewSize);
-                    scratch[slot] = handle ? MapHostView(handle, backing->process, nullptr,
-                                                         aligned % Impl::BackingViewSize, length, 0,
-                                                         PAGE_READWRITE, nullptr, 0)
-                                           : nullptr;
-                    if (!scratch[slot]) {
-                        error = GetLastError();
-                        backing->MappingFailure(
-                            "store_view_map", error, reinterpret_cast<VAddr>(pointer), offset,
-                            length, PAGE_READWRITE, aligned % Impl::BackingViewSize, handle, 0);
-                        return nullptr;
-                    }
-                    ++backing->pager_store_copies;
-                    return static_cast<u8*>(scratch[slot]) + offset - aligned;
-                };
-                const auto* from = access(input, 0);
-                auto* to = from ? access(output, 1) : nullptr;
-                if (from && to) {
-                    std::memcpy(to, from, chunk);
-                    break;
-                }
-            }
-            if (!Impl::IsMappingResourceError(error) || GetTickCount64() - started >= 30000) {
-                SetLastError(error);
-                throw std::runtime_error("Unable to access memory store: " +
-                                         Common::GetLastErrorMsg());
-            }
-            if (GetTickCount64() - started >= 1000)
-                backing->section_recovery_requested.store(true, std::memory_order_release);
-            backing->RequestMappingRecovery();
-            lock.unlock();
-            backing->WaitForMappingRecovery(epoch);
-        }
-        output += chunk;
-        input += chunk;
-        size -= chunk;
-    }
-    return true;
-}
+#include "core/uwp/address_space_api.inc"
 #endif
 
-void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_exec) {
+void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_exec,
+                        s32 memory_type) {
     const VAddr end_addr = virtual_addr + size - 1;
     if (phys_addr != -1 && std::bit_width(end_addr) <= Traits::ADDRESS_SPACE_BITS) {
         const u64 base_page = virtual_addr >> Traits::PAGE_BITS;
@@ -2455,7 +902,12 @@ void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_e
     // canonical copy of the memory and rely on the JIT to map translated code as executable.
     constexpr auto prot = PAGE_READWRITE;
 #endif
+#ifdef SHADPS4_UWP
+    MemoryCriticalScope critical;
+    return impl->Map(virtual_addr, phys_addr, size, prot, uintptr_t(-1), memory_type);
+#else
     return impl->Map(virtual_addr, phys_addr, size, prot);
+#endif
 }
 
 void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd) {

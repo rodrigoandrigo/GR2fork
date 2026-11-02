@@ -114,6 +114,8 @@ void DestroyFreeTypeFace(FT_Face& face) {
     face = nullptr;
 }
 
+static std::optional<std::filesystem::path> ResolveBuiltinSysFontAlias(std::string_view filename);
+
 namespace {
 
 constexpr std::string_view kBuiltinFontPrefix = "@builtin/";
@@ -460,13 +462,17 @@ static std::optional<std::filesystem::path> ResolveKnownSysFontAliasImpl(
     }};
 
     for (const auto& [from, to] : kAliases) {
-        if (ps4_filename == from) {
-            return resolve_existing(to);
+        if (EqualsAsciiInsensitive(ps4_filename, from)) {
+            if (auto existing = resolve_existing(to)) {
+                return existing;
+            }
+            return ResolveBuiltinSysFontAlias(to);
         }
-        if (ps4_filename == to) {
+        if (EqualsAsciiInsensitive(ps4_filename, to)) {
             if (auto reverse = resolve_existing(from)) {
                 return reverse;
             }
+            return ResolveBuiltinSysFontAlias(to);
         }
     }
     return std::nullopt;
@@ -1888,12 +1894,10 @@ std::shared_ptr<std::vector<unsigned char>> LoadBuiltinFontBytesShared(
     static std::mutex cache_mutex;
     static std::unordered_map<std::string, std::shared_ptr<std::vector<unsigned char>>> cache;
 
-    const std::string cache_key(blob->virtual_path);
-    {
-        std::scoped_lock lock(cache_mutex);
-        if (const auto it = cache.find(cache_key); it != cache.end()) {
-            return it->second;
-        }
+    const std::string cache_key = fmt::format("{}", fmt::ptr(blob->compressed_data));
+    std::scoped_lock lock(cache_mutex);
+    if (const auto it = cache.find(cache_key); it != cache.end()) {
+        return it->second;
     }
 
     const unsigned int output_len = StbDecompressLength(blob->compressed_data);
@@ -1906,10 +1910,7 @@ std::shared_ptr<std::vector<unsigned char>> LoadBuiltinFontBytesShared(
         return {};
     }
 
-    {
-        std::scoped_lock lock(cache_mutex);
-        return cache.emplace(cache_key, std::move(bytes)).first->second;
-    }
+    return cache.emplace(cache_key, std::move(bytes)).first->second;
 }
 
 bool IsBuiltinFontPath(const std::filesystem::path& path) {
@@ -2014,6 +2015,15 @@ BuiltinSystemFontSelection BuildBuiltinSystemFontSelection(u32 font_set_type) {
     return selection;
 }
 
+static std::optional<std::filesystem::path> ResolveBuiltinSysFontAlias(std::string_view filename) {
+    for (const auto& definition : kSystemFontDefinitions) {
+        if (EqualsAsciiInsensitive(filename, definition.default_file)) {
+            return BuildBuiltinSystemFontSelection(definition.font_set_type).primary_path;
+        }
+    }
+    return std::nullopt;
+}
+
 static bool DirectoryContainsAnyFontFiles(const std::filesystem::path& dir) {
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) {
@@ -2075,7 +2085,7 @@ static std::filesystem::path GetSysFontBaseDirImpl(bool log_errors) {
 }
 
 std::filesystem::path GetSysFontBaseDir() {
-    return GetSysFontBaseDirImpl(true);
+    return GetSysFontBaseDirImpl(false);
 }
 
 static std::filesystem::path ResolveSystemFontPathCandidate(const std::filesystem::path& base_dir,
@@ -2118,13 +2128,18 @@ static std::filesystem::path ResolveSystemFontPathCandidate(const std::filesyste
 
 std::filesystem::path ResolveSystemFontPath(u32 font_set_type) {
     if (const auto* def = FindSystemFontDefinition(font_set_type); def) {
-        const auto base_dir = GetSysFontBaseDir();
-        if (base_dir.empty()) {
-            return {};
+        const auto base_dir = GetSysFontBaseDirImpl(false);
+        if (!base_dir.empty() && def->default_file && *def->default_file) {
+            const auto candidate = ResolveSystemFontPathCandidate(base_dir, def->default_file);
+            std::error_code error;
+            if (std::filesystem::is_regular_file(candidate, error)) {
+                return candidate;
+            }
+            if (const auto alias = ResolveKnownSysFontAlias(base_dir, def->default_file)) {
+                return *alias;
+            }
         }
-        if (def->default_file && *def->default_file) {
-            return ResolveSystemFontPathCandidate(base_dir, def->default_file);
-        }
+        return BuildBuiltinSystemFontSelection(font_set_type).primary_path;
     }
     LOG_ERROR(Lib_Font, "SystemFonts: unknown font set type=0x{:08X}", font_set_type);
     return {};
@@ -2137,19 +2152,18 @@ const FontSetCache* EnsureFontSetCache(u32 font_set_type) {
     std::scoped_lock lock(g_fontset_cache_mutex);
     auto& cache = g_fontset_cache[font_set_type];
     if (!cache.loaded) {
-        cache.loaded = true;
         auto path = ResolveSystemFontPath(font_set_type);
-        if (path.empty()) {
+        if (path.empty() || !LoadFontFile(path, cache.bytes) || !HasSfntTables(cache.bytes)) {
             path = BuildBuiltinSystemFontSelection(font_set_type).primary_path;
+            if (path.empty() || !LoadFontFile(path, cache.bytes) || !HasSfntTables(cache.bytes)) {
+                cache.bytes.clear();
+                LOG_ERROR(Lib_Font, "SystemFonts: failed to load font set {:#x}", font_set_type);
+                return nullptr;
+            }
         }
-        if (!path.empty() && LoadFontFile(path, cache.bytes)) {
-            cache.available = HasSfntTables(cache.bytes);
-            cache.path = cache.available ? path : std::filesystem::path{};
-        } else {
-            cache.available = false;
-            LOG_ERROR(Lib_Font, "SystemFonts: failed to load font for set type=0x{:08X} path='{}'",
-                      font_set_type, path.string());
-        }
+        cache.loaded = true;
+        cache.available = true;
+        cache.path = path;
     }
     return cache.available ? &cache : nullptr;
 }
@@ -2158,13 +2172,45 @@ bool HasSfntTables(const std::vector<unsigned char>& bytes) {
     if (bytes.size() < 12) {
         return false;
     }
-    const u8* ptr = bytes.data();
-    const u32 num_tables = (ptr[4] << 8) | ptr[5];
-    constexpr u32 kDirEntrySize = 16;
-    if (bytes.size() < 12 + static_cast<size_t>(num_tables) * kDirEntrySize) {
-        return false;
+    const auto word = [&](size_t offset) {
+        return (u32{bytes[offset]} << 24) | (u32{bytes[offset + 1]} << 16) |
+               (u32{bytes[offset + 2]} << 8) | u32{bytes[offset + 3]};
+    };
+    const auto valid_face = [&](size_t offset) {
+        if (offset > bytes.size() || bytes.size() - offset < 12) {
+            return false;
+        }
+        const u32 tag = word(offset);
+        if (tag != 0x00010000 && tag != 0x4f54544f && tag != 0x74727565) {
+            return false;
+        }
+        const size_t tables = (u32{bytes[offset + 4]} << 8) | bytes[offset + 5];
+        if (!tables || tables > (bytes.size() - offset - 12) / 16) {
+            return false;
+        }
+        for (size_t i = 0; i < tables; ++i) {
+            const size_t entry = offset + 12 + i * 16;
+            const size_t start = word(entry + 8);
+            const size_t length = word(entry + 12);
+            if (start > bytes.size() || length > bytes.size() - start) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (word(0) == 0x74746366) {
+        const size_t faces = word(8);
+        if (!faces || faces > (bytes.size() - 12) / 4) {
+            return false;
+        }
+        for (size_t i = 0; i < faces; ++i) {
+            if (!valid_face(word(12 + i * 4))) {
+                return false;
+            }
+        }
+        return true;
     }
-    return true;
+    return valid_face(0);
 }
 
 bool LoadFontFileWithSubfont(const std::filesystem::path& path,
@@ -2215,10 +2261,19 @@ bool LoadFontFileWithSubfont(const std::filesystem::path& path,
         const auto container = parent.parent_path();
         const auto sibling = container / ((parent_name == "font") ? "font2" : "font") / file_name;
         if (std::filesystem::is_regular_file(sibling, ec) && !ec) {
-            return try_load(sibling);
+            if (try_load(sibling)) {
+                return true;
+            }
         }
     }
 
+    if (const auto alias = ResolveKnownSysFontAlias(parent, file_name.string())) {
+        if (const auto builtin = LoadBuiltinFontBytesShared(*alias, &out_subfont_index)) {
+            out_bytes.assign(builtin->begin(), builtin->end());
+            return !out_bytes.empty();
+        }
+        return try_load(*alias);
+    }
     return false;
 }
 
@@ -2301,7 +2356,7 @@ bool AttachSystemFont(FontState& st, Libraries::Font::OrbisFontHandle handle) {
     }
 
     std::filesystem::path primary_path = ResolveSystemFontPath(st.font_set_type);
-    bool using_builtin_primary = false;
+    bool using_builtin_primary = IsBuiltinFontPath(primary_path);
     std::vector<unsigned char> primary_bytes;
     u32 primary_face_index = subfont_index;
     if (primary_path.empty() ||

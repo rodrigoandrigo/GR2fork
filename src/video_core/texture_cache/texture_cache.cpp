@@ -2107,7 +2107,11 @@ void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
-    if (total_used_memory < trigger_gc_memory) {
+    u64 process_headroom = UINT64_MAX;
+#ifdef SHADPS4_UWP
+    process_headroom = Core::AddressSpace::MemoryHeadroom();
+#endif
+    if (total_used_memory < trigger_gc_memory && process_headroom >= 400_MB) {
         return;
     }
     lru_lazy_gc_runs_ += lru_lazy_touch;
@@ -2128,8 +2132,9 @@ void TextureCache::GarbageCollectImages() {
     gc_comparing.store(true, std::memory_order_release);
 
     const auto configure = [&](bool allow_aggressive) {
-        pressured = total_used_memory >= pressure_gc_memory;
-        aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
+        pressured = total_used_memory >= pressure_gc_memory || process_headroom < 400_MB;
+        aggresive = allow_aggressive &&
+                    (total_used_memory >= critical_gc_memory || process_headroom < 250_MB);
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
@@ -2193,7 +2198,7 @@ void TextureCache::GarbageCollectImages() {
     configure(false);
     image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
-    if (total_used_memory >= critical_gc_memory) {
+    if (total_used_memory >= critical_gc_memory || process_headroom < 250_MB) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);

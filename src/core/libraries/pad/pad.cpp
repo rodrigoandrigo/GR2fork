@@ -260,7 +260,7 @@ int PS4_SYSV_ABI scePadGetVersionInfo() {
 }
 
 int PS4_SYSV_ABI scePadInit() {
-    LOG_ERROR(Lib_Pad, "(STUBBED) called");
+    LOG_DEBUG(Lib_Pad, "Initializing controller service");
     g_initialized = true;
     return ORBIS_OK;
 }

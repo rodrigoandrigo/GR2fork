@@ -35,6 +35,10 @@ public:
     static std::shared_ptr<void> AcquireHostAccess(const void* address, u64 size,
                                                    bool populate = true);
     static bool CopyBacking(void* destination, const void* source, u64 size);
+    void DiscardPhysical(PAddr physical, u64 size);
+    static u64 ReclaimMemory(u64 size, bool urgent = true);
+    static u64 MemoryHeadroom();
+    static u64 MemoryPressureEpoch();
     static void StartPager();
     static void StopPager();
 #endif
@@ -95,7 +99,8 @@ public:
      *                  If zero is provided the mapping is considered as private.
      * @return A pointer to the mapped memory.
      */
-    void* Map(VAddr virtual_addr, u64 size, PAddr phys_addr = -1, bool exec = false);
+    void* Map(VAddr virtual_addr, u64 size, PAddr phys_addr = -1, bool exec = false,
+              s32 memory_type = 0);
 
     /// Memory maps a specified file descriptor.
     void* MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd);

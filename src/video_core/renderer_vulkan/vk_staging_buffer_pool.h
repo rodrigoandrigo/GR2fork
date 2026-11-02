@@ -85,6 +85,8 @@ private:
     std::array<Ring, NUM_TYPES> rings;
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     u64 frame = 0;
+    u64 pressure_epoch{};
+    bool trim_pressure{};
 };
 
 } // namespace Vulkan

@@ -98,6 +98,9 @@ enum class TransferOption : s32 {
     SdlCancelled = -1,
 };
 TransferOption AskMigrationOption() {
+#ifdef SHADPS4_UWP
+    return TransferOption::Copy;
+#else
     TransferOption user_choice = TransferOption::Nothing;
 #ifndef _WIN32
     SDL_MessageBoxButtonData btns[4]
@@ -134,6 +137,7 @@ TransferOption AskMigrationOption() {
     };
     SDL_ShowMessageBox(&msg_box, reinterpret_cast<s32*>(&user_choice));
     return user_choice;
+#endif
 }
 
 static void MoveFolder(fs::path const& _from, fs::path const& _to) {

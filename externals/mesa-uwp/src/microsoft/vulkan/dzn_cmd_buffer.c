@@ -4791,7 +4791,7 @@ dzn_cmd_buffer_update_pipeline(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint
          ID3D12GraphicsCommandList1_IASetPrimitiveTopology(cmdbuf->cmdlist, topology);
          new_pipeline_state = dzn_graphics_pipeline_get_state(gfx, &cmdbuf->state.pipeline_variant);
          if (!new_pipeline_state) {
-            vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_UNKNOWN);
+            dzn_cmd_buffer_record_failure(cmdbuf, E_FAIL, "graphics pipeline variant");
             return;
          }
          struct dzn_physical_device *pdev =

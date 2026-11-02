@@ -564,7 +564,7 @@ std::shared_ptr<BrokeredFsBackend> BrokeredFsBackend::Subdirectory(
 std::shared_ptr<BrokeredFsBackend> BrokeredFsBackend::GameDirectory(
     std::string_view relative) const {
     auto game = Subdirectory(relative);
-    if (game->Exists("sce_sys/param.sfo") || game->root.Name() != L"Image0")
+    if (game->root.Name() != L"Image0")
         return game;
     try {
         StorageFolder parent{nullptr};
@@ -577,8 +577,7 @@ std::shared_ptr<BrokeredFsBackend> BrokeredFsBackend::GameDirectory(
         if (parent) {
             const auto folder = parent.GetFolderAsync(L"Sc0").get();
             auto candidate = std::make_shared<BrokeredFsBackend>(winrt::get_abi(folder), true);
-            if (candidate->Exists("param.sfo"))
-                game->metadata = std::move(candidate);
+            game->metadata = std::move(candidate);
         }
     } catch (const winrt::hresult_error& error) {
         if (!Missing(error) && error.code() != E_ACCESSDENIED)

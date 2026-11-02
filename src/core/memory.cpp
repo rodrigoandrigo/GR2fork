@@ -620,6 +620,9 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
         auto& new_dmem_area = dmem_handle->second;
         new_dmem_area.dma_type = PhysicalMemoryType::Free;
         new_dmem_area.memory_type = 0;
+#ifdef SHADPS4_UWP
+        impl.DiscardPhysical(phys_addr, size);
+#endif
 
         // Merge the new dmem_area with dmem_map
         MergeAdjacent(dmem_map, dmem_handle);
@@ -704,7 +707,7 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
         MergeAdjacent(new_vma.phys_areas, new_vma.phys_areas.find(current_addr - mapped_addr));
 
         // Perform an address space mapping for each physical area
-        void* out_addr = impl.Map(current_addr, size_to_map, new_dmem_area.base);
+        void* out_addr = impl.Map(current_addr, size_to_map, new_dmem_area.base, false, mtype);
         rasterizer->RegisterMemory(current_addr, size_to_map);
 
         // Tracy memory tracking breaks from merging memory areas. Disabled for now.
@@ -940,7 +943,18 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     if (type != VMAType::Reserved && type != VMAType::PoolReserved) {
         // Flexible address space mappings were performed while finding direct memory areas.
         if (type != VMAType::Flexible) {
-            impl.Map(mapped_addr, size, phys_addr, is_exec);
+            if (type == VMAType::Direct) {
+                for (u64 offset = 0; offset < size;) {
+                    const auto area = FindDmemArea(phys_addr + offset);
+                    const auto length =
+                        std::min(size - offset, area->second.GetEnd() - phys_addr - offset);
+                    impl.Map(mapped_addr + offset, length, phys_addr + offset, is_exec,
+                             area->second.memory_type);
+                    offset += length;
+                }
+            } else {
+                impl.Map(mapped_addr, size, phys_addr, is_exec);
+            }
             rasterizer->RegisterMemory(mapped_addr, size);
             // Tracy memory tracking breaks from merging memory areas. Disabled for now.
             // TRACK_ALLOC(mapped_addr, size, "VMEM");
@@ -1280,8 +1294,10 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
                 MergeAdjacent(fmem_map, new_fmem_handle);
 
                 // Zero out the old memory data
+#ifndef SHADPS4_UWP
                 const auto unmap_hardware_address = impl.BackingBase() + phys_addr;
                 std::memset(unmap_hardware_address, 0, size_in_dma);
+#endif
 
                 // Update flexible usage
                 flexible_usage -= size_in_dma;

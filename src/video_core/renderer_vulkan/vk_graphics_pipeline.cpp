@@ -485,8 +485,7 @@ GraphicsPipeline::GraphicsPipeline(
     if (geometry_module) {
         device.destroyShaderModule(geometry_module);
     }
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
-               vk::to_string(pipeline_result));
+    Check<"create graphics pipeline">(pipeline_result);
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }

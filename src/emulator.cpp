@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <charconv>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include <sstream>
 #include <fmt/core.h>
 #include <fmt/xchar.h>
+#include <pugixml.hpp>
 #ifndef SHADPS4_UWP
 #include <hwinfo/hwinfo.h>
 #endif
@@ -39,6 +41,7 @@
 #include "core/file_format/psf.h"
 #include "core/file_format/trp.h"
 #include "core/file_sys/fs.h"
+#include "core/libraries/font/font_internal.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
 #ifdef SHADPS4_UWP
@@ -218,10 +221,11 @@ std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
 
         // Extract the number part
         const std::string num_str = stem.substr(pattern.length());
-        s32 trophy_index;
-        try {
-            trophy_index = std::stoi(num_str);
-        } catch (...) {
+        s32 trophy_index{};
+        const auto parsed =
+            std::from_chars(num_str.data(), num_str.data() + num_str.size(), trophy_index);
+        if (parsed.ec != std::errc{} || parsed.ptr != num_str.data() + num_str.size() ||
+            trophy_index < 0) {
             continue;
         }
 
@@ -238,11 +242,14 @@ std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
         // Extract the actual trophies if they're not extracted yet.
         const auto& trophy_output_dir =
             Common::FS::GetUserPath(Common::FS::PathType::TrophyDir) / np_comm_id;
-        if (!std::filesystem::exists(trophy_output_dir)) {
-            if (KeyManager::GetInstance()->GetAllKeys().TrophyKeySet.ReleaseTrophyKey.size() != 16) {
-                LOG_INFO(Loader, "Skipping trophy extraction: configure a trophy decryption key");
-                continue;
-            }
+        pugi::xml_document installed_configuration;
+        pugi::xml_document installed_master;
+        const auto configuration = trophy_output_dir / "Xml" / "TROPCONF.XML";
+        const auto master = trophy_output_dir / "Xml" / "TROP.XML";
+        if (!installed_configuration.load_file(configuration.native().c_str()) ||
+            !installed_configuration.child("trophyconf") ||
+            !installed_master.load_file(master.native().c_str()) ||
+            !installed_master.child("trophyconf")) {
             const std::string entry_guest = std::string(trophy_dir_guest) + "/" + entry.name;
             std::filesystem::path trp_source;
             std::filesystem::path temp_extract;
@@ -252,12 +259,16 @@ std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
                 } else {
                     // Archive-backed: dump bytes to a temp file for TRP.
                     if (auto bytes = mnt->ReadFile(entry_guest)) {
-                        temp_extract = std::filesystem::temp_directory_path() /
-                                       (np_comm_id + "_" + entry.name);
+                        const auto temporary_directory =
+                            Common::FS::GetUserPath(Common::FS::PathType::TempDataDir) / "trophy";
+                        std::filesystem::create_directories(temporary_directory);
+                        temp_extract = temporary_directory / (np_comm_id + "_" + entry.name);
                         Common::FS::IOFile out(temp_extract, Common::FS::FileAccessMode::Create);
-                        out.WriteRaw<u8>(bytes->data(), bytes->size());
-                        out.Close();
-                        trp_source = temp_extract;
+                        if (out.IsOpen() &&
+                            out.WriteRaw<u8>(bytes->data(), bytes->size()) == bytes->size()) {
+                            out.Close();
+                            trp_source = temp_extract;
+                        }
                     }
                 }
             }
@@ -793,7 +804,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     if (std::filesystem::is_empty(host_font_dir) || std::filesystem::is_empty(host_font2_dir)) {
-        LOG_WARNING(Loader, "No dumped system fonts, expect missing text or instability");
+        const auto builtin = Libraries::Font::Internal::LoadBuiltinFontBytesShared(
+            "@builtin/NotoSans-Regular.ttf", nullptr);
+        if (builtin && Libraries::Font::Internal::HasSfntTables(*builtin)) {
+            LOG_INFO(Loader, "Using bundled Noto fallback fonts for missing system font files");
+        } else {
+            LOG_ERROR(Loader, "System font files and bundled fallback fonts are unavailable");
+        }
     }
 
     auto env_max = std::min<u64>(env_vars.size(), 63);

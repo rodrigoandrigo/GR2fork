@@ -915,13 +915,21 @@ int PS4_SYSV_ABI sceNpTrophyRegisterContext(OrbisNpTrophyContext context,
         ctx.trophy_xml_path = GetTrophyXmlPath(ctx.xml_dir, EmulatorSettings.GetConsoleLanguage());
 
         if (!std::filesystem::exists(ctx.trophy_xml_path)) {
-            LOG_ERROR(Lib_NpTrophy, "Could not find trophy files.");
-            // Stub success here to prevent issues specific to missing a trophy key.
+            LOG_ERROR(Lib_NpTrophy,
+                      "Trophy configuration is not installed for service label {}; verify archive "
+                      "extraction and the configured trophy key",
+                      ctx.service_label);
+            return ORBIS_NP_TROPHY_ERROR_TITLE_CONF_NOT_INSTALLED;
         }
     } else {
         LOG_ERROR(Lib_NpTrophy, "No npCommId found for trophy index/service_label: {}",
                   ctx.service_label);
-        return ORBIS_NP_UTIL_ERROR_INVALID_TITLEID;
+        return ORBIS_NP_TROPHY_ERROR_TITLE_CONF_NOT_INSTALLED;
+    }
+    pugi::xml_document configuration;
+    if (!configuration.load_file(ctx.trophy_xml_path.native().c_str()) ||
+        !configuration.child("trophyconf")) {
+        return ORBIS_NP_TROPHY_ERROR_BROKEN_TITLE_CONF;
     }
 
     ctx.registered = true;

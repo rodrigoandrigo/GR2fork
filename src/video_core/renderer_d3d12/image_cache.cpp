@@ -1,3 +1,4 @@
+#include "core/uwp/memory_pressure.h"
 #include "video_core/renderer_d3d12/image_cache.h"
 
 #include <algorithm>
@@ -657,19 +658,25 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
     D3D12_CLEAR_VALUE clear{};
     clear.Format = has_stencil ? dsv_format : view_format;
     clear.DepthStencil.Depth = 1.f;
-    winrt::check_hresult(device->Device()->CreateCommittedResource(
-        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
-        (multisampled && info.props.is_depth) || has_stencil ? &clear : nullptr,
-        IID_PPV_ARGS(&result->native)));
+    winrt::check_hresult(Core::Uwp::AllocateMemory([&] {
+        return device->Device()->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+            (multisampled && info.props.is_depth) || has_stencil ? &clear : nullptr,
+            IID_PPV_ARGS(&result->native));
+    }));
     result->allocation_bytes = allocation + extra + stencil_extra;
     if (multisampled) {
-        winrt::check_hresult(device->Device()->CreateCommittedResource(
-            &heap, D3D12_HEAP_FLAG_NONE, &staging, D3D12_RESOURCE_STATE_COMMON, nullptr,
-            IID_PPV_ARGS(&result->msaa->planes)));
+        winrt::check_hresult(Core::Uwp::AllocateMemory([&] {
+            return device->Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &staging,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&result->msaa->planes));
+        }));
         if (has_stencil) {
-            winrt::check_hresult(device->Device()->CreateCommittedResource(
-                &heap, D3D12_HEAP_FLAG_NONE, &stencil_planes_desc, D3D12_RESOURCE_STATE_COMMON,
-                nullptr, IID_PPV_ARGS(&result->msaa->stencil_planes)));
+            winrt::check_hresult(Core::Uwp::AllocateMemory([&] {
+                return device->Device()->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &stencil_planes_desc, D3D12_RESOURCE_STATE_COMMON,
+                    nullptr, IID_PPV_ARGS(&result->msaa->stencil_planes));
+            }));
         }
         auto& resources = *result->msaa;
         resources.descriptors.Initialize(device->Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,

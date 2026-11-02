@@ -42,6 +42,11 @@ std::atomic_bool guest_ready{};
 std::atomic_bool guest_started{};
 std::atomic_bool guest_threads_stopped{true};
 std::atomic_bool session_failed{};
+enum class MemoryFailureState { None, Writing, Pending, Reported };
+std::atomic<MemoryFailureState> memory_failure_state{};
+std::atomic<uint32_t> memory_failure_error{};
+std::atomic<uint64_t> memory_failure_address{};
+std::atomic<uint64_t> memory_failure_access{};
 std::mutex session_mutex;
 std::mutex guest_control_mutex;
 std::mutex worker_stop_mutex;
@@ -74,6 +79,15 @@ int32_t Fail(std::string message) {
         }
     }
     return -1;
+}
+
+void ReportPendingMemoryFailure() {
+    auto pending = MemoryFailureState::Pending;
+    if (memory_failure_state.compare_exchange_strong(pending, MemoryFailureState::Reported)) {
+        Fail(fmt::format("Guest memory backing recovery failed: Win32 {}, address {:#x}, access {}",
+                         memory_failure_error.load(), memory_failure_address.load(),
+                         memory_failure_access.load()));
+    }
 }
 
 int ExecuteProbe(void* allocation, DWORD* exception) {
@@ -135,6 +149,7 @@ void RegisterGuestWorker(std::stop_source source) {
         source.request_stop();
 }
 void StopGuestWorkers() {
+    ReportPendingMemoryFailure();
     guest_stop_source.request_stop();
     std::vector<std::stop_source> sources;
     {
@@ -153,6 +168,18 @@ void FailGuestSession(std::string message) {
     StopGuestWorkers();
     guest_ready.store(false);
     Fail(std::move(message));
+}
+void FailGuestMemory(std::uint32_t error, std::uint64_t address, std::uint64_t access) noexcept {
+    auto expected = MemoryFailureState::None;
+    if (!memory_failure_state.compare_exchange_strong(expected, MemoryFailureState::Writing))
+        return;
+    memory_failure_error.store(error);
+    memory_failure_address.store(address);
+    memory_failure_access.store(access);
+    memory_failure_state.store(MemoryFailureState::Pending);
+    session_failed.store(true);
+    guest_ready.store(false);
+    stop_requested.store(true);
 }
 bool StopRequested() {
     return stop_requested.load();
@@ -416,6 +443,7 @@ int32_t shadps4_run(const wchar_t* executable) {
             last_error.clear();
         }
         session_failed.store(false);
+        memory_failure_state.store(MemoryFailureState::None);
         guest_started.store(true);
         guest_threads_stopped.store(false);
         try {
@@ -431,6 +459,7 @@ int32_t shadps4_run(const wchar_t* executable) {
         emulator = Common::Singleton<Core::Emulator>::Instance();
         LOG_INFO(Core, "[UWP stage] loading guest executable");
         emulator->Run(std::filesystem::path{path});
+        ReportPendingMemoryFailure();
         guest_threads_stopped.store(true);
         state.store(session_failed.load() ? SHADPS4_FAILED : SHADPS4_STOPPED);
         return session_failed.load() ? -1 : 0;

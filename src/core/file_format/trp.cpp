@@ -1,13 +1,24 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cctype>
 #include <system_error>
+#include <pugixml.hpp>
+#include "common/string_util.h"
 
 #include "common/aes.h"
 #include "common/key_manager.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/file_format/trp.h"
+
+static std::string UppercaseFileName(std::string_view name) {
+    std::string result{name};
+    for (char& c : result) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return result;
+}
 
 static void DecryptEFSM(std::span<const u8, 16> trophyKey, std::span<const u8, 16> NPcommID,
                         std::span<const u8, 16> efsmIv, std::span<const u8> ciphertext,
@@ -43,22 +54,23 @@ bool TRP::Extract(const std::filesystem::path& trophyPath, std::string npCommId,
     const auto& user_key_vec =
         KeyManager::GetInstance()->GetAllKeys().TrophyKeySet.ReleaseTrophyKey;
 
-    if (user_key_vec.size() != 16) {
-        LOG_INFO(Common_Filesystem, "Trophy decryption key is not specified");
-        return false;
-    }
-
+    const bool has_key = user_key_vec.size() == 16;
     std::array<u8, 16> user_key{};
-    std::copy(user_key_vec.begin(), user_key_vec.end(), user_key.begin());
+    if (has_key) {
+        std::copy(user_key_vec.begin(), user_key_vec.end(), user_key.begin());
+    }
 
     s32 trpFileIndex = 0;
     bool success = true;
-    const auto cleanupOnFailure = [&outputPath] {
-        std::error_code ec;
-        std::filesystem::remove_all(outputPath, ec);
+    const bool output_existed = std::filesystem::exists(outputPath);
+    const auto cleanupOnFailure = [&outputPath, output_existed] {
+        if (!output_existed) {
+            std::error_code ec;
+            std::filesystem::remove_all(outputPath, ec);
+        }
     };
     try {
-        if (trophyPath.extension() != ".trp") {
+        if (Common::ToLower(trophyPath.extension().string()) != ".trp") {
             return false;
         }
         Common::FS::IOFile file(trophyPath, Common::FS::FileAccessMode::Read);
@@ -80,6 +92,12 @@ bool TRP::Extract(const std::filesystem::path& trophyPath, std::string npCommId,
             return false;
         }
 
+        const u64 file_size = file.GetSize();
+        const u64 entry_size = header.entry_size;
+        if (file_size < sizeof(TrpHeader) || entry_size < sizeof(TrpEntry) ||
+            header.entry_num > (file_size - sizeof(TrpHeader)) / entry_size) {
+            return false;
+        }
         s64 seekPos = sizeof(TrpHeader);
         std::error_code dir_ec;
         std::filesystem::create_directories(outputPath / "Icons", dir_ec);
@@ -109,14 +127,46 @@ bool TRP::Extract(const std::filesystem::path& trophyPath, std::string npCommId,
                 break;
             }
 
-            std::string_view name(entry.entry_name);
-
-            if (entry.flag == ENTRY_FLAG_PNG) {
+            const std::string_view name(
+                entry.entry_name,
+                std::find(std::begin(entry.entry_name), std::end(entry.entry_name), '\0') -
+                    std::begin(entry.entry_name));
+            if (name.empty() || name.find_first_of("/\\:") != std::string_view::npos ||
+                name == "." || name == ".." || entry.entry_pos > file_size ||
+                entry.entry_len > file_size - entry.entry_pos) {
+                success = false;
+                break;
+            }
+            const auto normalized_name = UppercaseFileName(name);
+            if (entry.flag == ENTRY_FLAG_PNG &&
+                (normalized_name.ends_with(".XML") || normalized_name.ends_with(".SFM"))) {
+                std::vector<u8> xml(entry.entry_len);
+                pugi::xml_document document;
+                if (!file.Seek(entry.entry_pos) || !file.Read(xml) ||
+                    !document.load_buffer(xml.data(), xml.size()) ||
+                    !document.child("trophyconf")) {
+                    success = false;
+                    break;
+                }
+                auto filename = normalized_name;
+                filename.replace(filename.find_last_of('.') + 1, std::string::npos, "XML");
+                if (Common::FS::IOFile::WriteBytes(outputPath / "Xml" / filename, xml) !=
+                    xml.size()) {
+                    success = false;
+                    break;
+                }
+            } else if (entry.flag == ENTRY_FLAG_PNG) {
                 if (!ProcessPngEntry(file, entry, outputPath, name)) {
                     success = false;
                     // Continue with next entry
                 }
             } else if (entry.flag == ENTRY_FLAG_ENCRYPTED_XML) {
+                if (!has_key) {
+                    LOG_WARNING(Common_Filesystem,
+                                "Trophy metadata is encrypted; configure the trophy key");
+                    success = false;
+                    break;
+                }
                 // Check if we have a valid NPCommID for decryption
                 if (npCommId.size() >= 12 && npCommId[0] == 'N' && npCommId[1] == 'P') {
                     if (!ProcessEncryptedXmlEntry(file, entry, outputPath, name, user_key,
@@ -146,6 +196,13 @@ bool TRP::Extract(const std::filesystem::path& trophyPath, std::string npCommId,
         return false;
     }
 
+    pugi::xml_document configuration;
+    pugi::xml_document master;
+    const auto configuration_path = outputPath / "Xml" / "TROPCONF.XML";
+    const auto master_path = outputPath / "Xml" / "TROP.XML";
+    success = success && configuration.load_file(configuration_path.native().c_str()) &&
+              configuration.child("trophyconf") && master.load_file(master_path.native().c_str()) &&
+              master.child("trophyconf");
     if (!success) {
         cleanupOnFailure();
         return false;
@@ -229,9 +286,15 @@ bool TRP::ProcessEncryptedXmlEntry(Common::FS::IOFile& file, const TrpEntry& ent
 
     // Remove padding
     removePadding(XML);
+    pugi::xml_document document;
+    if (!document.load_buffer(XML.data(), XML.size()) || !document.child("trophyconf")) {
+        LOG_ERROR(Common_Filesystem,
+                  "Trophy XML could not be decoded; verify the configured trophy key");
+        return false;
+    }
 
     // Create output filename
-    std::string xml_name(entry.entry_name);
+    std::string xml_name = UppercaseFileName(name);
     size_t pos = xml_name.find("ESFM");
     if (pos != std::string::npos) {
         xml_name.replace(pos, 4, "XML");

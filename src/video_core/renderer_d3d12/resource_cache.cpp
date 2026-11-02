@@ -1,3 +1,4 @@
+#include "core/uwp/memory_pressure.h"
 #include "video_core/renderer_d3d12/resource_cache.h"
 
 #include <algorithm>
@@ -551,9 +552,11 @@ ResourceCache::Buffer& ResourceCache::GetBuffer(VAddr address, u64 size, bool ph
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     Microsoft::WRL::ComPtr<ID3D12Resource> native;
-    winrt::check_hresult(context->Device()->CreateCommittedResource(
-        &heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_COMMON, nullptr,
-        IID_PPV_ARGS(&native)));
+    winrt::check_hresult(Core::Uwp::AllocateMemory([&] {
+        return context->Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&native));
+    }));
     result->native = std::move(native);
     result->allocation_bytes =
         context->Device()->GetResourceAllocationInfo(0, 1, &description).SizeInBytes;
