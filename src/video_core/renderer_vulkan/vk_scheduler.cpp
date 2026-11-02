@@ -747,7 +747,7 @@ template <typename CmdBuf>
 void DynamicState::CommitTo(const Instance& instance, CmdBuf& cmdbuf) {
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
-        if (instance.IsExtendedDynamicStateSupported()) {
+        if (instance.UsesDynamicGraphicsState()) {
             cmdbuf.setViewportWithCount(viewports);
         } else {
             cmdbuf.setViewport(0, viewports);
@@ -755,7 +755,7 @@ void DynamicState::CommitTo(const Instance& instance, CmdBuf& cmdbuf) {
     }
     if (dirty_state.scissors) {
         dirty_state.scissors = false;
-        if (instance.IsExtendedDynamicStateSupported()) {
+        if (instance.UsesDynamicGraphicsState()) {
             cmdbuf.setScissorWithCount(scissors);
         } else {
             cmdbuf.setScissor(0, scissors);
@@ -763,26 +763,26 @@ void DynamicState::CommitTo(const Instance& instance, CmdBuf& cmdbuf) {
     }
     if (dirty_state.depth_test_enabled) {
         dirty_state.depth_test_enabled = false;
-        if (instance.IsExtendedDynamicStateSupported()) {
+        if (instance.UsesDynamicGraphicsState()) {
             cmdbuf.setDepthTestEnable(depth_test_enabled);
         }
     }
     if (dirty_state.depth_write_enabled) {
         dirty_state.depth_write_enabled = false;
         // Note that this must be set in a command buffer even if depth test is disabled.
-        if (instance.IsExtendedDynamicStateSupported()) {
+        if (instance.UsesDynamicGraphicsState()) {
             cmdbuf.setDepthWriteEnable(depth_write_enabled);
         }
     }
     if (depth_test_enabled && dirty_state.depth_compare_op) {
         dirty_state.depth_compare_op = false;
-        if (instance.IsExtendedDynamicStateSupported()) {
+        if (instance.UsesDynamicGraphicsState()) {
             cmdbuf.setDepthCompareOp(depth_compare_op);
         }
     }
     if (dirty_state.depth_bounds_test_enabled) {
         dirty_state.depth_bounds_test_enabled = false;
-        if (instance.IsDepthBoundsSupported() && instance.IsExtendedDynamicStateSupported()) {
+        if (instance.IsDepthBoundsSupported() && instance.UsesDynamicGraphicsState()) {
             cmdbuf.setDepthBoundsTestEnable(depth_bounds_test_enabled);
         }
     }
@@ -802,12 +802,12 @@ void DynamicState::CommitTo(const Instance& instance, CmdBuf& cmdbuf) {
     }
     if (dirty_state.stencil_test_enabled) {
         dirty_state.stencil_test_enabled = false;
-        if (instance.IsExtendedDynamicStateSupported()) {
+        if (instance.UsesDynamicGraphicsState()) {
             cmdbuf.setStencilTestEnable(stencil_test_enabled);
         }
     }
     if (stencil_test_enabled) {
-        if (!instance.IsExtendedDynamicStateSupported()) {
+        if (!instance.UsesDynamicGraphicsState()) {
             dirty_state.stencil_front_ops = false;
             dirty_state.stencil_back_ops = false;
         }
@@ -895,13 +895,13 @@ void DynamicState::CommitTo(const Instance& instance, CmdBuf& cmdbuf) {
     }
     if (dirty_state.cull_mode) {
         dirty_state.cull_mode = false;
-        if (instance.IsExtendedDynamicStateSupported()) {
+        if (instance.UsesDynamicGraphicsState()) {
             cmdbuf.setCullMode(cull_mode);
         }
     }
     if (dirty_state.front_face) {
         dirty_state.front_face = false;
-        if (instance.IsExtendedDynamicStateSupported()) {
+        if (instance.UsesDynamicGraphicsState()) {
             cmdbuf.setFrontFace(front_face);
         }
     }

@@ -88,6 +88,7 @@ GraphicsPipeline::GraphicsPipeline(
                               : LiverpoolToVK::PrimitiveType(key.prim_type);
     const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
         .topology = topology,
+        .primitiveRestartEnable = key.primitive_restart_enable,
     };
 
     const vk::PipelineTessellationStateCreateInfo tessellation_state = {
@@ -98,10 +99,14 @@ GraphicsPipeline::GraphicsPipeline(
         vk::PipelineRasterizationStateCreateInfo{
             .depthClampEnable = key.depth_clamp_enable &&
                                 (!key.depth_clip_enable || instance.IsDepthClipEnableSupported()),
-            .rasterizerDiscardEnable = false,
+            .rasterizerDiscardEnable = key.rasterizer_discard_enable,
             .polygonMode = LiverpoolToVK::PolygonMode(key.polygon_mode),
             .cullMode = key.cull_mode,
             .frontFace = key.front_face,
+            .depthBiasEnable = key.depth_bias_enable,
+            .depthBiasConstantFactor = key.depth_bias_constant,
+            .depthBiasClamp = key.depth_bias_clamp,
+            .depthBiasSlopeFactor = key.depth_bias_slope,
             .lineWidth = 1.0f,
         },
         vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT{
@@ -153,7 +158,20 @@ GraphicsPipeline::GraphicsPipeline(
         vk::DynamicState::eLineWidth,          vk::DynamicState::ePrimitiveRestartEnable,
     };
 
-    if (!instance.IsExtendedDynamicStateSupported()) {
+    if (instance.GetDriverID() == vk::DriverId::eMesaDozen) {
+        const auto first_variant = std::remove_if(
+            dynamic_states.begin(), dynamic_states.end(), [](vk::DynamicState state) {
+                return state == vk::DynamicState::eDepthBiasEnable ||
+                       state == vk::DynamicState::eDepthBias ||
+                       state == vk::DynamicState::eStencilCompareMask ||
+                       state == vk::DynamicState::eStencilWriteMask ||
+                       state == vk::DynamicState::ePrimitiveRestartEnable ||
+                       state == vk::DynamicState::eRasterizerDiscardEnable;
+            });
+        dynamic_states.erase(first_variant, dynamic_states.end());
+    }
+
+    if (!instance.UsesDynamicGraphicsState()) {
         const auto first_static = std::remove_if(
             dynamic_states.begin(), dynamic_states.end(), [](vk::DynamicState state) {
                 return state == vk::DynamicState::eViewportWithCount ||
@@ -172,7 +190,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     if (instance.IsDepthBoundsSupported()) {
-        if (instance.IsExtendedDynamicStateSupported()) {
+        if (instance.UsesDynamicGraphicsState()) {
             dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
         }
         dynamic_states.push_back(vk::DynamicState::eDepthBounds);
@@ -184,7 +202,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
     if (instance.IsVertexInputDynamicState()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputEXT);
-    } else if (!sdata.vertex_bindings.empty() && instance.IsExtendedDynamicStateSupported()) {
+    } else if (!sdata.vertex_bindings.empty() && instance.UsesDynamicGraphicsState()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputBindingStride);
     }
 
@@ -453,10 +471,10 @@ GraphicsPipeline::GraphicsPipeline(
         .pViewportState = &viewport_info,
         .pRasterizationState = &raster_chain.get(),
         .pMultisampleState = &sdata.multisampling,
-        .pDepthStencilState = !instance.IsExtendedDynamicState3Supported() ||
-                                      !instance.IsExtendedDynamicStateSupported()
-                                  ? &depth_stencil_info
-                                  : nullptr,
+        .pDepthStencilState =
+            !instance.IsExtendedDynamicState3Supported() || !instance.UsesDynamicGraphicsState()
+                ? &depth_stencil_info
+                : nullptr,
         .pColorBlendState = &color_blending,
         .pDynamicState = &dynamic_info,
         .layout = pipeline_layout,

@@ -1938,7 +1938,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
-    if (instance.IsVertexInputDynamicState() || !instance.IsExtendedDynamicStateSupported()) {
+    if (instance.IsVertexInputDynamicState() || !instance.UsesDynamicGraphicsState()) {
         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
     } else {
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),

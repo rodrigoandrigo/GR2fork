@@ -34,6 +34,12 @@ struct GraphicsPipelineKey {
     std::array<size_t, MaxShaderStages> stage_hashes;
     std::array<vk::Format, MaxVertexBufferCount> vertex_buffer_formats;
     std::array<u32, MaxVertexBufferCount> vertex_buffer_strides;
+    vk::Bool32 primitive_restart_enable;
+    vk::Bool32 rasterizer_discard_enable;
+    vk::Bool32 depth_bias_enable;
+    float depth_bias_constant;
+    float depth_bias_clamp;
+    float depth_bias_slope;
     u32 viewport_count;
     vk::Bool32 depth_test_enable;
     vk::Bool32 depth_write_enable;

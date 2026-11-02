@@ -262,7 +262,9 @@ private:
     void InstallGraphicsPipeline(const GraphicsPipelineKey& key, PendingGraphicsPipeline& pending);
     void ReapPendingPipelines(bool drain = false);
     bool DrawsPhoto() const;
-    std::chrono::milliseconds SyncBudget(bool photo) const;
+    bool WaitForGraphicsPipeline(PendingGraphicsPipeline& pending, bool photo);
+    u32 sync_budget_frame{~u32{0}};
+    std::chrono::steady_clock::duration sync_budget_spent{};
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>>
         pending_graphics_pipelines;
     std::unordered_set<GraphicsPipelineKey> abandoned_graphics_pipelines;

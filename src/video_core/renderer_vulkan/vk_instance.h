@@ -193,6 +193,10 @@ public:
         return dynamic_state;
     }
 
+    bool UsesDynamicGraphicsState() const {
+        return dynamic_state && driver_id != vk::DriverId::eMesaDozen;
+    }
+
     bool IsExtendedDynamicState3Supported() const {
         return dynamic_state_3;
     }
@@ -211,7 +215,7 @@ public:
 
     /// Returns true when VK_EXT_vertex_input_dynamic_state is supported.
     bool IsVertexInputDynamicState() const {
-        return vertex_input_dynamic_state;
+        return vertex_input_dynamic_state && driver_id != vk::DriverId::eMesaDozen;
     }
 
     /// Returns true when VK_KHR_fragment_shader_barycentric is supported.

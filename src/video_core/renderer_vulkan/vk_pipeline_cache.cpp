@@ -1161,7 +1161,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             pending.photo_waited = true;
             if (pre_compile_hook_)
                 pre_compile_hook_(pre_compile_user_);
-            pending.future.wait_for(SyncBudget(true));
+            WaitForGraphicsPipeline(pending, true);
             ReapPendingPipelines();
         }
         if (!graphics_pipelines.contains(graphics_key)) {
@@ -1202,7 +1202,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         auto pending = StartGraphicsPipeline(pipeline_hash, fetch_shader);
         const bool photo = DrawsPhoto();
         pending->photo_waited = photo;
-        const bool ready = pending->future.wait_for(SyncBudget(photo)) == std::future_status::ready;
+        const bool ready = WaitForGraphicsPipeline(*pending, photo);
         graphics_pipelines.erase(it);
         pending_graphics_pipelines.emplace(graphics_key, std::move(pending));
         if (!ready) {
@@ -1336,9 +1336,24 @@ void PipelineCache::ReapPendingPipelines(bool drain) {
         std::rethrow_exception(failure);
 }
 
-std::chrono::milliseconds PipelineCache::SyncBudget(bool photo) const {
-    const int budget = std::clamp(EmulatorSettings.GetPipelineSyncBudgetMs(), 0, 50000);
-    return std::chrono::milliseconds(photo ? std::max(budget, 700) : budget);
+bool PipelineCache::WaitForGraphicsPipeline(PendingGraphicsPipeline& pending, bool photo) {
+    const int budget_ms = std::clamp(EmulatorSettings.GetPipelineSyncBudgetMs(), 0, 50000);
+    if (photo) {
+        return pending.future.wait_for(std::chrono::milliseconds{std::max(budget_ms, 700)}) ==
+               std::future_status::ready;
+    }
+    const u32 frame = DebugState.GetFrameNum();
+    if (sync_budget_frame != frame) {
+        sync_budget_frame = frame;
+        sync_budget_spent = {};
+    }
+    const std::chrono::steady_clock::duration budget = std::chrono::milliseconds{budget_ms};
+    const auto remaining =
+        std::max(budget - sync_budget_spent, std::chrono::steady_clock::duration::zero());
+    const auto start = std::chrono::steady_clock::now();
+    const bool ready = pending.future.wait_for(remaining) == std::future_status::ready;
+    sync_budget_spent += std::chrono::steady_clock::now() - start;
+    return ready;
 }
 
 bool PipelineCache::DrawsPhoto() const {
@@ -1365,7 +1380,7 @@ bool PipelineCache::DrawsPhoto() const {
 // refresh. The Fragment runtime-info slot must be stamp-current: its rebuild
 // reads the key's color buffers, which the full refresh has already masked.
 bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
-    if (!instance.IsExtendedDynamicStateSupported()) {
+    if (!instance.UsesDynamicGraphicsState()) {
         return false;
     }
     const u64 stamp = liverpool->GetGfxStateStamp();
@@ -1621,7 +1636,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
 
-    if (!instance.IsExtendedDynamicStateSupported()) {
+    if (!instance.UsesDynamicGraphicsState()) {
         key.viewport_count = std::max(
             1u, static_cast<u32>(std::ranges::count_if(
                     regs.viewports, [](const auto& viewport) { return viewport.xscale != 0; })));
@@ -1652,6 +1667,41 @@ bool PipelineCache::RefreshGraphicsKey() {
                             ? LiverpoolToVK::CullMode(regs.polygon_control.CullingMode())
                             : vk::CullModeFlagBits::eNone;
         key.front_face = LiverpoolToVK::FrontFace(regs.polygon_control.front_face);
+    }
+
+    if (instance.GetDriverID() == vk::DriverId::eMesaDozen) {
+        key.rasterizer_discard_enable = regs.clipper_control.dx_rasterization_kill;
+        key.depth_bias_enable = regs.polygon_control.NeedsBias();
+        if (key.depth_bias_enable) {
+            const bool front = regs.polygon_control.enable_polygon_offset_front;
+            key.depth_bias_constant =
+                front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset;
+            key.depth_bias_clamp = regs.poly_offset.depth_bias;
+            key.depth_bias_slope =
+                (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f;
+        }
+        if (key.stencil_test_enable) {
+            const auto front = regs.stencil_ref_front;
+            const auto back = regs.depth_control.backface_enable ? regs.stencil_ref_back : front;
+            key.stencil_front.compareMask = front.stencil_mask;
+            key.stencil_back.compareMask = back.stencil_mask;
+            key.stencil_front.writeMask =
+                regs.depth_render_control.stencil_clear_enable ? 0U : front.stencil_write_mask;
+            key.stencil_back.writeMask =
+                regs.depth_render_control.stencil_clear_enable ? 0U : back.stencil_write_mask;
+        }
+        const auto topology = LiverpoolToVK::PrimitiveType(regs.primitive_type);
+        const bool list = topology == vk::PrimitiveTopology::ePointList ||
+                          topology == vk::PrimitiveTopology::eLineList ||
+                          topology == vk::PrimitiveTopology::eTriangleList ||
+                          topology == vk::PrimitiveTopology::eLineListWithAdjacency ||
+                          topology == vk::PrimitiveTopology::eTriangleListWithAdjacency;
+        const bool patch = regs.primitive_type == AmdGpu::PrimitiveType::PatchPrimitive ||
+                           regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
+                           regs.primitive_type == AmdGpu::PrimitiveType::RectList;
+        key.primitive_restart_enable = (regs.enable_primitive_restart & 1) != 0 &&
+                                       (instance.IsListRestartSupported() || !list) &&
+                                       (instance.IsPatchListRestartSupported() || !patch);
     }
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
@@ -1936,7 +1986,7 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
                        MaxVertexBufferCount);
-            if (!instance.IsExtendedDynamicStateSupported()) {
+            if (!instance.UsesDynamicGraphicsState()) {
                 key.vertex_buffer_strides[vertex_binding] = buffer.GetStride();
             }
             key.vertex_buffer_formats[vertex_binding++] =
