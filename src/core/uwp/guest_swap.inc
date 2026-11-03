@@ -31,11 +31,11 @@ static uint64_t uwp_swap_full_tick, uwp_swap_full_rearms;
 
 static uint64_t uwp_swap_urgent_pages, uwp_swap_urgent_sweeps;
 
-#define UWP_SWAP_SLOT_ZERO UINT32_C(0xFFFFFFFF)
+#define UWP_SWAP_SLOT_ZERO UINT64_C(0xFFFFFFFFFFFFFFFF)
 
-#define UWP_SWAP_SLOT_POOL UINT32_C(0x80000000)
+#define UWP_SWAP_SLOT_POOL UINT64_C(0x8000000000000000)
 
-#define UWP_SWAP_FILE_MAX_BYTES UINT64_C(0x80000000)
+#define UWP_SWAP_FILE_MAX_BYTES (UINT64_C(4096) << 20)
 #define UWP_SWAP_RECORD_ALIGN UINT64_C(4096)
 
 static uint64_t uwp_swap_free_checked_tick, uwp_swap_free_bytes;
@@ -82,7 +82,7 @@ static uint64_t uwp_swap_free_space(void) {
     return uwp_swap_free_bytes;
 }
 
-static uint32_t* uwp_swap_slot;
+static uint64_t* uwp_swap_slot;
 static size_t uwp_swap_slot_count;
 static uint64_t uwp_swap_store_next;
 static uint64_t uwp_swap_store_pages, uwp_swap_store_raw, uwp_swap_store_zero;
@@ -622,7 +622,7 @@ static void uwp_pool_free_blob(uint32_t index) {
     uwp_pool_bytes = uwp_pool_bytes > length ? uwp_pool_bytes - length : 0;
 }
 
-static uint32_t uwp_pool_store(size_t total) {
+static uint64_t uwp_pool_store(size_t total) {
     if (uwp_pool_off || !uwp_pool_init())
         return 0;
     const uint32_t index = uwp_pool_alloc(total);
@@ -659,7 +659,7 @@ static int uwp_pool_load(uint32_t index, void* data) {
     return 1;
 }
 
-static int uwp_pool_slot(uint32_t slot) {
+static int uwp_pool_slot(uint64_t slot) {
     return slot != UWP_SWAP_SLOT_ZERO && (slot & UWP_SWAP_SLOT_POOL) != 0;
 }
 
@@ -679,12 +679,12 @@ static int uwp_swap_store_pool_locked(uint64_t physical, size_t total) {
     const size_t key = (size_t)(physical / PAGE);
     if (!uwp_swap_slot || key >= uwp_swap_slot_count)
         return 0;
-    const uint32_t pooled = uwp_pool_store(total);
+    const uint64_t pooled = uwp_pool_store(total);
     if (!pooled)
         return 0;
-    const uint32_t previous = uwp_swap_slot[key];
+    const uint64_t previous = uwp_swap_slot[key];
     if (uwp_pool_slot(previous))
-        uwp_pool_free_blob(previous & ~UWP_SWAP_SLOT_POOL);
+        uwp_pool_free_blob((uint32_t)(previous & ~UWP_SWAP_SLOT_POOL));
     uwp_swap_slot[key] = pooled;
     ++uwp_swap_store_pages;
     return 1;
@@ -699,7 +699,7 @@ static int uwp_swap_transfer_locked(uint64_t physical, void* data, int write) {
         return 0;
     }
     if (!write) {
-        const uint32_t slot = uwp_swap_slot[key];
+        const uint64_t slot = uwp_swap_slot[key];
         if (slot == 0) {
             uwp_swap_transfer_error = ERROR_NOT_FOUND;
             return 0;
@@ -709,7 +709,7 @@ static int uwp_swap_transfer_locked(uint64_t physical, void* data, int write) {
             return 1;
         }
         if (uwp_pool_slot(slot)) {
-            return uwp_pool_load(slot & ~UWP_SWAP_SLOT_POOL, data);
+            return uwp_pool_load((uint32_t)(slot & ~UWP_SWAP_SLOT_POOL), data);
         }
         if (!uwp_swap_io_at((uint64_t)slot - 1, uwp_swap_io, 2, 0))
             return 0;
@@ -737,7 +737,7 @@ static int uwp_swap_transfer_locked(uint64_t physical, void* data, int write) {
         ++uwp_swap_store_pages;
         uwp_swap_blank_bytes += PAGE;
         if (uwp_pool_slot(uwp_swap_slot[key]))
-            uwp_pool_free_blob(uwp_swap_slot[key] & ~UWP_SWAP_SLOT_POOL);
+            uwp_pool_free_blob((uint32_t)(uwp_swap_slot[key] & ~UWP_SWAP_SLOT_POOL));
         uwp_swap_slot[key] = UWP_SWAP_SLOT_ZERO;
         return 1;
     }
@@ -773,7 +773,7 @@ static int uwp_swap_transfer_locked(uint64_t physical, void* data, int write) {
     uwp_swap_store_payload += total - 2;
     uint64_t offset = 0;
     uint64_t new_space = 0;
-    const uint32_t slot = uwp_swap_slot[key];
+    const uint64_t slot = uwp_swap_slot[key];
     if (slot != 0 && slot != UWP_SWAP_SLOT_ZERO && !uwp_pool_slot(slot)) {
 
         unsigned char header[2];
@@ -812,7 +812,7 @@ static int uwp_swap_transfer_locked(uint64_t physical, void* data, int write) {
         uwp_swap_store_next += need;
         new_space = need;
     }
-    if (offset + total > UINT32_MAX) {
+    if (offset + total > UWP_SWAP_FILE_MAX_BYTES) {
         uwp_swap_transfer_error = ERROR_DISK_QUOTA_EXCEEDED;
         return 0;
     }
@@ -828,15 +828,15 @@ static int uwp_swap_transfer_locked(uint64_t physical, void* data, int write) {
     }
 
     if (uwp_pool_slot(slot))
-        uwp_pool_free_blob(slot & ~UWP_SWAP_SLOT_POOL);
-    uwp_swap_slot[key] = (uint32_t)offset + 1;
+        uwp_pool_free_blob((uint32_t)(slot & ~UWP_SWAP_SLOT_POOL));
+    uwp_swap_slot[key] = offset + 1;
     ++uwp_swap_store_pages;
     return 1;
 }
 
 static void uwp_swap_describe_corruption(uint64_t physical, uint64_t expected, uint64_t actual) {
     const size_t key = (size_t)(physical / PAGE);
-    const uint32_t slot = (uwp_swap_slot && key < uwp_swap_slot_count) ? uwp_swap_slot[key] : 0;
+    const uint64_t slot = (uwp_swap_slot && key < uwp_swap_slot_count) ? uwp_swap_slot[key] : 0;
     size_t length = 0;
     if (slot != 0 && slot != UWP_SWAP_SLOT_ZERO && uwp_swap_file != INVALID_HANDLE_VALUE) {
         unsigned char header[2];
@@ -845,7 +845,7 @@ static void uwp_swap_describe_corruption(uint64_t physical, uint64_t expected, u
         }
     }
     fprintf(stderr,
-            "UWP swap: corrupt record physical=%" PRIu64 " key=%zu slot=%u length=%zu (%s)"
+            "UWP swap: corrupt record physical=%" PRIu64 " key=%zu slot=%" PRIu64 " length=%zu (%s)"
             " stored=%" PRIu64 " pages codec fallbacks=%" PRIu64 " write failures=%" PRIu64
             " expected=%016" PRIx64 " read=%016" PRIx64 "\n",
             physical, key, slot, length,
@@ -863,9 +863,9 @@ static void uwp_swap_drop_pool_record(uint64_t physical) {
     if (!uwp_swap_slot || key >= uwp_swap_slot_count)
         return;
     AcquireSRWLockExclusive(&uwp_swap_io_lock);
-    const uint32_t slot = uwp_swap_slot[key];
+    const uint64_t slot = uwp_swap_slot[key];
     if (uwp_pool_slot(slot)) {
-        uwp_pool_free_blob(slot & ~UWP_SWAP_SLOT_POOL);
+        uwp_pool_free_blob((uint32_t)(slot & ~UWP_SWAP_SLOT_POOL));
         uwp_swap_slot[key] = 0;
     }
     ReleaseSRWLockExclusive(&uwp_swap_io_lock);

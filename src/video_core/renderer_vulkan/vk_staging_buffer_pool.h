@@ -78,6 +78,8 @@ private:
     void TrimLarge(std::vector<LargeBuffer>& cache);
 
     void PublishStats() const;
+    void DiagnoseExpansion(const char* path, u64 size, VideoCore::MemoryType type,
+                           bool deferred, bool unsynchronized);
 
     const Instance& instance;
     Scheduler& scheduler;

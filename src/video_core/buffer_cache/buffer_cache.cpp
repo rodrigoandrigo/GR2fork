@@ -762,6 +762,24 @@ const Buffer* BufferCache::GetDenseArena(u64 first_block, u64 last_block) {
         end = std::max(end, last->first + last->second->size_bytes);
         ++last;
     }
+    if (first != last && std::next(first) == last) {
+        const VAddr previous_begin = first->first;
+        const VAddr previous_end = previous_begin + first->second->size_bytes;
+        const u64 growth = Common::AlignUp(
+            std::max<u64>(DensePageSize, std::min<u64>(first->second->size_bytes / 8, 4_MB)),
+            DensePageSize);
+        if (end > previous_end) {
+            const VAddr limit =
+                last == dense_arenas.end() ? (1ULL << ADDRESS_SPACE_BITS) : last->first;
+            end += std::min<u64>(growth, limit - end);
+        } else if (begin < previous_begin) {
+            const VAddr limit =
+                first == dense_arenas.begin()
+                    ? 0
+                    : std::prev(first)->first + std::prev(first)->second->size_bytes;
+            begin -= std::min<u64>(growth, begin - limit);
+        }
+    }
     auto buffer = std::make_unique<Buffer>(instance, begin, end - begin, MemoryType::DeviceLocal,
                                            "Dense guest buffer arena");
 #ifdef SHADPS4_UWP

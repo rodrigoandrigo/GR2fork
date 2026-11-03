@@ -158,7 +158,7 @@ int uwp_memory_init(uint64_t bytes, uint64_t direct, uintptr_t canonical, const 
     runtime_memory_reserve();
     const char* swap_flag = getenv("SHADPS4_UWP_SWAP");
     uwp_swap_disabled = !enabled || (swap_flag && *swap_flag == '0');
-    uwp_swap_disk_budget = uwp_swap_disk_ceiling = UINT64_C(2048) << 20;
+    uwp_swap_disk_budget = uwp_swap_disk_ceiling = UINT64_C(4096) << 20;
     const char* budget = getenv("SHADPS4_UWP_SWAP_DISK_MB");
     unsigned long long mb = budget ? strtoull(budget, NULL, 10) : 0;
     if (mb >= 64 && mb <= 8192)

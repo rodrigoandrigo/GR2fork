@@ -64,10 +64,41 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
     }
 
     if (!best) {
+        scheduler.DrainPendingOperations();
+#ifdef SHADPS4_UWP
+        trim_pressure = Core::AddressSpace::MemoryHeadroom() < 640_MB;
+#endif
+    }
+    if (!best && trim_pressure && !unsynchronized) {
+        Block* reusable{};
+        for (Block& block : ring.blocks) {
+            const u64 tick = block.buffer->LastTick();
+            if (tick < scheduler.CurrentTick() &&
+                (!reusable || tick < reusable->buffer->LastTick()))
+                reusable = &block;
+        }
+        if (reusable) {
+            scheduler.Wait(reusable->buffer->LastTick());
+            scheduler.DrainPendingOperations();
+            if (const auto offset = reusable->buffer->Reserve(size, alignment, false)) {
+                best = reusable;
+                best_offset = *offset;
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "[StagingPressure] ring_reserve_failed_after_wait size={} alignment={} "
+                            "type={} candidate_tick={} current_tick={} capacity={}",
+                            size, alignment, u32(type), reusable->buffer->LastTick(),
+                            scheduler.CurrentTick(), reusable->buffer->SizeBytes());
+            }
+        }
+    }
+
+    if (!best) {
         if (!ring.blocks.empty() && unsynchronized) {
             best = &ring.blocks[(ring.current + 1) % ring.blocks.size()];
             best_offset = 0;
         } else {
+            DiagnoseExpansion("ring", size, type, false, unsynchronized);
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
                                                                     BLOCK_SIZE),
@@ -105,7 +136,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     LargeBuffer* best{};
     for (LargeBuffer& entry : cache) {
         const u64 entry_size = entry.buffer->SizeBytes();
-        if (entry.held || entry_size < size || entry_size > max_size ||
+        if (entry.held || entry_size < size || (!trim_pressure && entry_size > max_size) ||
             (!scheduler.IsFree(std::max(entry.tick, entry.buffer->LastUseTick())) &&
              !unsynchronized)) {
             continue;
@@ -116,6 +147,27 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     }
 
     if (!best) {
+        scheduler.DrainPendingOperations();
+#ifdef SHADPS4_UWP
+        trim_pressure = Core::AddressSpace::MemoryHeadroom() < 640_MB;
+#endif
+    }
+    if (!best && trim_pressure && !unsynchronized) {
+        for (LargeBuffer& entry : cache) {
+            const u64 tick = std::max(entry.tick, entry.buffer->LastUseTick());
+            if (!entry.held && entry.buffer->SizeBytes() >= size &&
+                tick < scheduler.CurrentTick() &&
+                (!best || entry.buffer->SizeBytes() < best->buffer->SizeBytes()))
+                best = &entry;
+        }
+        if (best) {
+            scheduler.Wait(std::max(best->tick, best->buffer->LastUseTick()));
+            scheduler.DrainPendingOperations();
+        }
+    }
+
+    if (!best) {
+        DiagnoseExpansion("dedicated", size, type, deferred, unsynchronized);
         best = &cache.emplace_back(LargeBuffer{
             .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
                                                           type, "StagingBufferPool:Dedicated"),
@@ -141,6 +193,69 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
         ref.mapped = buffer.mapped_data.data();
     }
     return ref;
+}
+
+void StagingBufferPool::DiagnoseExpansion(const char* path, u64 size, MemoryType type,
+                                         bool deferred, bool unsynchronized) {
+#ifdef SHADPS4_UWP
+    const u64 headroom = Core::AddressSpace::MemoryHeadroom();
+    if (headroom >= 640_MB)
+        return;
+    const u64 current = scheduler.CurrentTick();
+    LOG_WARNING(Render_Vulkan,
+                "[StagingPressure] expansion path={} requested_bytes={} allocation_bytes={} "
+                "type={} deferred={} unsynchronized={} headroom_bytes={} current_tick={} "
+                "known_gpu={} frame={} pressure={}",
+                path, size, std::string_view(path) == "ring" ? BLOCK_SIZE : RoundAllocationSize(size),
+                u32(type), deferred, unsynchronized, headroom, current,
+                scheduler.GetWorkSemaphore()->KnownGpuTick(), frame, trim_pressure);
+    for (size_t t = 0; t < NUM_TYPES; ++t) {
+        u64 ring_bytes{}, current_bytes{}, pending_bytes{}, completed_bytes{}, held_bytes{};
+        u64 large_bytes{}, too_small{}, candidates{};
+        size_t rows{};
+        auto describe = [&](const VideoCore::Buffer& buffer, u64 tick, bool held,
+                            const char* kind) {
+            const u64 bytes = buffer.SizeBytes();
+            const bool complete = scheduler.IsFree(tick);
+            if (held)
+                held_bytes += bytes;
+            else if (tick >= current)
+                current_bytes += bytes;
+            else if (!complete)
+                pending_bytes += bytes;
+            else
+                completed_bytes += bytes;
+            if (bytes < size)
+                ++too_small;
+            else if (!held && tick < current)
+                ++candidates;
+            if (rows++ < 12)
+                LOG_WARNING(Render_Vulkan,
+                            "[StagingPressure] entry type={} kind={} bytes={} tick={} held={} "
+                            "gpu_done={} current_batch={}",
+                            t, kind, bytes, tick, held, complete, tick >= current);
+        };
+        for (const Block& block : rings[t].blocks) {
+            ring_bytes += block.buffer->SizeBytes();
+            describe(*block.buffer, block.buffer->LastTick(), false, "ring");
+        }
+        for (const LargeBuffer& entry : large_caches[t]) {
+            large_bytes += entry.buffer->SizeBytes();
+            describe(*entry.buffer, std::max(entry.tick, entry.buffer->LastUseTick()), entry.held,
+                     "dedicated");
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "[StagingPressure] totals type={} ring_count={} ring_bytes={} "
+                    "dedicated_count={} dedicated_bytes={} held_bytes={} current_batch_bytes={} "
+                    "pending_previous_bytes={} completed_bytes={} too_small_count={} "
+                    "previous_candidates={} entries_not_shown={}",
+                    t, rings[t].blocks.size(), ring_bytes, large_caches[t].size(), large_bytes,
+                    held_bytes, current_bytes, pending_bytes, completed_bytes, too_small, candidates,
+                    rows > 12 ? rows - 12 : 0);
+    }
+    ResourceMemory::Report("staging_expansion", false);
+    Common::Log::Flush();
+#endif
 }
 
 void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
@@ -172,9 +287,13 @@ void StagingBufferPool::TickFrame() {
 
 void StagingBufferPool::TrimRing(Ring& ring) {
     auto& blocks = ring.blocks;
+    const auto newest = std::ranges::max_element(blocks, {}, &Block::last_used_frame);
+    const auto* retained = newest == blocks.end() ? nullptr : newest->buffer.get();
     for (size_t i = blocks.size(); i-- > 0;) {
         Block& block = blocks[i];
-        if ((!trim_pressure && frame - block.last_used_frame < RING_IDLE_FRAMES) ||
+        const u64 age = frame - block.last_used_frame;
+        if ((block.buffer.get() == retained && age < RING_IDLE_FRAMES) ||
+            age < (trim_pressure ? 2 : RING_IDLE_FRAMES) ||
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }
@@ -195,9 +314,16 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 }
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
+    u64 retained_bytes{};
     for (size_t i = cache.size(); i-- > 0;) {
         auto& entry = cache[i];
-        if (entry.held || (!trim_pressure && frame - entry.last_used_frame < LARGE_IDLE_FRAMES) ||
+        const u64 age = frame - entry.last_used_frame;
+        if (!entry.held && age < LARGE_IDLE_FRAMES &&
+            entry.buffer->SizeBytes() <= BLOCK_SIZE - retained_bytes) {
+            retained_bytes += entry.buffer->SizeBytes();
+            continue;
+        }
+        if (entry.held || age < (trim_pressure ? 2 : LARGE_IDLE_FRAMES) ||
             !scheduler.IsFree(std::max(entry.tick, entry.buffer->LastUseTick()))) {
             continue;
         }
