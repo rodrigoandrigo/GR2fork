@@ -7,6 +7,9 @@
 #include "video_core/renderer_vulkan/vk_pipeline_progress.h"
 
 #include "common/assert.h"
+#ifdef SHADPS4_UWP
+#include "core/address_space.h"
+#endif
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -492,6 +495,21 @@ GraphicsPipeline::GraphicsPipeline(
     PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::VulkanCreatePipeline);
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+#ifdef SHADPS4_UWP
+    for (unsigned attempt = 0;
+         attempt < 3 && (pipeline_result == vk::Result::eErrorOutOfDeviceMemory ||
+                         pipeline_result == vk::Result::eErrorOutOfHostMemory);
+         ++attempt) {
+        const auto reclaimed = Core::AddressSpace::ReclaimMemory(256_MB);
+        LOG_WARNING(Render_Vulkan, "Graphics pipeline allocation recovery: attempt={} reclaimed={}",
+                    attempt + 1, reclaimed);
+        if (!reclaimed)
+            break;
+        auto retry = device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+        pipeline_result = retry.result;
+        pipe = std::move(retry.value);
+    }
+#endif
     PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::PipelineCreated);
     if (geometry_module) {
         device.destroyShaderModule(geometry_module);

@@ -16,6 +16,7 @@ static uint64_t uwp_swap_frame_count;
 static unsigned char uwp_swap_copy[16384];
 static uint64_t uwp_swap_out, uwp_swap_in, uwp_swap_disk_pages, uwp_swap_views;
 static uint64_t uwp_swap_hash_checks, uwp_swap_hash_errors, uwp_swap_view_evictions;
+static uint64_t uwp_swap_whole_maps, uwp_swap_view_recoveries, uwp_swap_io_retries;
 static uint64_t uwp_swap_view_limit = UINT64_C(64) * 1024 * 1024 / PAGE;
 
 static uint64_t uwp_swap_passes, uwp_swap_dry;
@@ -361,17 +362,45 @@ failed:
 
 static DWORD uwp_swap_transfer_error;
 
+static int uwp_swap_resource_error(DWORD error) {
+    return error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY ||
+           error == ERROR_COMMITMENT_LIMIT || error == ERROR_WORKING_SET_QUOTA ||
+           error == ERROR_NO_SYSTEM_RESOURCES || error == ERROR_NONPAGED_SYSTEM_RESOURCES ||
+           error == ERROR_PAGED_SYSTEM_RESOURCES || error == ERROR_PAGEFILE_QUOTA ||
+           error == ERROR_NOT_ENOUGH_QUOTA;
+}
+
 static int uwp_swap_io_at(uint64_t offset, void* data, size_t size, int write) {
-    OVERLAPPED at = {0};
-    DWORD done = 0;
-    at.Offset = (DWORD)offset;
-    at.OffsetHigh = (DWORD)(offset >> 32);
-    BOOL ok = write ? WriteFile(uwp_swap_file, data, (DWORD)size, &done, &at)
-                    : ReadFile(uwp_swap_file, data, (DWORD)size, &done, &at);
-    if (!ok || done != size) {
-        uwp_swap_transfer_error = GetLastError();
-        return 0;
+    size_t transferred = 0, limit = size;
+    while (transferred < size) {
+        OVERLAPPED at = {0};
+        DWORD done = 0;
+        const uint64_t position = offset + transferred;
+        at.Offset = (DWORD)position;
+        at.OffsetHigh = (DWORD)(position >> 32);
+        const size_t remaining = size - transferred;
+        const DWORD chunk = (DWORD)(remaining < limit ? remaining : limit);
+        BOOL ok =
+            write ? WriteFile(uwp_swap_file, (const unsigned char*)data + transferred, chunk, &done,
+                              &at)
+                  : ReadFile(uwp_swap_file, (unsigned char*)data + transferred, chunk, &done, &at);
+        if (!ok) {
+            const DWORD error = GetLastError();
+            if (uwp_swap_resource_error(error) && chunk > 4096) {
+                limit = 4096;
+                ++uwp_swap_io_retries;
+                continue;
+            }
+            uwp_swap_transfer_error = error;
+            return 0;
+        }
+        if (!done || done > chunk) {
+            uwp_swap_transfer_error = write ? ERROR_WRITE_FAULT : ERROR_HANDLE_EOF;
+            return 0;
+        }
+        transferred += done;
     }
+    uwp_swap_transfer_error = ERROR_SUCCESS;
     return 1;
 }
 
@@ -907,6 +936,29 @@ static void uwp_swap_coalesce(UwpPage* page) {
     page->split = 0;
 }
 
+static void uwp_swap_release_views(UwpPage* page) {
+    const unsigned before = page->view_mask;
+    if (page->whole_view) {
+        if (!UnmapViewOfFile2(GetCurrentProcess(), (void*)page->address, MEM_PRESERVE_PLACEHOLDER))
+            uwp_fail("whole swap view release", page->address);
+        uwp_swap_forget_view(page->address, PAGE);
+        page->whole_view = 0;
+        page->view_mask = 0;
+    } else {
+        for (unsigned i = 0; i < 4; ++i) {
+            if (!(page->view_mask & (1u << i)))
+                continue;
+            const uintptr_t address = page->address + i * 4096;
+            if (!UnmapViewOfFile2(GetCurrentProcess(), (void*)address, MEM_PRESERVE_PLACEHOLDER))
+                uwp_fail("swap view release", address);
+            page->view_mask &= ~(1u << i);
+            uwp_swap_forget_view(address, 4096);
+        }
+    }
+    if (before)
+        --uwp_swap_views;
+}
+
 static int uwp_swap_unmap_view(UwpPage* page) {
     UwpPhysical* physical = &uwp_physical[page->physical / PAGE];
     if (physical->frame) {
@@ -937,18 +989,7 @@ static int uwp_swap_unmap_view(UwpPage* page) {
             return 0;
         }
     }
-    for (unsigned i = 0; i < 4; ++i) {
-        if (page->view_mask & (1u << i)) {
-            if (!UnmapViewOfFile2(GetCurrentProcess(), (void*)(page->address + i * 4096),
-                                  MEM_PRESERVE_PLACEHOLDER)) {
-                uwp_fail("swap view release", page->address);
-            }
-            uwp_swap_forget_view(page->address + i * 4096, 4096);
-        }
-    }
-    if (page->view_mask)
-        --uwp_swap_views;
-    page->view_mask = 0;
+    uwp_swap_release_views(page);
     if (physical->frame) {
         uwp_swap_frames[physical->frame - 1] = 0;
         --uwp_swap_frame_count;
@@ -958,26 +999,38 @@ static int uwp_swap_unmap_view(UwpPage* page) {
     return 1;
 }
 
-static int uwp_swap_view_room(UwpPage* exclude) {
+static uint64_t uwp_swap_trim_views(UwpPage* exclude, uint64_t requested) {
     const size_t max_scan = uwp_count * 2;
-    for (size_t n = 0; uwp_swap_frame_count >= uwp_swap_view_limit && n < max_scan; ++n) {
+    uint64_t released = 0;
+    for (size_t n = 0; released < requested && n < max_scan; ++n) {
         if (uwp_swap_view_cursor >= uwp_count)
             uwp_swap_view_cursor = 0;
         UwpPage* page = &uwp_pages[uwp_swap_view_cursor++];
-        if (page == exclude || !page->mapped || (page->kind != 3 && page->kind != 4))
+        if (page == exclude || !page->mapped || page->kind != 3 || !page->view_mask)
             continue;
         UwpPhysical* physical = &uwp_physical[page->physical / PAGE];
-        if ((physical->pinned || physical->leases) || !physical->frame)
+        if (physical->pinned || physical->leases || !physical->frame)
             continue;
         if (physical->recent) {
             physical->recent = 0;
             continue;
         }
+        const size_t before = uwp_swap_live_count;
         physical->hash_valid = 0;
-        if (uwp_swap_unmap_view(page))
+        if (uwp_swap_unmap_view(page)) {
+            released += before - uwp_swap_live_count;
             ++uwp_swap_view_evictions;
+        }
     }
-    return uwp_swap_frame_count < uwp_swap_view_limit;
+    return released;
+}
+
+static int uwp_swap_view_room(UwpPage* exclude) {
+    while (uwp_swap_frame_count >= uwp_swap_view_limit) {
+        if (!uwp_swap_trim_views(exclude, 1))
+            return 0;
+    }
+    return 1;
 }
 
 static unsigned char* uwp_swap_bytes(uint64_t offset) {
@@ -1042,6 +1095,38 @@ static int uwp_swap_page_in(UwpPage* page) {
     UwpPhysical* physical = &uwp_physical[page->physical / PAGE];
     uwp_swap_bytes(page->physical);
     unsigned before = page->view_mask;
+    const int protection = page->protection[0];
+    int uniform = protection != 0;
+    for (unsigned i = 1; i < 4; ++i)
+        uniform = uniform && page->protection[i] == protection;
+    if (!before && uniform) {
+        uwp_swap_coalesce(page);
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            void* view =
+                MapViewOfFile3FromApp(uwp_swap_section, GetCurrentProcess(), (void*)page->address,
+                                      (physical->frame - 1) * PAGE, PAGE, MEM_REPLACE_PLACEHOLDER,
+                                      win_prot(protection), NULL, 0);
+            if (view) {
+                if (!uwp_swap_accept_view(view, page->address, PAGE, page->address)) {
+                    UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+                    return 0;
+                }
+                page->whole_view = 1;
+                page->view_mask = 15;
+                page->kind = 3;
+                ++uwp_swap_views;
+                ++uwp_swap_whole_maps;
+                ++uwp_commit_epoch;
+                return 1;
+            }
+            const DWORD error = GetLastError();
+            if (!uwp_swap_resource_error(error) || !uwp_swap_trim_views(page, 16))
+                break;
+            ++uwp_swap_view_recoveries;
+        }
+    }
+    if (!before)
+        uwp_swap_split(page);
     for (unsigned i = 0; i < 4; ++i) {
         if ((page->view_mask & (1u << i)) || !page->protection[i])
             continue;
@@ -1055,7 +1140,17 @@ static int uwp_swap_page_in(UwpPage* page) {
                 break;
             }
 
-            if (attempt == 7 || !uwp_swap_page_out_locked(UINT64_C(16) * 1024 * 1024, page, 1, 0)) {
+            const DWORD error = GetLastError();
+            if (attempt == 7 || !uwp_swap_resource_error(error)) {
+                SetLastError(error);
+                uwp_fail("swap page-in", page->address + i * 4096);
+            }
+            if (uwp_swap_trim_views(page, 16)) {
+                ++uwp_swap_view_recoveries;
+                continue;
+            }
+            if (!uwp_swap_page_out_locked(UINT64_C(16) * 1024 * 1024, page, 1, 0)) {
+                SetLastError(error);
                 uwp_fail("swap page-in", page->address + i * 4096);
             }
         }
@@ -1082,6 +1177,15 @@ static int uwp_swap_protect(UwpPage* page, unsigned index, int prot) {
     if (page->view_mask & bit) {
         DWORD old;
         if (!VirtualProtectFromApp((void*)address, 4096, win_prot(prot), &old)) {
+            if (page->whole_view) {
+                uwp_swap_release_views(page);
+                page->kind = 4;
+                page->protection[index] = prot;
+                uwp_swap_split(page);
+                uwp_swap_page_in(page);
+                ++uwp_commit_epoch;
+                return 1;
+            }
             if (!UnmapViewOfFile2(GetCurrentProcess(), (void*)address, MEM_PRESERVE_PLACEHOLDER)) {
                 return 0;
             }
@@ -1608,6 +1712,8 @@ static void uwp_swap_report(void) {
     uint64_t disk = uwp_swap_store_next / PAGE, views = uwp_swap_views;
     uint64_t checks = uwp_swap_hash_checks, errors = uwp_swap_hash_errors;
     uint64_t evictions = uwp_swap_view_evictions;
+    const uint64_t mappings = uwp_swap_live_count, whole = uwp_swap_whole_maps;
+    const uint64_t view_recoveries = uwp_swap_view_recoveries, io_retries = uwp_swap_io_retries;
     ReleaseSRWLockExclusive(&uwp_commit_lock);
     read_unlock();
     const char* profile = getenv("BB_IO_STATS");
@@ -1623,6 +1729,9 @@ static void uwp_swap_report(void) {
            " MiB; checks=%" PRIu64 " corrupt=%" PRIu64 " window evictions=%" PRIu64 "\n",
            out >> 20, in >> 20, (disk * PAGE) >> 20, (views * PAGE) >> 20, checks, errors,
            evictions);
+    printf("UWP swap: native views=%" PRIu64 " whole-page maps=%" PRIu64 " view recoveries=%" PRIu64
+           " quota I/O retries=%" PRIu64 "\n",
+           mappings, whole, view_recoveries, io_retries);
     printf("UWP swap: pageable private=%" PRIu64 " pinned=%" PRIu64 " MiB; page-out passes=%" PRIu64
            " with nothing to give=%" PRIu64 "\n",
            resident >> 20, pinned_mb, uwp_swap_passes, uwp_swap_dry);

@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#ifdef SHADPS4_UWP
+#include "core/address_space.h"
+#endif
 
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -90,6 +93,21 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     };
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+#ifdef SHADPS4_UWP
+    for (unsigned attempt = 0;
+         attempt < 3 && (pipeline_result == vk::Result::eErrorOutOfDeviceMemory ||
+                         pipeline_result == vk::Result::eErrorOutOfHostMemory);
+         ++attempt) {
+        const auto reclaimed = Core::AddressSpace::ReclaimMemory(256_MB);
+        LOG_WARNING(Render_Vulkan, "Compute pipeline allocation recovery: attempt={} reclaimed={}",
+                    attempt + 1, reclaimed);
+        if (!reclaimed)
+            break;
+        auto retry = device.createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+        pipeline_result = retry.result;
+        pipe = std::move(retry.value);
+    }
+#endif
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

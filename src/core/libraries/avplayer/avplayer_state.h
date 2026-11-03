@@ -42,6 +42,8 @@ public:
     bool SetLooping(bool is_looping);
 
 private:
+    bool StopSource();
+
     // Event Replacement
     static void PS4_SYSV_ABI AutoPlayEventCallback(void* handle, AvPlayerEvents event_id,
                                                    s32 source_id, void* event_data);

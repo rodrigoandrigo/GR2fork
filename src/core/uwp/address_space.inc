@@ -428,6 +428,9 @@ struct AddressSpace::Impl {
         pager = std::jthread([](std::stop_token stop) {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             bool draining{};
+            u64 retry_at{};
+            u64 unreclaimed_usage{};
+            u64 retry_delay{40};
             auto reported = GetTickCount64();
             while (!stop.stop_requested()) {
                 u64 reclaimed{};
@@ -439,8 +442,22 @@ struct AddressSpace::Impl {
                             draining = true;
                         if (used <= limit - 768_MB)
                             draining = false;
-                        if (draining)
+                        if (!draining) {
+                            retry_at = 0;
+                            retry_delay = 40;
+                        } else if (GetTickCount64() >= retry_at ||
+                                   (used > unreclaimed_usage &&
+                                    used - unreclaimed_usage >= 32_MB)) {
                             reclaimed = uwp_memory_reclaim(2_MB, false);
+                            if (reclaimed) {
+                                retry_at = 0;
+                                retry_delay = 40;
+                            } else {
+                                unreclaimed_usage = used;
+                                retry_at = GetTickCount64() + retry_delay;
+                                retry_delay = std::min<u64>(retry_delay * 2, 500);
+                            }
+                        }
                     }
                 } catch (const winrt::hresult_error&) {
                 }

@@ -15,6 +15,7 @@ typedef struct {
     uint64_t physical;
     int mapped, kind, pageable, split, committed, isolated, placed;
     unsigned view_mask;
+    int whole_view;
     int protection[4];
 } UwpPage;
 
@@ -220,8 +221,7 @@ int runtime_memory_handle_commit_fault_at(uintptr_t address, int access, int gue
         unsigned index = (unsigned)((address - page->address) / 4096);
         int wanted = page->protection[index];
 
-        if ((wanted & PROT_EXEC) ||
-            (guest_code && (page->kind == 3 || page->kind == 4 || uwp_pin_private_pages()))) {
+        if ((wanted & PROT_EXEC) || (guest_code && uwp_pin_private_pages())) {
             physical->pinned = 1;
         }
         int permitted = (access == 1)   ? (wanted & PROT_WRITE)

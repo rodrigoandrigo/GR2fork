@@ -32,13 +32,40 @@ real do processo e para novamente com 768 MiB. Ela substitui o limite fixo e as
 inferências preventivas do pager anterior. Pedidos após falha de alocação podem
 executar até três sweeps, com prazo limitado; as passagens posteriores podem
 ignorar a segunda chance, mas nunca as leases.
+Varreduras periódicas sem páginas recuperáveis usam intervalo progressivo de
+40 a 500 ms. Crescimento de 32 MiB antecipa a próxima tentativa; uma recuperação
+bem-sucedida restaura a cadência normal. Pedidos explícitos não usam esse atraso.
+
+A criação de pipelines gráficos e compute também recupera memória guest quando
+Vulkan retorna falta de memória do host ou dispositivo. Cada tentativa pede até
+256 MiB ao pager, com no máximo três repetições e interrupção se nada for
+recuperado. Os erros restantes continuam sendo propagados ao chamador.
 
 O arquivo esparso temporário fica em `cache/swap`, com exclusão ao fechar.
 Cada registro contém uma página de 16 KiB, comprimida quando útil, com marcador
-para página zerada, fallback raw e verificação FNV. O teto padrão é 2 GiB e há
+para página zerada, fallback raw e verificação FNV. O teto padrão é 4 GiB e há
 reserva de 384 MiB no dispositivo para saves e outros arquivos. O formato de
-slots também limita o arquivo a 2 GiB. O pool de frames mapeados é limitado a
+slots usa índices de 64 bits e limita o arquivo a 4 GiB. O pool de frames mapeados é limitado a
 64 MiB e mantém seu compromisso de memória até o encerramento da sessão.
+O acesso guest a dados restaurados não os fixa permanentemente nem promove sua
+view para seção comprometida fora do swap. Leases adiam a retirada da view; após sua
+liberação, a página volta a ser candidata e suas escritas são preservadas antes
+da retirada. Código executável e a opção explícita `SHADPS4_UWP_PIN_PRIVATE`
+mantêm a fixação exigida por suas políticas.
+
+Do pager de `KytyPS5-xbox-on-upstream` foram adaptados o retorno por uma view da
+página completa e a recuperação de mapeamentos separada dos bytes residentes.
+Uma página de 16 KiB com proteção uniforme volta por uma única view já preenchida;
+proteções distintas ou falta de suporte mantêm o caminho de subviews de 4 KiB.
+Mudanças posteriores de proteção, promoção de aliases e liberação reconhecem os
+dois layouts. Falhas de mapeamento tentam retirar views frias antes de paginar
+outras páginas, respeitando pins e leases. Os contadores distinguem views nativas,
+mapeamentos completos e recuperações de views.
+
+As transferências do arquivo completam leituras e escritas parciais. Falhas de
+quota ou recursos em transferências maiores permitem uma nova tentativa em
+blocos de 4 KiB; progresso nulo é erro e o registro só é publicado após a gravação
+completa. O log contabiliza essas tentativas separadamente.
 
 Quando o armazenamento não aceita uma escrita, um pool comprimido em RAM de
 192 MiB pode preservar a página. O compromisso desse pool é contado por bitmap
@@ -190,6 +217,16 @@ As arenas densas arredondam a capacidade para 1 MiB ou para o tamanho do bloco,
 se maior, em vez de 16 MiB. Regiões apenas adjacentes permanecem separadas;
 intervalos que atravessam arenas unem as regiões sobrepostas, copiam os dados
 na GPU e mantêm os buffers anteriores até a fence.
+
+Ao expandir uma única arena, reserva-se mais 1/8 da capacidade anterior,
+arredondado à página densa, com limite de 4 MiB quando o bloco não excede esse
+tamanho. A reserva é limitada pelas arenas vizinhas e pelo espaço de endereços;
+alocações iniciais e uniões de múltiplas arenas não recebem essa reserva.
+Isso evita realocações a cada MiB durante crescimento sequencial sem voltar
+a unir regiões apenas adjacentes. Uma verificação privada na GPU reproduziu
+25 → 26 → 27 → 28 → 29 MiB com uma migração de 25 MiB para capacidade de 30 MiB;
+o readback confirmou os dados antigos e zeros na extensão. A limitação por
+uma arena vizinha também passou. A redução do pico no Xbox requer nova execução.
 
 Push descriptors usam pools de até 16 snapshots e reaproveitam espaço de pools
 compatíveis do mesmo command buffer. Cada atualização recebe um novo set;
@@ -386,3 +423,33 @@ os contadores de pedidos/reutilizações por acesso. O resumo das arenas restant
 passa a cada 30 segundos. A coleta detalhada de memória da thread de gravação
 ocorre somente em falha; os erros de alocação e diagnósticos de PSO permanecem.
 Essa configuração substitui a periodicidade e o rastreamento descritos acima.
+
+## Recuperação de staging antes de expansão
+
+Quando o pool não encontra espaço reutilizável, executa as liberações diferidas
+já elegíveis antes de alocar. Com menos de 640 MiB de margem UWP, procura um
+buffer da submissão anterior, aguarda sua fence e o reutiliza. Não força flush
+do tick atual. Alocações dedicadas mantidas por consumidores CPU continuam
+protegidas; buffers maiores já existentes podem atender pedidos menores sob
+pressão. O caminho habitual com espaço disponível não ganha essa coleta extra.
+A recuperação reduz expansões evitáveis; não torna reutilizável um recurso
+que pertence ao tick atual ou permanece mantido por um consumidor.
+
+A limpeza sob pressão preserva o ring usado mais recentemente de cada tipo
+por até 300 frames sem uso e até 16 MiB de alocações dedicadas recentes por
+tipo, com expiração de 120 frames. As demais alocações recebem tolerância de
+dois frames antes de retirada por pressão. Fences, held e destruição diferida
+continuam ativos; a reserva não implica prealocação. Isso evita remover todo
+o pool em um frame e precisar recriá-lo no seguinte.
+
+## Diagnóstico de expansão sob pressão
+
+`[StagingPressure]` é emitido antes de uma nova alocação de staging com margem
+inferior a 640 MiB. Registra caminho ring/dedicated, pedido/capacidade, tipo,
+flags, tick e fence conhecida. Por tipo, separa bytes retidos por CPU, do batch
+atual, pendentes de submissões anteriores e já concluídos; informa tamanho
+insuficiente e candidatos anteriores, além de até 12 entradas detalhadas.
+`ring_reserve_failed_after_wait` identifica reserva recusada mesmo após a espera.
+O resumo ResourceMemory acompanha a expansão, limitado a cada cinco segundos,
+e o log é descarregado antes da alocação. Não há coleta extra em pedidos que
+reutilizam espaço nem mudança de sincronização causada por este diagnóstico.

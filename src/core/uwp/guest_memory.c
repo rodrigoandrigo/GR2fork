@@ -373,10 +373,7 @@ void uwp_memory_shutdown(void) {
         if (page->kind == 2) {
             UnmapViewOfFile2(GetCurrentProcess(), (void*)page->address, MEM_PRESERVE_PLACEHOLDER);
         } else if (page->kind == 3) {
-            for (unsigned j = 0; j < 4; ++j)
-                if (page->view_mask & (1u << j))
-                    UnmapViewOfFile2(GetCurrentProcess(), (void*)(page->address + j * 4096),
-                                     MEM_PRESERVE_PLACEHOLDER);
+            uwp_swap_release_views(page);
         } else if (page->placed) {
             VirtualFree((void*)page->address, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
         }
@@ -403,6 +400,7 @@ void uwp_memory_shutdown(void) {
     free(swap_path);
     uwp_swap_frame_count = uwp_swap_store_next = uwp_swap_disk_pages = uwp_swap_views = 0;
     uwp_swap_live_count = uwp_swap_live_full = 0;
+    uwp_swap_whole_maps = uwp_swap_view_recoveries = uwp_swap_io_retries = 0;
     uwp_swap_slot_count = uwp_swap_cursor = uwp_swap_view_cursor = 0;
     uwp_pool_size = uwp_pool_commit = uwp_pool_pages = uwp_pool_bytes = 0;
     uwp_pool_blob_used = uwp_pool_free_count = 0;
