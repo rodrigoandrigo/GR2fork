@@ -446,6 +446,12 @@ struct AddressSpace::Impl {
                 }
                 if (GetTickCount64() - reported >= 5000) {
                     uwp_memory_report();
+                    if (auto driver = GetModuleHandleW(L"vulkan_dzn.dll")) {
+                        using ReportCompiles = void (*)();
+                        if (auto report = reinterpret_cast<ReportCompiles>(
+                                GetProcAddress(driver, "mesa_uwp_report_compiles")))
+                            report();
+                    }
                     reported = GetTickCount64();
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(reclaimed ? 1 : 40));

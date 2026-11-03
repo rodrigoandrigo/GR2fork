@@ -4,6 +4,11 @@
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
+#include <source_location>
+#ifdef SHADPS4_UWP
+#include <windows.h>
+#endif
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -1350,14 +1355,215 @@ s32 PS4_SYSV_ABI sceGnmRegisterResource(void* res_handle, void* owner_handle, co
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
-static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx, u32 flip_mode,
-                                   s64 flip_arg, void* unk) {
-    // check for `prepareFlip` packet
+struct FlipProbe {
+    std::array<u32, 8> words{};
+    bool readable{};
+};
+
+static bool ReadFlipDiagnostic(const u32* address, std::span<u32> output) {
+#ifdef SHADPS4_UWP
+    try {
+        auto lease = Core::AddressSpace::AcquireHostAccess(address, output.size_bytes(), false);
+        SIZE_T copied{};
+        return ReadProcessMemory(GetCurrentProcess(), address, output.data(), output.size_bytes(),
+                                 &copied) &&
+               copied == output.size_bytes();
+    } catch (...) {
+    }
+#endif
+    return false;
+}
+
+static FlipProbe ProbeFlipRequest(const u32* base, u32 size) {
+    FlipProbe result;
+    const auto address = reinterpret_cast<uintptr_t>(base);
+    if (base && !(address & 3) && size >= 64 && size <= (UINTPTR_MAX - address) / sizeof(u32)) {
+        result.readable = ReadFlipDiagnostic(base + size - 64, result.words);
+    }
+    return result;
+}
+
+struct FlipDiagnosticHistory {
+    u64 sequence{};
+    const u32* base{};
+    u32 size{};
+    u32 header_before{};
+    u32 marker{};
+    u32 header_after{};
+    u32 buffer_index{};
+    bool patched{};
+};
+
+static std::array<FlipDiagnosticHistory, 16> flip_diagnostic_history;
+static u64 flip_diagnostic_sequence{};
+
+static void DiagnoseFlipRequest(const u32* base, u32 size, u32 observed, u32 vo_handle,
+                                u32 buffer_index, u32 flip_mode, s64 flip_arg,
+                                const FlipProbe& before_wait,
+                                const std::source_location& where) noexcept {
+    try {
+        const auto address = reinterpret_cast<uintptr_t>(base);
+        LOG_ERROR(
+            Lib_GnmDriver,
+            "[FlipDiag] caller={} file={} line={} base={:#x} size_dw={} size_bytes={} "
+            "observed_header={:#010x} expected_header=0xc03e1000 vo={} buffer={} "
+            "mode={} arg={} prewait_readable={} prewait_header={:#010x} prewait_marker={:#010x}",
+            where.function_name(), where.file_name(), where.line(), address, size,
+            u64(size) * sizeof(u32), observed, vo_handle, buffer_index, flip_mode, flip_arg,
+            before_wait.readable, before_wait.words[0], before_wait.words[1]);
+        for (u64 n = flip_diagnostic_sequence > flip_diagnostic_history.size()
+                         ? flip_diagnostic_sequence - flip_diagnostic_history.size()
+                         : 0;
+             n < flip_diagnostic_sequence; ++n) {
+            const auto& entry = flip_diagnostic_history[n % flip_diagnostic_history.size()];
+            LOG_ERROR(Lib_GnmDriver,
+                      "[FlipDiag] history sequence={} base={} same_base={} size_dw={} "
+                      "header_before={:#010x} marker={:#010x} header_after={:#010x} "
+                      "buffer={} patched={}",
+                      entry.sequence, fmt::ptr(entry.base), entry.base == base, entry.size,
+                      entry.header_before, entry.marker, entry.header_after, entry.buffer_index,
+                      entry.patched);
+        }
+        if (!base || (address & 3) || size < 64 || size > 0x100000 ||
+            size > (UINTPTR_MAX - address) / sizeof(u32)) {
+            LOG_ERROR(Lib_GnmDriver, "[FlipDiag] invalid_or_oversized_range; snapshot skipped");
+            Common::Log::Flush();
+            return;
+        }
+        const auto expected_address = address + (u64(size) - 64) * sizeof(u32);
+#ifdef SHADPS4_UWP
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<void*>(expected_address), &info, sizeof(info))) {
+            LOG_ERROR(Lib_GnmDriver,
+                      "[FlipDiag] expected_va={:#x} region={} allocation={} region_bytes={} "
+                      "state={:#x} protection={:#x} type={:#x}",
+                      expected_address, fmt::ptr(info.BaseAddress), fmt::ptr(info.AllocationBase),
+                      info.RegionSize, info.State, info.Protect, info.Type);
+        }
+#endif
+        std::vector<u32> snapshot(size);
+        bool complete = ReadFlipDiagnostic(base, snapshot);
+        const auto tail_start = size > 128 ? size - 128 : 0;
+        if (!complete) {
+            LOG_ERROR(Lib_GnmDriver, "[FlipDiag] full_snapshot_unreadable; reading tail only");
+            if (!ReadFlipDiagnostic(base + tail_start, std::span{snapshot}.subspan(tail_start))) {
+                LOG_ERROR(Lib_GnmDriver, "[FlipDiag] tail_snapshot_unreadable");
+                Common::Log::Flush();
+                return;
+            }
+        }
+        const auto expected = size - 64;
+        LOG_ERROR(Lib_GnmDriver,
+                  "[FlipDiag] snapshot_complete={} expected_offset_dw={} header={:#010x} "
+                  "marker={:#010x} offset5={:#010x} offset6={:#010x} header_changed={} "
+                  "looks_already_patched={}",
+                  complete, expected, snapshot[expected], snapshot[expected + 1],
+                  snapshot[expected + 5], snapshot[expected + 6],
+                  before_wait.readable && before_wait.words[0] != snapshot[expected],
+                  ((snapshot[expected] >> 8) & 0xff) == u32(PM4ItOpcode::WriteData) &&
+                      snapshot[expected + 6] == u32(PM4CmdNop::PayloadType::PatchedFlip));
+        for (u32 at = tail_start; at < size; at += 8) {
+            std::array<u32, 8> words{};
+            std::copy_n(snapshot.begin() + at, std::min<u32>(8, size - at), words.begin());
+            LOG_ERROR(Lib_GnmDriver,
+                      "[FlipDiag] raw offset_dw={} {:08x} {:08x} {:08x} {:08x} "
+                      "{:08x} {:08x} {:08x} {:08x}",
+                      at, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+                      words[7]);
+        }
+        unsigned candidates{};
+        for (u32 at = tail_start; at + 1 < size && candidates < 8; ++at) {
+            const auto header = snapshot[at];
+            if ((header >> 30) == 3 && ((header >> 8) & 0xff) == u32(PM4ItOpcode::Nop)) {
+                const auto marker = snapshot[at + 1];
+                if (marker == u32(PM4CmdNop::PayloadType::PrepareFlip) ||
+                    marker == u32(PM4CmdNop::PayloadType::PrepareFlipLabel) ||
+                    marker == u32(PM4CmdNop::PayloadType::PrepareFlipInterrupt) ||
+                    marker == u32(PM4CmdNop::PayloadType::PrepareFlipInterruptLabel) ||
+                    marker == u32(PM4CmdNop::PayloadType::PatchedFlip)) {
+                    LOG_ERROR(Lib_GnmDriver,
+                              "[FlipDiag] tail_candidate offset_dw={} header={:#010x} "
+                              "marker={:#010x} expected_position={}",
+                              at, header, marker, at == expected);
+                    ++candidates;
+                }
+            }
+        }
+        if (complete) {
+            std::array<u32, 12> last_packets{};
+            u32 count{}, at{};
+            while (at < size) {
+                last_packets[count++ % last_packets.size()] = at;
+                const auto header = snapshot[at];
+                const auto type = header >> 30;
+                const auto length = type == 2 ? 1u : ((header >> 16) & 0x3fff) + 2;
+                if (type == 1 || length > size - at) {
+                    LOG_ERROR(Lib_GnmDriver,
+                              "[FlipDiag] packet_walk_stopped offset_dw={} header={:#010x} "
+                              "type={} declared_dw={} remaining_dw={}",
+                              at, header, type, length, size - at);
+                    break;
+                }
+                if (type == 3 && ((header >> 8) & 0xff) == u32(PM4ItOpcode::Nop) && at + 1 < size &&
+                    candidates < 16) {
+                    const auto marker = snapshot[at + 1];
+                    if (marker == u32(PM4CmdNop::PayloadType::PrepareFlip) ||
+                        marker == u32(PM4CmdNop::PayloadType::PrepareFlipLabel) ||
+                        marker == u32(PM4CmdNop::PayloadType::PrepareFlipInterrupt) ||
+                        marker == u32(PM4CmdNop::PayloadType::PrepareFlipInterruptLabel) ||
+                        marker == u32(PM4CmdNop::PayloadType::PatchedFlip)) {
+                        LOG_ERROR(Lib_GnmDriver,
+                                  "[FlipDiag] packet_candidate offset_dw={} header={:#010x} "
+                                  "marker={:#010x} expected_position={}",
+                                  at, header, marker, at == expected);
+                        ++candidates;
+                    }
+                }
+                at += length;
+            }
+            for (u32 n = count > last_packets.size() ? count - last_packets.size() : 0; n < count;
+                 ++n) {
+                const auto offset = last_packets[n % last_packets.size()];
+                const auto header = snapshot[offset];
+                LOG_ERROR(Lib_GnmDriver,
+                          "[FlipDiag] packet offset_dw={} header={:#010x} type={} opcode={:#x} "
+                          "payload0={:#010x} expected_position={}",
+                          offset, header, header >> 30, (header >> 8) & 0xff,
+                          offset + 1 < size ? snapshot[offset + 1] : 0, offset == expected);
+            }
+        }
+        Common::Log::Flush();
+    } catch (...) {
+    }
+}
+
+static inline s32 PatchFlipRequest(
+    u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg, void* unk,
+    const FlipProbe& before_wait = {},
+    const std::source_location& where = std::source_location::current()) {
+    const auto address = reinterpret_cast<uintptr_t>(cmdbuf);
+    const bool valid_range =
+        cmdbuf && !(address & 3) && size >= 64 && size <= (UINTPTR_MAX - address) / sizeof(u32);
+    if (!valid_range) {
+        DiagnoseFlipRequest(cmdbuf, size, 0, vo_handle, buf_idx, flip_mode, flip_arg, before_wait,
+                            where);
+        ASSERT_MSG(valid_range, "Invalid prepareFlip range");
+    }
+    auto* base = cmdbuf;
     cmdbuf += size - 64;
-    ASSERT_MSG(cmdbuf[0] == 0xc03e1000, "Can't find `prepareFlip` packet");
+    const auto observed = cmdbuf[0];
+    if (observed != 0xc03e1000) {
+        DiagnoseFlipRequest(base, size, observed, vo_handle, buf_idx, flip_mode, flip_arg,
+                            before_wait, where);
+    }
+    ASSERT_MSG(observed == 0xc03e1000, "Can't find `prepareFlip` packet");
+    auto& diagnostic =
+        flip_diagnostic_history[flip_diagnostic_sequence % flip_diagnostic_history.size()];
+    diagnostic = {++flip_diagnostic_sequence, base, size, observed, 0, 0, buf_idx, false};
 
     std::array<u32, 7> backup{};
     std::memcpy(backup.data(), cmdbuf, backup.size() * sizeof(decltype(backup)::value_type));
+    diagnostic.marker = backup[1];
 
     ASSERT_MSG(((backup[2] & 3) == 0u) || (backup[1] != PM4CmdNop::PayloadType::PrepareFlipLabel),
                "Invalid flip packet");
@@ -1431,6 +1637,8 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
         }
     }
 
+    diagnostic.header_after = cmdbuf[0];
+    diagnostic.patched = true;
     return ORBIS_OK;
 }
 
@@ -2430,10 +2638,11 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
     std::scoped_lock lk{m_submit_lock};
+    const auto before_wait = ProbeFlipRequest(cmdbuf, size_dw);
     WaitGpuIdle();
 
-    const s32 patch_result =
-        PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
+    const s32 patch_result = PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode,
+                                              flip_arg, nullptr /*unk*/, before_wait);
     if (patch_result != ORBIS_OK) {
         return patch_result;
     }

@@ -1029,11 +1029,12 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
 }
 
 void EmitContext::DefineImagesAndSamplers() {
-    for (const auto& image_desc : info.images) {
+    for (auto& image_desc : info.images) {
         const auto sharp = image_desc.GetSharp(info);
         const auto nfmt = sharp.GetNumberFmt();
         const bool is_integer = AmdGpu::IsInteger(nfmt);
         const bool is_storage = image_desc.is_written || image_desc.is_feedback;
+        image_desc.native_sampled = image_desc.CanUseNativeSampling(info, sharp);
         const MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const VectorIds& data_types = GetAttributeType(*this, nfmt);
         const Id sampled_type = data_types[1];

@@ -6645,6 +6645,8 @@ optimize_nir(struct nir_shader *s, const struct nir_to_dxil_options *opts)
          NIR_PASS(progress, s, dxil_nir_lower_16bit_conv);
       NIR_PASS(progress, s, nir_opt_remove_phis);
       NIR_PASS(progress, s, nir_opt_dce);
+      if (s->allocation_failed)
+         return;
       NIR_PASS(progress, s, nir_opt_if,
                nir_opt_if_optimize_phi_true_false | nir_opt_if_avoid_64bit_phis);
       NIR_PASS(progress, s, nir_opt_dead_cf);
@@ -6657,7 +6659,11 @@ optimize_nir(struct nir_shader *s, const struct nir_to_dxil_options *opts)
       };
       NIR_PASS(progress, s, nir_opt_peephole_select, &peephole_select_options);
       NIR_PASS(progress, s, nir_opt_algebraic);
+      if (s->allocation_failed)
+         return;
       NIR_PASS(progress, s, dxil_nir_algebraic);
+      if (s->allocation_failed)
+         return;
       if (s->options->lower_int64_options)
          NIR_PASS(progress, s, nir_lower_int64);
       NIR_PASS(progress, s, nir_lower_alu);
@@ -6676,6 +6682,8 @@ optimize_nir(struct nir_shader *s, const struct nir_to_dxil_options *opts)
    do {
       progress = false;
       NIR_PASS(progress, s, nir_opt_algebraic_late);
+      if (s->allocation_failed)
+         return;
    } while (progress);
 
    NIR_PASS(_, s, nir_lower_undef_to_zero, NULL);
@@ -6989,6 +6997,8 @@ nir_to_dxil(struct nir_shader *s, const struct nir_to_dxil_options *opts,
    bool retval = true;
    debug_dxil = (int)debug_get_option_debug_dxil();
    blob_init(blob);
+   if (s->allocation_failed)
+      return false;
 
    if (opts->shader_model_max < dxil_min_shader_model) {
       debug_printf("D3D12: cannot support emitting shader models lower than %d.%d\n",
@@ -7080,6 +7090,10 @@ nir_to_dxil(struct nir_shader *s, const struct nir_to_dxil_options *opts,
    /* Do a round of optimization to try to vectorize loads/stores. Otherwise the addresses used for loads
     * might be too opaque for the pass to see that they're next to each other. */
    optimize_nir(s, opts);
+   if (s->allocation_failed) {
+      retval = false;
+      goto out;
+   }
 
 /* Vectorize UBO/SSBO accesses aggressively. This can help increase alignment to enable us to do better
     * chunking of loads and stores after lowering bit sizes. Ignore load/store size limitations here, we'll
@@ -7119,10 +7133,18 @@ nir_to_dxil(struct nir_shader *s, const struct nir_to_dxil_options *opts,
        ctx->mod.shader_kind == DXIL_DOMAIN_SHADER) {
       /* Make sure any derefs are gone after lower_io before updating tess level vars */
       NIR_PASS(_, s, nir_opt_dce);
+   if (s->allocation_failed) {
+      retval = false;
+      goto out;
+   }
       NIR_PASS(_, s, dxil_nir_fixup_tess_level_for_domain);
    }
 
    optimize_nir(s, opts);
+   if (s->allocation_failed) {
+      retval = false;
+      goto out;
+   }
 
    NIR_PASS(_, s, nir_remove_dead_variables,
               nir_var_function_temp | nir_var_mem_constant | nir_var_mem_shared, NULL);
@@ -7132,15 +7154,25 @@ nir_to_dxil(struct nir_shader *s, const struct nir_to_dxil_options *opts,
       goto out;
    }
 
-   if (!allocate_sysvalues(ctx))
-      return false;
+   if (!allocate_sysvalues(ctx)) {
+      retval = false;
+      goto out;
+   }
 
    NIR_PASS(_, s, dxil_nir_lower_sysval_to_load_input, ctx->system_value);
    NIR_PASS(_, s, nir_opt_dce);
+   if (s->allocation_failed) {
+      retval = false;
+      goto out;
+   }
 
    /* This needs to be after any copy prop is done to prevent these movs from being erased */
    NIR_PASS(_, s, dxil_nir_move_consts);
    NIR_PASS(_, s, nir_opt_dce);
+   if (s->allocation_failed) {
+      retval = false;
+      goto out;
+   }
 
    NIR_PASS(_, s, dxil_nir_guess_image_formats);
 

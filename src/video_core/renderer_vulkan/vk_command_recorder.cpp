@@ -3,6 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#ifdef SHADPS4_UWP
+#include <windows.h>
+#include "common/logging/log.h"
+#endif
 #include <cstring>
 
 #include "common/assert.h"
@@ -12,6 +17,31 @@
 namespace Vulkan {
 
 namespace {
+
+struct ReadbackDiagnostic {
+    u64 id{}, generation{};
+    std::source_location caller;
+};
+
+void TraceReadback(unsigned phase, ReadbackDiagnostic& trace, vk::Image image, vk::Buffer buffer,
+                   u32 count, u64 offset) {
+#ifdef SHADPS4_UWP
+    using Trace = int (*)(unsigned, u64, u64, u64, u64*, const char*, unsigned, unsigned, u64);
+    static const auto driver = GetModuleHandleW(L"vulkan_dzn.dll");
+    static const auto function =
+        driver ? reinterpret_cast<Trace>(GetProcAddress(driver, "mesa_uwp_trace_readback"))
+               : nullptr;
+    if (function &&
+        function(phase, trace.id, reinterpret_cast<uintptr_t>(static_cast<VkImage>(image)),
+                 reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(buffer)), &trace.generation,
+                 trace.caller.function_name(), trace.caller.line(), count, offset)) {
+        using Dump = void (*)(u64);
+        if (auto dump = reinterpret_cast<Dump>(GetProcAddress(driver, "mesa_uwp_dump_readbacks")))
+            dump(0);
+        Common::Log::Flush();
+    }
+#endif
+}
 
 /// Debug label names are stored up to this size, terminator included.
 constexpr size_t MaxLabelBytes = 64;
@@ -649,20 +679,30 @@ void CommandRecorder::copyBufferToImage(
     Append(cursor, regions.data(), count);
 }
 
-void CommandRecorder::copyImageToBuffer(
-    vk::Image src_image, vk::ImageLayout src_image_layout, vk::Buffer dst_buffer,
-    vk::ArrayProxy<const vk::BufferImageCopy> const& regions) const {
+void CommandRecorder::copyImageToBuffer(vk::Image src_image, vk::ImageLayout src_image_layout,
+                                        vk::Buffer dst_buffer,
+                                        vk::ArrayProxy<const vk::BufferImageCopy> const& regions,
+                                        const std::source_location& caller) const {
+    static std::atomic<u64> next_copy{};
+    ReadbackDiagnostic trace{++next_copy, 0, caller};
+    const u32 count = regions.size();
+    const u64 offset = count ? regions.data()[0].bufferOffset : 0;
+    TraceReadback(0, trace, src_image, dst_buffer, count, offset);
     if (!scheduler->HasRecordingThread()) {
+        TraceReadback(1, trace, src_image, dst_buffer, count, offset);
         Raw().copyImageToBuffer(src_image, src_image_layout, dst_buffer, regions);
+        TraceReadback(2, trace, src_image, dst_buffer, count, offset);
         return;
     }
-    const u32 count = regions.size();
     std::byte* cursor = scheduler->RecordWithPayload(
         sizeof(vk::BufferImageCopy) * count,
-        [src_image, src_image_layout, dst_buffer, count](vk::CommandBuffer cmdbuf,
-                                                         const std::byte* payload) {
+        [src_image, src_image_layout, dst_buffer, count, offset,
+         trace](vk::CommandBuffer cmdbuf, const std::byte* payload) {
+            auto execution_trace = trace;
+            TraceReadback(1, execution_trace, src_image, dst_buffer, count, offset);
             cmdbuf.copyImageToBuffer(src_image, src_image_layout, dst_buffer, count,
                                      PayloadAs<vk::BufferImageCopy>(payload));
+            TraceReadback(2, execution_trace, src_image, dst_buffer, count, offset);
         });
     Append(cursor, regions.data(), count);
 }
@@ -754,3 +794,4 @@ void CommandRecorder::endDebugUtilsLabelEXT() const {
 }
 
 } // namespace Vulkan
+

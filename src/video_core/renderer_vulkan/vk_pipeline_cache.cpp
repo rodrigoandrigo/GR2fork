@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifdef SHADPS4_UWP
+#include <windows.h>
 #include "core/address_space.h"
+#include "uwp/dozen_host.h"
 #endif
 #include <bit>
 #include <cstring>
 #include <limits>
 #include <ranges>
+#include <nlohmann/json.hpp>
 #include <xxhash.h>
 
 #include "common/hash.h"
@@ -1122,6 +1125,9 @@ PipelineCache::~PipelineCache() {
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    graphics_unavailable_reason = "ready";
+    graphics_rejected_stage = -1;
+    graphics_diagnostic_key_valid = false;
     ReapPendingPipelines();
     ++graphics_lookups;
     // The indirect draw's SGPR offsets reach the vertex runtime info without
@@ -1138,11 +1144,16 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
     lookup_pipe_gen_ = pipe_gen;
     if (key_stamp_reuse && !params_changed && ReuseGraphicsKey(pipe_gen)) {
+        graphics_diagnostic_key_valid = true;
         return last_graphics_pipeline;
     }
+    graphics_unavailable_reason = "graphics_key_rejected";
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    graphics_diagnostic_key_valid = true;
+    graphics_unavailable_reason = "ready";
+    graphics_rejected_stage = -1;
     // Registers the key does not read (viewport, scissor) restamp every draw,
     // so the restamp here keys the reuse on the stamp this key was last built
     // at, not on the one that first stored it.
@@ -1154,6 +1165,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         return last_graphics_pipeline;
     }
     if (abandoned_graphics_pipelines.contains(graphics_key)) {
+        graphics_unavailable_reason = "pipeline_abandoned";
         ++async_skipped_draws;
         return nullptr;
     }
@@ -1168,11 +1180,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             ReapPendingPipelines();
         }
         if (!graphics_pipelines.contains(graphics_key)) {
+            graphics_unavailable_reason = "compilation_pending";
             ++async_skipped_draws;
             return nullptr;
         }
     }
     if (!graphics_pipelines.contains(graphics_key) && pending_graphics_pipelines.size() >= 4) {
+        graphics_unavailable_reason = "compile_queue_full";
         ++async_skipped_draws;
         return nullptr;
     }
@@ -1209,6 +1223,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         graphics_pipelines.erase(it);
         pending_graphics_pipelines.emplace(graphics_key, std::move(pending));
         if (!ready) {
+            graphics_unavailable_reason = "compile_wait_budget_exhausted";
             ++async_skipped_draws;
             return nullptr;
         }
@@ -1221,6 +1236,95 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     last_key_stamp = liverpool->GetGfxStateStamp();
     key_is_last = true;
     return last_graphics_pipeline;
+}
+
+nlohmann::json PipelineCache::GraphicsPipelineDiagnostic() const {
+    const auto& regs = liverpool->regs;
+    const auto now = std::chrono::steady_clock::now();
+    nlohmann::json diagnostic{
+        {"version", 2},
+        {"reason", graphics_unavailable_reason},
+        {"rejected_hw_stage", graphics_rejected_stage},
+        {"key_complete", graphics_diagnostic_key_valid},
+        {"stage_enable", regs.stage_enable.raw},
+        {"gs_onchip", bool(regs.vgt_gs_mode.onchip)},
+        {"streamout_config", regs.vgt_strmout_config.raw},
+        {"geometry_supported", instance.IsGeometryStageSupported()},
+        {"tessellation_supported", instance.IsTessellationSupported()},
+        {"pending_count", pending_graphics_pipelines.size()},
+        {"pending_limit", 4},
+        {"sync_budget_ms", std::clamp(EmulatorSettings.GetPipelineSyncBudgetMs(), 0, 50000)},
+        {"sync_budget_frame", sync_budget_frame},
+        {"sync_budget_spent_us",
+         std::chrono::duration_cast<std::chrono::microseconds>(sync_budget_spent).count()},
+        {"frame", DebugState.GetFrameNum()},
+        {"stage_hashes", graphics_key.stage_hashes},
+    };
+    const auto hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+    diagnostic[graphics_diagnostic_key_valid ? "key_hash" : "partial_key_hash"] = hash;
+    if (graphics_diagnostic_key_valid) {
+        if (const auto it = abandoned_graphics_pipelines.find(graphics_key);
+            it != abandoned_graphics_pipelines.end())
+            diagnostic["abandon_reason"] = it->second;
+    }
+    static constexpr std::array<const char*, 6> stage_names{"fragment", "vertex", "geometry",
+                                                            "export",   "hull",   "local"};
+    diagnostic["guest_stages"] = nlohmann::json::array();
+    for (u32 stage = 0; stage < stage_names.size(); ++stage) {
+        const auto* program = regs.ProgramForStage(stage);
+        nlohmann::json entry{{"hw_stage", stage},
+                             {"name", stage_names[stage]},
+                             {"enabled", regs.stage_enable.IsStageEnabled(stage)},
+                             {"address", program ? program->Address<VAddr>() : 0}};
+        if (program)
+            entry["user_data"] = program->user_data;
+        diagnostic["guest_stages"].push_back(std::move(entry));
+    }
+    diagnostic["resolved_stages"] = nlohmann::json::array();
+    for (u32 stage = 0; stage < infos.size(); ++stage) {
+        const auto* info = infos[stage];
+        if (!info)
+            continue;
+        diagnostic["resolved_stages"].push_back({{"sw_stage", stage},
+                                                 {"hw_stage", u32(info->hw_stage)},
+                                                 {"hash", info->pgm_hash},
+                                                 {"address", info->pgm_base}});
+    }
+    diagnostic["pending"] = nlohmann::json::array();
+    for (const auto& [key, pending] : pending_graphics_pipelines) {
+        const auto status = pending->future.valid()
+                                ? pending->future.wait_for(std::chrono::milliseconds(0))
+                                : std::future_status::deferred;
+        const auto progress = pending->progress.Read();
+        nlohmann::json phases = nlohmann::json::object();
+        for (size_t i = 0; i < progress.completed_ms.size(); ++i)
+            if (progress.completed_ms[i])
+                phases[PipelineCompileProgress::Names[i]] = progress.completed_ms[i];
+        nlohmann::json worker{{"thread_id", progress.thread},
+                              {"phase", PipelineCompileProgress::Names[size_t(progress.phase)]},
+                              {"phase_ms", progress.phase_ms},
+                              {"completed_phase_ms", std::move(phases)}};
+        if (progress.phase == PipelineCompileProgress::Phase::Failed)
+            worker["failed_in"] = PipelineCompileProgress::Names[size_t(progress.failed_in)];
+#ifdef SHADPS4_UWP
+        if (progress.thread && instance.GetDriverID() == vk::DriverId::eMesaDozen)
+            worker["dozen"] = Core::Uwp::DozenCompileDiagnostic(progress.thread);
+#endif
+        diagnostic["pending"].push_back({
+            {"worker", std::move(worker)},
+            {"key_hash", std::hash<GraphicsPipelineKey>{}(key)},
+            {"matches_draw", graphics_diagnostic_key_valid && key == graphics_key},
+            {"age_ms",
+             std::chrono::duration_cast<std::chrono::milliseconds>(now - pending->start).count()},
+            {"state", status == std::future_status::ready     ? "ready_not_installed"
+                      : status == std::future_status::timeout ? "compiling"
+                                                              : "invalid_or_deferred"},
+            {"abandoned", pending->abandoned},
+            {"photo_waited", pending->photo_waited},
+            {"stage_hashes", key.stage_hashes},
+        });
+    }
+    return diagnostic;
 }
 
 std::unique_ptr<PipelineCache::PendingGraphicsPipeline> PipelineCache::StartGraphicsPipeline(
@@ -1264,12 +1368,28 @@ std::unique_ptr<PipelineCache::PendingGraphicsPipeline> PipelineCache::StartGrap
     pending->driver_cache = std::move(cache);
     PendingGraphicsPipeline* job = pending.get();
     pending->future = std::async(std::launch::async, [this, job, key = graphics_key] {
-        auto pipeline = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile, key,
-            *job->driver_cache, job->copied_infos, job->runtime_infos,
-            job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules, job->sdata, false,
-            std::span<const AmdGpu::Buffer>{job->vertex_sharps.data(), job->vertex_sharps.size()});
-        return pipeline;
+        PipelineCompileProgress::Scope compile_scope{job->progress};
+        try {
+#ifdef SHADPS4_UWP
+            LOG_INFO(Render_Vulkan, "[PipelineCompile] begin kind=graphics hash={:#x} tid={}",
+                     job->hash, GetCurrentThreadId());
+#endif
+            auto pipeline = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile, key,
+                *job->driver_cache, job->copied_infos, job->runtime_infos,
+                job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules, job->sdata, false,
+                std::span<const AmdGpu::Buffer>{job->vertex_sharps.data(),
+                                                job->vertex_sharps.size()});
+#ifdef SHADPS4_UWP
+            LOG_INFO(Render_Vulkan, "[PipelineCompile] end kind=graphics hash={:#x} tid={}",
+                     job->hash, GetCurrentThreadId());
+#endif
+            PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::Complete);
+            return pipeline;
+        } catch (...) {
+            PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::Failed);
+            throw;
+        }
     });
     return pending;
 }
@@ -1314,7 +1434,7 @@ void PipelineCache::ReapPendingPipelines(bool drain) {
             if (!pending.abandoned &&
                 std::chrono::steady_clock::now() - pending.start >= std::chrono::seconds(30)) {
                 pending.abandoned = true;
-                abandoned_graphics_pipelines.insert(it->first);
+                abandoned_graphics_pipelines.insert_or_assign(it->first, "compile_timeout_30s");
                 LOG_ERROR(Render_Vulkan,
                           "Abandoning graphics pipeline {:#x} after 30 seconds; compilation "
                           "resources remain alive",
@@ -1330,8 +1450,15 @@ void PipelineCache::ReapPendingPipelines(bool drain) {
                 InstallGraphicsPipeline(it->first, pending);
             }
         } catch (...) {
-            abandoned_graphics_pipelines.insert(it->first);
             failure = std::current_exception();
+            std::string reason{"unknown_compile_exception"};
+            try {
+                std::rethrow_exception(failure);
+            } catch (const std::exception& error) {
+                reason = error.what();
+            } catch (...) {
+            }
+            abandoned_graphics_pipelines.insert_or_assign(it->first, std::move(reason));
         }
         it = pending_graphics_pipelines.erase(it);
     }
@@ -1611,7 +1738,12 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
+#ifdef SHADPS4_UWP
+        LOG_INFO(Render_Vulkan, "[PipelineCompile] begin kind=compute hash={:#x} tid={}",
+                 pipeline_hash, GetCurrentThreadId());
+#else
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+#endif
 
         ComputePipeline::SerializationSupport sdata{};
         if (pre_compile_hook_) {
@@ -1620,6 +1752,10 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         it.value() = std::make_unique<ComputePipeline>(
             instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
             *pipeline_cache, compute_key, *infos[0], modules[0], sdata, false);
+#ifdef SHADPS4_UWP
+        LOG_INFO(Render_Vulkan, "[PipelineCompile] end kind=compute hash={:#x} tid={}",
+                 pipeline_hash, GetCurrentThreadId());
+#endif
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
         if (num_new_pipelines % 64 == 1)
@@ -1873,6 +2009,8 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
         if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) {
             store_hash(stage_out_idx, 0);
             infos[stage_out_idx] = nullptr;
+            graphics_rejected_stage = static_cast<s32>(stage_in);
+            graphics_unavailable_reason = "required_stage_disabled";
             return false;
         }
 
@@ -1880,6 +2018,8 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
         if (!pgm || !pgm->Address<u32*>()) {
             store_hash(stage_out_idx, 0);
             infos[stage_out_idx] = nullptr;
+            graphics_rejected_stage = static_cast<s32>(stage_in);
+            graphics_unavailable_reason = "required_shader_address_missing";
             return false;
         }
 
@@ -1920,10 +2060,15 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
         if (!instance.IsGeometryStageSupported()) {
+            graphics_unavailable_reason = "geometry_stage_unsupported";
+            graphics_rejected_stage = static_cast<s32>(HwStage::Geometry);
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
+            graphics_unavailable_reason =
+                regs.vgt_gs_mode.onchip ? "geometry_onchip_unsupported" : "streamout_unsupported";
+            graphics_rejected_stage = static_cast<s32>(HwStage::Geometry);
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
@@ -1936,6 +2081,8 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::LsHs:
         if (!instance.IsTessellationSupported()) {
+            graphics_unavailable_reason = "tessellation_unsupported";
+            graphics_rejected_stage = static_cast<s32>(HwStage::Hull);
             return false;
         }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
@@ -1950,13 +2097,20 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::LsHsEsGs:
         if (!instance.IsTessellationSupported()) {
+            graphics_unavailable_reason = "tessellation_unsupported";
+            graphics_rejected_stage = static_cast<s32>(HwStage::Hull);
             return false;
         }
         if (!instance.IsGeometryStageSupported()) {
+            graphics_unavailable_reason = "geometry_stage_unsupported";
+            graphics_rejected_stage = static_cast<s32>(HwStage::Geometry);
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
+            graphics_unavailable_reason =
+                regs.vgt_gs_mode.onchip ? "geometry_onchip_unsupported" : "streamout_unsupported";
+            graphics_rejected_stage = static_cast<s32>(HwStage::Geometry);
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
@@ -1977,6 +2131,7 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
         bind_stage(HwStage::Vertex, SwStage::Vertex);
         break;
     default:
+        graphics_unavailable_reason = "stage_configuration_unsupported";
         LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
         return false;
     }

@@ -908,6 +908,16 @@ enum dzn_internal_buf_bucket {
    DZN_INTERNAL_BUF_BUCKET_COUNT,
 };
 
+VkResult
+dzn_diagnostic_record_error(struct vk_command_buffer *base, VkResult result,
+                            const char *file, int line, const char *function);
+
+HRESULT
+dzn_diagnostic_create_resource(ID3D12Device4 *device, const D3D12_HEAP_PROPERTIES *heap,
+                                D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC *desc,
+                                D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear,
+                                REFIID iid, void **resource, const char *function, int line);
+
 struct dzn_cmd_buffer {
    struct vk_command_buffer vk;
    struct vk_vertex_input_state dynamic_vi;
@@ -1022,6 +1032,7 @@ struct dzn_descriptor_set_layout_binding {
        * For non-dynamic buffer types, index into the set's buffer descriptor slot list when bindless. */
       uint32_t buffer_idx;
    };
+   bool native_sampled;
    bool variable_size;
    uint32_t inline_offset;
    uint32_t inline_size;

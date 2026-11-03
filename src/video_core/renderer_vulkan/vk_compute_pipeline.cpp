@@ -34,6 +34,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
 
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
+    std::vector<u32> native_bindings;
     for (const auto& buffer : info->buffers) {
         // During deserialization, we don't have access to the UD to fetch sharp data. To address
         // this properly we need to track shaprs or portion of them in `sdata`, but since we're
@@ -56,6 +57,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             .descriptorCount = num_bindings,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
+        if (image.native_sampled)
+            native_bindings.push_back(binding);
         has_desc_arrays |= num_bindings > 1;
         binding += num_bindings;
     }
@@ -78,7 +81,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};
-    AssignLayouts(bindings, flags, push_constants, debug_str);
+    AssignLayouts(bindings, flags, push_constants, debug_str, native_bindings);
     const auto device = instance.GetDevice();
 
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {

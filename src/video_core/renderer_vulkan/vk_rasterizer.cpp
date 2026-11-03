@@ -611,6 +611,8 @@ void Rasterizer::TraceCommand(const Pipeline* pipeline, const char* command, con
             event["arguments"] = {{"x", arguments[0]}, {"y", arguments[1]}, {"z", arguments[2]}};
         else if (kind == "dispatch_indirect")
             event["arguments"] = {{"address", arguments[0]}, {"bytes", arguments[1]}};
+        if (std::string_view{result} == "pipeline_unavailable")
+            event["pipeline_diagnostic"] = pipeline_cache.GraphicsPipelineDiagnostic();
         if (pipeline) {
             for (const auto* info : pipeline->GetStages()) {
                 if (!info)
@@ -914,6 +916,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
+        TraceCommand(nullptr, "draw_indirect", "pipeline_unavailable",
+                     {arg_address + offset, max_count, stride, count_address});
         return;
     }
 

@@ -6,9 +6,10 @@
 #include <array>
 #include <chrono>
 #include <future>
-#include <unordered_set>
 #include <memory>
+#include <string>
 #include <variant>
+#include <nlohmann/json_fwd.hpp>
 #include <tsl/robin_map.h>
 #include "common/assert.h"
 #include "shader_recompiler/profile.h"
@@ -16,6 +17,7 @@
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_progress.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "vulkan/vulkan.hpp"
 
@@ -199,6 +201,8 @@ public:
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
+    nlohmann::json GraphicsPipelineDiagnostic() const;
+
     const ComputePipeline* GetComputePipeline();
 
     /// Resolves the stage's program and publishes its info and module into
@@ -241,6 +245,7 @@ public:
 
 private:
     struct PendingGraphicsPipeline {
+        PipelineCompileProgress progress;
         std::chrono::steady_clock::time_point start;
         u64 hash{};
         vk::UniquePipelineCache driver_cache;
@@ -267,7 +272,10 @@ private:
     std::chrono::steady_clock::duration sync_budget_spent{};
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>>
         pending_graphics_pipelines;
-    std::unordered_set<GraphicsPipelineKey> abandoned_graphics_pipelines;
+    tsl::robin_map<GraphicsPipelineKey, std::string> abandoned_graphics_pipelines;
+    const char* graphics_unavailable_reason{"not_requested"};
+    s32 graphics_rejected_stage{-1};
+    bool graphics_diagnostic_key_valid{};
     void LoadDriverCache();
     void SaveDriverCache();
     bool RefreshGraphicsKey();

@@ -120,6 +120,16 @@ struct Buffer {
         return buffer.bda_addr;
     }
 
+    void MarkUsed(u64 tick) const noexcept {
+        if (tick > last_use_tick) {
+            last_use_tick = tick;
+        }
+    }
+
+    [[nodiscard]] u64 LastUseTick() const noexcept {
+        return last_use_tick;
+    }
+
     /// Makes host writes in provided range visible to the device.
     void Flush(u64 offset, u64 size);
 
@@ -132,6 +142,9 @@ struct Buffer {
     bool is_coherent{};
     MemoryType mem_type{MemoryType::DeviceLocal};
     UniqueBuffer buffer;
+
+private:
+    mutable u64 last_use_tick{};
 };
 
 struct StreamBuffer : public Buffer {
@@ -147,9 +160,9 @@ struct StreamBuffer : public Buffer {
     /// Reserves and commits a region in one step.
     std::optional<u64> Reserve(u64 size, u64 alignment = 0, bool allow_wait = true);
 
-    /// Tick of the most recent commit into this buffer, 0 if never used.
+    /// Tick of the most recent reservation or GPU access, 0 if never used.
     [[nodiscard]] u64 LastTick() const noexcept {
-        return last_tick;
+        return LastUseTick();
     }
 
     /// Maps and commits a memory region with user provided data
@@ -185,7 +198,6 @@ private:
     vk::DeviceSize non_coherent_atom_size{};
     u64 offset{};
     u64 mapped_size{};
-    u64 last_tick{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

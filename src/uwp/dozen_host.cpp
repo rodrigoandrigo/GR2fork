@@ -1,8 +1,10 @@
 #include "uwp/dozen_host.h"
 
+#include <array>
 #include <filesystem>
 #include <stdexcept>
 #include <string_view>
+#include <nlohmann/json.hpp>
 #include <windows.h>
 
 #include <appmodel.h>
@@ -34,6 +36,12 @@ using SetLog = void (*)(void (*)(void*, const char*), void*);
 SetWindow set_window;
 SetAttach set_attach;
 SetLog set_log;
+using GetCompileDiagnostic = int (*)(unsigned, char*, size_t);
+GetCompileDiagnostic get_compile_diagnostic;
+using DumpPso = int (*)(unsigned, char*, size_t);
+DumpPso dump_pso;
+using NativeSampledBindings = int (*)(uintptr_t, uintptr_t, uint32_t, const uint32_t*);
+NativeSampledBindings native_sampled_bindings;
 DozenHost* current_host;
 
 template <typename T>
@@ -52,6 +60,8 @@ void DriverLog(void*, const char* message) {
         LOG_WARNING(Render_Vulkan, "Dozen: {}", message);
     else
         LOG_INFO(Render_Vulkan, "Dozen: {}", message);
+    if (text.find("[ReadbackDiag]") != text.npos || text.find("[CompileDiag]") != text.npos)
+        Common::Log::Flush();
 }
 
 void LoadDriver() {
@@ -89,6 +99,11 @@ void LoadDriver() {
         set_attach = GetExport<SetAttach>("mesa_uwp_set_swapchain_attach_callback");
         set_log = GetExport<SetLog>("mesa_uwp_set_log_callback");
         set_log(&DriverLog, nullptr);
+        get_compile_diagnostic = reinterpret_cast<GetCompileDiagnostic>(
+            GetProcAddress(driver, "mesa_uwp_get_compile_diagnostic"));
+        native_sampled_bindings = reinterpret_cast<NativeSampledBindings>(
+            GetProcAddress(driver, "mesa_uwp_set_native_sampled_bindings"));
+        dump_pso = reinterpret_cast<DumpPso>(GetProcAddress(driver, "mesa_uwp_dump_pso"));
         VULKAN_HPP_DEFAULT_DISPATCHER.init(
             GetExport<PFN_vkGetInstanceProcAddr>("vk_icdGetInstanceProcAddr"));
     } catch (...) {
@@ -98,6 +113,39 @@ void LoadDriver() {
     }
 }
 } // namespace
+
+void ConfigureDozenNativeSampling(uintptr_t device, uintptr_t layout,
+                                  std::span<const uint32_t> bindings) {
+    if (!bindings.empty() && native_sampled_bindings &&
+        native_sampled_bindings(device, layout, static_cast<uint32_t>(bindings.size()),
+                                bindings.data()) != 0)
+        throw std::runtime_error("Cannot configure native sampled bindings");
+}
+
+nlohmann::json DozenCompileDiagnostic(uint32_t thread) {
+    if (!get_compile_diagnostic)
+        return {{"available", false}, {"status", "export_unavailable"}};
+    std::array<char, 16384> json{};
+    const auto status = get_compile_diagnostic(thread, json.data(), json.size());
+    if (status != 0)
+        return {{"available", true},
+                {"status", status == 1 ? "diagnostic_lock_busy" : "snapshot_failed"}};
+    auto result = nlohmann::json::parse(json.data(), nullptr, false);
+    if (result.is_discarded())
+        return {{"available", true}, {"status", "invalid_snapshot"}};
+    if (dump_pso && result.value("active", false)) {
+        std::array<char, 8192> path{};
+        const int status = dump_pso(thread, path.data(), path.size());
+        result["pso_capture"] = {{"status", status == 0   ? "saved"
+                                            : status == 1 ? "unavailable"
+                                            : status == 2 ? "busy"
+                                                          : "failed"}};
+        if (status == 0)
+            result["pso_capture"]["directory"] = path.data();
+    }
+    result["available"] = true;
+    return result;
+}
 
 struct DozenHost::Bootstrap {
     Vulkan::Instance instance;
@@ -257,5 +305,8 @@ void ShutdownDozenDriver() {
     set_attach = nullptr;
     set_window = nullptr;
     set_log = nullptr;
+    get_compile_diagnostic = nullptr;
+    dump_pso = nullptr;
+    native_sampled_bindings = nullptr;
 }
 } // namespace Core::Uwp

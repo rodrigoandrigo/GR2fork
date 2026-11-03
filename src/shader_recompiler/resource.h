@@ -174,6 +174,7 @@ struct ImageResource {
     bool is_written{};
     bool is_r128{};
     bool is_feedback{};
+    bool native_sampled{};
     u8 constant_mip_index{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
@@ -207,6 +208,29 @@ struct ImageResource {
             }
         }
         return image;
+    }
+
+    bool CanUseNativeSampling(const auto& info, AmdGpu::Image sharp) const {
+        if (is_written || is_feedback || NumBindings(info) != 1)
+            return false;
+        if (is_depth || sharp.NumSamples() > 1 || AmdGpu::IsBlockCoded(sharp.GetDataFmt()))
+            return true;
+        switch (sharp.GetDataFmt()) {
+        case AmdGpu::DataFormat::Format8:
+        case AmdGpu::DataFormat::Format32:
+        case AmdGpu::DataFormat::Format8_8_8_8:
+        case AmdGpu::DataFormat::Format32_32_32:
+        case AmdGpu::DataFormat::Format32_32_32_32:
+            return true;
+        case AmdGpu::DataFormat::Format16:
+        case AmdGpu::DataFormat::Format16_16_16_16:
+            return sharp.GetNumberFmt() == AmdGpu::NumberFormat::Float ||
+                   sharp.GetNumberFmt() == AmdGpu::NumberFormat::Unorm ||
+                   sharp.GetNumberFmt() == AmdGpu::NumberFormat::Uint ||
+                   sharp.GetNumberFmt() == AmdGpu::NumberFormat::Sint;
+        default:
+            return false;
+        }
     }
 
     constexpr bool Fetch(const u32* flatbuf, AmdGpu::Image* out) const {

@@ -2285,6 +2285,14 @@ dzn_nir_raw_texture_instr(nir_builder *b, nir_instr *instr, void *data)
       return false;
    nir_deref_instr *texture = nir_src_as_deref(tex->src[texture_src].src);
    const struct dzn_pipeline_layout *layout = data;
+   nir_variable *texture_var = nir_deref_instr_get_variable(texture);
+   unsigned set = texture_var->data.descriptor_set, binding = texture_var->data.binding;
+   if (set < layout->vk.set_count && layout->vk.set_layouts[set]) {
+      const struct dzn_descriptor_set_layout *set_layout =
+          container_of(layout->vk.set_layouts[set], struct dzn_descriptor_set_layout, vk);
+      if (binding < set_layout->binding_count && set_layout->bindings[binding].native_sampled)
+         return false;
+   }
    b->cursor = nir_before_instr(instr);
    bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
    unsigned dimensions = tex->sampler_dim == GLSL_SAMPLER_DIM_1D ? 1 :

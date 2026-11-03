@@ -22,6 +22,9 @@
  */
 
 #include "dzn_private.h"
+#ifdef _XBOX_UWP
+static const GUID dzn_root_blob_guid = {0x618ce6d1,0x15d0,0x4a15,{0xa3,0x51,0xb2,0xa9,0x65,0x73,0x80,0x14}};
+#endif
 
 #include "vk_alloc.h"
 #include "vk_buffer.h"
@@ -3675,6 +3678,10 @@ dzn_device_create_root_sig(struct dzn_device *device,
       uint8_t hash[BLAKE3_KEY_LEN];
       _mesa_blake3_compute(ID3D10Blob_GetBufferPointer(sig), ID3D10Blob_GetBufferSize(sig), hash);
       ID3D12RootSignature_SetPrivateData(root_sig, &dzn_root_sig_hash_guid, sizeof(hash), hash);
+#ifdef _XBOX_UWP
+      ID3D12RootSignature_SetPrivateData(root_sig, &dzn_root_blob_guid,
+                                        ID3D10Blob_GetBufferSize(sig), ID3D10Blob_GetBufferPointer(sig));
+#endif
    }
    ID3D10Blob_Release(sig);
    return root_sig;
@@ -4447,11 +4454,168 @@ dzn_buffer_emit_address_binding_report(struct dzn_device *device,
                              buffer->gpuva, buffer->size, type);
 }
 
+
+#ifdef _XBOX_UWP
+struct dzn_readback_buffer_record {
+   uint64_t handle, generation, size, resource, memory, memory_offset;
+   uint64_t created, bound, destroyed;
+   void *destroy_stack[8];
+   unsigned destroy_frames;
+   bool live;
+};
+struct dzn_readback_event {
+   uint64_t sequence, id, image, buffer, expected, actual, offset, destroyed;
+   void *destroy_stack[8];
+   unsigned destroy_frames;
+   const char *caller;
+   uint32_t phase, line, regions, thread;
+   bool live;
+};
+static SRWLOCK readback_lock = SRWLOCK_INIT;
+static struct dzn_readback_buffer_record readback_buffers[4096][4];
+static struct dzn_readback_event readback_events[32];
+static uint64_t readback_sequence, readback_generation, readback_event_count;
+
+static struct dzn_readback_buffer_record *
+dzn_readback_find(uint64_t handle, bool insert)
+{
+   struct dzn_readback_buffer_record *bucket = readback_buffers[((handle >> 4) ^ (handle >> 20)) & 4095];
+   struct dzn_readback_buffer_record *oldest = bucket;
+   for (unsigned i = 0; i < 4; ++i) {
+      if (bucket[i].handle == handle)
+         return &bucket[i];
+      if (bucket[i].generation < oldest->generation)
+         oldest = &bucket[i];
+   }
+   return insert ? oldest : NULL;
+}
+
+static void
+dzn_readback_lifetime(struct dzn_buffer *buffer, unsigned phase,
+                       VkDeviceMemory memory, uint64_t offset)
+{
+   const uint64_t handle = (uint64_t)(uintptr_t)buffer;
+   AcquireSRWLockExclusive(&readback_lock);
+   struct dzn_readback_buffer_record *record = dzn_readback_find(handle, phase == 0);
+   if (record) {
+      uint64_t sequence = ++readback_sequence;
+      if (phase == 0) {
+         *record = (struct dzn_readback_buffer_record) {
+            .handle = handle, .generation = ++readback_generation,
+            .size = buffer->size, .created = sequence, .live = true,
+            .resource = (uint64_t)(uintptr_t)buffer->res,
+            .bound = buffer->res ? sequence : 0,
+         };
+      } else if (phase == 1) {
+         record->resource = (uint64_t)(uintptr_t)buffer->res;
+         record->memory = (uint64_t)(uintptr_t)memory;
+         record->memory_offset = offset;
+         record->bound = sequence;
+      } else {
+         record->destroyed = sequence;
+         record->destroy_frames = CaptureStackBackTrace(1, ARRAY_SIZE(record->destroy_stack), record->destroy_stack, NULL);
+         record->live = false;
+         for (unsigned i = 0; i < ARRAY_SIZE(readback_events); ++i) {
+            struct dzn_readback_event *event = &readback_events[i];
+            if (event->buffer == handle && event->expected == record->generation) {
+               event->destroyed = sequence;
+               event->destroy_frames = record->destroy_frames;
+               memcpy(event->destroy_stack, record->destroy_stack, sizeof(event->destroy_stack));
+            }
+         }
+      }
+   }
+   ReleaseSRWLockExclusive(&readback_lock);
+}
+
+__declspec(dllexport) int
+mesa_uwp_trace_readback(unsigned phase, uint64_t id, uint64_t image,
+                         uint64_t buffer, uint64_t *generation, const char *caller,
+                         unsigned line, unsigned regions, uint64_t offset)
+{
+   AcquireSRWLockExclusive(&readback_lock);
+   struct dzn_readback_buffer_record *record = dzn_readback_find(buffer, false);
+   const uint64_t actual = record ? record->generation : 0;
+   if (phase == 0)
+      *generation = actual;
+   struct dzn_readback_event event = {
+      .sequence = ++readback_sequence, .id = id, .image = image, .buffer = buffer,
+      .expected = *generation, .actual = actual, .offset = offset, .caller = caller,
+      .phase = phase, .line = line, .regions = regions, .thread = GetCurrentThreadId(),
+      .live = record && record->live,
+   };
+   if (record && record->generation == *generation) {
+      event.destroyed = record->destroyed;
+      event.destroy_frames = record->destroy_frames;
+      memcpy(event.destroy_stack, record->destroy_stack, sizeof(event.destroy_stack));
+   }
+   readback_events[readback_event_count++ % ARRAY_SIZE(readback_events)] = event;
+   int suspicious = phase == 1 && (!record || !record->live || !record->bound || actual != *generation);
+   ReleaseSRWLockExclusive(&readback_lock);
+   return suspicious;
+}
+
+__declspec(dllexport) void
+mesa_uwp_dump_readbacks(uint64_t fault)
+{
+   struct dzn_readback_event events[32];
+   struct dzn_readback_buffer_record records[32];
+   if (!TryAcquireSRWLockShared(&readback_lock)) {
+      mesa_loge("[ReadbackDiag] registry_busy fault=0x%llx", (unsigned long long)fault);
+      return;
+   }
+   const uint64_t count = MIN2(readback_event_count, ARRAY_SIZE(events));
+   for (uint64_t i = 0; i < count; ++i) {
+      events[i] = readback_events[(readback_event_count - count + i) % ARRAY_SIZE(events)];
+      const struct dzn_readback_buffer_record *record = dzn_readback_find(events[i].buffer, false);
+      records[i] = record ? *record : (struct dzn_readback_buffer_record) { 0 };
+   }
+   ReleaseSRWLockShared(&readback_lock);
+   mesa_loge("[ReadbackDiag] dump fault=0x%llx events=%llu", (unsigned long long)fault, (unsigned long long)count);
+   for (uint64_t i = 0; i < count; ++i) {
+      const struct dzn_readback_event *event = &events[i];
+      const struct dzn_readback_buffer_record *record = &records[i];
+      MEMORY_BASIC_INFORMATION info = { 0 };
+      VirtualQuery((void *)(uintptr_t)event->buffer, &info, sizeof(info));
+      mesa_loge("[ReadbackDiag] seq=%llu copy=%llu phase=%u tid=%u caller=%s line=%u image=0x%llx buffer=0x%llx regions=%u offset=%llu expected_gen=%llu event_gen=%llu event_live=%u current_gen=%llu current_live=%u bytes=%llu resource=0x%llx memory=0x%llx memory_offset=%llu created=%llu bound=%llu destroyed=%llu region=%p region_bytes=%llu state=0x%x protect=0x%x fault_in_object=%u",
+         (unsigned long long)event->sequence, (unsigned long long)event->id, event->phase,
+         event->thread, event->caller ? event->caller : "unknown", event->line,
+         (unsigned long long)event->image, (unsigned long long)event->buffer, event->regions,
+         (unsigned long long)event->offset, (unsigned long long)event->expected,
+         (unsigned long long)event->actual, event->live, (unsigned long long)record->generation,
+         record->live, (unsigned long long)record->size, (unsigned long long)record->resource,
+         (unsigned long long)record->memory, (unsigned long long)record->memory_offset,
+         (unsigned long long)record->created, (unsigned long long)record->bound,
+         (unsigned long long)record->destroyed, info.BaseAddress, (unsigned long long)info.RegionSize,
+         (unsigned)info.State, (unsigned)info.Protect,
+         fault >= event->buffer && fault - event->buffer < sizeof(struct dzn_buffer));
+      bool already_reported = false;
+      for (uint64_t j = 0; j < i; ++j)
+         already_reported |= events[j].buffer == event->buffer && events[j].expected == event->expected;
+      if (event->destroyed && !already_reported) {
+         for (unsigned frame = 0; frame < event->destroy_frames; ++frame) {
+            HMODULE module = NULL;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+               (LPCWSTR)event->destroy_stack[frame], &module);
+            mesa_loge("[ReadbackDiag] destroy_stack buffer=0x%llx generation=%llu destroyed=%llu frame=%u pc=%p module=%p rva=0x%llx",
+               (unsigned long long)event->buffer, (unsigned long long)event->expected,
+               (unsigned long long)event->destroyed, frame, event->destroy_stack[frame], module,
+               (unsigned long long)((uintptr_t)event->destroy_stack[frame] - (uintptr_t)module));
+         }
+      }
+   }
+}
+#endif
+
 static void
 dzn_buffer_destroy(struct dzn_buffer *buf, const VkAllocationCallbacks *pAllocator)
 {
    if (!buf)
       return;
+
+#ifdef _XBOX_UWP
+   dzn_readback_lifetime(buf, 2, VK_NULL_HANDLE, 0);
+#endif
 
    struct dzn_device *device = container_of(buf->base.device, struct dzn_device, vk);
 
@@ -4572,6 +4736,9 @@ dzn_buffer_create(struct dzn_device *device,
       buf->gpuva = ID3D12Resource_GetGPUVirtualAddress(buf->res);
    }
 
+#ifdef _XBOX_UWP
+   dzn_readback_lifetime(buf, 0, VK_NULL_HANDLE, 0);
+#endif
    *out = dzn_buffer_to_handle(buf);
    return VK_SUCCESS;
 }
@@ -4817,6 +4984,9 @@ dzn_BindBufferMemory2(VkDevice _device,
          }
       }
 
+#ifdef _XBOX_UWP
+      dzn_readback_lifetime(buffer, 1, pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+#endif
       buffer->gpuva = ID3D12Resource_GetGPUVirtualAddress(buffer->res);
       dzn_buffer_emit_address_binding_report(
          device, buffer, VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);

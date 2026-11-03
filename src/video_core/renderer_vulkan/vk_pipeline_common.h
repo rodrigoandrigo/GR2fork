@@ -143,7 +143,8 @@ protected:
     /// Takes the pipeline's layouts from the shared cache, or creates owned ones.
     void AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bindings,
                        vk::DescriptorSetLayoutCreateFlags flags,
-                       const vk::PushConstantRange& push_constants, std::string_view debug_name);
+                       const vk::PushConstantRange& push_constants, std::string_view debug_name,
+                       std::span<const u32> native_bindings = {});
     /// Whether count set-0 descriptors fit the device's push descriptor limit.
     [[nodiscard]] bool FitsPushDescriptors(u32 count) const;
 

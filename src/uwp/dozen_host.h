@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <span>
+#include <nlohmann/json_fwd.hpp>
 #include "uwp/shadps4_api.h"
 
 namespace Frontend {
@@ -8,6 +10,9 @@ class WindowSDL;
 }
 
 namespace Core::Uwp {
+nlohmann::json DozenCompileDiagnostic(uint32_t thread);
+void ConfigureDozenNativeSampling(uintptr_t device, uintptr_t layout,
+                                  std::span<const uint32_t> bindings);
 void ReleaseDozenBootstrap();
 void ShutdownDozenDriver();
 class DozenHost {

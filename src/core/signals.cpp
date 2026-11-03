@@ -183,6 +183,16 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+#ifdef SHADPS4_UWP
+        if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
+            if (auto driver = GetModuleHandleW(L"vulkan_dzn.dll")) {
+                using DumpReadbacks = void (*)(u64);
+                if (auto dump = reinterpret_cast<DumpReadbacks>(
+                        GetProcAddress(driver, "mesa_uwp_dump_readbacks")))
+                    dump(pExp->ExceptionRecord->ExceptionInformation[1]);
+            }
+        }
+#endif
         if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
             const auto& regs = *pExp->ContextRecord;
             LOG_CRITICAL(Debug,

@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef SHADPS4_UWP
+#include "uwp/dozen_host.h"
+#endif
 #include <cstddef>
 #include <optional>
+#include "video_core/renderer_vulkan/vk_pipeline_progress.h"
 
 #include "common/assert.h"
 #include "core/emulator_settings.h"
@@ -91,7 +95,12 @@ void CommandPool::Allocate(std::size_t begin, std::size_t end) {
     const vk::Device device = instance.GetDevice();
     const auto result =
         device.allocateCommandBuffers(&buffer_alloc_info, cmd_buffers.data() + begin);
-    ASSERT(result == vk::Result::eSuccess);
+    if (result != vk::Result::eSuccess) {
+        LOG_ERROR(Render_Vulkan, "[VkRecordMemory] vkAllocateCommandBuffers failed={} begin={} end={} pool_capacity={} cpu_tick={} known_gpu={}",
+                  vk::to_string(result), begin, end, ticks.size(), work_semaphore->CurrentTick(),
+                  work_semaphore->KnownGpuTick());
+    }
+    Check<"vkAllocateCommandBuffers: command pool growth">(result);
 
     for (std::size_t i = begin; i < end; ++i) {
         SetObjectName(device, cmd_buffers[i], "CommandPool: Command Buffer {}", i);
@@ -106,14 +115,18 @@ vk::CommandBuffer CommandPool::Commit() {
 PipelineLayoutCache::Layouts PipelineLayoutCache::Acquire(
     std::span<const vk::DescriptorSetLayoutBinding> bindings,
     vk::DescriptorSetLayoutCreateFlags flags, const vk::PushConstantRange& push_constants,
-    std::string_view debug_name) {
+    std::string_view debug_name, std::span<const u32> native_bindings) {
     // The key is the raw shape: flags, the push range and each binding's
     // index, type, count and stages; equal keys are equal layouts.
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::LayoutKey);
     std::string key;
     key.reserve(16 + 16 * bindings.size());
     const auto put = [&](const auto& v) {
         key.append(reinterpret_cast<const char*>(&v), sizeof(v));
     };
+    put(static_cast<u32>(native_bindings.size()));
+    for (u32 binding : native_bindings)
+        put(binding);
     put(static_cast<u32>(flags));
     put(static_cast<u32>(push_constants.stageFlags));
     put(push_constants.offset);
@@ -125,7 +138,9 @@ PipelineLayoutCache::Layouts PipelineLayoutCache::Acquire(
         put(b.descriptorCount);
         put(static_cast<u32>(b.stageFlags));
     }
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::LayoutCacheLock);
     std::scoped_lock lock{mutex};
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::LayoutCacheLookup);
     auto [it, inserted] = layouts.try_emplace(std::move(key));
     if (inserted) {
         const auto device = instance.GetDevice();
@@ -134,9 +149,17 @@ PipelineLayoutCache::Layouts PipelineLayoutCache::Acquire(
             .bindingCount = static_cast<u32>(bindings.size()),
             .pBindings = bindings.data(),
         };
+        PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::DescriptorSetLayout);
         auto [set_result, set] = device.createDescriptorSetLayoutUnique(desc_layout_ci);
         ASSERT_MSG(set_result == vk::Result::eSuccess,
                    "Failed to create shared descriptor set layout: {}", vk::to_string(set_result));
+#ifdef SHADPS4_UWP
+        if (instance.GetDriverID() == vk::DriverId::eMesaDozen)
+            Core::Uwp::ConfigureDozenNativeSampling(
+                reinterpret_cast<uintptr_t>(static_cast<VkDevice>(device)),
+                reinterpret_cast<uintptr_t>(static_cast<VkDescriptorSetLayout>(*set)),
+                native_bindings);
+#endif
         const vk::DescriptorSetLayout set_layout = *set;
         const vk::PipelineLayoutCreateInfo layout_info = {
             .setLayoutCount = 1U,
@@ -144,6 +167,7 @@ PipelineLayoutCache::Layouts PipelineLayoutCache::Acquire(
             .pushConstantRangeCount = 1U,
             .pPushConstantRanges = &push_constants,
         };
+        PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::PipelineLayout);
         auto [layout_result, layout] = device.createPipelineLayoutUnique(layout_info);
         ASSERT_MSG(layout_result == vk::Result::eSuccess,
                    "Failed to create shared pipeline layout: {}", vk::to_string(layout_result));

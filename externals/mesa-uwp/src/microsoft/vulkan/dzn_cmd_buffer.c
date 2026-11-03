@@ -32,6 +32,117 @@
 
 #include "dxil_spirv_nir.h"
 
+static unsigned
+dzn_diagnostic_list_count(const struct list_head *head)
+{
+   unsigned count = 0;
+   if (head->next) {
+      for (const struct list_head *at = head->next; at != head; at = at->next)
+         ++count;
+   }
+   return count;
+}
+
+VkResult
+dzn_diagnostic_record_error(struct vk_command_buffer *base, VkResult result,
+                            const char *file, int line, const char *function);
+
+#undef vk_command_buffer_set_error
+#define vk_command_buffer_set_error(command_buffer, error) \
+   dzn_diagnostic_record_error(command_buffer, error, __FILE__, __LINE__, __func__)
+
+HRESULT
+dzn_diagnostic_create_resource(ID3D12Device4 *device, const D3D12_HEAP_PROPERTIES *heap,
+                                D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC *desc,
+                                D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear,
+                                REFIID iid, void **resource, const char *function, int line)
+{
+   HRESULT hr = ID3D12Device1_CreateCommittedResource(device, heap, flags, desc, state, clear,
+                                                     iid, resource);
+   const bool large = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ?
+      desc->Width >= (64ull << 20) :
+      desc->Width * desc->Height * desc->DepthOrArraySize >= (16ull << 20);
+   if (FAILED(hr) || large) {
+      const D3D12_RESOURCE_ALLOCATION_INFO allocation =
+         dzn_ID3D12Device4_GetResourceAllocationInfo(device, 0, 1, desc);
+      mesa_logi("[DozenRecordAlloc] function=%s line=%d hr=0x%08x heap=%u dimension=%u allocation_bytes=%llu "
+                "width=%llu height=%u depth_layers=%u mips=%u format=%u samples=%u flags=0x%x",
+                function, line, (unsigned)hr, heap->Type, desc->Dimension,
+                (unsigned long long)allocation.SizeInBytes, (unsigned long long)desc->Width, desc->Height, desc->DepthOrArraySize,
+                desc->MipLevels, desc->Format, desc->SampleDesc.Count, desc->Flags);
+   }
+   return hr;
+}
+
+#undef ID3D12Device1_CreateCommittedResource
+#define ID3D12Device1_CreateCommittedResource(device, heap, flags, desc, state, clear, iid, resource) \
+   dzn_diagnostic_create_resource(device, heap, flags, desc, state, clear, iid, resource, __func__, __LINE__)
+
+static HRESULT
+dzn_diagnostic_create_resource3(ID3D12Device10 *device, const D3D12_HEAP_PROPERTIES *heap,
+                                 D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC1 *desc,
+                                 D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE *clear,
+                                 ID3D12ProtectedResourceSession *session, UINT format_count,
+                                 const DXGI_FORMAT *formats, REFIID iid, void **resource,
+                                 const char *function, int line)
+{
+   HRESULT hr = ID3D12Device10_CreateCommittedResource3(device, heap, flags, desc, layout, clear,
+                                                       session, format_count, formats, iid, resource);
+   const bool large = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ?
+      desc->Width >= (64ull << 20) :
+      desc->Width * desc->Height * desc->DepthOrArraySize >= (16ull << 20);
+   if (FAILED(hr) || large) {
+      mesa_logi("[DozenRecordAlloc] function=%s line=%d api=CreateCommittedResource3 hr=0x%08x "
+                "heap=%u dimension=%u width=%llu height=%u depth_layers=%u mips=%u format=%u "
+                "samples=%u flags=0x%x castable_formats=%u",
+                function, line, (unsigned)hr, heap->Type, desc->Dimension,
+                (unsigned long long)desc->Width, desc->Height, desc->DepthOrArraySize,
+                desc->MipLevels, desc->Format, desc->SampleDesc.Count, desc->Flags, format_count);
+   }
+   return hr;
+}
+
+#undef ID3D12Device10_CreateCommittedResource3
+#define ID3D12Device10_CreateCommittedResource3(device, heap, flags, desc, layout, clear, session, format_count, formats, iid, resource) \
+   dzn_diagnostic_create_resource3(device, heap, flags, desc, layout, clear, session, format_count, formats, iid, resource, __func__, __LINE__)
+
+static VkResult
+dzn_cmd_buffer_alloc_internal_buf_impl(struct dzn_cmd_buffer *cmdbuf, uint32_t size,
+                                       enum dzn_internal_buf_bucket bucket,
+                                       D3D12_RESOURCE_STATES init_state, uint64_t align,
+                                       ID3D12Resource **out, uint64_t *offset,
+                                       const char *caller, const char *file, int line);
+
+#define dzn_cmd_buffer_alloc_internal_buf(cmdbuf, size, bucket, state, align, out, offset) \
+   dzn_cmd_buffer_alloc_internal_buf_impl(cmdbuf, size, bucket, state, align, out, offset, __func__, __FILE__, __LINE__)
+
+static void
+dzn_diagnostic_internal_alloc(struct dzn_cmd_buffer *cmdbuf, uint32_t requested,
+                               uint64_t allocated, enum dzn_internal_buf_bucket bucket,
+                               D3D12_RESOURCE_STATES state, uint64_t align, uint64_t offset,
+                               const char *path, VkResult result, HRESULT hr,
+                               const char *caller, const char *file, int line)
+{
+   if (result == VK_SUCCESS && requested < (64u << 20))
+      return;
+   uint64_t retained_bytes = 0;
+   unsigned retained_resources = 0;
+   for (unsigned b = 0; b < DZN_INTERNAL_BUF_BUCKET_COUNT; ++b) {
+      list_for_each_entry(struct dzn_internal_resource, resource, &cmdbuf->internal_bufs[b], link) {
+         retained_bytes += resource->size;
+         ++retained_resources;
+      }
+   }
+   mesa_log(result == VK_SUCCESS ? MESA_LOG_INFO : MESA_LOG_ERROR, MESA_LOG_TAG,
+             "[DozenInternalAlloc] caller=%s file=%s line=%d cmdbuf=%p requested_bytes=%u "
+             "allocation_bytes=%llu bucket=%s initial_state=0x%x alignment=%llu offset=%llu "
+             "path=%s result=%d hr=0x%08x retained_bytes=%llu retained_resources=%u",
+             caller, file, line, (void *)cmdbuf, requested, (unsigned long long)allocated,
+             bucket == DZN_INTERNAL_BUF_UPLOAD ? "upload" : "default", state,
+             (unsigned long long)align, (unsigned long long)offset, path, result, (unsigned)hr,
+             (unsigned long long)retained_bytes, retained_resources);
+}
+
 enum dzn_queue_family_transfer_kind {
    DZN_QUEUE_FAMILY_TRANSFER_NONE,
    DZN_QUEUE_FAMILY_TRANSFER_LOCAL,
@@ -697,6 +808,53 @@ struct dzn_feedback_image {
    uint8_t *copied;
    uint8_t *initialized;
 };
+
+VkResult
+dzn_diagnostic_record_error(struct vk_command_buffer *base, VkResult result,
+                            const char *file, int line, const char *function)
+{
+   if (base->record_result == VK_SUCCESS) {
+      struct dzn_cmd_buffer *cmdbuf = container_of(base, struct dzn_cmd_buffer, vk);
+      struct dzn_device *device = container_of(base->base.device, struct dzn_device, vk);
+      uint64_t internal_bytes = 0;
+      unsigned internal_count = 0;
+      uint64_t internal_allocation_bytes = 0, feedback_allocation_bytes = 0;
+      for (unsigned bucket = 0; bucket < DZN_INTERNAL_BUF_BUCKET_COUNT; ++bucket) {
+         if (!cmdbuf->internal_bufs[bucket].next)
+            continue;
+         list_for_each_entry(struct dzn_internal_resource, resource, &cmdbuf->internal_bufs[bucket], link) {
+            internal_bytes += resource->size;
+            const D3D12_RESOURCE_DESC desc = dzn_ID3D12Resource_GetDesc(resource->res);
+            const D3D12_RESOURCE_ALLOCATION_INFO allocation =
+               dzn_ID3D12Device4_GetResourceAllocationInfo(device->dev, 0, 1, &desc);
+            if (allocation.SizeInBytes != UINT64_MAX) internal_allocation_bytes += allocation.SizeInBytes;
+            ++internal_count;
+         }
+      }
+      util_dynarray_foreach(&cmdbuf->feedback_images, struct dzn_feedback_image *, entry) {
+         const D3D12_RESOURCE_ALLOCATION_INFO allocation =
+            dzn_ID3D12Device4_GetResourceAllocationInfo(device->dev, 0, 1, &(*entry)->image.desc);
+         if (allocation.SizeInBytes != UINT64_MAX) feedback_allocation_bytes += allocation.SizeInBytes;
+      }
+      mesa_loge("[DozenRecordError] first_error=%d function=%s file=%s line=%d cmdbuf=%p "
+                "device_reason=0x%08x internal_buffer_bytes=%llu internal_resources=%u "
+                "internal_allocation_bytes=%llu feedback_allocation_bytes=%llu "
+                "feedback_images=%u raw_state_bytes=%u push_descriptor_pools=%u "
+                "resource_heaps_active=%u resource_heaps_free=%u sampler_heaps_active=%u",
+                result, function, file, line, (void *)cmdbuf,
+                (unsigned)ID3D12Device_GetDeviceRemovedReason(device->dev),
+                (unsigned long long)internal_bytes, internal_count,
+                (unsigned long long)internal_allocation_bytes, (unsigned long long)feedback_allocation_bytes,
+                util_dynarray_num_elements(&cmdbuf->feedback_images, struct dzn_feedback_image *),
+                cmdbuf->raw_images.size,
+                util_dynarray_num_elements(&cmdbuf->push_descriptor_pools, VkDescriptorPool),
+                dzn_diagnostic_list_count(&cmdbuf->cbv_srv_uav_pool.active_heaps),
+                dzn_diagnostic_list_count(&cmdbuf->cbv_srv_uav_pool.free_heaps),
+                dzn_diagnostic_list_count(&cmdbuf->sampler_pool.active_heaps));
+   }
+   return __vk_command_buffer_set_error(base, result, file, line);
+}
+
 
 static struct dzn_rendering_attachment *
 dzn_feedback_attachment(struct dzn_cmd_buffer *cmdbuf, unsigned index)
@@ -3242,13 +3400,14 @@ heap_type_for_bucket(enum dzn_internal_buf_bucket bucket)
 }
 
 static VkResult
-dzn_cmd_buffer_alloc_internal_buf(struct dzn_cmd_buffer *cmdbuf,
+dzn_cmd_buffer_alloc_internal_buf_impl(struct dzn_cmd_buffer *cmdbuf,
                                   uint32_t size,
                                   enum dzn_internal_buf_bucket bucket,
                                   D3D12_RESOURCE_STATES init_state,
                                   uint64_t align,
                                   ID3D12Resource **out,
-                                  uint64_t *offset)
+                                  uint64_t *offset,
+                                  const char *caller, const char *file, int line)
 {
    struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
    ID3D12Resource *res;
@@ -3261,6 +3420,8 @@ dzn_cmd_buffer_alloc_internal_buf(struct dzn_cmd_buffer *cmdbuf,
          cmdbuf->cur_upload_buf_offset = new_offset + size;
          *out = cmdbuf->cur_upload_buf->res;
          *offset = new_offset;
+         dzn_diagnostic_internal_alloc(cmdbuf, size, cmdbuf->cur_upload_buf->size, bucket,
+            init_state, align, new_offset, "active_upload", VK_SUCCESS, S_OK, caller, file, line);
          return VK_SUCCESS;
       }
       cmdbuf->cur_upload_buf = NULL;
@@ -3285,6 +3446,8 @@ dzn_cmd_buffer_alloc_internal_buf(struct dzn_cmd_buffer *cmdbuf,
          cmdbuf->cur_upload_buf = pooled;
          cmdbuf->cur_upload_buf_offset = size;
       }
+      dzn_diagnostic_internal_alloc(cmdbuf, size, pooled->size, bucket, init_state,
+         align, 0, "pool", VK_SUCCESS, S_OK, caller, file, line);
       return VK_SUCCESS;
    }
 
@@ -3309,6 +3472,8 @@ dzn_cmd_buffer_alloc_internal_buf(struct dzn_cmd_buffer *cmdbuf,
                                             &IID_ID3D12Resource,
                                             (void **)&res);
    if (FAILED(hres)) {
+      dzn_diagnostic_internal_alloc(cmdbuf, size, alloc_size, bucket, init_state, align,
+         0, "create_resource", VK_ERROR_OUT_OF_DEVICE_MEMORY, hres, caller, file, line);
       return vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
 
@@ -3316,6 +3481,8 @@ dzn_cmd_buffer_alloc_internal_buf(struct dzn_cmd_buffer *cmdbuf,
       vk_alloc(&device->vk.alloc, sizeof(*entry), 8,
                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!entry) {
+      dzn_diagnostic_internal_alloc(cmdbuf, size, alloc_size, bucket, init_state, align,
+         0, "metadata", VK_ERROR_OUT_OF_DEVICE_MEMORY, S_OK, caller, file, line);
       ID3D12Resource_Release(res);
       return vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
@@ -3331,6 +3498,8 @@ dzn_cmd_buffer_alloc_internal_buf(struct dzn_cmd_buffer *cmdbuf,
       cmdbuf->cur_upload_buf = entry;
       cmdbuf->cur_upload_buf_offset = size;
    }
+   dzn_diagnostic_internal_alloc(cmdbuf, size, alloc_size, bucket, init_state, align,
+      0, "new", VK_SUCCESS, S_OK, caller, file, line);
    return VK_SUCCESS;
 }
 
@@ -6788,11 +6957,15 @@ dzn_CmdFillBuffer(VkCommandBuffer commandBuffer,
       size = buf->size - dstOffset;
 
    size &= ~3ULL;
+   if (!size)
+      return;
+
+   const uint32_t upload_size = MIN2(size, 1u << 20);
 
    ID3D12Resource *src_res;
    uint64_t src_offset;
    VkResult result =
-      dzn_cmd_buffer_alloc_internal_buf(cmdbuf, size,
+      dzn_cmd_buffer_alloc_internal_buf(cmdbuf, upload_size,
                                         DZN_INTERNAL_BUF_UPLOAD,
                                         D3D12_RESOURCE_STATE_GENERIC_READ,
                                         4,
@@ -6802,17 +6975,26 @@ dzn_CmdFillBuffer(VkCommandBuffer commandBuffer,
       return;
 
    uint32_t *cpu_ptr;
-   ID3D12Resource_Map(src_res, 0, NULL, (void **)&cpu_ptr);
+   const D3D12_RANGE read_range = { 0, 0 };
+   HRESULT hr = ID3D12Resource_Map(src_res, 0, &read_range, (void **)&cpu_ptr);
+   if (FAILED(hr)) {
+      dzn_cmd_buffer_record_failure(cmdbuf, hr, "FillBuffer upload Map");
+      return;
+   }
    cpu_ptr += src_offset / sizeof(uint32_t);
-   for (uint32_t i = 0; i < size / 4; i++)
+   for (uint32_t i = 0; i < upload_size / 4; i++)
       cpu_ptr[i] = data;
 
-   ID3D12Resource_Unmap(src_res, 0, NULL);
+   const D3D12_RANGE written_range = { src_offset, src_offset + upload_size };
+   ID3D12Resource_Unmap(src_res, 0, &written_range);
 
    if (!cmdbuf->enhanced_barriers)
       dzn_cmd_buffer_query_buffer_barrier(cmdbuf, buf->res,
          D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COPY_DEST);
-   ID3D12GraphicsCommandList1_CopyBufferRegion(cmdbuf->cmdlist, buf->res, dstOffset, src_res, src_offset, size);
+   for (uint64_t offset = 0; offset < size; offset += upload_size) {
+      ID3D12GraphicsCommandList1_CopyBufferRegion(cmdbuf->cmdlist, buf->res,
+         dstOffset + offset, src_res, src_offset, MIN2(size - offset, upload_size));
+   }
    if (!cmdbuf->enhanced_barriers)
       dzn_cmd_buffer_query_buffer_barrier(cmdbuf, buf->res,
          D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);

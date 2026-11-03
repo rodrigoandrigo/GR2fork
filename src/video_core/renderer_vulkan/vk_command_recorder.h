@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <source_location>
+
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -97,9 +99,10 @@ public:
     void copyBufferToImage(vk::Buffer src_buffer, vk::Image dst_image,
                            vk::ImageLayout dst_image_layout,
                            vk::ArrayProxy<const vk::BufferImageCopy> const& regions) const;
-    void copyImageToBuffer(vk::Image src_image, vk::ImageLayout src_image_layout,
-                           vk::Buffer dst_buffer,
-                           vk::ArrayProxy<const vk::BufferImageCopy> const& regions) const;
+    void copyImageToBuffer(
+        vk::Image src_image, vk::ImageLayout src_image_layout, vk::Buffer dst_buffer,
+        vk::ArrayProxy<const vk::BufferImageCopy> const& regions,
+        const std::source_location& caller = std::source_location::current()) const;
     void resolveImage(vk::Image src_image, vk::ImageLayout src_image_layout, vk::Image dst_image,
                       vk::ImageLayout dst_image_layout,
                       vk::ArrayProxy<const vk::ImageResolve> const& regions) const;

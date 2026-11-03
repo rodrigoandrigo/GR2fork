@@ -441,6 +441,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     }
 
     auto cmdbuf = scheduler.CommandBuffer();
+    buffer->MarkUsed(scheduler.CurrentTick());
     cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              buffer->Handle(), buffer_copies);
 
@@ -789,6 +790,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
+    handle->MarkUsed(scheduler.CurrentTick());
     // The untracked buffer only ever reports reads, so its write list was always empty.
     if (handle == untracked_buffer) {
         return false;
@@ -803,6 +805,7 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+    handle->MarkUsed(scheduler.CurrentTick());
     constexpr static vk::AccessFlags2 READ_MASK =
         vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eVertexAttributeRead |
         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |

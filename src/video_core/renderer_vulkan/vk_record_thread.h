@@ -62,6 +62,7 @@ private:
 
     void Run(std::stop_token stop);
     void BeginPrimary();
+    void Diagnose(const char* operation, bool failed = false) noexcept;
     void Submit(const SubmitRequest& request);
 
     const Instance& instance;
@@ -77,6 +78,11 @@ private:
     u64 completed{};
     u64 submitted_tick{};
     std::exception_ptr failure;
+    const char* operation = "initialization";
+    u64 active_tick{};
+    u64 memory_sample_time{};
+    u64 memory_sample_usage{};
+    u64 memory_report_time{};
     std::jthread thread;
 };
 

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <utility>
 #include <boost/container/small_vector.hpp>
+#include "video_core/renderer_vulkan/vk_pipeline_progress.h"
 
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
@@ -42,7 +43,9 @@ GraphicsPipeline::GraphicsPipeline(
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     const auto debug_str = GetDebugString();
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::DescriptorBindings);
     BuildDescSetLayout(preloading, debug_str);
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::VertexInput);
 
     if (!preloading) {
         VertexInputs<AmdGpu::Buffer> guest_buffers;
@@ -60,6 +63,7 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::PipelineState);
     const vk::PipelineVertexInputDivisorStateCreateInfo divisor_state = {
         .vertexBindingDivisorCount = static_cast<u32>(sdata.divisors.size()),
         .pVertexBindingDivisors = sdata.divisors.data(),
@@ -231,6 +235,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
     vk::ShaderModule geometry_module{};
     if (geometry_primitive) {
+        PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::AuxiliaryGeometry);
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             sdata.geometry = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
@@ -251,6 +256,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     } else if (!geometry_primitive && (is_rect_list || is_quad_list)) {
+        PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::AuxiliaryTessellationControl);
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
@@ -270,6 +276,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     } else if (!geometry_primitive && (is_rect_list || is_quad_list)) {
+        PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::AuxiliaryTessellationEval);
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
@@ -289,6 +296,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     } else if (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation) {
+        PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::AuxiliaryFragment);
         if (!preloading) {
             const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
 
@@ -301,6 +309,7 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
 
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::PipelineState);
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
     };
@@ -480,8 +489,10 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = pipeline_layout,
     };
 
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::VulkanCreatePipeline);
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::PipelineCreated);
     if (geometry_module) {
         device.destroyShaderModule(geometry_module);
     }
@@ -567,6 +578,7 @@ template void GraphicsPipeline::GetVertexInputs(
 
 void GraphicsPipeline::BuildDescSetLayout(bool preloading, std::string_view debug_str) {
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
+    std::vector<u32> native_bindings;
     u32 binding{};
 
     for (const auto* stage : stages) {
@@ -594,6 +606,8 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading, std::string_view debu
                 .descriptorCount = num_bindings,
                 .stageFlags = stage_bit,
             });
+            if (image.native_sampled)
+                native_bindings.push_back(binding);
             has_desc_arrays |= num_bindings > 1;
             binding += num_bindings;
         }
@@ -615,7 +629,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading, std::string_view debu
         .offset = 0,
         .size = sizeof(Shader::PushData),
     };
-    AssignLayouts(bindings, flags, push_constants, debug_str);
+    AssignLayouts(bindings, flags, push_constants, debug_str, native_bindings);
 }
 
 } // namespace Vulkan

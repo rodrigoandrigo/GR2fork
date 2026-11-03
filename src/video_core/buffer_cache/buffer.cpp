@@ -274,7 +274,7 @@ std::optional<u64> StreamBuffer::Reserve(u64 size, u64 alignment, bool allow_wai
 void StreamBuffer::AdvanceAndWatch() {
     offset += mapped_size;
     const u64 tick = scheduler.CurrentTick();
-    last_tick = tick;
+    MarkUsed(tick);
 
     // Extend the last watch if it belongs to the same tick.
     if (current_watch_cursor != 0 && current_watches[current_watch_cursor - 1].tick == tick) {

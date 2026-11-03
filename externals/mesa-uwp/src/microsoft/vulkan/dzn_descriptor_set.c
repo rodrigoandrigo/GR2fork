@@ -22,6 +22,9 @@
  */
 
 #include "dzn_private.h"
+#ifdef _XBOX_UWP
+#include "util/uwp_util.h"
+#endif
 
 #include "vk_alloc.h"
 #include "vk_descriptors.h"
@@ -32,6 +35,18 @@
 #include "util/mesa-blake3.h"
 #include "util/format/u_format.h"
 #include "vk_format.h"
+
+#undef vk_command_buffer_set_error
+#define vk_command_buffer_set_error(command_buffer, error) \
+   dzn_diagnostic_record_error(command_buffer, error, __FILE__, __LINE__, __func__)
+
+#undef ID3D12Device_CreateCommittedResource
+#define ID3D12Device_CreateCommittedResource(device, heap, flags, desc, state, clear, iid, resource) \
+   dzn_diagnostic_create_resource(device, heap, flags, desc, state, clear, iid, resource, __func__, __LINE__)
+
+#undef ID3D12Device1_CreateCommittedResource
+#define ID3D12Device1_CreateCommittedResource(device, heap, flags, desc, state, clear, iid, resource) \
+   dzn_diagnostic_create_resource(device, heap, flags, desc, state, clear, iid, resource, __func__, __LINE__)
 
 static uint32_t
 translate_desc_stages(VkShaderStageFlags in)
@@ -831,6 +846,7 @@ dzn_pipeline_layout_hash_stages(struct dzn_pipeline_layout *layout,
             if (!(BITFIELD_BIT(stage) & set_layout->bindings[b].stages))
                continue;
 
+            _mesa_blake3_update(&ctx, &set_layout->bindings[b].native_sampled, sizeof(bool));
             _mesa_blake3_update(&ctx, &b, sizeof(b));
             _mesa_blake3_update(&ctx, &set, sizeof(set));
             _mesa_blake3_update(&ctx, &layout->binding_translation[set].image_offsets[b],
@@ -1426,9 +1442,12 @@ dzn_descriptor_heap_init(struct dzn_descriptor_heap *heap,
                D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
    };
 
-   if (FAILED(ID3D12Device1_CreateDescriptorHeap(device->dev, &desc,
-                                                 &IID_ID3D12DescriptorHeap,
-                                                 (void **)&heap->heap))) {
+   const HRESULT heap_hr = ID3D12Device1_CreateDescriptorHeap(device->dev, &desc,
+                                                              &IID_ID3D12DescriptorHeap,
+                                                              (void **)&heap->heap);
+   if (FAILED(heap_hr)) {
+      mesa_loge("[DozenDescriptorAlloc] hr=0x%08x type=%u count=%u descriptor_size=%u shader_visible=%u",
+                (unsigned)heap_hr, type, desc_count, heap->desc_sz, shader_visible);
       return vk_error(device,
                       shader_visible ?
                       VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -4039,3 +4058,29 @@ dzn_UpdateDescriptorSetWithTemplate(VkDevice _device,
       }
    }
 }
+
+#ifdef _XBOX_UWP
+MESA_UWP_EXPORT VkResult mesa_uwp_set_native_sampled_bindings(VkDevice device_handle,
+                                                              VkDescriptorSetLayout layout_handle,
+                                                              uint32_t count,
+                                                              const uint32_t *bindings) {
+   VK_FROM_HANDLE(dzn_device, device, device_handle);
+   VK_FROM_HANDLE(dzn_descriptor_set_layout, layout, layout_handle);
+   if (!layout || layout->vk.base.device != &device->vk || (count && !bindings))
+      return VK_ERROR_INITIALIZATION_FAILED;
+   for (uint32_t i = 0; i < count; ++i)
+      if (bindings[i] >= layout->binding_count ||
+          layout->bindings[bindings[i]].type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+         return VK_ERROR_INITIALIZATION_FAILED;
+   for (uint32_t i = 0; i < count; ++i)
+      ((struct dzn_descriptor_set_layout_binding *)layout->bindings)[bindings[i]].native_sampled =
+          true;
+   struct mesa_blake3 hash;
+   _mesa_blake3_init(&hash);
+   _mesa_blake3_update(&hash, layout->vk.blake3, sizeof(layout->vk.blake3));
+   for (uint32_t i = 0; i < layout->binding_count; ++i)
+      _mesa_blake3_update(&hash, &layout->bindings[i].native_sampled, sizeof(bool));
+   _mesa_blake3_final(&hash, layout->vk.blake3);
+   return VK_SUCCESS;
+}
+#endif

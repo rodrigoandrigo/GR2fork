@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef SHADPS4_UWP
+#include "uwp/dozen_host.h"
+#endif
 #include <array>
 #include <bit>
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include "video_core/renderer_vulkan/vk_pipeline_progress.h"
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -459,9 +463,10 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
 void Pipeline::AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bindings,
                              vk::DescriptorSetLayoutCreateFlags flags,
                              const vk::PushConstantRange& push_constants,
-                             std::string_view debug_name) {
+                             std::string_view debug_name, std::span<const u32> native_bindings) {
     if (layouts) {
-        const auto shared = layouts->Acquire(bindings, flags, push_constants, debug_name);
+        const auto shared =
+            layouts->Acquire(bindings, flags, push_constants, debug_name, native_bindings);
         desc_layout = shared.set;
         pipeline_layout = shared.pipeline;
         return;
@@ -472,9 +477,16 @@ void Pipeline::AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bin
         .bindingCount = static_cast<u32>(bindings.size()),
         .pBindings = bindings.data(),
     };
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::DescriptorSetLayout);
     auto [set_result, set] = device.createDescriptorSetLayoutUnique(desc_layout_ci);
     ASSERT_MSG(set_result == vk::Result::eSuccess, "Failed to create descriptor set layout: {}",
                vk::to_string(set_result));
+#ifdef SHADPS4_UWP
+    if (instance.GetDriverID() == vk::DriverId::eMesaDozen)
+        Core::Uwp::ConfigureDozenNativeSampling(
+            reinterpret_cast<uintptr_t>(static_cast<VkDevice>(device)),
+            reinterpret_cast<uintptr_t>(static_cast<VkDescriptorSetLayout>(*set)), native_bindings);
+#endif
     owned_desc_layout = std::move(set);
     desc_layout = *owned_desc_layout;
     const vk::PipelineLayoutCreateInfo layout_info = {
@@ -483,6 +495,7 @@ void Pipeline::AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bin
         .pushConstantRangeCount = 1U,
         .pPushConstantRanges = &push_constants,
     };
+    PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::PipelineLayout);
     auto [layout_result, layout] = device.createPipelineLayoutUnique(layout_info);
     ASSERT_MSG(layout_result == vk::Result::eSuccess, "Failed to create pipeline layout: {}",
                vk::to_string(layout_result));

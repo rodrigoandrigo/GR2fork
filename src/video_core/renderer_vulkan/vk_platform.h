@@ -3,8 +3,9 @@
 
 #pragma once
 
-#include <fmt/format.h>
+#include <source_location>
 #include <stdexcept>
+#include <fmt/format.h>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -56,11 +57,16 @@ void SetObjectName(vk::Device device, const HandleType& handle, const char* form
 }
 
 template <StringLiteral msg = "">
-static void Check(vk::Result r) {
+static void Check(vk::Result r,
+                  const std::source_location& where = std::source_location::current()) {
 #ifdef SHADPS4_UWP
     if (r != vk::Result::eSuccess) {
-        throw std::runtime_error(fmt::format("Vulkan operation '{}' failed: {}", msg.value,
-                                             vk::to_string(r)));
+        const auto* operation = msg.len > 1 ? msg.value : where.function_name();
+        LOG_ERROR(Render_Vulkan,
+                  "[VulkanFailure] operation={} result={} file={} line={} function={}", operation,
+                  vk::to_string(r), where.file_name(), where.line(), where.function_name());
+        throw std::runtime_error(
+            fmt::format("Vulkan operation '{}' failed: {}", operation, vk::to_string(r)));
     }
 #else
     if constexpr (msg.len <= 1) {
@@ -73,8 +79,9 @@ static void Check(vk::Result r) {
 }
 
 template <StringLiteral msg = "", typename T>
-static T Check(vk::ResultValue<T> r) {
-    Check<msg>(r.result);
+static T Check(vk::ResultValue<T> r,
+               const std::source_location& where = std::source_location::current()) {
+    Check<msg>(r.result, where);
     return std::move(r.value);
 }
 

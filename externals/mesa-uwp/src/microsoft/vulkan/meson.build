@@ -35,6 +35,7 @@ libdzn_files = files(
   'dzn_meta.c',
   'dzn_nir.c',
   'dzn_pipeline.c',
+  'dzn_pso_capture.cpp',
   'dzn_query.c',
   'dzn_sync.c',
   'dzn_util.c',

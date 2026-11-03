@@ -10,6 +10,8 @@
 #include "video_core/renderer_vulkan/vk_record_thread.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #ifdef SHADPS4_UWP
+#include <vk_mem_alloc.h>
+#include <winrt/Windows.System.h>
 #include "uwp/session.h"
 #endif
 
@@ -29,6 +31,7 @@ RecordThread::RecordThread(const Instance& instance_, Semaphore& work_semaphore_
                 failure = error;
             }
             done_cv.notify_all();
+            Diagnose(operation, true);
 #ifdef SHADPS4_UWP
             try {
                 std::rethrow_exception(error);
@@ -104,7 +107,8 @@ u64 RecordThread::WaitSubmitted(u64 tick) {
 void RecordThread::ResetCommandBuffer() {
     WaitIdle();
     // With the queue drained the thread is parked, so the pool is free to use from here.
-    Check(primary.reset());
+    Diagnose("vkResetCommandBuffer");
+    Check<"vkResetCommandBuffer: VkRecord">(primary.reset());
 }
 
 void RecordThread::Run(std::stop_token stop) {
@@ -125,6 +129,8 @@ void RecordThread::Run(std::stop_token stop) {
         }
         done_cv.notify_all();
 
+        active_tick = work.submit ? work.submit->signal_tick : work_semaphore.CurrentTick();
+        Diagnose("CommandChunk::ExecuteAll");
         work.chunk->ExecuteAll(primary);
         if (work.submit) {
             Submit(*work.submit);
@@ -142,12 +148,80 @@ void RecordThread::Run(std::stop_token stop) {
     }
 }
 
+void RecordThread::Diagnose(const char* next_operation, bool failed) noexcept {
+    operation = next_operation;
+#ifdef SHADPS4_UWP
+    try {
+        const auto now = GetTickCount64();
+        if (!failed && now - memory_sample_time < 100)
+            return;
+        u64 usage{}, limit{};
+        bool sample_valid{};
+        try {
+            usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
+            limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+            sample_valid = true;
+        } catch (const winrt::hresult_error&) {
+            if (!failed)
+                return;
+        }
+        const auto growth = usage > memory_sample_usage ? usage - memory_sample_usage : 0;
+        const auto headroom = limit - std::min(usage, limit);
+        const bool report =
+            failed || (now - memory_report_time >= 1000 &&
+                       ((memory_sample_time && growth >= 128_MB) || (limit && headroom < 640_MB)));
+        if (report) {
+            size_t queued{}, recycled{};
+            u64 sent{}, done{}, submitted{};
+            {
+                std::scoped_lock lock{mutex};
+                queued = pending.size();
+                recycled = free_chunks.size();
+                sent = dispatched;
+                done = completed;
+                submitted = submitted_tick;
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "[VkRecordMemory] failed={} operation={} tick={} app_sample_valid={} "
+                        "app_bytes={} limit_bytes={} "
+                        "headroom_bytes={} previous_bytes={} interval_ms={} queued={} recycled={} "
+                        "dispatched={} completed={} submitted={} known_gpu={}",
+                        failed, operation, active_tick, sample_valid, usage, limit, headroom,
+                        memory_sample_usage, memory_sample_time ? now - memory_sample_time : 0,
+                        queued, recycled, sent, done, submitted, work_semaphore.KnownGpuTick());
+            memory_report_time = now;
+        }
+        memory_sample_time = now;
+        memory_sample_usage = usage;
+        if (failed) {
+            std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+            vmaGetHeapBudgets(instance.GetAllocator(), budgets.data());
+            const auto& properties = instance.GetMemoryProperties();
+            for (u32 i = 0; i < properties.memoryHeapCount; ++i) {
+                const auto& heap = budgets[i];
+                LOG_ERROR(Render_Vulkan,
+                          "[VkRecordMemory] heap={} flags={:#x} size={} usage={} budget={} "
+                          "vma_block_bytes={} vma_allocation_bytes={} blocks={} allocations={}",
+                          i, u32(properties.memoryHeaps[i].flags), properties.memoryHeaps[i].size,
+                          heap.usage, heap.budget, heap.statistics.blockBytes,
+                          heap.statistics.allocationBytes, heap.statistics.blockCount,
+                          heap.statistics.allocationCount);
+            }
+            Common::Log::Flush();
+        }
+    } catch (...) {
+    }
+#endif
+}
+
 void RecordThread::BeginPrimary() {
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
+    Diagnose("CommandPool::Commit");
     primary = command_pool.Commit();
-    Check(primary.begin(begin_info));
+    Diagnose("vkBeginCommandBuffer");
+    Check<"vkBeginCommandBuffer: VkRecord">(primary.begin(begin_info));
 }
 
 void RecordThread::Submit(const SubmitRequest& request) {
@@ -163,7 +237,8 @@ void RecordThread::Submit(const SubmitRequest& request) {
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
     });
-    Check(primary.end());
+    Diagnose("vkEndCommandBuffer");
+    Check<"vkEndCommandBuffer: VkRecord">(primary.end());
 
     const SubmitInfo& info = request.info;
     std::array<vk::PipelineStageFlags, std::tuple_size_v<decltype(info.wait_semas)>>
@@ -190,11 +265,14 @@ void RecordThread::Submit(const SubmitRequest& request) {
 
     {
         std::scoped_lock lk{Scheduler::submit_mutex};
+        Diagnose("ImGui texture submission");
         ImGui::Core::TextureManager::Submit();
+        Diagnose("vkQueueSubmit");
         const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+        Check<"vkQueueSubmit: VkRecord">(submit_result);
     }
 
+    Diagnose("timeline semaphore refresh");
     work_semaphore.Refresh();
     BeginPrimary();
 }

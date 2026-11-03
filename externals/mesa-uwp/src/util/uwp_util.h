@@ -2,6 +2,7 @@
 #define UWP_UTIL_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,6 +16,18 @@ extern "C" {
 
 int uwp_get_cache_directory(char *path, size_t capacity);
 int uwp_is_desktop_device(void);
+int uwp_shader_compile_begin(void);
+void uwp_shader_compile_end(void);
+uint64_t uwp_compile_diagnostic_begin(const char *scope);
+void uwp_compile_diagnostic_phase(const char *phase, int stage);
+void uwp_native_pso_begin(void);
+void uwp_native_pso_end(void);
+MESA_UWP_EXPORT void mesa_uwp_set_native_pso_concurrency(unsigned limit);
+void uwp_compile_diagnostic_pso(const char *json);
+void uwp_compile_diagnostic_native_pso(int begin, int64_t result);
+void uwp_compile_diagnostic_end(uint64_t id, int64_t result);
+MESA_UWP_EXPORT void mesa_uwp_report_compiles(void);
+MESA_UWP_EXPORT int mesa_uwp_get_compile_diagnostic(unsigned thread, char *json, size_t capacity);
 MESA_UWP_EXPORT void* uwp_get_window_reference(void);
 /* A failed COM marshaling request makes the window getter return NULL until
  * the host supplies a new reference. Width/height are published together. */
