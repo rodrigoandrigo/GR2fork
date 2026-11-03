@@ -60,7 +60,8 @@ void DriverLog(void*, const char* message) {
         LOG_WARNING(Render_Vulkan, "Dozen: {}", message);
     else
         LOG_INFO(Render_Vulkan, "Dozen: {}", message);
-    if (text.find("[ReadbackDiag]") != text.npos || text.find("[CompileDiag]") != text.npos)
+    if (text.find("[ReadbackDiag]") != text.npos || text.find("[DescriptorMemory]") != text.npos ||
+        text.find("[CompileDiag]") != text.npos)
         Common::Log::Flush();
 }
 

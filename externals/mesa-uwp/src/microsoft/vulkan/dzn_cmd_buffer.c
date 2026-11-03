@@ -8010,6 +8010,19 @@ dzn_cmd_buffer_push_descriptors(struct dzn_cmd_buffer *cmdbuf,
           &desc_state->sets[set_index].set->layout->vk, &set_layout->vk))
       previous = desc_state->sets[set_index].set;
    VkDescriptorPool pool = VK_NULL_HANDLE;
+   uint32_t pool_count =
+      util_dynarray_num_elements(&cmdbuf->push_descriptor_pools, VkDescriptorPool);
+   for (uint32_t i = pool_count; i-- > 0;) {
+      VkDescriptorPool candidate =
+         *util_dynarray_element(&cmdbuf->push_descriptor_pools, VkDescriptorPool, i);
+      struct dzn_descriptor_pool *object = dzn_descriptor_pool_from_handle(candidate);
+      if (object->used_set_count && object->used_set_count < object->set_count &&
+          object->sets[0].layout &&
+          dzn_descriptor_set_layouts_compatible(&object->sets[0].layout->vk, &set_layout->vk)) {
+         pool = candidate;
+         break;
+      }
+   }
    VkDescriptorSet set = VK_NULL_HANDLE;
    VkResult result = dzn_descriptor_set_push_allocate(device, set_layout,
                                                        previous, &pool, &set);
@@ -8026,14 +8039,16 @@ dzn_cmd_buffer_push_descriptors(struct dzn_cmd_buffer *cmdbuf,
       dzn_descriptor_set_push_update(device, set, write_count, writes);
    }
 
-   VkDescriptorPool *pool_slot =
-      util_dynarray_grow(&cmdbuf->push_descriptor_pools, VkDescriptorPool, 1);
-   if (!pool_slot) {
-      dzn_DestroyDescriptorPool(device_handle, pool, NULL);
-      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-      return;
+   if (pool != VK_NULL_HANDLE) {
+      VkDescriptorPool *pool_slot =
+         util_dynarray_grow(&cmdbuf->push_descriptor_pools, VkDescriptorPool, 1);
+      if (!pool_slot) {
+         dzn_DestroyDescriptorPool(device_handle, pool, NULL);
+         vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return;
+      }
+      *pool_slot = pool;
    }
-   *pool_slot = pool;
 
    VK_FROM_HANDLE(dzn_descriptor_set, set_object, set);
    dzn_cmd_buffer_disturb_descriptor_sets(cmdbuf, bind_point, pipeline_layout,

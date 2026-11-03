@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #ifdef SHADPS4_UWP
 #include <vk_mem_alloc.h>
+#include "video_core/renderer_vulkan/vk_resource_memory.h"
 #include <winrt/Windows.System.h>
 #include "uwp/session.h"
 #endif
@@ -151,6 +152,8 @@ void RecordThread::Run(std::stop_token stop) {
 void RecordThread::Diagnose(const char* next_operation, bool failed) noexcept {
     operation = next_operation;
 #ifdef SHADPS4_UWP
+    if (!failed)
+        return;
     try {
         const auto now = GetTickCount64();
         if (!failed && now - memory_sample_time < 100)
@@ -193,13 +196,14 @@ void RecordThread::Diagnose(const char* next_operation, bool failed) noexcept {
         }
         memory_sample_time = now;
         memory_sample_usage = usage;
-        if (failed) {
+        const bool resource_report = report && ResourceMemory::Report(operation, failed);
+        if (resource_report || failed) {
             std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
             vmaGetHeapBudgets(instance.GetAllocator(), budgets.data());
             const auto& properties = instance.GetMemoryProperties();
             for (u32 i = 0; i < properties.memoryHeapCount; ++i) {
                 const auto& heap = budgets[i];
-                LOG_ERROR(Render_Vulkan,
+                LOG_WARNING(Render_Vulkan,
                           "[VkRecordMemory] heap={} flags={:#x} size={} usage={} budget={} "
                           "vma_block_bytes={} vma_allocation_bytes={} blocks={} allocations={}",
                           i, u32(properties.memoryHeaps[i].flags), properties.memoryHeaps[i].size,

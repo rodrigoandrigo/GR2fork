@@ -167,6 +167,65 @@ e desconhecido, além do dump automático em uma exceção injetada. O Bloodborn
 chegou ao menu com captura conferida e completou 95 segundos/2.562 frames,
 retorno e shutdown normais. A causa específica no Xbox requer novos logs.
 
+## Revisão das arenas densas
+
+`[DenseArena] growth` identifica o intervalo pedido, a capacidade resultante,
+arenas/bytes incorporados, ampliação da cobertura VA e tick. O resumo a cada
+cinco segundos mostra capacidade atual, ocupação dos intervalos registrados em
+`resident_ranges`, pedidos/reutilizações, bytes alocados cumulativamente e
+cópias de migração gravadas. Lista até 16 arenas com intervalo, último uso e
+estado da fence. A ocupação lógica não comprova que os dados ainda são usados
+pelo jogo; `gpu_done` também não significa que uma arena pode ser descartada.
+
+`[ResourceMemory]` separa `dense_active` de `dense_retired`, mantida até a
+liberação diferida após a fence. O diagnóstico não altera expansão, alocação,
+reciclagem ou sincronização das arenas. O índice de descritores foi ampliado
+para 32.768 entradas, com busca limitada a 128 posições para evitar varreduras
+longas. Perdas continuam explícitas. A verificação privada registrou/liberou
+9.000 entradas simultâneas sem perdas e exercitou o caminho denso no PC.
+
+## Redução de alocações no Dozen
+
+As arenas densas arredondam a capacidade para 1 MiB ou para o tamanho do bloco,
+se maior, em vez de 16 MiB. Regiões apenas adjacentes permanecem separadas;
+intervalos que atravessam arenas unem as regiões sobrepostas, copiam os dados
+na GPU e mantêm os buffers anteriores até a fence.
+
+Push descriptors usam pools de até 16 snapshots e reaproveitam espaço de pools
+compatíveis do mesmo command buffer. Cada atualização recebe um novo set;
+atualizações parciais preservam os bindings anteriores. O reset continua
+liberando os pools após a conclusão do uso do command buffer.
+
+A verificação GPU no PC, com SM6.4 e barreiras legadas, preservou 80 snapshots
+com dois layouts alternados usando seis pools, em duas execuções com reset.
+Uma compilação privada forçou arenas densas no Pac-Man, verificou separação,
+união e liberação após fence, apresentou imagem e encerrou normalmente.
+Bloodborne chegou ao menu com captura conferida, completou 95 segundos e
+2.503 frames, com retorno e shutdown normais. A redução do consumo e a
+estabilidade sob pressão no Xbox exigem validação no dispositivo.
+
+## Diagnóstico de retenção de recursos
+
+Sob pressão, `[ResourceMemory]` publica a cada cinco segundos totais vivos,
+criados/destruídos e pico em bytes de buffers/imagens VMA rastreados. Separa
+staging ativo, staging retirado aguardando fence, streams e demais buffers.
+Mostra as 16 maiores alocações com tamanho, nome, handle, tipo de memória e,
+para imagens, formato/dimensões/mips/layers/samples. Os heaps VMA são amostrados
+junto desses registros; falhas de gravação forçam a captura imediatamente.
+
+`[DescriptorMemory]` informa heaps por tipo/visibilidade, origem da criação,
+pools de descritores, capacidade, totais vivos/criados/destruídos e picos.
+Também é descarregado na falha de criação de heap. `payload_bytes` e
+`metadata_payload_bytes` representam capacidade útil e metadados conhecidos;
+não medem o custo físico interno do driver D3D12. Nos pools, `slots` é a
+capacidade de sets. Os registros são fixos (8.192 recursos VMA e 32.768 descritores/pools),
+com perdas/limpezas não correspondidas explicitadas nos contadores.
+
+As verificações privadas no PC confirmaram retorno dos totais após liberação,
+criação/destruição de heap real e relatório automático com `E_OUTOFMEMORY`
+injetado. A execução privada com amostragem forçada terminou normalmente;
+a causa e retenção sob pressão real no Xbox dependem dos próximos logs.
+
 ## Diagnóstico de esperas na compilação
 
 `[PipelineCompile]` identifica início/fim da criação de pipelines gráficos
@@ -227,13 +286,18 @@ A captura por LT + RT também salva os PSOs pendentes em
 A reconstrução em outro processo e a seleção da API alternativa no Xbox estão
 descritas em [Dozen PSO replay](../tools/DozenPsoReplay/README.md).
 
+O lowering de imagens e texturas raw está desativado por padrão no Dozen.
+O export `mesa_uwp_set_raw_image_lowering` permanece disponível para habilitação
+explícita antes da criação do dispositivo; o aplicativo não o reativa.
+
 Os bindings de amostragem comprovadamente nativa são anotados antes da criação
 do pipeline layout, através do export opcional
 `mesa_uwp_set_native_sampled_bindings`. A classificação cobre BC, MSAA, depth
 e formatos sem representação raw neste backend: R8, R32, RGBA8, RGB/RGBA32, além de R16/RGBA16 float, UNORM, UINT
 e SINT. Exige um único descritor, sem escrita ou feedback. A lista acompanha
 os formatos de `dzn_raw_image_format`; expandir essa representação exige revisar
-a classificação. O lowering raw permanece ativo para os demais bindings; arrays de descritores não recebem essa promessa.
+a classificação. Quando habilitado, o lowering raw permanece ativo para os
+demais bindings; arrays de descritores não recebem essa promessa.
 A classificação participa das especializações, do cache de layouts e dos hashes
 NIR/DXIL. A versão de metadata dos shaders foi incrementada para regenerar
 entradas que não continham essa informação. O shader continua usando a instrução
@@ -313,6 +377,12 @@ Backup inicial com manifesto e SHA-256:
 Essas verificações não demonstram pressão real de memória nem gameplay no Xbox.
 Não houve instalação de pacote.
 
+## Diagnósticos após a correção dos descritores
 
-
-
+O rastreamento detalhado de pools/heaps de descritores foi removido, incluindo
+seu registro e lock global. O símbolo exportado de relatório permanece vazio
+para compatibilidade. Foram removidos os logs de cada crescimento de arena e
+os contadores de pedidos/reutilizações por acesso. O resumo das arenas restantes
+passa a cada 30 segundos. A coleta detalhada de memória da thread de gravação
+ocorre somente em falha; os erros de alocação e diagnósticos de PSO permanecem.
+Essa configuração substitui a periodicidade e o rastreamento descritos acima.

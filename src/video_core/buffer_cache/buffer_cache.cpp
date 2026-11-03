@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <chrono>
+#ifdef SHADPS4_UWP
+#include "video_core/renderer_vulkan/vk_resource_memory.h"
+#endif
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
@@ -196,6 +199,10 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
+#ifdef SHADPS4_UWP
+    if (!sparse_buffers)
+        ReportDenseArenas();
+#endif
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
@@ -689,34 +696,88 @@ void BufferCache::SynchronizeDmaBuffers() {
     }
 }
 
+#ifdef SHADPS4_UWP
+void BufferCache::ReportDenseArenas() {
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    if (u64(now) - dense_diagnostic_time < 30000)
+        return;
+    dense_diagnostic_time = now;
+    u64 capacity{}, resident{};
+    struct Row {
+        VAddr begin{};
+        u64 bytes{}, resident{}, tick{};
+    };
+    std::array<Row, 16> largest{};
+    for (const auto& [begin, buffer] : dense_arenas) {
+        const u64 first = begin >> block_shift;
+        const u64 last = (begin + buffer->size_bytes) >> block_shift;
+        u64 used{};
+        resident_ranges.ForEachInRange(first, last, [&](const Backing& range) {
+            used += (std::min(last, range.end) - std::max(first, range.start)) << block_shift;
+        });
+        capacity += buffer->size_bytes;
+        resident += used;
+        if (buffer->size_bytes > largest.back().bytes) {
+            largest.back() = Row{begin, buffer->size_bytes, used, buffer->LastUseTick()};
+            std::sort(largest.begin(), largest.end(),
+                      [](const Row& a, const Row& b) { return a.bytes > b.bytes; });
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "[DenseArena] summary arenas={} capacity_bytes={} logical_resident_bytes={} "
+                "capacity_without_resident_bytes={} "
+                "allocated_cumulative_bytes={} migration_copy_bytes={} current_tick={} gpu_tick={}",
+                dense_arenas.size(), capacity, resident, capacity - std::min(capacity, resident),
+                dense_allocated_bytes, dense_copy_bytes,
+                scheduler.CurrentTick(), scheduler.GetWorkSemaphore()->KnownGpuTick());
+    for (u32 i = 0; i < largest.size() && largest[i].bytes; ++i)
+        LOG_WARNING(Render_Vulkan,
+                    "[DenseArena] largest rank={} begin={:#x} capacity_bytes={} "
+                    "logical_resident_bytes={} last_use_tick={} gpu_done={}",
+                    i, largest[i].begin, largest[i].bytes, largest[i].resident, largest[i].tick,
+                    scheduler.IsFree(largest[i].tick));
+}
+#endif
+
 const Buffer* BufferCache::GetDenseArena(u64 first_block, u64 last_block) {
-    constexpr u64 DensePageSize = 16_MB;
+    const u64 DensePageSize = std::max<u64>(1_MB, 1ULL << block_shift);
     VAddr begin = Common::AlignDown(first_block << block_shift, DensePageSize);
     VAddr end = Common::AlignUp((last_block + 1) << block_shift, DensePageSize);
     auto first = dense_arenas.upper_bound(begin);
     if (first != dense_arenas.begin()) {
         const auto previous = std::prev(first);
-        if (previous->first + previous->second->size_bytes >= begin)
+        if (previous->first + previous->second->size_bytes > begin)
             first = previous;
     }
     if (first != dense_arenas.end() && first->first <= begin &&
-        first->first + first->second->size_bytes >= end)
+        first->first + first->second->size_bytes >= end) {
         return first->second.get();
+    }
 
     auto last = first;
-    while (last != dense_arenas.end() && last->first <= end) {
+    while (last != dense_arenas.end() && last->first < end) {
         begin = std::min(begin, last->first);
         end = std::max(end, last->first + last->second->size_bytes);
         ++last;
     }
     auto buffer = std::make_unique<Buffer>(instance, begin, end - begin, MemoryType::DeviceLocal,
                                            "Dense guest buffer arena");
+#ifdef SHADPS4_UWP
+    dense_allocated_bytes += end - begin;
+#endif
     runtime.FillBuffer(buffer.get(), 0, end - begin, 0);
     while (first != last) {
         auto previous = std::move(first->second);
         first = dense_arenas.erase(first);
         const vk::BufferCopy copy{0, previous->cpu_addr - begin, previous->size_bytes};
         runtime.CopyBuffer(previous.get(), buffer.get(), std::span{&copy, 1});
+#ifdef SHADPS4_UWP
+        dense_copy_bytes += previous->size_bytes;
+        Vulkan::ResourceMemory::Name(reinterpret_cast<uintptr_t>(previous->buffer.allocation),
+                                     "Dense guest buffer arena:retired");
+#endif
         scheduler.DeferOperation([retired = std::move(previous)] {});
     }
     const auto* result = buffer.get();

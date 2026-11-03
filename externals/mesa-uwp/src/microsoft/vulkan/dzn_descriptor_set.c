@@ -1396,6 +1396,13 @@ dzn_descriptor_watch_metadata(struct dzn_cmd_buffer *cmdbuf, struct dzn_descript
    mtx_unlock(&device->descriptor_update_lock);
 }
 
+
+#ifdef _XBOX_UWP
+__declspec(dllexport) void mesa_uwp_report_descriptor_memory(void)
+{
+}
+#endif
+
 void
 dzn_descriptor_heap_finish(struct dzn_descriptor_heap *heap)
 {
@@ -1416,17 +1423,18 @@ dzn_descriptor_heap_finish(struct dzn_descriptor_heap *heap)
    heap->raw_metadata = NULL;
    free(heap->raw_descriptors);
    heap->raw_descriptors = NULL;
-   if (heap->heap)
+   if (heap->heap) {
       ID3D12DescriptorHeap_Release(heap->heap);
+   }
    heap->heap = NULL;
 }
 
 VkResult
-dzn_descriptor_heap_init(struct dzn_descriptor_heap *heap,
+dzn_descriptor_heap_init_impl(struct dzn_descriptor_heap *heap,
                          struct dzn_device *device,
                          D3D12_DESCRIPTOR_HEAP_TYPE type,
                          uint32_t desc_count,
-                         bool shader_visible)
+                         bool shader_visible, const char *caller)
 {
    heap->device = device;
    heap->type = type;
@@ -1448,6 +1456,9 @@ dzn_descriptor_heap_init(struct dzn_descriptor_heap *heap,
    if (FAILED(heap_hr)) {
       mesa_loge("[DozenDescriptorAlloc] hr=0x%08x type=%u count=%u descriptor_size=%u shader_visible=%u",
                 (unsigned)heap_hr, type, desc_count, heap->desc_sz, shader_visible);
+#ifdef _XBOX_UWP
+      mesa_uwp_report_descriptor_memory();
+#endif
       return vk_error(device,
                       shader_visible ?
                       VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1492,6 +1503,15 @@ dzn_descriptor_heap_init(struct dzn_descriptor_heap *heap,
 
    return VK_SUCCESS;
 }
+
+VkResult
+dzn_descriptor_heap_init(struct dzn_descriptor_heap *heap, struct dzn_device *device,
+                         D3D12_DESCRIPTOR_HEAP_TYPE type, uint32_t count, bool visible)
+{
+   return dzn_descriptor_heap_init_impl(heap, device, type, count, visible, "external");
+}
+#define dzn_descriptor_heap_init(heap, device, type, count, visible) \
+   dzn_descriptor_heap_init_impl(heap, device, type, count, visible, __func__)
 
 D3D12_CPU_DESCRIPTOR_HANDLE
 dzn_descriptor_heap_get_cpu_handle(const struct dzn_descriptor_heap *heap, uint32_t desc_offset)
@@ -3652,42 +3672,59 @@ dzn_descriptor_set_push_allocate(struct dzn_device *device,
    if (total_push_descriptors > DZN_MAX_PUSH_DESCRIPTORS)
       return vk_error(device, VK_ERROR_OUT_OF_POOL_MEMORY);
 
+   const uint32_t sets_per_pool = 16;
    VkDescriptorPoolSize pool_sizes[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
    uint32_t pool_size_count = 0;
    for (uint32_t type = 0; type < ARRAY_SIZE(descriptor_counts); type++) {
       if (descriptor_counts[type]) {
          pool_sizes[pool_size_count++] = (VkDescriptorPoolSize) {
             .type = (VkDescriptorType)type,
-            .descriptorCount = descriptor_counts[type],
+            .descriptorCount = descriptor_counts[type] * sets_per_pool,
          };
       }
    }
 
    VkDescriptorPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-      .maxSets = 1,
+      .maxSets = sets_per_pool,
       .poolSizeCount = pool_size_count,
       .pPoolSizes = pool_sizes,
    };
-   VkDescriptorPool pool = VK_NULL_HANDLE;
-   VkResult result = dzn_descriptor_pool_create(device, &pool_info, NULL, &pool);
-   if (result != VK_SUCCESS)
-      return result;
-
    VkDescriptorSetLayout layout_handle =
       dzn_descriptor_set_layout_to_handle((struct dzn_descriptor_set_layout *)layout);
    VkDescriptorSetAllocateInfo alloc_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-      .descriptorPool = pool,
       .descriptorSetCount = 1,
       .pSetLayouts = &layout_handle,
    };
+   VkDescriptorPool pool = *out_pool;
+   *out_pool = VK_NULL_HANDLE;
    VkDescriptorSet set = VK_NULL_HANDLE;
+   bool owns_pool = false;
+   VkResult result;
+   if (!pool && previous && previous->pool &&
+       !memcmp(previous->layout->vk.blake3, layout->vk.blake3, sizeof(layout->vk.blake3)) &&
+       previous->pool->used_set_count < previous->pool->set_count)
+      pool = dzn_descriptor_pool_to_handle(previous->pool);
+   if (pool) {
+      alloc_info.descriptorPool = pool;
+      result = dzn_AllocateDescriptorSets(dzn_device_to_handle(device), &alloc_info, &set);
+      if (result == VK_SUCCESS)
+         goto allocated;
+      if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL)
+         return result;
+   }
+   result = dzn_descriptor_pool_create(device, &pool_info, NULL, &pool);
+   if (result != VK_SUCCESS)
+      return result;
+   owns_pool = true;
+   alloc_info.descriptorPool = pool;
    result = dzn_AllocateDescriptorSets(dzn_device_to_handle(device), &alloc_info, &set);
    if (result != VK_SUCCESS) {
-      dzn_descriptor_pool_destroy(dzn_descriptor_pool_from_handle(pool), NULL);
+      dzn_DestroyDescriptorPool(dzn_device_to_handle(device), pool, NULL);
       return result;
    }
+allocated:
 
    if (previous &&
        memcmp(previous->layout->vk.blake3, layout->vk.blake3,
@@ -3710,7 +3747,7 @@ dzn_descriptor_set_push_allocate(struct dzn_device *device,
       }
    }
 
-   *out_pool = pool;
+   *out_pool = owns_pool ? pool : VK_NULL_HANDLE;
    *out_set = set;
    return VK_SUCCESS;
 }

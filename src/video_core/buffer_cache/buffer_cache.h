@@ -214,6 +214,10 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
     const Buffer* GetDenseArena(u64 first_block, u64 last_block);
+#ifdef SHADPS4_UWP
+    void ReportDenseArenas();
+    u64 dense_allocated_bytes{}, dense_copy_bytes{}, dense_diagnostic_time{};
+#endif
 
     /// True when every block in [first_block, last_block] has its residency bit set.
     bool AllResident(u64 first_block, u64 last_block) const;

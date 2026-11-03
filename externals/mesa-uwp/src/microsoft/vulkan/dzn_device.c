@@ -72,7 +72,7 @@ static const GUID dzn_root_blob_guid = {0x618ce6d1,0x15d0,0x4a15,{0xa3,0x51,0xb2
 
 static unsigned dzn_shader_model_limit = UINT32_MAX;
 static unsigned dzn_force_legacy_barriers;
-static unsigned dzn_raw_image_lowering = 1;
+static unsigned dzn_raw_image_lowering = 0;
 
 MESA_UWP_EXPORT void
 mesa_uwp_set_raw_image_lowering(int enabled)

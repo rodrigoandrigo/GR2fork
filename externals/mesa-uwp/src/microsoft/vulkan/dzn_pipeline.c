@@ -44,7 +44,6 @@
 #include "vk_common_entrypoints.h"
 #ifdef _XBOX_UWP
 #include "util/uwp_util.h"
-#include "dzn_pso_capture.h"
 #define DZN_COMPILE_BEGIN(scope) uwp_compile_diagnostic_begin(scope)
 #define DZN_COMPILE_PHASE(phase, stage) uwp_compile_diagnostic_phase(phase, stage)
 #define DZN_COMPILE_END(id, result) uwp_compile_diagnostic_end(id, result)
@@ -359,73 +358,6 @@ dzn_pso_stream_hash(const D3D12_PIPELINE_STATE_STREAM_DESC *desc, uint8_t out[BL
    return true;
 }
 
-#ifdef _XBOX_UWP
-static void
-dzn_diagnostic_pso(const D3D12_PIPELINE_STATE_STREAM_DESC *desc, bool at_draw, bool is_compute)
-{
-   char json[8192];
-   uint8_t hash[BLAKE3_KEY_LEN];
-   char key[BLAKE3_KEY_LEN * 2 + 1] = {0};
-   if (dzn_pso_stream_hash(desc, hash))
-      for (unsigned i = 0; i < BLAKE3_KEY_LEN; ++i)
-         snprintf(key + i * 2, 3, "%02x", hash[i]);
-   size_t used = snprintf(json, sizeof(json),
-      "{\"version\":1,\"native_api\":\"%s\",\"stream_hash\":\"%s\",\"stream_bytes\":%zu,\"at_draw\":%s,\"subobjects\":[",
-      is_compute ? "CreateComputePipelineState" :
-      (dzn_pso_use_legacy() ? "CreateGraphicsPipelineState" : "CreatePipelineState"),
-      key, desc->SizeInBytes, at_draw ? "true" : "false");
-   const uint8_t *p = desc->pPipelineStateSubobjectStream;
-   const uint8_t *end = p + desc->SizeInBytes;
-   unsigned count = 0;
-   bool truncated = false;
-   while (p < end) {
-      if ((size_t)(end - p) < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)) {
-         truncated = true;
-         break;
-      }
-      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *)p;
-      size_t offset = 0, size = dzn_pso_subobject_size(type, &offset);
-      if (!size || ALIGN_POT(size, sizeof(void *)) > (size_t)(end - p) ||
-          sizeof(json) - used < 1024) {
-         truncated = true;
-         break;
-      }
-      const void *data = p + offset;
-      size_t bytes = size - offset;
-      bool shader = type >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS &&
-                    type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
-      if (shader) {
-         const D3D12_SHADER_BYTECODE *code = data;
-         data = code->pShaderBytecode;
-         bytes = code->BytecodeLength;
-      }
-      struct mesa_blake3 ctx;
-      _mesa_blake3_init(&ctx);
-      if (bytes)
-         _mesa_blake3_update(&ctx, data, bytes);
-      _mesa_blake3_final(&ctx, hash);
-      for (unsigned i = 0; i < BLAKE3_KEY_LEN; ++i)
-         snprintf(key + i * 2, 3, "%02x", hash[i]);
-      used += snprintf(json + used, sizeof(json) - used,
-         "%s{\"type\":%u,\"bytes\":%zu,\"hash\":\"%s\"", count++ ? "," : "",
-         (unsigned)type, bytes, key);
-      if (!shader && type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE &&
-          type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT &&
-          type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT &&
-          type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO &&
-          type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING) {
-         used += snprintf(json + used, sizeof(json) - used, ",\"data_hex\":\"");
-         for (size_t i = 0; i < bytes; ++i)
-            used += snprintf(json + used, sizeof(json) - used, "%02x", ((const uint8_t *)data)[i]);
-         used += snprintf(json + used, sizeof(json) - used, "\"");
-      }
-      used += snprintf(json + used, sizeof(json) - used, "}");
-      p += ALIGN_POT(size, sizeof(void *));
-   }
-   snprintf(json + used, sizeof(json) - used, "],\"truncated\":%s}", truncated ? "true" : "false");
-   uwp_compile_diagnostic_pso(json);
-}
-#endif
 
 HRESULT
 dzn_create_pso_impl(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
@@ -491,10 +423,6 @@ dzn_create_pso_impl(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM
    }
 
 #ifdef _XBOX_UWP
-   dzn_diagnostic_pso(desc, at_draw, is_compute);
-   uint8_t capture_hash[BLAKE3_KEY_LEN];
-   const bool capture_named = dzn_pso_stream_hash(desc, capture_hash);
-   dzn_pso_capture_prepare(desc, capture_named ? capture_hash : NULL);
    uwp_native_pso_begin();
    uwp_compile_diagnostic_native_pso(1, 0);
    DZN_COMPILE_PHASE("d3d12_create_pso", -1);
@@ -515,7 +443,6 @@ dzn_create_pso_impl(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM
 #ifdef _XBOX_UWP
    uwp_compile_diagnostic_native_pso(0, hr);
    uwp_native_pso_end();
-   dzn_pso_capture_finish();
    DZN_COMPILE_PHASE("d3d12_create_pso_returned", -1);
 #endif
 

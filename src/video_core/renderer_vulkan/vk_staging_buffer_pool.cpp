@@ -7,6 +7,7 @@
 #include "common/alignment.h"
 #ifdef SHADPS4_UWP
 #include "core/address_space.h"
+#include "video_core/renderer_vulkan/vk_resource_memory.h"
 #endif
 #include "common/assert.h"
 #include "common/types.h"
@@ -73,6 +74,9 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
                 .last_used_frame = frame,
             });
             ring.current = ring.blocks.size() - 1;
+#ifdef SHADPS4_UWP
+            ResourceMemory::Name(reinterpret_cast<uintptr_t>(best->buffer->buffer.allocation), "StagingPool:Ring");
+#endif
             best_offset = *best->buffer->Reserve(size, alignment, false);
         }
     }
@@ -174,6 +178,9 @@ void StagingBufferPool::TrimRing(Ring& ring) {
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }
+#ifdef SHADPS4_UWP
+        ResourceMemory::Name(reinterpret_cast<uintptr_t>(block.buffer->buffer.allocation), "StagingPool:RetiredRing");
+#endif
         scheduler.DeferOperation([retired = std::move(block.buffer)] {});
         blocks.erase(blocks.begin() + i);
         if (i < ring.current) {
@@ -194,6 +201,9 @@ void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
             !scheduler.IsFree(std::max(entry.tick, entry.buffer->LastUseTick()))) {
             continue;
         }
+#ifdef SHADPS4_UWP
+        ResourceMemory::Name(reinterpret_cast<uintptr_t>(entry.buffer->buffer.allocation), "StagingPool:RetiredLarge");
+#endif
         scheduler.DeferOperation([retired = std::move(entry.buffer)] {});
         cache.erase(cache.begin() + i);
     }

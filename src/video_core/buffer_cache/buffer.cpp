@@ -4,6 +4,7 @@
 #include <numeric>
 #ifdef SHADPS4_UWP
 #include "core/address_space.h"
+#include "video_core/renderer_vulkan/vk_resource_memory.h"
 #endif
 
 #include "common/alignment.h"
@@ -75,6 +76,11 @@ UniqueBuffer::~UniqueBuffer() {
 
 void UniqueBuffer::Destroy() {
     if (allocation) {
+#ifdef SHADPS4_UWP
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(allocator, allocation, &info);
+        Vulkan::ResourceMemory::Remove(reinterpret_cast<uintptr_t>(allocation), info.size, 0);
+#endif
         vmaDestroyBuffer(allocator, buffer, allocation);
     } else if (buffer) {
         device.destroyBuffer(buffer);
@@ -127,6 +133,10 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};
+#ifdef SHADPS4_UWP
+        Vulkan::ResourceMemory::Add(reinterpret_cast<uintptr_t>(allocation), reinterpret_cast<uintptr_t>(unsafe_buffer),
+                                    out_alloc_info->size, 0, out_alloc_info->memoryType);
+#endif
     } else {
         buffer_ci.flags |=
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
@@ -164,6 +174,11 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
     };
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, mem_type, &alloc_info);
+#ifdef SHADPS4_UWP
+    if (buffer.allocation)
+        Vulkan::ResourceMemory::Name(reinterpret_cast<uintptr_t>(buffer.allocation),
+                                    debug_name.empty() ? BufferTypeName(mem_type) : debug_name);
+#endif
 
     const auto device = instance.GetDevice();
     if (!debug_name.empty()) {
@@ -206,6 +221,9 @@ StreamBuffer::StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& 
       non_coherent_atom_size{instance.NonCoherentAtomSize()} {
     ReserveWatches(current_watches, WATCHES_INITIAL_RESERVE);
     ReserveWatches(previous_watches, WATCHES_INITIAL_RESERVE);
+#ifdef SHADPS4_UWP
+    Vulkan::ResourceMemory::Name(reinterpret_cast<uintptr_t>(buffer.allocation), "StreamBuffer");
+#endif
     Vulkan::SetObjectName(instance.GetDevice(), Handle(), "StreamBuffer({}):{:#x}",
                           BufferTypeName(mem_type), size_bytes);
 }

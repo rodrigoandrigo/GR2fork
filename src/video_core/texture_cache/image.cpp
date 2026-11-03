@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #ifdef SHADPS4_UWP
 #include "core/address_space.h"
+#include "video_core/renderer_vulkan/vk_resource_memory.h"
 #endif
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -123,12 +124,18 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 
 UniqueImage::~UniqueImage() {
     if (image) {
+#ifdef SHADPS4_UWP
+        Vulkan::ResourceMemory::Remove(reinterpret_cast<uintptr_t>(allocation), size_bytes, 1);
+#endif
         vmaDestroyImage(allocator, image, allocation);
     }
 }
 
 void UniqueImage::Destroy() {
     if (image) {
+#ifdef SHADPS4_UWP
+        Vulkan::ResourceMemory::Remove(reinterpret_cast<uintptr_t>(allocation), size_bytes, 1);
+#endif
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
@@ -201,6 +208,12 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+#ifdef SHADPS4_UWP
+    Vulkan::ResourceMemory::Add(reinterpret_cast<uintptr_t>(allocation), reinterpret_cast<uintptr_t>(unsafe_image),
+                               size_bytes, 1, alloc_info.memoryType, u32(image_ci.format),
+                               image_ci.extent.width, image_ci.extent.height, image_ci.extent.depth,
+                               image_ci.mipLevels, image_ci.arrayLayers, u32(image_ci.samples));
+#endif
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
