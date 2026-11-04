@@ -107,6 +107,8 @@ struct Buffer {
         return size_bytes;
     }
 
+    mutable u64 cache_frame{};
+
     vk::Buffer Handle() const noexcept {
         return buffer.buffer;
     }

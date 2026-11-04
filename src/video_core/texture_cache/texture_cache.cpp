@@ -2103,6 +2103,34 @@ void TextureCache::MarkDirtyIfEdgesModified(Image& image) {
     }
 }
 
+u64 TextureCache::ReleaseCleanImages(u64 target_bytes) {
+    if (!liverpool->OnGpuThread())
+        return 0;
+    u64 retired{};
+    image_lru_cache.ForEachItemBelow(gc_tick + 1, [&](Image& image) {
+        if (retired >= target_bytes)
+            return true;
+        const u64 tick = std::max(image.tick_accessed_last,
+                                 image.ReadFastState() >> Image::kFastStateTouchShift);
+        if (image.binding.is_bound || image.binding.is_target || image.usage.vo_surface ||
+            gc_tick - image.gc_tick_accessed_last < 2 || tick >= scheduler.CurrentTick() ||
+            !scheduler.IsFree(tick) || image.HasGpuValidData())
+            return false;
+        const auto id = slot_images.GetSlotId(image);
+        {
+            std::unique_lock lock{image.mutex, std::try_to_lock};
+            if (!lock.owns_lock() || image.HasGpuValidData())
+                return false;
+            UntrackImage(id);
+        }
+        retired += image.SizeBytes();
+        UnregisterImage(id);
+        DeleteImage(id);
+        return false;
+    });
+    return retired;
+}
+
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();

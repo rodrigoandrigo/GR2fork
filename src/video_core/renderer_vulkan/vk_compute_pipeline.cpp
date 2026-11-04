@@ -4,6 +4,7 @@
 #include <boost/container/small_vector.hpp>
 #ifdef SHADPS4_UWP
 #include "core/address_space.h"
+#include "video_core/renderer_vulkan/vk_memory_recovery.h"
 #endif
 
 #include "shader_recompiler/info.h"
@@ -91,6 +92,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .stage = shader_ci,
         .layout = pipeline_layout,
     };
+#ifdef SHADPS4_UWP
+    if (Core::AddressSpace::MemoryHeadroom() < 512_MB)
+        AllocationRecoveryScope::RecoverOrPage(128_MB);
+#endif
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
 #ifdef SHADPS4_UWP
@@ -98,10 +103,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
          attempt < 3 && (pipeline_result == vk::Result::eErrorOutOfDeviceMemory ||
                          pipeline_result == vk::Result::eErrorOutOfHostMemory);
          ++attempt) {
-        const auto reclaimed = Core::AddressSpace::ReclaimMemory(256_MB);
-        LOG_WARNING(Render_Vulkan, "Compute pipeline allocation recovery: attempt={} reclaimed={}",
-                    attempt + 1, reclaimed);
-        if (!reclaimed)
+        const bool recovered = AllocationRecoveryScope::RecoverOrPage(256_MB);
+        LOG_WARNING(Render_Vulkan, "Compute pipeline allocation recovery: attempt={} recovered={}",
+                    attempt + 1, recovered);
+        if (!recovered)
             break;
         auto retry = device.createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
         pipeline_result = retry.result;

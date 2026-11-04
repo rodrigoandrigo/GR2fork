@@ -1131,13 +1131,15 @@ dzn_pipeline_compile_shader_impl(struct dzn_device *device,
       return result;
 
 #ifdef _WIN32
-   char *err;
+   char *err = NULL;
    DZN_COMPILE_PHASE("dxil_validate", nir->info.stage);
-   bool res = dxil_validate_module(instance->dxil_validator,
+   enum dxil_validation_result validation =
+      dxil_validate_module_result(instance->dxil_validator,
                                    (void *)slot->pShaderBytecode,
                                    slot->BytecodeLength, &err);
 
-   if (instance->debug_flags & DZN_DEBUG_DXIL) {
+   if ((instance->debug_flags & DZN_DEBUG_DXIL) &&
+       validation != DXIL_VALIDATION_OUT_OF_MEMORY) {
       char *disasm = dxil_disasm_module(instance->dxil_validator,
                                         (void *)slot->pShaderBytecode,
                                         slot->BytecodeLength);
@@ -1151,7 +1153,9 @@ dzn_pipeline_compile_shader_impl(struct dzn_device *device,
       }
    }
 
-   if (!res && !(instance->debug_flags & DZN_DEBUG_EXPERIMENTAL)) {
+   if (validation != DXIL_VALIDATION_SUCCESS &&
+       (validation == DXIL_VALIDATION_OUT_OF_MEMORY ||
+        !(instance->debug_flags & DZN_DEBUG_EXPERIMENTAL))) {
       if (err) {
 #ifdef _XBOX_UWP
          // The UWP debug sink forwards to the embedding callback; the Store
@@ -1166,8 +1170,12 @@ dzn_pipeline_compile_shader_impl(struct dzn_device *device,
 #endif
          ralloc_free(err);
       }
-      return vk_errorf(device, VK_ERROR_UNKNOWN, "DXIL validation failed");
+      return vk_errorf(device,
+                       validation == DXIL_VALIDATION_OUT_OF_MEMORY ? VK_ERROR_OUT_OF_HOST_MEMORY :
+                                                                    VK_ERROR_UNKNOWN,
+                       "DXIL validation failed");
    }
+   ralloc_free(err);
 #endif
 
    return VK_SUCCESS;

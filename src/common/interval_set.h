@@ -86,6 +86,22 @@ public:
         Coalesce(at, m);
     }
 
+    void Remove(u64 start, u64 end) {
+        if (start >= end)
+            return;
+        auto [first, last] = OverlapRun(start, end);
+        if (first == last)
+            return;
+        IV remaining[2];
+        std::size_t count{};
+        if (first->start < start)
+            remaining[count++] = first->SubRange(first->start, start);
+        const auto tail = std::prev(last);
+        if (tail->end > end)
+            remaining[count++] = tail->SubRange(end, tail->end);
+        Splice(first, last, remaining, count);
+    }
+
     /// Returns immutable iterator to an interval that contains provided address.
     const_iterator Find(u64 addr) const {
         auto it = std::ranges::upper_bound(intervals, addr, {}, &IV::end);

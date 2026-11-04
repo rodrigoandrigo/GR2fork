@@ -13,6 +13,10 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/renderer_vulkan/vk_memory_recovery.h"
+#ifdef SHADPS4_UWP
+#include "video_core/renderer_vulkan/vk_resource_memory.h"
+#endif
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -649,7 +653,44 @@ void Rasterizer::TraceCommand(const Pipeline* pipeline, const char* command, con
     }
 }
 
+u64 Rasterizer::RecoverAllocationMemory(bool caches, bool aggressive) {
+#ifdef SHADPS4_UWP
+    if (!liverpool->OnGpuThread())
+        return 0;
+    const u64 before = ResourceMemory::AllocatedBytes();
+    scheduler.GetWorkSemaphore()->Refresh();
+    scheduler.DrainPendingOperations();
+    if (AllocationRecoveryScope::CanTrimStaging())
+        runtime.GetStagingPool().ReleaseCompleted(aggressive);
+    const auto now = GetTickCount64();
+    u64 retired_images{};
+    u64 clean_buffers{};
+    if (caches && Core::AddressSpace::MemoryHeadroom() < 640_MB &&
+        now - memory_recovery_time >= 250) {
+        memory_recovery_time = now;
+        clean_buffers = buffer_cache.ReleaseCleanArenas(64_MB);
+        retired_images = texture_cache.ReleaseCleanImages(64_MB);
+        if (retired_images && Core::AddressSpace::MemoryHeadroom() < 256_MB)
+            scheduler.Flush();
+        scheduler.DrainPendingOperations();
+    }
+    const u64 after = ResourceMemory::AllocatedBytes();
+    const u64 released = before - std::min(before, after);
+    if (released || retired_images)
+        LOG_INFO(Render_Vulkan,
+                 "[AllocationRecovery] released={} clean_buffers={} retired_images={} tick={}",
+                 released, clean_buffers, retired_images, scheduler.CurrentTick());
+    return released;
+#else
+    return 0;
+#endif
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+#ifdef SHADPS4_UWP
+    AllocationRecoveryScope recovery_scope{&Rasterizer::RecoverAllocationThunk, this};
+    AllocationRecoveryScope::PrepareCaches();
+#endif
     RENDERER_TRACE;
 
     Skipcache::Framework::Instance().OnDraw();
@@ -901,6 +942,10 @@ void Rasterizer::DropCopyHold(u64& counter) {
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
+#ifdef SHADPS4_UWP
+    AllocationRecoveryScope recovery_scope{&Rasterizer::RecoverAllocationThunk, this};
+    AllocationRecoveryScope::PrepareCaches();
+#endif
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -1008,6 +1053,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 }
 
 void Rasterizer::DispatchDirect() {
+#ifdef SHADPS4_UWP
+    AllocationRecoveryScope recovery_scope{&Rasterizer::RecoverAllocationThunk, this};
+    AllocationRecoveryScope::PrepareCaches();
+#endif
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -1062,6 +1111,10 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+#ifdef SHADPS4_UWP
+    AllocationRecoveryScope recovery_scope{&Rasterizer::RecoverAllocationThunk, this};
+    AllocationRecoveryScope::PrepareCaches();
+#endif
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -3149,6 +3202,10 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+#ifdef SHADPS4_UWP
+    AllocationRecoveryScope recovery_scope{&Rasterizer::RecoverAllocationThunk, this};
+    AllocationRecoveryScope::PrepareCaches();
+#endif
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
@@ -3171,6 +3228,10 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+#ifdef SHADPS4_UWP
+    AllocationRecoveryScope recovery_scope{&Rasterizer::RecoverAllocationThunk, this};
+    AllocationRecoveryScope::PrepareCaches();
+#endif
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {

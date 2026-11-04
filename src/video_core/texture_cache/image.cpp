@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #ifdef SHADPS4_UWP
 #include "core/address_space.h"
+#include "video_core/renderer_vulkan/vk_memory_recovery.h"
 #include "video_core/renderer_vulkan/vk_resource_memory.h"
 #endif
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -157,22 +158,31 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
+#ifdef SHADPS4_UWP
+    Vulkan::AllocationRecoveryScope::Prepare();
+#endif
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
 #ifdef SHADPS4_UWP
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        Vulkan::AllocationRecoveryScope::Recover();
+        alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
     for (unsigned attempt = 0; attempt < 3 && (result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
                                                result == VK_ERROR_OUT_OF_HOST_MEMORY);
          ++attempt) {
-        if (!Core::AddressSpace::ReclaimMemory(32_MB))
+        if (!Vulkan::AllocationRecoveryScope::RecoverOrPage(32_MB))
             break;
         result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
                                 &alloc_info);
     }
 #endif
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+        (alloc_ci.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT)) {
         alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        LOG_WARNING(Render_Vulkan, "Allocating image of size {} bytes over budget.",
-                    alloc_info.size);
+        LOG_WARNING(Render_Vulkan, "Retrying image allocation without the heap budget constraint.");
         result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
                                 &alloc_info);
     }

@@ -296,6 +296,11 @@ private:
         auto* r = static_cast<Rasterizer*>(self);
         r->DropCopyHold(r->hold_compiles_);
     }
+    static u64 RecoverAllocationThunk(void* self, bool caches, bool aggressive) {
+        return static_cast<Rasterizer*>(self)->RecoverAllocationMemory(caches, aggressive);
+    }
+    u64 RecoverAllocationMemory(bool caches, bool aggressive);
+    u64 memory_recovery_time{};
     u64 bindpf_img_{};
     u64 bindpf_backing_{};
     // bind_write_plan: the mode, this bind's verdicts, and the write list the

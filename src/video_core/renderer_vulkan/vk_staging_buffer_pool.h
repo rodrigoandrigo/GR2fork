@@ -48,6 +48,7 @@ public:
 
     /// Releases idle memory.
     void TickFrame();
+    u64 ReleaseCompleted(bool aggressive);
 
 private:
     struct Block {

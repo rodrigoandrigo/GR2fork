@@ -9,6 +9,7 @@
 #include "common/assert.h"
 #ifdef SHADPS4_UWP
 #include "core/address_space.h"
+#include "video_core/renderer_vulkan/vk_memory_recovery.h"
 #endif
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
@@ -493,6 +494,10 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::VulkanCreatePipeline);
+#ifdef SHADPS4_UWP
+    if (Core::AddressSpace::MemoryHeadroom() < 512_MB)
+        AllocationRecoveryScope::RecoverOrPage(128_MB);
+#endif
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
 #ifdef SHADPS4_UWP
@@ -500,10 +505,10 @@ GraphicsPipeline::GraphicsPipeline(
          attempt < 3 && (pipeline_result == vk::Result::eErrorOutOfDeviceMemory ||
                          pipeline_result == vk::Result::eErrorOutOfHostMemory);
          ++attempt) {
-        const auto reclaimed = Core::AddressSpace::ReclaimMemory(256_MB);
-        LOG_WARNING(Render_Vulkan, "Graphics pipeline allocation recovery: attempt={} reclaimed={}",
-                    attempt + 1, reclaimed);
-        if (!reclaimed)
+        const bool recovered = AllocationRecoveryScope::RecoverOrPage(256_MB);
+        LOG_WARNING(Render_Vulkan, "Graphics pipeline allocation recovery: attempt={} recovered={}",
+                    attempt + 1, recovered);
+        if (!recovered)
             break;
         auto retry = device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
         pipeline_result = retry.result;

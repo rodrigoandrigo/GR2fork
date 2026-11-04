@@ -205,6 +205,34 @@ void BufferCache::TickFrame() {
 #endif
 }
 
+u64 BufferCache::ReleaseCleanArenas(u64 target_bytes) {
+    if (sparse_buffers || !liverpool->OnGpuThread())
+        return 0;
+    u64 released{};
+    const u64 frame = DebugState.GetFrameNum();
+    for (auto it = dense_arenas.begin(); it != dense_arenas.end() && released < target_bytes;) {
+        const auto& buffer = *it->second;
+        if (frame < buffer.cache_frame || frame - buffer.cache_frame < 2 ||
+            buffer.LastUseTick() >= scheduler.CurrentTick() ||
+            !scheduler.IsFree(buffer.LastUseTick()) ||
+            memory_tracker->IsRegionGpuModified(buffer.cpu_addr, buffer.size_bytes)) {
+            ++it;
+            continue;
+        }
+        memory_tracker->MarkRegionAsCpuModified(buffer.cpu_addr, buffer.size_bytes);
+        {
+            std::scoped_lock lock{arena_mutex};
+            resident_ranges.Remove(buffer.cpu_addr >> block_shift,
+                                   (buffer.cpu_addr + buffer.size_bytes) >> block_shift);
+        }
+        released += buffer.size_bytes;
+        it = dense_arenas.erase(it);
+    }
+    if (released)
+        Skipcache::Framework::Instance().BumpMemGen();
+    return released;
+}
+
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, false, assume_locks);
@@ -753,6 +781,7 @@ const Buffer* BufferCache::GetDenseArena(u64 first_block, u64 last_block) {
     }
     if (first != dense_arenas.end() && first->first <= begin &&
         first->first + first->second->size_bytes >= end) {
+        first->second->cache_frame = DebugState.GetFrameNum();
         return first->second.get();
     }
 
@@ -782,6 +811,7 @@ const Buffer* BufferCache::GetDenseArena(u64 first_block, u64 last_block) {
     }
     auto buffer = std::make_unique<Buffer>(instance, begin, end - begin, MemoryType::DeviceLocal,
                                            "Dense guest buffer arena");
+    buffer->cache_frame = DebugState.GetFrameNum();
 #ifdef SHADPS4_UWP
     dense_allocated_bytes += end - begin;
 #endif

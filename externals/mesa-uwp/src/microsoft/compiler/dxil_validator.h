@@ -30,6 +30,12 @@
 
 struct dxil_validator;
 
+enum dxil_validation_result {
+   DXIL_VALIDATION_SUCCESS,
+   DXIL_VALIDATION_FAILED,
+   DXIL_VALIDATION_OUT_OF_MEMORY,
+};
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -43,6 +49,10 @@ dxil_destroy_validator(struct dxil_validator *val);
 bool
 dxil_validate_module(struct dxil_validator *val, void *data,
                      size_t size, char **error);
+
+enum dxil_validation_result
+dxil_validate_module_result(struct dxil_validator *val, void *data,
+                            size_t size, char **error);
 
 char *
 dxil_disasm_module(struct dxil_validator *val, void *data, size_t size);

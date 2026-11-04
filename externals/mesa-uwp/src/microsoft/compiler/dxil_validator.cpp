@@ -324,10 +324,22 @@ public:
 bool
 dxil_validate_module(struct dxil_validator *val, void *data, size_t size, char **error)
 {
+   return dxil_validate_module_result(val, data, size, error) == DXIL_VALIDATION_SUCCESS;
+}
+
+static enum dxil_validation_result
+dxil_validation_failure(HRESULT hr)
+{
+   return hr == E_OUTOFMEMORY ? DXIL_VALIDATION_OUT_OF_MEMORY : DXIL_VALIDATION_FAILED;
+}
+
+enum dxil_validation_result
+dxil_validate_module_result(struct dxil_validator *val, void *data, size_t size, char **error)
+{
    if (error)
       *error = NULL;
    if (!val)
-      return false;
+      return DXIL_VALIDATION_FAILED;
 
    ShaderBlob source(data, size);
 
@@ -338,13 +350,13 @@ dxil_validate_module(struct dxil_validator *val, void *data, size_t size, char *
       if (error)
          *error = ralloc_asprintf(val, "DXIL Validate failed (HRESULT 0x%08x, result %s)",
                                  (unsigned)hr, result ? "present" : "null");
-      return false;
+      return dxil_validation_failure(hr);
    }
    HRESULT status_hr = result->GetStatus(&hr);
    if (FAILED(status_hr)) {
       if (error)
          *error = ralloc_asprintf(val, "DXIL GetStatus failed (HRESULT 0x%08x)", (unsigned)status_hr);
-      return false;
+      return dxil_validation_failure(status_hr);
    }
 
    if (FAILED(hr) && error) {
@@ -383,7 +395,7 @@ dxil_validate_module(struct dxil_validator *val, void *data, size_t size, char *
          *error = ralloc_asprintf(val, "DXIL validation failed (HRESULT 0x%08x)", (unsigned)hr);
    }
 
-   return SUCCEEDED(hr);
+   return SUCCEEDED(hr) ? DXIL_VALIDATION_SUCCESS : dxil_validation_failure(hr);
 }
 
 char *

@@ -401,6 +401,7 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+    u64 ReleaseCleanImages(u64 target_bytes);
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {

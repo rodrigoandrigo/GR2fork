@@ -40,6 +40,10 @@ A criação de pipelines gráficos e compute também recupera memória guest qua
 Vulkan retorna falta de memória do host ou dispositivo. Cada tentativa pede até
 256 MiB ao pager, com no máximo três repetições e interrupção se nada for
 recuperado. Os erros restantes continuam sendo propagados ao chamador.
+Com margem inferior a 512 MiB, há uma tentativa preventiva de recuperar 128 MiB
+antes da criação. Falhas `E_OUTOFMEMORY` da validação DXIL retornam
+`VK_ERROR_OUT_OF_HOST_MEMORY`, em vez de erro desconhecido, mantendo a validação
+ativa e permitindo que esse caminho de recuperação seja acionado.
 
 O arquivo esparso temporário fica em `cache/swap`, com exclusão ao fechar.
 Cada registro contém uma página de 16 KiB, comprimida quando útil, com marcador
@@ -93,13 +97,20 @@ sem criar um alias canônico permanente. Acesso host que realmente precisa de um
 ponteiro materializa e fixa suas páginas. Leases de PM4, arquivos, sockets,
 readbacks e submissões GPU permanecem integradas.
 
-Dozen/Vulkan e D3D12 nativo pedem recuperação limitada de páginas guest após
-falhas de alocação. Staging concluído pela fence pode ser liberado antecipadamente
-sob pressão; imagens consideram também o limite do processo, preservando o
-writeback e os retiros por fence existentes. A tradução de módulos de shader
-pode abrir espaço antes de compilar. As arenas densas e o descarte diferido do
-GR2fork continuam usando seu scheduler; a fila de preparação específica do
-runtime de referência não foi introduzida no emulador.
+Dozen/Vulkan processa liberações por fences concluídas e staging seguro antes
+de recorrer à paginação guest em falhas de alocação. Sob pressão, draws e dispatches
+retiram caches frios: arenas densas limpas com GPU concluída são reconstruídas
+da memória guest no próximo uso, evitando manter sua cópia gráfica indefinidamente.
+Buffers modificados pela GPU, alocações mantidas por CPU e recursos do tick atual
+são preservados. Imagens limpas usam a retirada existente por fence; superfícies
+de apresentação permanecem protegidas. A coleta não reentra nas estruturas de
+um pool durante sua própria alocação e não adiciona espera global da CPU.
+
+Uma recusa pelo orçamento estimado do heap permite a tentativa já existente sem
+essa restrição antes de expulsar páginas guest, distinguindo a estimativa do heap
+de uma falha real do dispositivo. `[AllocationRecovery]` registra bytes liberados,
+buffers limpos retirados e imagens ainda aguardando descarte. D3D12 nativo mantém
+seu caminho próprio de recuperação limitada de páginas guest.
 
 Uma falha no handler de commit retorna o erro Win32 depois de liberar os locks,
 sem propagar exceção C++ pela pilha guest e sem encerrar o processo. O mecanismo

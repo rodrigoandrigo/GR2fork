@@ -26,6 +26,11 @@ inline std::array<Totals, 2> totals;
 inline u64 sequence{}, dropped{}, missing{};
 inline std::chrono::steady_clock::time_point reported;
 
+inline u64 AllocatedBytes() {
+    std::lock_guard lock{mutex};
+    return totals[0].bytes + totals[1].bytes;
+}
+
 inline Entry* Find(uintptr_t key, bool insert) {
     Entry* reusable{};
     const auto hash = ((key >> 4) ^ (key >> 20)) % entries.size();

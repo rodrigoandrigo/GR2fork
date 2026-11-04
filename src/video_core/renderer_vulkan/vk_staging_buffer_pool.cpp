@@ -13,6 +13,7 @@
 #include "common/types.h"
 #include "core/devtools/widget/gpu_memory.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_memory_recovery.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
@@ -41,6 +42,7 @@ StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment, bool deferred,
                                             bool unsynchronized) {
+    AllocationRecoveryScope::StagingScope recovery_scope;
     Ring& ring = rings[u32(type)];
     if (deferred || size > BLOCK_SIZE) {
         return RequestLarge(size, type, deferred, unsynchronized);
@@ -98,6 +100,8 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             best = &ring.blocks[(ring.current + 1) % ring.blocks.size()];
             best_offset = 0;
         } else {
+            if (trim_pressure)
+                ReleaseCompleted(false);
             DiagnoseExpansion("ring", size, type, false, unsynchronized);
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
@@ -167,6 +171,8 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     }
 
     if (!best) {
+        if (trim_pressure)
+            ReleaseCompleted(false);
         DiagnoseExpansion("dedicated", size, type, deferred, unsynchronized);
         best = &cache.emplace_back(LargeBuffer{
             .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
@@ -283,6 +289,36 @@ void StagingBufferPool::TickFrame() {
         TrimLarge(cache);
     }
     PublishStats();
+}
+
+u64 StagingBufferPool::ReleaseCompleted(bool aggressive) {
+    u64 released{};
+    for (auto& ring : rings) {
+        const auto newest = std::ranges::max_element(ring.blocks, {}, &Block::last_used_frame);
+        const auto* retained = newest == ring.blocks.end() ? nullptr : newest->buffer.get();
+        for (size_t i = ring.blocks.size(); i-- > 0;) {
+            const auto& buffer = *ring.blocks[i].buffer;
+            if ((!aggressive && &buffer == retained) ||
+                buffer.LastTick() >= scheduler.CurrentTick() ||
+                !scheduler.IsFree(buffer.LastTick()))
+                continue;
+            released += buffer.SizeBytes();
+            ring.blocks.erase(ring.blocks.begin() + i);
+        }
+        ring.current = 0;
+    }
+    for (auto& cache : large_caches) {
+        for (size_t i = cache.size(); i-- > 0;) {
+            const auto& entry = cache[i];
+            const u64 tick = std::max(entry.tick, entry.buffer->LastUseTick());
+            if (entry.held || tick >= scheduler.CurrentTick() || !scheduler.IsFree(tick) ||
+                (!aggressive && frame - entry.last_used_frame < 2))
+                continue;
+            released += entry.buffer->SizeBytes();
+            cache.erase(cache.begin() + i);
+        }
+    }
+    return released;
 }
 
 void StagingBufferPool::TrimRing(Ring& ring) {
