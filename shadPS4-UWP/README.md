@@ -1,70 +1,70 @@
 # ShadPS4-UWP
 
-ShadPS4-UWP é a adaptação do emulador de PlayStation 4 shadPS4 para a Universal Windows Platform (UWP), com interface para Windows e Xbox em Modo de Desenvolvedor.
+ShadPS4-UWP adapts the shadPS4 PlayStation 4 emulator to the Universal Windows Platform (UWP), with an interface for Windows and Xbox in Developer Mode.
 
-O aplicativo combina um frontend em C++/XAML e ImGui com o núcleo de emulação compilado como `shadPS4.dll`. A interface permite gerenciar a biblioteca de jogos, importar módulos do sistema e controlar a execução por controle ou teclado. O projeto integra o ciclo de vida UWP e o redimensionamento da janela à execução dos jogos.
+The application combines a C++/XAML and ImGui frontend with the emulation core compiled as `shadPS4.dll`. The interface lets you manage your game library, import system modules, and control execution using a controller or keyboard. The project integrates the UWP lifecycle and window resizing with game execution.
 
-A renderização oferece Vulkan através do Mesa Dozen, selecionado por padrão, e um backend D3D12 nativo. O Dozen traduz Vulkan para Direct3D 12; as bibliotecas gráficas são compiladas e incluídas no pacote pelo fluxo de build.
+Rendering supports Vulkan through Mesa Dozen, selected by default, and a native D3D12 backend. Dozen translates Vulkan to Direct3D 12; the graphics libraries are built and included in the package by the build workflow.
 
 ## Interface
 
-A interface adapta o visual do shadPS4 Qt Launcher ao frontend UWP: menus no topo, barra de ferramentas com os ícones originais, biblioteca em lista ou grade, pesquisa, ajuste do tamanho das capas e painel inferior de logs redimensionável. A paleta escura e a fonte do sistema acompanham o estilo do launcher.
+The interface adapts the appearance of the shadPS4 Qt Launcher to the UWP frontend: top menus, a toolbar with the original icons, a list or grid library, search, adjustable cover sizes, and a resizable log panel at the bottom. The dark palette and system font follow the launcher's style.
 
-As configurações ficam em uma única janela com abas e perfis globais ou por jogo. Os atalhos de controles e teclado abrem essa mesma janela. As opções são obtidas da API do núcleo e cada opção aparece em uma única categoria; áudio, pastas e seleção do backend gráfico têm locais próprios. Use **Salvar** ou **Aplicar** para gravar alterações, ou **Fechar** para descartá-las.
+Settings are available in a single tabbed window with global or per-game profiles. The controller and keyboard shortcuts open this same window. Options come from the core API, and each option appears in a single category; audio, folders, and graphics backend selection have dedicated sections. Use **Save** or **Apply** to save changes, or **Close** to discard them.
 
-O modo de exibição, o tamanho das capas e a disposição do painel de logs são preservados entre inicializações. O aplicativo mantém navegação por teclado e controle, além dos seletores de pastas do UWP.
+The display mode, cover size, and log panel layout persist between launches. The application supports keyboard and controller navigation, as well as UWP folder pickers.
 
-No Xbox, a biblioteca e os menus solicitam o ponteiro do sistema. Ele é ocultado ao iniciar o jogo e restaurado ao voltar à interface, encerrar a sessão ou cancelar uma inicialização que falhou.
+On Xbox, the library and menus request the system pointer. It is hidden when a game starts and restored when returning to the interface, ending the session, or canceling a failed launch.
 
-## Jogos em PKG
+## PKG games
 
-Use **Arquivo > Adicionar PKG…** para selecionar um pacote individual, ou adicione uma pasta que contenha arquivos `.pkg`. A autorização de acesso fica salva na biblioteca do aplicativo.
+Use **File > Add PKG...** to select an individual package, or add a folder containing `.pkg` files. Access authorization is saved in the application library.
 
-Pacotes PS4 no formato FPKG são acessados diretamente, com leitura, descriptografia e descompressão sob demanda, seguindo a implementação do Prosperity. O jogo é montado no sistema de arquivos virtual como `/app0`, sem extrair o pacote inteiro para o armazenamento do aplicativo.
+PS4 packages in FPKG format are accessed directly, with on-demand reading, decryption, and decompression, following the Prosperity implementation. The game is mounted in the virtual filesystem as `/app0`, without extracting the entire package to application storage.
 
-A coluna **Formato** distingue **PKG** e **Pasta**; a grade também mostra essa informação. Título, serial, versão e capa são lidos do pacote. Atualizações e DLCs recebem identificação própria e não são iniciados como jogos independentes.
+The **Format** column distinguishes **PKG** from **Folder**; the grid also displays this information. The title, serial, version, and cover are read from the package. Updates and DLCs are identified separately and are not launched as standalone games.
 
-## Touchpad no controle Xbox
+## Touchpad on the Xbox controller
 
-Segure **View** e mova o **analógico esquerdo** para posicionar o dedo no touchpad do PS4. O contato começa ao mover o analógico além da zona inicial ou pressioná-lo, e continua enquanto View estiver segurado, inclusive ao voltar o analógico ao centro.
+Hold **View** and move the **left stick** to position your finger on the PS4 touchpad. Contact begins when the stick moves beyond the initial dead zone or is pressed, and continues while View is held, even when the stick returns to the center.
 
-Use **View + L3** para clicar no touchpad. Soltar apenas L3 libera o clique e mantém o dedo em contato; soltar View levanta o dedo e devolve o analógico à função normal do jogo. Cada jogador tem seu próprio gesto e identificador de contato.
+Use **View + L3** to click the touchpad. Releasing only L3 releases the click while keeping the finger in contact; releasing View lifts the finger and restores the stick's normal game function. Each player has an independent gesture and contact identifier.
 
-O menu, a perda de foco e a desconexão liberam o contato. Depois disso, solte View antes de começar outro gesto. As mesmas instruções ficam na aba **Entrada**, sem criar uma configuração paralela.
+The menu, loss of focus, and controller disconnection release contact. Afterward, release View before starting another gesture. The same instructions are available in the **Input** tab, without a separate configuration.
 
-## Requisitos de build
+## Build requirements
 
-- Windows x64 e PowerShell.
-- Visual Studio com toolset C++ `v145` (Visual Studio 2026), ferramentas C++ para UWP, MSBuild, Clang/LLVM e integração CMake/Ninja.
+- Windows x64 and PowerShell.
+- Visual Studio with the C++ `v145` toolset (Visual Studio 2026), UWP C++ tools, MSBuild, Clang/LLVM, and CMake/Ninja integration.
 - Windows SDK **10.0.26100.0**.
-- CMake **3.24 ou superior**, disponível no `PATH`.
-- Git, para obter os submódulos do repositório.
-- MSYS2 em `C:\msys64`, com ambiente UCRT64, Python 3, Bison e Flex. O script do Mesa utiliza `C:\msys64\usr\bin` e `C:\msys64\ucrt64\bin`.
-- No Python utilizado pelo build: Meson **1.4 ou superior**, Mako, PyYAML e packaging.
-- Runtime UWP **Microsoft.VCLibs.140.00 x64** instalado no Windows.
-- Fontes do **SDL3-uwp**, incluindo `VisualC-WinRT\SDL-UWP.vcxproj`, em uma pasta separada.
+- CMake **3.24 or later**, available in `PATH`.
+- Git, to fetch the repository submodules.
+- MSYS2 in `C:\msys64`, with the UCRT64 environment, Python 3, Bison, and Flex. The Mesa script uses `C:\msys64\usr\bin` and `C:\msys64\ucrt64\bin`.
+- In the Python environment used by the build: Meson **1.4 or later**, Mako, PyYAML, and packaging.
+- The **Microsoft.VCLibs.140.00 x64** UWP runtime installed on Windows.
+- The **SDL3-uwp** source tree, including `VisualC-WinRT\SDL-UWP.vcxproj`, in a separate folder.
 
-As fontes do Mesa e do backend D3D12 ficam em `externals/mesa-uwp` e `externals/d3d12-native` neste repositório.
+The Mesa and D3D12 backend sources are located in `externals/mesa-uwp` and `externals/d3d12-native` in this repository.
 
-## Preparação
+## Preparation
 
-Na raiz do repositório, inicialize os submódulos:
+From the repository root, initialize the submodules:
 
 ```powershell
 git submodule update --init --recursive
 ```
 
-No terminal UCRT64 do MSYS2, instale as ferramentas de geração:
+In the MSYS2 UCRT64 terminal, install the build-generation tools:
 
 ```bash
 pacman -S --needed bison flex mingw-w64-ucrt-x86_64-python mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-python-mako mingw-w64-ucrt-x86_64-python-yaml mingw-w64-ucrt-x86_64-python-packaging
 ```
 
-Tenha disponível a árvore do SDL3-uwp e ajuste o argumento `-SDL3Source` abaixo para sua localização.
+Have the SDL3-uwp source tree available and adjust the `-SDL3Source` argument below to its location.
 
-## Build completo
+## Full build
 
-Execute no PowerShell, a partir da raiz do repositório:
+Run the following in PowerShell from the repository root:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-uwp.ps1 `
@@ -74,34 +74,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-uwp.ps1 `
     -Jobs 6
 ```
 
-O script configura o ambiente x64 do Visual Studio e executa estas etapas:
+The script configures the Visual Studio x64 environment and performs these steps:
 
-1. Compila o SDL3 para UWP.
-2. Compila o Mesa Dozen e o compilador `spirv_to_dxil`.
-3. Configura e compila o núcleo `shadPS4.dll` com CMake, Ninja e clang-cl.
-4. Compila o frontend UWP e gera o pacote MSIX Bundle.
-5. Assina o pacote, verifica sua assinatura CMS e exporta o certificado público.
+1. Builds SDL3 for UWP.
+2. Builds Mesa Dozen and the `spirv_to_dxil` compiler.
+3. Configures and builds the `shadPS4.dll` core using CMake, Ninja, and clang-cl.
+4. Builds the UWP frontend and generates the MSIX Bundle package.
+5. Signs the package, verifies its CMS signature, and exports the public certificate.
 
-### Opções
+### Options
 
-| Parâmetro | Função |
+| Parameter | Purpose |
 | --- | --- |
-| `-Configuration Release` | Seleciona `Release` ou `Debug`; o padrão é `Release`. |
-| `-SDL3Source <pasta>` | Localização das fontes do SDL3-uwp. |
-| `-D3D12Source <pasta>` | Substitui a pasta padrão `externals/d3d12-native`. |
-| `-PythonExecutable <arquivo>` | Define o Python com as dependências do Mesa. |
-| `-Jobs 6` | Define o paralelismo da compilação do núcleo e do Mesa. |
-| `-CoreOnly` | Compila SDL3, Mesa e núcleo, sem gerar o frontend e o pacote. |
-| `-SkipSigning` | Gera o aplicativo e o pacote sem executar a assinatura final. |
-| `-CertificatePath <arquivo.pfx>` | Usa um certificado próprio na assinatura. |
+| `-Configuration Release` | Selects `Release` or `Debug`; defaults to `Release`. |
+| `-SDL3Source <folder>` | Location of the SDL3-uwp source tree. |
+| `-D3D12Source <folder>` | Overrides the default `externals/d3d12-native` folder. |
+| `-PythonExecutable <file>` | Specifies the Python executable with the Mesa dependencies. |
+| `-Jobs 6` | Sets parallelism for the core and Mesa builds. |
+| `-CoreOnly` | Builds SDL3, Mesa, and the core without generating the frontend or package. |
+| `-SkipSigning` | Generates the application and package without performing the final signing step. |
+| `-CertificatePath <file.pfx>` | Uses a custom certificate for signing. |
 
-Para gerar uma versão de depuração, utilize o mesmo comando com `-Configuration Debug`.
+To generate a debug build, use the same command with `-Configuration Debug`.
 
-## Assinatura
+## Signing
 
-Por padrão, o script utiliza `shadPS4-UWP/shadPS4-UWP_TemporaryKey.pfx`. Um certificado próprio deve conter a chave privada, estar dentro da validade, ser carregável com senha vazia e ter o assunto correspondente ao `Publisher` do manifesto.
+By default, the script uses `shadPS4-UWP/shadPS4-UWP_TemporaryKey.pfx`. A custom certificate must contain the private key, be within its validity period, be loadable with an empty password, and have a subject matching the manifest's `Publisher`.
 
-Para assinar um pacote já gerado:
+To sign an existing package:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sign-uwp.ps1 `
@@ -109,38 +109,37 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sign-uwp.ps1 `
     -CertificatePath "C:\certificados\shadPS4-UWP.pfx"
 ```
 
-O script utiliza o SignTool do SDK 10.0.26100.0, valida a assinatura e grava `shadPS4-UWP.cer` ao lado do pacote. A conclusão bem-sucedida informa `CMS_SIGNATURE=PASS`.
+The script uses SignTool from SDK 10.0.26100.0, validates the signature, and writes `shadPS4-UWP.cer` next to the package. Successful completion reports `CMS_SIGNATURE=PASS`.
 
-## Arquivos gerados
+## Generated files
 
-Os caminhos abaixo são relativos à raiz do repositório:
+The paths below are relative to the repository root:
 
-| Caminho | Conteúdo |
+| Path | Contents |
 | --- | --- |
-| `Build/UWP-Release/` | Build CMake/Ninja do núcleo e build do SDL3. |
-| `Build/Dozen-UWP/` | Build do Mesa, incluindo `vulkan_dzn.dll` e `spirv_to_dxil.dll`. |
-| `shadPS4-UWP/Runtime/Release/` | Núcleo e bibliotecas de runtime utilizadas pelo frontend. |
-| `shadPS4-UWP/AppPackages/` | Pacotes `.msixbundle` e certificado público exportado pela assinatura. |
+| `Build/UWP-Release/` | CMake/Ninja core build and SDL3 build. |
+| `Build/Dozen-UWP/` | Mesa build, including `vulkan_dzn.dll` and `spirv_to_dxil.dll`. |
+| `shadPS4-UWP/Runtime/Release/` | Core and runtime libraries used by the frontend. |
+| `shadPS4-UWP/AppPackages/` | `.msixbundle` packages and the public certificate exported during signing. |
 
-Para builds de depuração, os diretórios do núcleo e do runtime utilizam `Debug` no lugar de `Release`.
+For debug builds, the core and runtime directories use `Debug` instead of `Release`.
 
-## Organização
+## Project layout
 
-- `shadPS4-UWP/`: frontend, manifesto, recursos e projeto UWP.
-- `src/`: núcleo de emulação e backends gráficos.
-- `externals/mesa-uwp/`: implementação Mesa Dozen para UWP.
-- `externals/d3d12-native/`: integração do backend D3D12 nativo.
-- [scripts/build-uwp.ps1](../scripts/build-uwp.ps1): build completo.
-- [scripts/build-dozen.ps1](../scripts/build-dozen.ps1): build das bibliotecas Mesa.
-- [scripts/sign-uwp.ps1](../scripts/sign-uwp.ps1): assinatura e verificação do pacote.
+- `shadPS4-UWP/`: frontend, manifest, assets, and UWP project.
+- `src/`: emulation core and graphics backends.
+- `externals/mesa-uwp/`: Mesa Dozen implementation for UWP.
+- `externals/d3d12-native/`: native D3D12 backend integration.
+- [scripts/build-uwp.ps1](../scripts/build-uwp.ps1): full build.
+- [scripts/build-dozen.ps1](../scripts/build-dozen.ps1): Mesa library build.
+- [scripts/sign-uwp.ps1](../scripts/sign-uwp.ps1): package signing and verification.
 
-## Cheats, patches e informações durante o jogo
+## Cheats, patches, and in-game information
 
-Selecione um jogo e abra **Cheats / Patches > Gerenciar jogo selecionado…**. As abas permitem baixar arquivos dos repositórios shadPS4 e GoldHEN, consultar versões, créditos e notas, excluir arquivos e selecionar os patches. As seleções são salvas automaticamente e aplicadas na próxima inicialização. Atualizar os arquivos preserva os patches já selecionados. Durante a execução, abra o menu do emulador e use as caixas ou botões de cheats para o jogo em execução; desmarcar uma caixa aplica os bytes de desativação do arquivo.
+Select a game and open **Cheats / Patches > Manage selected game...**. The tabs let you download files from the shadPS4 and GoldHEN repositories, review versions, credits, and notes, delete files, and select patches. Selections are saved automatically and applied on the next launch. Updating the files preserves previously selected patches. During execution, open the emulator menu and use the cheat checkboxes or buttons for the running game; clearing a checkbox applies the file's disable bytes.
 
-**Configurações > Exibir contador de FPS** controla o contador no canto superior esquerdo da imagem. Ele mede os flips efetivos do jogo, com atualização a cada meio segundo, sem manter o swapchain da interface apresentando frames durante a gameplay.
+**Settings > Show FPS counter** controls the counter in the top-left corner of the image. It measures actual game flips, updating every half second, without keeping the interface swapchain presenting frames during gameplay.
 
-O **swap de memória** fica ativado por padrão no Xbox e desativado por padrão no PC. A configuração global `General.memory_swap_enabled` preserva uma escolha explícita. O backing usa páginas privadas de 16 KiB sob demanda, promovidas a seções compartilhadas quando surgem aliases. O pager retira páginas frias para registros comprimidos em arquivos temporários de `cache/swap`, com fallback comprimido em RAM, segunda chance e leases para acessos host/CPU/GPU. A política e a integração estão descritas em [UWP-MEMORY.md](../documents/UWP-MEMORY.md).
+**Memory swap** is enabled by default on Xbox and disabled by default on PC. The global `General.memory_swap_enabled` setting preserves an explicit choice. The backing uses on-demand 16 KiB private pages, promoted to shared sections when aliases are created. The pager moves cold pages to compressed records in temporary files under `cache/swap`, with compressed RAM fallback, second-chance eviction, and leases for host/CPU/GPU accesses. The policy and integration are described in [UWP-MEMORY.md](../documents/UWP-MEMORY.md).
 
-
-A compilação de pipelines gráficos do Vulkan/Dozen ocorre em segundo plano. **Orçamento síncrono de pipeline (ms)** controla quanto um draw espera pelo pipeline antes de ser descartado; o padrão é 50 ms e o valor 0 evita essa espera. Fotografias usam uma espera mínima de 700 ms. A opção pode ser ajustada globalmente ou por jogo. **Readback em fila de cópia** fica ativado por padrão e configurações antigas são migradas na primeira abertura com essa versão.
+Vulkan/Dozen graphics pipelines are compiled in the background. **Synchronous pipeline budget (ms)** controls how long a draw waits for its pipeline before being skipped; the default is 50 ms, and a value of 0 avoids this wait. Photo captures use a minimum wait of 700 ms. This option can be adjusted globally or per game. **Readback on copy queue** is enabled by default, and older settings are migrated when this version is first opened.
