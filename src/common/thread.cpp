@@ -131,10 +131,53 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
+    struct TimerCache {
+        HANDLE idle{};
+        u64 created{};
+        u64 reused{};
+        u64 failures{};
+        ~TimerCache() {
+            if (idle)
+                CloseHandle(idle);
+        }
+    };
+    thread_local TimerCache cache;
+    HANDLE timer = cache.idle;
+    cache.idle = nullptr;
+    if (!timer) {
+        timer = CreateWaitableTimer(nullptr, TRUE, nullptr);
+        if (timer)
+            ++cache.created;
+    } else {
+        ++cache.reused;
+    }
+    DWORD ret{};
+    if (timer && SetWaitableTimer(timer, &interval, 0, nullptr, nullptr, false)) {
+        ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
+        CancelWaitableTimer(timer);
+    } else {
+        const auto error = GetLastError();
+        if (timer) {
+            CloseHandle(timer);
+            timer = nullptr;
+        }
+        if (++cache.failures == 1) {
+            try {
+                LOG_WARNING(Common, "[WaitTimer] fallback tid={} win32={} created={} reused={}",
+                            GetCurrentThreadId(), error, cache.created, cache.reused);
+            } catch (...) {
+            }
+        }
+        const auto milliseconds = std::chrono::ceil<std::chrono::milliseconds>(duration).count();
+        ret = SleepEx(static_cast<DWORD>(std::clamp<int64_t>(milliseconds, 0, INFINITE - 1)),
+                      interruptible);
+    }
+    if (timer) {
+        if (!cache.idle)
+            cache.idle = timer;
+        else
+            CloseHandle(timer);
+    }
 
     if (remaining) {
         const auto end_sleep = std::chrono::high_resolution_clock::now();

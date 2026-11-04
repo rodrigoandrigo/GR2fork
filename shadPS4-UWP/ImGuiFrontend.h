@@ -45,7 +45,7 @@ struct FrontendGame {
     std::string metadata_path;
     std::string region;
     std::string firmware;
-    std::string format{"Pasta"};
+    std::string format{"Folder"};
     std::string executable;
     std::string launch_error;
     std::string source_path;
@@ -191,7 +191,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     std::string settings_profile;
     std::atomic<uint64_t> settings_request{};
     char search[256]{};
-    std::string status{"Inicializando…"};
+    std::string status{"Initializing..."};
     int next_graphics_backend{-1};
     std::wstring user_root;
     std::vector<FrontendRoot> roots;

@@ -4,7 +4,7 @@
     <Page x:Name="interfacePage" Background="Transparent" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch" IsTabStop="True" RequiresPointer="WhenFocused">
       <Grid>
         <SwapChainPanel x:Name="swapChainPanel" SizeChanged="OnPanelSizeChanged" PointerMoved="OnPointer" PointerPressed="OnPointer" PointerReleased="OnPointer" PointerWheelChanged="OnPointer" PointerExited="OnPointerLost" PointerCaptureLost="OnPointerLost" CompositionScaleChanged="OnCompositionScaleChanged" />
-        <TextBlock x:Name="statusText" Text="Inicializando shadPS4…" Foreground="White" TextWrapping="Wrap" VerticalAlignment="Top" Padding="16" />
+        <TextBlock x:Name="statusText" Text="Initializing shadPS4..." Foreground="White" TextWrapping="Wrap" VerticalAlignment="Top" Padding="16" />
       </Grid>
     </Page>
       <Border x:Name="fpsOverlay" HorizontalAlignment="Left" VerticalAlignment="Top"

@@ -429,8 +429,8 @@ void DirectXPage::EditText(std::string label, std::string value, bool secret,
     Capture(true);
     auto dialog = ref new Controls::ContentDialog();
     dialog->Title = ref new String(Wide(label).c_str());
-    dialog->PrimaryButtonText = L"Aplicar";
-    dialog->CloseButtonText = L"Cancelar";
+    dialog->PrimaryButtonText = L"Apply";
+    dialog->CloseButtonText = L"Cancel";
     auto text = ref new Controls::TextBox();
     text->Text = ref new String(Wide(value).c_str());
     dialog->Content = text;
@@ -475,9 +475,9 @@ void DirectXPage::ShowGameTextInput(ShadPS4TextInput request,
     Capture(true);
     auto dialog = ref new Controls::ContentDialog();
     game_text_dialog = dialog;
-    dialog->Title = ref new String(request.title[0] ? request.title : L"Entrada de texto");
-    dialog->PrimaryButtonText = L"Confirmar";
-    dialog->CloseButtonText = L"Cancelar";
+    dialog->Title = ref new String(request.title[0] ? request.title : L"Text input");
+    dialog->PrimaryButtonText = L"Confirm";
+    dialog->CloseButtonText = L"Cancel";
     auto text = ref new Controls::TextBox();
     auto password = ref new Controls::PasswordBox();
     const bool secret = (request.flags & SHADPS4_TEXT_PASSWORD) != 0;

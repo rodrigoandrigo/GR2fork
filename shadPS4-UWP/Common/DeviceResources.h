@@ -2,14 +2,14 @@
 
 namespace DX
 {
-	// Fornece uma interface para um aplicativo que possua DeviceResources a serem notificados da perda ou da criação do dispositivo.
+	// Provides an interface for an application that owns DeviceResources to receive device loss and creation notifications.
 	interface IDeviceNotify
 	{
 		virtual void OnDeviceLost() = 0;
 		virtual void OnDeviceRestored() = 0;
 	};
 
-	// Controla todos os recursos do dispositivo DirectX.
+	// Controls all DirectX device resources.
 	class DeviceResources
 	{
 	public:
@@ -25,14 +25,14 @@ namespace DX
 		void Trim();
 		void Present();
 
-		// O tamanho do destino de renderização, em pixels.
+		// Render target size, in pixels.
 		Windows::Foundation::Size	GetOutputSize() const					{ return m_outputSize; }
 
-		// O tamanho do destino de renderização, em DIPs.
+		// Render target size, in DIPs.
 		Windows::Foundation::Size	GetLogicalSize() const					{ return m_logicalSize; }
 		float						GetDpi() const							{ return m_effectiveDpi; }
 
-		// Acessadores D3D.
+		// D3D accessors.
 		ID3D11Device3*				GetD3DDevice() const					{ return m_d3dDevice.Get(); }
 		ID3D11DeviceContext3*		GetD3DDeviceContext() const				{ return m_d3dContext.Get(); }
 		IDXGISwapChain3*			GetSwapChain() const					{ return m_swapChain.Get(); }
@@ -42,7 +42,7 @@ namespace DX
 		D3D11_VIEWPORT				GetScreenViewport() const				{ return m_screenViewport; }
 		DirectX::XMFLOAT4X4			GetOrientationTransform3D() const		{ return m_orientationTransform3D; }
 
-		// Acessadores D2D.
+		// D2D accessors.
 		ID2D1Factory3*				GetD2DFactory() const					{ return m_d2dFactory.Get(); }
 		ID2D1Device2*				GetD2DDevice() const					{ return m_d2dDevice.Get(); }
 		ID2D1DeviceContext2*		GetD2DDeviceContext() const				{ return m_d2dContext.Get(); }
@@ -58,30 +58,30 @@ namespace DX
 		void UpdateRenderTargetSize();
 		DXGI_MODE_ROTATION ComputeDisplayRotation();
 
-		// Objetos Direct3D.
+		// Direct3D objects.
 		Microsoft::WRL::ComPtr<ID3D11Device3>			m_d3dDevice;
 		Microsoft::WRL::ComPtr<ID3D11DeviceContext3>	m_d3dContext;
 		Microsoft::WRL::ComPtr<IDXGISwapChain3>			m_swapChain;
 
-		// Objetos de renderização Direct3D. Necessário para 3D.
+		// Direct3D rendering objects. Required for 3D.
 		Microsoft::WRL::ComPtr<ID3D11RenderTargetView1>	m_d3dRenderTargetView;
 		Microsoft::WRL::ComPtr<ID3D11DepthStencilView>	m_d3dDepthStencilView;
 		D3D11_VIEWPORT									m_screenViewport;
 
-		// Componentes de desenho Direct2D.
+		// Direct2D drawing components.
 		Microsoft::WRL::ComPtr<ID2D1Factory3>		m_d2dFactory;
 		Microsoft::WRL::ComPtr<ID2D1Device2>		m_d2dDevice;
 		Microsoft::WRL::ComPtr<ID2D1DeviceContext2>	m_d2dContext;
 		Microsoft::WRL::ComPtr<ID2D1Bitmap1>		m_d2dTargetBitmap;
 
-		// Componentes de desenho DirectWrite.
+		// DirectWrite drawing components.
 		Microsoft::WRL::ComPtr<IDWriteFactory3>		m_dwriteFactory;
 		Microsoft::WRL::ComPtr<IWICImagingFactory2>	m_wicFactory;
 
-		// Referência armazenada em cache para o painel XAML.
+		// Cached reference to the XAML panel.
 		Windows::UI::Xaml::Controls::SwapChainPanel^	m_swapChainPanel;
 
-		// Propriedades do dispositivo armazenadas em cache.
+		// Cached device properties.
 		D3D_FEATURE_LEVEL								m_d3dFeatureLevel;
 		Windows::Foundation::Size						m_d3dRenderTargetSize;
 		Windows::Foundation::Size						m_outputSize;
@@ -92,16 +92,16 @@ namespace DX
 		float											m_compositionScaleX;
 		float											m_compositionScaleY;
 
-		// Variáveis que levam em conta se o aplicativo dá suporte a telas de alta resolução ou não.
+		// Variables accounting for whether the application supports high-resolution displays.
 		float											m_effectiveDpi;
 		float											m_effectiveCompositionScaleX;
 		float											m_effectiveCompositionScaleY;
 
-		// Transformações usadas para orientação da exibição.
+		// Transforms used for display orientation.
 		D2D1::Matrix3x2F	m_orientationTransform2D;
 		DirectX::XMFLOAT4X4	m_orientationTransform3D;
 
-		// O IDeviceNotify pode ser mantido diretamente, pois tem os DeviceResources.
+		// IDeviceNotify can be held directly because it owns DeviceResources.
 		IDeviceNotify* m_deviceNotify;
 	};
 }

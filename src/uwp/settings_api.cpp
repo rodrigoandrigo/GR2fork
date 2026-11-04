@@ -19,50 +19,50 @@ constexpr std::array groups{"General", "Network", "Log", "Debug",
 std::string Unsupported(std::string_view group, std::string_view key, const json& value) {
     if (group == "GPU" && (key == "window_width" || key == "window_height" ||
                            key == "full_screen" || key == "full_screen_mode"))
-        return "O tamanho e o modo da janela são controlados pelo host UWP; use Exibir/Tela cheia.";
+        return "Window size and mode are controlled by the UWP host; use View/Fullscreen.";
     if (group == "GPU" && key == "present_mode")
-        return "O host apresenta todos os frames em FIFO, sem descarte.";
+        return "The host presents every frame in FIFO order without dropping frames.";
     if (group == "Vulkan" && (key.starts_with("vkvalidation") || key.starts_with("vkcrash") ||
                               key == "renderdoc_enabled"))
-        return "As ferramentas de validação/captura desktop não estão incluídas no pacote UWP.";
+        return "Desktop validation/capture tools are not included in the UWP package.";
     if (group == "GPU" && key == "userfaultfd")
-        return "userfaultfd é uma API Linux, indisponível no UWP.";
+        return "userfaultfd is a Linux API and is unavailable in UWP.";
     if (group == "GPU" && key == "one_core_gpu_thread_pin")
-        return "A afinidade dos processadores é controlada pelo sistema no AppContainer.";
+        return "Processor affinity is controlled by the system in AppContainer.";
     if (group == "GPU" && key == "direct_memory_access_enabled")
-        return "O Dozen usa descritores com limites; acesso BDA direto não está habilitado neste caminho.";
+        return "Dozen uses bounded descriptors; direct BDA access is not enabled on this path.";
     if (group == "General") {
         if (key == "install_dirs" || key.ends_with("_dir")) {
-            return "O UWP usa pastas brokered e armazenamento privado; use Biblioteca/Importar.";
+            return "UWP uses brokered folders and private storage; use Library/Import.";
         }
         if (key == "discord_rpc_enabled") {
-            return "Discord RPC não está integrado ao AppContainer.";
+            return "Discord RPC is not integrated with AppContainer.";
         }
         if (key == "show_splash" || key.starts_with("trophy_")) {
-            return "A apresentação de splash/troféus guest ainda não tem adaptador UWP.";
+            return "Guest splash/trophy presentation does not have a UWP adapter yet.";
         }
     }
     if (group == "Network" && key == "enable_upnp") {
-        return "A descoberta/configuração UPnP desktop não tem adaptador AppContainer.";
+        return "Desktop UPnP discovery/configuration does not have an AppContainer adapter.";
     }
     if (group == "Log" && key == "type") {
-        return "O host usa callback e arquivo, sem console desktop.";
+        return "The host uses callbacks and files, without a desktop console.";
     }
     if (group == "Debug" && key == "config_version")
-        return "Metadado interno, não é uma preferência.";
+        return "Internal metadata, not a preference.";
     if (group == "Input") {
         if (key.starts_with("gyro_") || key == "motion_controls_enabled") {
-            return "O backend SDL WinRT não fornece sensores de movimento neste host.";
+            return "The SDL WinRT backend does not provide motion sensors on this host.";
         }
         if (key == "usb_device_backend" || key == "camera_id") {
-            return "USB/câmera desktop não têm adaptador brokered neste host.";
+            return "Desktop USB/camera access does not have a brokered adapter on this host.";
         }
         if (key.starts_with("cursor_") || key == "background_controller_input") {
-            return "Ponteiro, foco e suspensão são controlados pelo host UWP.";
+            return "Pointer input, focus and suspension are controlled by the UWP host.";
         }
     }
     if (!value.is_primitive() || value.is_null()) {
-        return "Coleção sem editor compatível; o valor persistido é preservado.";
+        return "Collection without a compatible editor; the persisted value is preserved.";
     }
     return {};
 }
@@ -73,64 +73,64 @@ json Choices(std::string_view key) {
         result.push_back({{"value", value}, {"label", label}});
     };
     if (key == "readbacks_mode") {
-        add(0, "Desativado");
-        add(1, "Relaxado");
-        add(2, "Preciso");
+        add(0, "Disabled");
+        add(1, "Relaxed");
+        add(2, "Accurate");
     } else if (key == "adaptive_skipcaches_mode") {
-        add(0, "Desativado");
-        add(1, "Adaptativo");
-        add(2, "Forçado");
-        add(3, "Somente validação");
+        add(0, "Disabled");
+        add(1, "Adaptive");
+        add(2, "Forced");
+        add(3, "Validation only");
     } else if (key == "audio_backend") {
         add(0, "SDL3");
         add(1, "OpenAL");
         add(2, "XAudio2");
     } else if (key == "openal_hrtf") {
-        add(0, "Automático");
-        add(1, "Ativado");
-        add(2, "Desativado");
+        add(0, "Automatic");
+        add(1, "Enabled");
+        add(2, "Disabled");
     } else if (key == "openal_output_mode") {
-        add(0, "Automático");
-        add(1, "Estéreo");
+        add(0, "Automatic");
+        add(1, "Stereo");
         add(2, "Quad");
         add(3, "5.1");
         add(4, "7.1");
     } else if (key == "console_language") {
-        constexpr std::array languages{"Japonês",
-                                       "Inglês (EUA)",
-                                       "Francês",
-                                       "Espanhol",
-                                       "Alemão",
-                                       "Italiano",
-                                       "Holandês",
-                                       "Português (Portugal)",
-                                       "Russo",
-                                       "Coreano",
-                                       "Chinês tradicional",
-                                       "Chinês simplificado",
-                                       "Finlandês",
-                                       "Sueco",
-                                       "Dinamarquês",
-                                       "Norueguês",
-                                       "Polonês",
-                                       "Português (Brasil)",
-                                       "Inglês (Reino Unido)",
-                                       "Turco",
-                                       "Espanhol (América Latina)",
-                                       "Árabe",
-                                       "Francês (Canadá)",
-                                       "Tcheco",
-                                       "Húngaro",
-                                       "Grego",
-                                       "Romeno",
-                                       "Tailandês",
-                                       "Vietnamita",
-                                       "Indonésio",
-                                       "Ucraniano"};
+        constexpr std::array languages{"Japanese",
+                                       "English (US)",
+                                       "French",
+                                       "Spanish",
+                                       "German",
+                                       "Italian",
+                                       "Dutch",
+                                       "Portuguese (Portugal)",
+                                       "Russian",
+                                       "Korean",
+                                       "Traditional Chinese",
+                                       "Simplified Chinese",
+                                       "Finnish",
+                                       "Swedish",
+                                       "Danish",
+                                       "Norwegian",
+                                       "Polish",
+                                       "Portuguese (Brazil)",
+                                       "English (UK)",
+                                       "Turkish",
+                                       "Spanish (Latin America)",
+                                       "Arabic",
+                                       "French (Canada)",
+                                       "Czech",
+                                       "Hungarian",
+                                       "Greek",
+                                       "Romanian",
+                                       "Thai",
+                                       "Vietnamese",
+                                       "Indonesian",
+                                       "Ukrainian"};
         for (size_t index = 0; index < languages.size(); ++index)
             add(index, languages[index]);
     } else if (key == "flush_level") {
-        add("", "Padrão");
+        add("", "Default");
         add("trace", "Trace");
         add("debug", "Debug");
         add("info", "Info");
@@ -139,9 +139,9 @@ json Choices(std::string_view key) {
         add("critical", "Critical");
         add("off", "Off");
     } else if (key == "special_pad_class") {
-        constexpr std::array labels{"Padrão",          "Guitarra",  "Bateria", "Mesa DJ",
-                                    "Tapete de dança", "Navegação", "Volante", "Stick",
-                                    "Fight stick",     "Pistola"};
+        constexpr std::array labels{"Default",          "Guitar",  "Drums", "DJ turntable",
+                                    "Dance mat", "Navigation", "Steering wheel", "Stick",
+                                    "Fight stick",     "Gun"};
         for (int index = 0; index < labels.size(); ++index)
             add(index, labels[index]);
     }
@@ -245,20 +245,20 @@ std::filesystem::path GamePath(const char* serial) {
         std::ranges::any_of(std::string_view{serial}, [](unsigned char c) {
             return !std::isalnum(c) && c != '_' && c != '-';
         }))
-        throw std::runtime_error("Identificador de perfil inválido.");
+        throw std::runtime_error("Invalid profile identifier.");
     return Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) /
            (std::string{serial} + ".json");
 }
 
 void WriteSnapshot(const json& document, char* data, uint32_t capacity, uint32_t* required) {
     if (!required || (!data && capacity))
-        throw std::runtime_error("Buffer inválido.");
+        throw std::runtime_error("Invalid buffer.");
     const auto text = document.dump();
     *required = static_cast<uint32_t>(text.size() + 1);
     if (!data || !capacity)
         return;
     if (capacity < *required)
-        throw std::runtime_error("Buffer insuficiente.");
+        throw std::runtime_error("Buffer too small.");
     std::memcpy(data, text.c_str(), *required);
 }
 
@@ -267,7 +267,7 @@ int32_t Call(F operation) {
     try {
         std::scoped_lock lock{settings_mutex};
         if (shadps4_get_state() != SHADPS4_READY) {
-            throw std::runtime_error("As configurações exigem um núcleo inicializado e parado.");
+            throw std::runtime_error("Settings require an initialized, stopped core.");
         }
         operation();
         return 0;
@@ -285,23 +285,23 @@ void Validate(std::string_view group, std::string_view key, const json& old, con
         : old.is_string()         ? !value.is_string()
         : old.is_number_integer() ? !value.is_number_integer()
                                   : !value.is_number()) {
-        throw std::runtime_error("Tipo de configuração inválido.");
+        throw std::runtime_error("Invalid setting type.");
     }
     if (value.is_number()) {
         const auto number = value.get<double>();
         const auto [minimum, maximum] = Bounds(key, old);
         if (!std::isfinite(number) || number < minimum || number > maximum) {
-            throw std::runtime_error("Valor fora da faixa permitida.");
+            throw std::runtime_error("Value outside the allowed range.");
         }
     }
     if (value.is_string() && value.get_ref<const std::string&>().size() > 4096) {
-        throw std::runtime_error("Texto de configuração muito longo.");
+        throw std::runtime_error("Setting text is too long.");
     }
     const auto choices = Choices(key);
     if (!choices.empty() && std::ranges::none_of(choices, [&](const auto& option) {
             return option.at("value") == value;
         })) {
-        throw std::runtime_error("Opção de configuração desconhecida.");
+        throw std::runtime_error("Unknown setting option.");
     }
 }
 } // namespace
@@ -309,13 +309,13 @@ void Validate(std::string_view group, std::string_view key, const json& old, con
 int32_t shadps4_get_settings(char* data, uint32_t capacity, uint32_t* required) {
     return Call([&] {
         if (!required || (!data && capacity))
-            throw std::runtime_error("Buffer inválido.");
+            throw std::runtime_error("Invalid buffer.");
         const auto text = Snapshot().dump();
         *required = static_cast<uint32_t>(text.size() + 1);
         if (!data || !capacity)
             return;
         if (capacity < *required)
-            throw std::runtime_error("Buffer insuficiente.");
+            throw std::runtime_error("Buffer too small.");
         std::memcpy(data, text.c_str(), *required);
     });
 }
@@ -323,18 +323,18 @@ int32_t shadps4_get_settings(char* data, uint32_t capacity, uint32_t* required) 
 int32_t shadps4_set_setting(const char* group, const char* key, const char* value_json) {
     return Call([&] {
         if (!group || !key || !value_json)
-            throw std::runtime_error("Configuração inválida.");
+            throw std::runtime_error("Invalid setting.");
         const auto previous = EmulatorSettings.GetGroupValues(group);
         if (!previous.is_object() || !previous.contains(key))
-            throw std::runtime_error("Configuração desconhecida.");
+            throw std::runtime_error("Unknown setting.");
         const auto value = json::parse(value_json);
         Validate(group, key, previous.at(key), value);
         if (!EmulatorSettings.SetGroupValues(group, {{key, value}}, false))
-            throw std::runtime_error("Falha ao aplicar configuração.");
+            throw std::runtime_error("Failed to apply setting.");
         if (!EmulatorSettings.Save()) {
             EmulatorSettings.SetGroupValues(group, previous, false);
             throw std::runtime_error(
-                "Falha ao salvar configuração; alteração em memória revertida.");
+                "Failed to save setting; in-memory change reverted.");
         }
         if (std::string_view{group} == "Log") {
             Common::Log::UpdateSinks();
@@ -360,7 +360,7 @@ int32_t shadps4_reset_settings() {
         if (!EmulatorSettings.Save()) {
             for (size_t index = 0; index < groups.size(); ++index)
                 EmulatorSettings.SetGroupValues(groups[index], previous[index], false);
-            throw std::runtime_error("Falha ao restaurar configurações.");
+            throw std::runtime_error("Failed to restore settings.");
         }
         Common::Log::UpdateSinks();
         Common::Log::UpdateLogLevels(EmulatorSettings.GetLogFilter());
@@ -376,7 +376,7 @@ int32_t shadps4_get_game_settings(const char* serial, char* data, uint32_t capac
         profile = EmulatorSettings;
         profile.ClearGameSpecificOverrides();
         if (std::filesystem::exists(path) && !profile.Load(serial))
-            throw std::runtime_error("Falha ao ler perfil.");
+            throw std::runtime_error("Failed to read profile.");
         WriteSnapshot(Snapshot(profile, true), data, capacity, required);
     });
 }
@@ -385,19 +385,19 @@ int32_t shadps4_set_game_setting(const char* serial, const char* group, const ch
     return Call([&] {
         const auto path = GamePath(serial);
         if (!group || !key || !value_json || !Overrideable(group, key))
-            throw std::runtime_error("Opção não permite override por jogo.");
+            throw std::runtime_error("This option does not allow per-game overrides.");
         EmulatorSettingsImpl profile;
         profile = EmulatorSettings;
         profile.ClearGameSpecificOverrides();
         if (std::filesystem::exists(path) && !profile.Load(serial))
-            throw std::runtime_error("Falha ao ler perfil.");
+            throw std::runtime_error("Failed to read profile.");
         const auto previous = profile.GetGroupValues(group);
         if (!previous.contains(key))
-            throw std::runtime_error("Configuração desconhecida.");
+            throw std::runtime_error("Unknown setting.");
         const auto value = json::parse(value_json);
         Validate(group, key, previous.at(key), value);
         if (!profile.SetGroupValues(group, {{key, value}}, true) || !profile.Save(serial))
-            throw std::runtime_error("Falha ao salvar perfil.");
+            throw std::runtime_error("Failed to save profile.");
     });
 }
 int32_t shadps4_delete_game_settings(const char* serial) {

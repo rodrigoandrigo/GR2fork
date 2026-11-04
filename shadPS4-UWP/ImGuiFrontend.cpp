@@ -53,45 +53,45 @@ std::string Lower(std::string text) {
 }
 std::string Label(std::string text) {
     static const std::unordered_map<std::string, std::string> labels{
-        {"big_picture_scale", "Escala da interface (1000 = 100%)"},
-        {"big_picture_folder_depth", "Profundidade de busca de jogos"},
-        {"pipeline_sync_budget_ms", "Orçamento síncrono de pipeline (ms)"},
-        {"readback_offload", "Readback em fila de cópia"},
-        {"memory_swap_enabled", "Swap de memória (padrão no Xbox)"},
-        {"show_fps_counter", "Exibir contador de FPS"},
-        {"console_language", "Idioma do console"},
+        {"big_picture_scale", "Interface scale (1000 = 100%)"},
+        {"big_picture_folder_depth", "Game search depth"},
+        {"pipeline_sync_budget_ms", "Synchronous pipeline budget (ms)"},
+        {"readback_offload", "Readback on copy queue"},
+        {"memory_swap_enabled", "Memory swap (default on Xbox)"},
+        {"show_fps_counter", "Show FPS counter"},
+        {"console_language", "Console language"},
         {"volume_slider", "Volume (%)"},
-        {"audio_backend", "Backend de áudio"},
-        {"neo_mode", "Emular PS4 Pro"},
-        {"dev_kit_mode", "Modo de desenvolvimento"},
-        {"extra_dmem_in_mbytes", "Memória direta adicional (MB)"},
-        {"extra_fmem_in_mbytes", "Memória flexível adicional (MB)"},
-        {"full_screen", "Iniciar em tela cheia"},
-        {"full_screen_mode", "Modo de tela cheia"},
-        {"window_width", "Largura da janela"},
-        {"window_height", "Altura da janela"},
-        {"internal_screen_width", "Largura da resolução interna"},
-        {"internal_screen_height", "Altura da resolução interna"},
-        {"hdr_allowed", "Habilitar HDR"},
-        {"fsr_enabled", "Habilitar FSR"},
-        {"rcas_enabled", "Habilitar RCAS (nitidez)"},
-        {"rcas_attenuation", "Atenuação RCAS"},
-        {"vblank_frequency", "Frequência de VBlank"},
-        {"null_gpu", "Habilitar NULL GPU"},
-        {"gpu_id", "Dispositivo gráfico"},
-        {"pipeline_cache_enabled", "Habilitar cache de pipelines"},
-        {"pipeline_cache_archived", "Compactar cache de pipelines"},
-        {"use_keyboard_as_keyboard", "Usar teclado como teclado do PS4"},
-        {"use_mice_as_mice", "Usar mouse como mouse do PS4"},
-        {"is_circle_enter", "Usar círculo para confirmar"},
-        {"use_unified_input_config", "Compartilhar configuração de entrada"},
-        {"special_pad_class", "Tipo de controle especial"},
-        {"default_controller_id", "Controle padrão"},
-        {"vblank_div", "Divisor de VBlank"},
-        {"is_pro", "Emular PS4 Pro"},
-        {"fullscreen", "Iniciar jogos em tela cheia"},
-        {"log_filter", "Filtro de log"},
-        {"flush_level", "Nível de gravação do log"}};
+        {"audio_backend", "Audio backend"},
+        {"neo_mode", "Emulate PS4 Pro"},
+        {"dev_kit_mode", "Development mode"},
+        {"extra_dmem_in_mbytes", "Additional direct memory (MB)"},
+        {"extra_fmem_in_mbytes", "Additional flexible memory (MB)"},
+        {"full_screen", "Start in fullscreen"},
+        {"full_screen_mode", "Fullscreen mode"},
+        {"window_width", "Window width"},
+        {"window_height", "Window height"},
+        {"internal_screen_width", "Internal resolution width"},
+        {"internal_screen_height", "Internal resolution height"},
+        {"hdr_allowed", "Enable HDR"},
+        {"fsr_enabled", "Enable FSR"},
+        {"rcas_enabled", "Enable RCAS (sharpening)"},
+        {"rcas_attenuation", "RCAS attenuation"},
+        {"vblank_frequency", "VBlank frequency"},
+        {"null_gpu", "Enable NULL GPU"},
+        {"gpu_id", "Graphics device"},
+        {"pipeline_cache_enabled", "Enable pipeline cache"},
+        {"pipeline_cache_archived", "Compress pipeline cache"},
+        {"use_keyboard_as_keyboard", "Use keyboard as PS4 keyboard"},
+        {"use_mice_as_mice", "Use mouse as PS4 mouse"},
+        {"is_circle_enter", "Use circle to confirm"},
+        {"use_unified_input_config", "Share input configuration"},
+        {"special_pad_class", "Special controller type"},
+        {"default_controller_id", "Default controller"},
+        {"vblank_div", "VBlank divisor"},
+        {"is_pro", "Emulate PS4 Pro"},
+        {"fullscreen", "Start games in fullscreen"},
+        {"log_filter", "Log filter"},
+        {"flush_level", "Log flush level"}};
     if (const auto found = labels.find(text); found != labels.end())
         return found->second;
     std::replace(text.begin(), text.end(), '_', ' ');
@@ -159,47 +159,47 @@ void LoadLauncherFont() {
 }
 std::string SettingsSection(const std::string& group, const std::string& key) {
     if (group == "Vulkan")
-        return key == "gpu_id" || key.compare(0, 15, "pipeline_cache_") == 0 ? "Dispositivo e cache"
-                                                                             : "Avançado";
+        return key == "gpu_id" || key.compare(0, 15, "pipeline_cache_") == 0 ? "Device and cache"
+                                                                             : "Advanced";
     if (group == "GPU") {
         if (key == "gpu_id" || key == "null_gpu")
-            return "Dispositivo e cache";
+            return "Device and cache";
         if (key == "fsr_enabled" || key == "rcas_enabled" || key == "rcas_attenuation")
             return "FSR";
         if (key == "full_screen" || key == "full_screen_mode" || key == "hdr_allowed" ||
             key == "window_width" || key == "window_height" || key == "internal_screen_width" ||
             key == "internal_screen_height" || key == "vblank_frequency")
-            return "Vídeo";
-        return "Avançado";
+            return "Video";
+        return "Advanced";
     }
     if (group == "Input")
         return key == "use_keyboard_as_keyboard" || key == "use_mice_as_mice" ||
                        key.compare(0, 4, "ime_") == 0
-                   ? "Teclado e mouse"
-                   : "Controle";
+                   ? "Keyboard and mouse"
+                   : "Controller";
     if (group == "Audio" || key == "volume_slider")
-        return "Saída de áudio";
-    return "Opções";
+        return "Audio output";
+    return "Options";
 }
 std::string SettingsPage(const std::string& group, const std::string& key) {
     if (group == "GPU" || group == "Vulkan")
-        return "Gráficos";
+        return "Graphics";
     if (group == "Input")
-        return "Entrada";
+        return "Input";
     if (group == "Audio")
-        return "Áudio";
+        return "Audio";
     if (group == "Network")
-        return "Rede";
+        return "Network";
     if (group == "General") {
         if (key == "volume_slider")
-            return "Áudio";
+            return "Audio";
         if (key == "big_picture_folder_depth")
-            return "Pastas";
+            return "Folders";
         if (key.compare(0, 12, "big_picture_") == 0 || key == "show_fps_counter")
             return "Interface";
         if (key == "console_language" || key.compare(0, 5, "user_") == 0)
-            return "Usuário";
-        return "Geral";
+            return "User";
+        return "General";
     }
     return group;
 }
@@ -338,7 +338,7 @@ void ImGuiFrontend::Complete(std::function<void()> update) {
 void ImGuiFrontend::Work() {
     const auto initialized = RoInitialize(RO_INIT_MULTITHREADED);
     if (FAILED(initialized)) {
-        Complete([this] { status = "Não foi possível criar o worker MTA."; });
+        Complete([this] { status = "Could not create the MTA worker."; });
         return;
     }
     for (;;) {
@@ -472,7 +472,7 @@ void ImGuiFrontend::Run(std::wstring root) {
                 log_height = std::clamp(layout.value("log_height", 140.0f), 60.0f, 600.0f);
             }
         } catch (...) {
-            status = "Preferências de interface restauradas.";
+            status = "Interface preferences restored.";
         }
 
         FrontendInput initial;
@@ -690,7 +690,7 @@ void ImGuiFrontend::Run(std::wstring root) {
         }
     } catch (...) {
         try {
-            ReportFailure(L"Falha inesperada no frontend.");
+            ReportFailure(L"Unexpected frontend failure.");
         } catch (...) {
         }
     }
@@ -725,13 +725,13 @@ void ImGuiFrontend::SetFolder(Platform::Agile<StorageFolder> source, std::string
         if (roots.size() >= 64) {
             Windows::Storage::AccessCache::StorageApplicationPermissions::FutureAccessList->Remove(
                 ref new Platform::String(Wide(token).c_str()));
-            throw std::runtime_error("Limite de 64 pastas de biblioteca.");
+            throw std::runtime_error("Limit of 64 library folders.");
         }
         for (const auto& root : roots)
             if (root.folder.Get() && root.folder.Get()->IsEqual(source.Get())) {
                 Windows::Storage::AccessCache::StorageApplicationPermissions::FutureAccessList
                     ->Remove(ref new Platform::String(Wide(token).c_str()));
-                Complete([this] { status = "Esta pasta já está na biblioteca."; });
+                Complete([this] { status = "This folder is already in the library."; });
                 return;
             }
         roots.push_back({source, token, true});
@@ -745,12 +745,12 @@ void ImGuiFrontend::SetPackage(Platform::Agile<StorageFile> source, std::string 
             Windows::Storage::AccessCache::StorageApplicationPermissions::FutureAccessList;
         if (roots.size() >= 64) {
             access->Remove(ref new Platform::String(Wide(token).c_str()));
-            throw std::runtime_error("Limite de 64 fontes de biblioteca.");
+            throw std::runtime_error("Limit of 64 library sources.");
         }
         for (const auto& root : roots)
             if (root.file.Get() && root.file.Get()->IsEqual(source.Get())) {
                 access->Remove(ref new Platform::String(Wide(token).c_str()));
-                Complete([this] { status = "Este PKG já está na biblioteca."; });
+                Complete([this] { status = "This PKG is already in the library."; });
                 return;
             }
         roots.push_back({{}, token, true, source});
@@ -792,7 +792,7 @@ void ImGuiFrontend::ChangeRoot(std::string token, bool enabled, bool remove) {
 void ImGuiFrontend::ImportFolder(Platform::Agile<StorageFolder> source, std::wstring target) {
     Queue([this, source, target] {
         if (target != L"sys_modules" && target != L"fonts" && target != L"addcont")
-            throw std::runtime_error("Destino inválido.");
+            throw std::runtime_error("Invalid destination.");
         auto root = concurrency::create_task(StorageFolder::GetFolderFromPathAsync(
                                                  ref new Platform::String(user_root.c_str())))
                         .get();
@@ -801,7 +801,7 @@ void ImGuiFrontend::ImportFolder(Platform::Agile<StorageFolder> source, std::wst
                                                        CreationCollisionOption::OpenIfExists))
                                .get();
         CopyFolder(source.Get(), destination, stopping);
-        Complete([this] { status = "Importação concluída no armazenamento privado."; });
+        Complete([this] { status = "Import to private storage completed."; });
     });
 }
 
@@ -816,17 +816,17 @@ std::vector<uint8_t> ImGuiFrontend::ReadFile(const std::string& path, uint64_t l
     } lease{token, close};
     uint64_t length{};
     if (size(token, &length) || length > limit)
-        throw std::runtime_error("Arquivo excede o limite de leitura.");
+        throw std::runtime_error("File exceeds the read limit.");
     std::vector<uint8_t> bytes(static_cast<size_t>(length));
     uint64_t offset{};
     while (offset < length) {
         if (stopping.load())
-            throw std::runtime_error("Operação cancelada.");
+            throw std::runtime_error("Operation canceled.");
         uint64_t got{};
         if (read(token, bytes.data() + offset, std::min<uint64_t>(length - offset, 1024 * 1024),
                  &got) ||
             !got)
-            throw std::runtime_error("Leitura incompleta.");
+            throw std::runtime_error("Incomplete read.");
         offset += got;
     }
     return bytes;
@@ -844,9 +844,9 @@ void ImGuiFrontend::ReadMetadata(FrontendGame& game) {
         if (game.format == "PKG") {
             const auto category = metadata.find("CATEGORY");
             if (category != metadata.end() && (category->second == "gp" || category->second == "ac")) {
-                game.format = category->second == "gp" ? "PKG (atualização)" : "PKG (DLC)";
+                game.format = category->second == "gp" ? "PKG (update)" : "PKG (DLC)";
                 game.executable.clear();
-                game.launch_error = "Este pacote é um complemento. Inicie o jogo base correspondente.";
+                game.launch_error = "This package is an add-on. Start the corresponding base game.";
             }
         }
 
@@ -854,19 +854,19 @@ void ImGuiFrontend::ReadMetadata(FrontendGame& game) {
             found != metadata.end() && !found->second.empty()) {
             switch (found->second.front()) {
             case 'U':
-                game.region = "EUA";
+                game.region = "USA";
                 break;
             case 'E':
-                game.region = "Europa";
+                game.region = "Europe";
                 break;
             case 'J':
-                game.region = "Japão";
+                game.region = "Japan";
                 break;
             case 'H':
-                game.region = "Ásia";
+                game.region = "Asia";
                 break;
             case 'K':
-                game.region = "Coreia";
+                game.region = "Korea";
                 break;
             }
         }
@@ -932,7 +932,7 @@ void ImGuiFrontend::Scan() {
             }
             game.executable = path + "/eboot.bin";
             if (game.metadata_path.find("/Sc0") != std::string::npos)
-                game.format = "Pasta (Image0/Sc0)";
+                game.format = "Folder (Image0/Sc0)";
             ReadMetadata(game);
             result->games.push_back(std::move(game));
             continue;
@@ -988,8 +988,8 @@ void ImGuiFrontend::Scan() {
             if (bootable)
                 game.executable = point + "/eboot.bin";
             else
-                game.launch_error = "PKG sem executável acessível. Verifique se é um jogo base em "
-                                    "formato FPKG compatível.";
+                game.launch_error = "PKG has no accessible executable. Check that it is a base game in "
+                                    "a compatible FPKG format.";
             ReadMetadata(game);
         }
         result->games.push_back(std::move(game));
@@ -1011,7 +1011,7 @@ void ImGuiFrontend::Scan() {
         failed_images.clear();
         decoded.clear();
         status = std::to_string(result->games.size()) +
-                 " jogos encontrados. Selecione um jogo para iniciar.";
+                 " games found. Select a game to start.";
         scanning.store(false);
         Filter();
     });
@@ -1110,7 +1110,7 @@ void ImGuiFrontend::LoadSettings(std::string profile, uint64_t request) {
         excluded = hidden;
         ui_scale = scale;
         show_fps = fps;
-        status = "Configurações carregadas.";
+        status = "Settings loaded.";
     });
 }
 ThumbnailPixels ImGuiFrontend::Decode(const std::string& key, const std::string& path) {
@@ -1122,11 +1122,11 @@ ThumbnailPixels ImGuiFrontend::Decode(const std::string& key, const std::string&
         std::ifstream stream(filename, std::ios::binary | std::ios::ate);
         const auto length = stream.tellg();
         if (!stream || length <= 0 || length > 1024 * 1024)
-            throw std::runtime_error("Ícone do launcher inválido.");
+            throw std::runtime_error("Invalid launcher icon.");
         bytes.resize(static_cast<size_t>(length));
         stream.seekg(0);
         if (!stream.read(reinterpret_cast<char*>(bytes.data()), bytes.size()))
-            throw std::runtime_error("Não foi possível ler o ícone do launcher.");
+            throw std::runtime_error("Could not read the launcher icon.");
     } else {
         bytes = ReadFile(path, 16 * 1024 * 1024);
     }
@@ -1144,7 +1144,7 @@ ThumbnailPixels ImGuiFrontend::Decode(const std::string& key, const std::string&
     uint32_t width{}, height{};
     Check(frame->GetSize(&width, &height));
     if (!width || !height || width > 16384 || height > 16384)
-        throw std::runtime_error("Imagem inválida.");
+        throw std::runtime_error("Invalid image.");
     const auto ratio = std::min(1.0, 256.0 / std::max(width, height));
     ThumbnailPixels output{key,
                            std::max(1U, static_cast<uint32_t>(width * ratio)),
@@ -1318,65 +1318,65 @@ void ImGuiFrontend::Draw() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar);
     if (ImGui::BeginMenuBar()) {
-        if (ImGui::BeginMenu("Arquivo")) {
-            if (ImGui::MenuItem("Adicionar pasta de jogos…", nullptr, false,
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Add game folder...", nullptr, false,
                                 idle && !scanning.load()) &&
                 choose_folder)
                 choose_folder(L"library");
-            if (ImGui::MenuItem("Adicionar PKG…", nullptr, false, idle && !scanning.load()) &&
+            if (ImGui::MenuItem("Add PKG...", nullptr, false, idle && !scanning.load()) &&
                 choose_folder)
                 choose_folder(L"pkg");
-            if (ImGui::MenuItem("Iniciar jogo", nullptr, false, can_play))
+            if (ImGui::MenuItem("Start game", nullptr, false, can_play))
                 StartGame();
-            if (ImGui::BeginMenu("Importar", idle)) {
-                if (ImGui::MenuItem("Módulos de sistema…") && choose_folder)
+            if (ImGui::BeginMenu("Import", idle)) {
+                if (ImGui::MenuItem("System modules...") && choose_folder)
                     choose_folder(L"sys_modules");
-                if (ImGui::MenuItem("Fontes…") && choose_folder)
+                if (ImGui::MenuItem("Fonts...") && choose_folder)
                     choose_folder(L"fonts");
-                if (ImGui::MenuItem("DLCs…") && choose_folder)
+                if (ImGui::MenuItem("DLCs...") && choose_folder)
                     choose_folder(L"addcont");
                 ImGui::EndMenu();
             }
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Exibir")) {
-            ImGui::MenuItem("Lista de jogos", nullptr, &show_game_list);
-            ImGui::MenuItem("Log do jogo", nullptr, &show_game_log);
-            if (ImGui::MenuItem("Capturar diagnóstico da imagem", nullptr, false,
+        if (ImGui::BeginMenu("View")) {
+            ImGui::MenuItem("Game list", nullptr, &show_game_list);
+            ImGui::MenuItem("Game log", nullptr, &show_game_log);
+            if (ImGui::MenuItem("Capture image diagnostics", nullptr, false,
                                 game_running &&
                                     core->GraphicsBackend() == SHADPS4_GRAPHICS_VULKAN_DOZEN)) {
                 const auto result = request_presentation_capture();
-                status = result == 0 ? "Captura solicitada para um frame completo. Arquivos em "
+                status = result == 0 ? "Capture requested for a complete frame. Files in "
                                        "screenshots/presentation."
-                         : result == 1 ? "Já existe uma captura pendente ou em andamento."
-                                       : "A captura requer uma sessão ativa com Dozen.";
+                         : result == 1 ? "A capture is already pending or in progress."
+                                       : "Capture requires an active Dozen session.";
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Modo lista", nullptr, !grid_view))
+            if (ImGui::MenuItem("List mode", nullptr, !grid_view))
                 grid_view = false;
-            if (ImGui::MenuItem("Modo grade", nullptr, grid_view))
+            if (ImGui::MenuItem("Grid mode", nullptr, grid_view))
                 grid_view = true;
-            if (ImGui::MenuItem("Tela cheia") && toggle_fullscreen)
+            if (ImGui::MenuItem("Fullscreen") && toggle_fullscreen)
                 toggle_fullscreen();
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Configurações")) {
-            if (ImGui::MenuItem("Configurar…", nullptr, false, idle))
+        if (ImGui::BeginMenu("Settings")) {
+            if (ImGui::MenuItem("Configure...", nullptr, false, idle))
                 open_settings();
-            if (ImGui::MenuItem("Controles e teclado…", nullptr, false, idle))
-                open_settings("Entrada");
-            if (ImGui::MenuItem("Pastas da biblioteca…", nullptr, false, idle))
-                open_settings("Pastas");
+            if (ImGui::MenuItem("Controllers and keyboard...", nullptr, false, idle))
+                open_settings("Input");
+            if (ImGui::MenuItem("Library folders...", nullptr, false, idle))
+                open_settings("Folders");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Cheats / Patches")) {
-            if (ImGui::MenuItem("Gerenciar jogo selecionado…", nullptr, false,
+            if (ImGui::MenuItem("Manage selected game...", nullptr, false,
                                 library && selection < library->games.size() && !session_pending))
                 OpenCheats();
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Ajuda")) {
-            if (ImGui::MenuItem("Sobre o ShadPS4-UWP"))
+        if (ImGui::BeginMenu("Help")) {
+            if (ImGui::MenuItem("About ShadPS4-UWP"))
                 about_open = true;
             ImGui::EndMenu();
         }
@@ -1387,7 +1387,7 @@ void ImGuiFrontend::Draw() {
     ImGui::PushStyleColor(ImGuiCol_Button, {0, 0, 0, 0});
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {2 * scale, 4 * scale});
-    if (ToolbarButton(game_running ? (session_paused ? "Continuar" : "Pausar") : "Iniciar",
+    if (ToolbarButton(game_running ? (session_paused ? "Resume" : "Pause") : "Start",
                       game_running && !session_paused ? "pause_icon.png" : "play_icon.png",
                       game_running || can_play)) {
         if (game_running) {
@@ -1398,40 +1398,40 @@ void ImGuiFrontend::Draw() {
         }
     }
     ImGui::SameLine();
-    if (ToolbarButton("Parar", "stop_icon.png", game_running)) {
+    if (ToolbarButton("Stop", "stop_icon.png", game_running)) {
         restart_requested = false;
-        status = "Encerrando sessão…";
+        status = "Ending session...";
         core->Stop();
     }
     ImGui::SameLine();
-    if (ToolbarButton("Reiniciar", "restart_game_icon.png", game_running)) {
+    if (ToolbarButton("Restart", "restart_game_icon.png", game_running)) {
         restart_requested = true;
-        status = "Reiniciando jogo…";
+        status = "Restarting game...";
         core->Stop();
     }
     ImGui::SameLine();
-    if (ToolbarButton("Configurações", "settings_icon.png", idle))
+    if (ToolbarButton("Settings", "settings_icon.png", idle))
         open_settings();
     ImGui::SameLine();
-    if (ToolbarButton("Tela cheia", "fullscreen_icon.png") && toggle_fullscreen)
+    if (ToolbarButton("Fullscreen", "fullscreen_icon.png") && toggle_fullscreen)
         toggle_fullscreen();
     ImGui::SameLine();
-    if (ToolbarButton("Controles", "controller_icon.png", idle))
-        open_settings("Entrada");
+    if (ToolbarButton("Controllers", "controller_icon.png", idle))
+        open_settings("Input");
     ImGui::SameLine();
-    if (ToolbarButton("Teclado", "keyboard_icon.png", idle))
-        open_settings("Entrada");
+    if (ToolbarButton("Keyboard", "keyboard_icon.png", idle))
+        open_settings("Input");
     ImGui::SameLine();
     ImGui::Dummy({2 * scale, 76 * scale});
     ImGui::SameLine();
-    if (ToolbarButton("Atualizar lista", "refreshlist_icon.png", idle && !scanning.load()))
+    if (ToolbarButton("Refresh list", "refreshlist_icon.png", idle && !scanning.load()))
         Queue([this] { Scan(); });
     ImGui::SameLine();
     ImGui::BeginGroup();
     ImGui::SetNextItemWidth(180 * scale);
-    ImGui::SliderFloat("##icon-size", &icon_size, 24, 128, "Tamanho: %.0f");
+    ImGui::SliderFloat("##icon-size", &icon_size, 24, 128, "Size: %.0f");
     ImGui::SetNextItemWidth(220 * scale);
-    if (ImGui::InputTextWithHint("##search", "Pesquisar…", search, sizeof(search)))
+    if (ImGui::InputTextWithHint("##search", "Search...", search, sizeof(search)))
         Filter();
     ImGui::EndGroup();
     ImGui::PopStyleVar(2);
@@ -1445,7 +1445,7 @@ void ImGuiFrontend::Draw() {
                                                       std::max(minimum, available - minimum))
                                          : 0;
     if (show_game_list) {
-        ImGui::TextUnformatted("Lista de jogos");
+        ImGui::TextUnformatted("Game list");
         ImGui::BeginChild(
             "game-list",
             {0, std::max(1.0f, available - (show_game_log ? log_size + 12 * scale : 0) -
@@ -1464,15 +1464,15 @@ void ImGuiFrontend::Draw() {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
         }
         ImGui::BeginChild("game-log", {0, -footer}, true);
-        ImGui::TextUnformatted("Log do jogo");
+        ImGui::TextUnformatted("Game log");
         DrawLogs();
         ImGui::EndChild();
     }
     ImGui::Separator();
-    ImGui::Text("Jogos: %zu", visible ? visible->size() : 0);
+    ImGui::Text("Games: %zu", visible ? visible->size() : 0);
     ImGui::SameLine();
     if (scanning.load())
-        ImGui::Text("Examinando pastas: %u", scanned.load());
+        ImGui::Text("Scanning folders: %u", scanned.load());
     else
         ImGui::TextUnformatted(status.c_str());
 
@@ -1490,7 +1490,7 @@ void ImGuiFrontend::Draw() {
             ApplicationData::Current->LocalSettings->Values->Insert(
                 L"shadps4.launcher.layout", ref new Platform::String(Wide(layout).c_str()));
         } catch (Platform::Exception ^) {
-            status = "Não foi possível salvar a disposição da interface.";
+            status = "Could not save the interface layout.";
         }
     }
     ImGui::End();
@@ -1500,7 +1500,7 @@ void ImGuiFrontend::Draw() {
             {std::min(1000 * scale, display.x - 24), std::min(740 * scale, display.y - 24)},
             ImGuiCond_Appearing);
         ImGui::SetNextWindowPos({display.x / 2, display.y / 2}, ImGuiCond_Appearing, {0.5f, 0.5f});
-        if (ImGui::Begin("Configurações", &settings_open, ImGuiWindowFlags_NoCollapse)) {
+        if (ImGui::Begin("Settings", &settings_open, ImGuiWindowFlags_NoCollapse)) {
             ImGui::BeginDisabled(!idle || settings_saving);
             DrawSettings();
             ImGui::EndDisabled();
@@ -1516,12 +1516,12 @@ void ImGuiFrontend::Draw() {
     }
     if (about_open) {
         ImGui::SetNextWindowSize({440 * scale, 180 * scale}, ImGuiCond_Appearing);
-        if (ImGui::Begin("Sobre o ShadPS4-UWP", &about_open, ImGuiWindowFlags_NoCollapse)) {
+        if (ImGui::Begin("About ShadPS4-UWP", &about_open, ImGuiWindowFlags_NoCollapse)) {
             ImGui::TextUnformatted("shadPS4-UWP");
-            ImGui::TextWrapped("Emulador de PlayStation 4 para Windows e Xbox UWP.");
+            ImGui::TextWrapped("PlayStation 4 emulator for Windows and Xbox UWP.");
             ImGui::Separator();
-            ImGui::TextWrapped("Interface adaptada do shadPS4 Qt Launcher.\nshadPS4 "
-                               "Emulator Project — GPL-2.0-or-later.");
+            ImGui::TextWrapped("Interface adapted from the shadPS4 Qt Launcher.\nshadPS4 "
+                               "Emulator Project - GPL-2.0-or-later.");
         }
         ImGui::End();
     }
@@ -1529,8 +1529,8 @@ void ImGuiFrontend::Draw() {
 
 void ImGuiFrontend::DrawLibrary() {
     if (!library || !visible || visible->empty()) {
-        ImGui::TextWrapped("Nenhum jogo encontrado. Use Arquivo > Adicionar pasta de jogos. Para "
-                           "Image0/Sc0, escolha a pasta que contém ambas.");
+        ImGui::TextWrapped("No games found. Use File > Add game folder. For "
+                           "Image0/Sc0, select the folder containing both.");
         return;
     }
     const float scale = ImGui::GetIO().FontGlobalScale;
@@ -1564,9 +1564,9 @@ void ImGuiFrontend::DrawLibrary() {
         }
         if (ImGui::BeginPopupContextItem("game-actions")) {
             selection = index;
-            if (ImGui::MenuItem("Iniciar", nullptr, false, !game_running && !session_pending))
+            if (ImGui::MenuItem("Start", nullptr, false, !game_running && !session_pending))
                 StartGame();
-            if (ImGui::MenuItem("Configurações do jogo…", nullptr, false,
+            if (ImGui::MenuItem("Game settings...", nullptr, false,
                                 !game_running && !session_pending && !game.serial.empty() &&
                                     settings_changes.empty())) {
                 const auto serial = game.serial;
@@ -1629,16 +1629,16 @@ void ImGuiFrontend::DrawLibrary() {
                                      ImGuiTableFlags_ScrollX | ImGuiTableFlags_Reorderable |
                                      ImGuiTableFlags_Hideable | ImGuiTableFlags_Sortable)) {
         ImGui::TableSetupScrollFreeze(2, 1);
-        ImGui::TableSetupColumn("Ícone",
+        ImGui::TableSetupColumn("Icon",
                                 ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
                                 icon_size * scale + 8);
-        ImGui::TableSetupColumn("Nome", ImGuiTableColumnFlags_WidthStretch, 3);
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 3);
         ImGui::TableSetupColumn("Serial", ImGuiTableColumnFlags_WidthFixed, 120 * scale);
-        ImGui::TableSetupColumn("Região", ImGuiTableColumnFlags_WidthFixed, 80 * scale);
+        ImGui::TableSetupColumn("Region", ImGuiTableColumnFlags_WidthFixed, 80 * scale);
         ImGui::TableSetupColumn("Firmware", ImGuiTableColumnFlags_WidthFixed, 80 * scale);
-        ImGui::TableSetupColumn("Versão", ImGuiTableColumnFlags_WidthFixed, 80 * scale);
-        ImGui::TableSetupColumn("Caminho", ImGuiTableColumnFlags_WidthStretch, 2);
-        ImGui::TableSetupColumn("Formato", ImGuiTableColumnFlags_WidthFixed, 140 * scale);
+        ImGui::TableSetupColumn("Version", ImGuiTableColumnFlags_WidthFixed, 80 * scale);
+        ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch, 2);
+        ImGui::TableSetupColumn("Format", ImGuiTableColumnFlags_WidthFixed, 140 * scale);
         ImGui::TableHeadersRow();
         if (const auto specs = ImGui::TableGetSortSpecs();
             specs && specs->SpecsDirty && specs->SpecsCount) {
@@ -1665,7 +1665,7 @@ void ImGuiFrontend::StartGame() {
         return;
     const auto& game = library->games[selection];
     if (game.executable.empty()) {
-        status = game.launch_error.empty() ? "O jogo não possui executável acessível."
+        status = game.launch_error.empty() ? "The game has no accessible executable."
                                            : game.launch_error;
         return;
     }
@@ -1673,7 +1673,7 @@ void ImGuiFrontend::StartGame() {
     const auto executable = game.executable;
     session_pending = true;
     menu_open = false;
-    status = "Iniciando jogo…";
+    status = "Starting game...";
     const auto weak = weak_from_this();
     if (!Queue([this, executable, weak] {
             core->Run(Wide(executable), [weak](std::wstring message) {
@@ -1687,7 +1687,7 @@ void ImGuiFrontend::StartGame() {
             });
         })) {
         session_pending = false;
-        status = "O worker está ocupado.";
+        status = "The worker is busy.";
     }
 }
 
@@ -1721,7 +1721,7 @@ void ImGuiFrontend::ApplySettings(bool close_window) {
                     reload_core =
                         backend >= 0 && backend != static_cast<int>(core->GraphicsBackend());
                     session_pending = reload_core;
-                    status = "Configurações salvas.";
+                    status = "Settings saved.";
                 });
             } catch (...) {
                 Complete([this] { settings_saving = false; });
@@ -1730,7 +1730,7 @@ void ImGuiFrontend::ApplySettings(bool close_window) {
         }))
         settings_saving = true;
     else
-        status = "Aguarde as operações pendentes.";
+        status = "Wait for pending operations.";
 }
 
 void ImGuiFrontend::DrawSetting(Setting& setting) {
@@ -1771,7 +1771,7 @@ void ImGuiFrontend::DrawSetting(Setting& setting) {
             stage(std::clamp(value, setting.minimum, setting.maximum));
     } else {
         ImGui::TextWrapped("%s", setting.value.get_ref<const std::string&>().c_str());
-        if (ImGui::Button("Editar…") && edit_text) {
+        if (ImGui::Button("Edit...") && edit_text) {
             const auto copy = setting;
             const auto request = settings_request.load();
             edit_text(setting.label, setting.value, false,
@@ -1791,7 +1791,7 @@ void ImGuiFrontend::DrawSetting(Setting& setting) {
     }
     ImGui::EndDisabled();
     if (!setting.editable && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("Opção global herdada pelo perfil do jogo.");
+        ImGui::SetTooltip("Global option inherited by the game profile.");
     ImGui::PopID();
     ImGui::PopID();
 }
@@ -1803,7 +1803,7 @@ void ImGuiFrontend::DrawSettings() {
                        next_graphics_backend != static_cast<int>(core->GraphicsBackend());
     ImGui::BeginDisabled(dirty);
     ImGui::SetNextItemWidth(360 * ImGui::GetIO().FontGlobalScale);
-    if (ImGui::BeginCombo("Perfil",
+    if (ImGui::BeginCombo("Profile",
                           settings_profile.empty() ? "Global" : settings_profile.c_str())) {
         const size_t count = library ? library->profiles.size() + 1 : 1;
         for (size_t index = 0; index < count; ++index) {
@@ -1827,8 +1827,8 @@ void ImGuiFrontend::DrawSettings() {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
     ImGui::BeginChild("settings-content",
                       {0, -description_height - ImGui::GetFrameHeightWithSpacing() * 2}, true);
-    constexpr std::array pages{"Geral", "Interface", "Gráficos", "Usuário", "Entrada",
-                               "Áudio", "Rede",      "Pastas",   "Log",     "Debug"};
+    constexpr std::array pages{"General", "Interface", "Graphics", "User", "Input",
+                               "Audio", "Network",      "Folders",   "Log",     "Debug"};
     if (ImGui::BeginTabBar("settings-pages")) {
         for (const auto* page : pages) {
             const bool requested = requested_settings_group == page;
@@ -1837,29 +1837,29 @@ void ImGuiFrontend::DrawSettings() {
             if (requested)
                 requested_settings_group.clear();
             ImGui::BeginChild("page-options", {0, 0}, false);
-            if (std::string_view(page) == "Entrada") {
-                ImGui::TextUnformatted("Touchpad no controle Xbox");
-                ImGui::TextWrapped("Segure View e mova o analógico esquerdo para tocar e deslizar. Pressione o analógico esquerdo (L3) com View segurado para clicar. Solte View para levantar o dedo.");
+            if (std::string_view(page) == "Input") {
+                ImGui::TextUnformatted("Touchpad on Xbox controller");
+                ImGui::TextWrapped("Hold View and move the left stick to touch and swipe. Press the left stick (L3) while holding View to click. Release View to lift your finger.");
                 ImGui::Separator();
             }
 
-            if (std::string_view(page) == "Gráficos") {
-                ImGui::TextUnformatted("Renderização");
+            if (std::string_view(page) == "Graphics") {
+                ImGui::TextUnformatted("Rendering");
                 ImGui::Separator();
                 const char* backends[] = {"Vulkan / Dozen", "D3D12 nativo"};
                 ImGui::BeginDisabled(!settings_profile.empty());
-                ImGui::Combo("Backend gráfico (global)", &next_graphics_backend, backends, 2);
+                ImGui::Combo("Graphics backend (global)", &next_graphics_backend, backends, 2);
                 ImGui::EndDisabled();
                 ImGui::Spacing();
             }
-            if (std::string_view(page) == "Pastas") {
-                ImGui::TextUnformatted("Pastas da biblioteca");
+            if (std::string_view(page) == "Folders") {
+                ImGui::TextUnformatted("Library folders");
                 ImGui::Separator();
                 ImGui::BeginDisabled(scanning.load() || !settings_profile.empty());
-                if (ImGui::Button("Adicionar pasta…") && choose_folder)
+                if (ImGui::Button("Add folder...") && choose_folder)
                     choose_folder(L"library");
                 ImGui::SameLine();
-                if (ImGui::Button("Adicionar PKG…") && choose_folder)
+                if (ImGui::Button("Add PKG...") && choose_folder)
                     choose_folder(L"pkg");
                 if (library)
                     for (const auto& root : library->roots) {
@@ -1868,31 +1868,31 @@ void ImGuiFrontend::DrawSettings() {
                         if (ImGui::Checkbox(root.name.c_str(), &enabled))
                             ChangeRoot(root.token, enabled, false);
                         ImGui::SameLine();
-                        if (ImGui::Button("Remover"))
+                        if (ImGui::Button("Remove"))
                             ChangeRoot(root.token, enabled, true);
                         ImGui::PopID();
                     }
                 ImGui::EndDisabled();
-                ImGui::TextWrapped("Módulos, fontes e DLCs são importados pelo menu "
-                                   "Arquivo > Importar.");
+                ImGui::TextWrapped("Modules, fonts and DLCs are imported through "
+                                   "File > Import.");
             }
-            bool any = std::string_view(page) == "Gráficos" || std::string_view(page) == "Pastas";
+            bool any = std::string_view(page) == "Graphics" || std::string_view(page) == "Folders";
             std::vector<std::string> sections;
             for (const auto& setting : settings) {
                 if (SettingsPage(setting.group, setting.key) != page)
                     continue;
                 any = true;
                 const auto section = SettingsSection(setting.group, setting.key);
-                if (section != "Avançado" &&
+                if (section != "Advanced" &&
                     std::find(sections.begin(), sections.end(), section) == sections.end())
                     sections.push_back(section);
             }
-            if (std::string_view(page) == "Gráficos")
+            if (std::string_view(page) == "Graphics")
                 std::stable_sort(sections.begin(), sections.end(),
                                  [](const auto& a, const auto& b) {
                                      const auto rank = [](const auto& section) {
-                                         return section == "Dispositivo e cache" ? 0
-                                                : section == "Vídeo"             ? 1
+                                         return section == "Device and cache" ? 0
+                                                : section == "Video"             ? 1
                                                                                  : 2;
                                      };
                                      return rank(a) < rank(b);
@@ -1913,16 +1913,16 @@ void ImGuiFrontend::DrawSettings() {
                 }
                 ImGui::EndTable();
             }
-            if (std::string_view(page) == "Gráficos" &&
-                ImGui::CollapsingHeader("Opções avançadas de GPU"))
+            if (std::string_view(page) == "Graphics" &&
+                ImGui::CollapsingHeader("Advanced GPU options"))
                 for (auto& setting : settings)
                     if (SettingsPage(setting.group, setting.key) == page &&
-                        SettingsSection(setting.group, setting.key) == "Avançado")
+                        SettingsSection(setting.group, setting.key) == "Advanced")
                         DrawSetting(setting);
 
             if (!any)
-                ImGui::TextWrapped("Nenhuma opção disponível nesta categoria para o "
-                                   "perfil selecionado.");
+                ImGui::TextWrapped("No options are available in this category for the "
+                                   "selected profile.");
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
@@ -1930,7 +1930,7 @@ void ImGuiFrontend::DrawSettings() {
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();
-    if (ImGui::Button(settings_profile.empty() ? "Restaurar padrões" : "Excluir perfil do jogo")) {
+    if (ImGui::Button(settings_profile.empty() ? "Restore defaults" : "Delete game profile")) {
         const auto profile = settings_profile;
         const auto request = settings_request.load();
         if (Queue([this, profile, request] {
@@ -1942,29 +1942,29 @@ void ImGuiFrontend::DrawSettings() {
                     next_graphics_backend = static_cast<int>(core->GraphicsBackend());
                 });
             }))
-            status = "Restaurando configurações…";
+            status = "Restoring settings...";
     }
     ImGui::SameLine();
     ImGui::SetCursorPosX(
         std::max(ImGui::GetCursorPosX(), ImGui::GetWindowContentRegionMax().x - 240 * scale));
-    if (ImGui::Button("Salvar", {72 * scale, 0}))
+    if (ImGui::Button("Save", {72 * scale, 0}))
         ApplySettings(true);
     ImGui::SameLine();
-    if (ImGui::Button("Aplicar", {72 * scale, 0}))
+    if (ImGui::Button("Apply", {72 * scale, 0}))
         ApplySettings(false);
     ImGui::SameLine();
-    if (ImGui::Button("Fechar", {72 * scale, 0}))
+    if (ImGui::Button("Close", {72 * scale, 0}))
         settings_open = false;
     ImGui::BeginChild("settings-description", {0, 0}, true);
     ImGui::TextWrapped("%s", dirty
-                                 ? "Há alterações não salvas. Salve ou aplique antes de trocar de "
-                                   "perfil."
-                                 : "As configurações são compartilhadas com o núcleo de emulação.");
+                                 ? "There are unsaved changes. Save or apply before switching "
+                                   "profiles."
+                                 : "Settings are shared with the emulation core.");
     ImGui::EndChild();
 }
 
 void ImGuiFrontend::DrawLogs() {
-    if (ImGui::Button("Limpar visualização"))
+    if (ImGui::Button("Clear view"))
         logs.clear();
     ImGui::BeginChild("log-tail", {0, 0}, true, ImGuiWindowFlags_HorizontalScrollbar);
     ImGuiListClipper clipper;
@@ -2005,7 +2005,7 @@ void ImGuiFrontend::CheatsCommand(nlohmann::json request) {
                 Complete([this, data = std::move(data), code] {
                     cheats_busy = false;
                     if (code)
-                        cheats_error = data.value("error", "Falha em cheats/patches.");
+                        cheats_error = data.value("error", "Cheats/patches failed.");
                     else
                         cheats_data = data;
                 });
@@ -2018,7 +2018,7 @@ void ImGuiFrontend::CheatsCommand(nlohmann::json request) {
             }
         })) {
         cheats_busy = false;
-        cheats_error = "A fila de tarefas está ocupada.";
+        cheats_error = "The task queue is busy.";
     }
 }
 
@@ -2034,18 +2034,18 @@ void ImGuiFrontend::DrawCheats() {
         if (!cheats_error.empty())
             ImGui::TextWrapped("%s", cheats_error.c_str());
         if (cheats_busy)
-            ImGui::TextUnformatted("Processando…");
+            ImGui::TextUnformatted("Processing...");
         ImGui::BeginDisabled(cheats_busy);
         const char* repositories[]{"shadPS4", "GoldHEN"};
-        ImGui::Combo("Repositório", &cheats_repository, repositories, 2);
-        if (ImGui::Button("Atualizar lista local"))
+        ImGui::Combo("Repository", &cheats_repository, repositories, 2);
+        if (ImGui::Button("Refresh local list"))
             CheatsCommand({{"operation", "list"}});
         if (ImGui::BeginTabBar("cheats-patches-tabs")) {
             if (ImGui::BeginTabItem("Cheats")) {
-                if (ImGui::Button("Baixar / atualizar cheats deste jogo"))
+                if (ImGui::Button("Download / update cheats for this game"))
                     CheatsCommand({{"operation", "download_cheats"}});
-                ImGui::TextWrapped("Cheats são aplicados durante a execução e podem "
-                                   "ser desativados na mesma sessão.");
+                ImGui::TextWrapped("Cheats are applied during execution and can "
+                                   "be disabled in the same session.");
                 const bool matching_game = game_running && active_game_path.size() && library &&
                                            std::any_of(library->games.begin(), library->games.end(),
                                                        [this](const auto& game) {
@@ -2053,9 +2053,9 @@ void ImGuiFrontend::DrawCheats() {
                                                                   game.serial == cheats_serial;
                                                        });
                 if (!matching_game)
-                    ImGui::TextWrapped("Inicie este jogo para aplicar os cheats compatíveis.");
+                    ImGui::TextWrapped("Start this game to apply compatible cheats.");
                 if (!cheats_data.contains("cheats") || cheats_data["cheats"].empty())
-                    ImGui::TextUnformatted("Nenhum arquivo de cheats local para este jogo.");
+                    ImGui::TextUnformatted("No local cheat files for this game.");
                 for (const auto& file : cheats_data.value("cheats", nlohmann::json::array())) {
                     const auto filename = file.at("file").get<std::string>();
                     ImGui::PushID(filename.c_str());
@@ -2064,10 +2064,10 @@ void ImGuiFrontend::DrawCheats() {
                             ImGui::TextWrapped("%s", file.at("error").get<std::string>().c_str());
                         } else {
                             const bool compatible = file.at("compatible").get<bool>();
-                            ImGui::Text("Versão: %s%s",
+                            ImGui::Text("Version: %s%s",
                                         file.at("version").get<std::string>().c_str(),
-                                        compatible ? "" : " (incompatível)");
-                            ImGui::TextWrapped("Créditos: %s", file.at("credits").dump().c_str());
+                                        compatible ? "" : " (incompatible)");
+                            ImGui::TextWrapped("Credits: %s", file.at("credits").dump().c_str());
                             ImGui::BeginDisabled(!matching_game || !compatible || cheats_busy);
                             for (const auto& mod : file.at("mods")) {
                                 ImGui::PushID(mod.at("index").get<int>());
@@ -2089,7 +2089,7 @@ void ImGuiFrontend::DrawCheats() {
                             ImGui::EndDisabled();
                         }
                         ImGui::BeginDisabled(game_running || cheats_busy);
-                        if (ImGui::Button("Excluir arquivo de cheats"))
+                        if (ImGui::Button("Delete cheat file"))
                             CheatsCommand({{"operation", "delete_cheats"}, {"file", filename}});
                         ImGui::EndDisabled();
                         ImGui::TreePop();
@@ -2099,12 +2099,12 @@ void ImGuiFrontend::DrawCheats() {
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Patches")) {
-                if (ImGui::Button("Baixar / atualizar patches deste jogo"))
+                if (ImGui::Button("Download / update patches for this game"))
                     CheatsCommand({{"operation", "download_patches"}});
-                ImGui::TextWrapped("As seleções são salvas automaticamente e aplicadas "
-                                   "na próxima inicialização do jogo.");
+                ImGui::TextWrapped("Selections are saved automatically and applied "
+                                   "the next time the game starts.");
                 if (!cheats_data.contains("patches") || cheats_data["patches"].empty())
-                    ImGui::TextUnformatted("Nenhum patch local para este jogo.");
+                    ImGui::TextUnformatted("No local patches for this game.");
                 for (const auto& patch : cheats_data.value("patches", nlohmann::json::array())) {
                     const auto repo = patch.at("repository").get<std::string>();
                     const auto filename = patch.at("file").get<std::string>();
@@ -2120,13 +2120,13 @@ void ImGuiFrontend::DrawCheats() {
                                        {"index", patch.at("index")},
                                        {"enabled", enabled}});
                     ImGui::EndDisabled();
-                    ImGui::TextWrapped("%s | Versão %s | %s", repo.c_str(),
+                    ImGui::TextWrapped("%s | Version %s | %s", repo.c_str(),
                                        patch.at("version").get<std::string>().c_str(),
                                        patch.at("author").get<std::string>().c_str());
-                    if (ImGui::TreeNode("Notas e arquivo")) {
+                    if (ImGui::TreeNode("Notes and file")) {
                         ImGui::TextWrapped("%s", patch.at("note").get<std::string>().c_str());
                         ImGui::TextWrapped("%s", filename.c_str());
-                        if (ImGui::Button("Excluir arquivo de patches"))
+                        if (ImGui::Button("Delete patch file"))
                             CheatsCommand({{"operation", "delete_patches"},
                                            {"repository", repo},
                                            {"file", filename}});

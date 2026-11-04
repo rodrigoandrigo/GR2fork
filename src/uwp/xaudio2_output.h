@@ -38,6 +38,15 @@ private:
     std::array<Buffer, 8> buffers;
     std::atomic<uint64_t> completed{};
     std::atomic<HRESULT> error{S_OK};
+    void ReportQueue(const char* reason, uint64_t now, HRESULT result = S_OK) noexcept;
+    uint32_t sample_rate{};
+    uint32_t buffer_frames{};
+    uint64_t submitted{};
+    uint64_t rejected{};
+    uint64_t empty_observations{};
+    uint64_t previous_submit{};
+    uint64_t previous_report{};
+    uint64_t maximum_gap{};
     mutable std::mutex mutex;
 };
 } // namespace Core::Uwp

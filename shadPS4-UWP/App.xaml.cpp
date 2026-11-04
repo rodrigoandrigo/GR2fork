@@ -1,6 +1,6 @@
 //
 // App.xaml.cpp
-// Implementação da classe App.
+// App class implementation.
 //
 
 #include "pch.h"
@@ -24,8 +24,8 @@ using namespace Windows::UI::Xaml::Interop;
 using namespace Windows::UI::Xaml::Media;
 using namespace Windows::UI::Xaml::Navigation;
 /// <summary>
-/// Inicializa o objeto singleton do aplicativo.  Esta é a primeira linha de código criado
-/// executado e, como tal, é o equivalente lógico de main() ou WinMain().
+/// Initializes the singleton application object. This is the first line of application code
+/// executed and, as such, is the logical equivalent of main() or WinMain().
 /// </summary>
 App::App()
 {
@@ -60,11 +60,11 @@ App::App()
 }
 
 /// <summary>
-/// Chamado quando o aplicativo é iniciado normalmente pelo usuário final.  Outros pontos de entrada
-/// serão usados quando o aplicativo é iniciado para abrir um arquivo específico, para exibir
-/// resultados da pesquisa e assim por diante.
+/// Called when the application is launched normally by the end user. Other entry points
+/// are used when the application is launched to open a specific file, display
+/// search results, and so on.
 /// </summary>
-/// <param name="e">Detalhes sobre a solicitação e o processo de inicialização.</param>
+/// <param name="e">Details about the launch request and process.</param>
 void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEventArgs^ e)
 {
     UwpDiagnostics::Record("app_launched previous_execution_state", static_cast<uint32_t>(e->PreviousExecutionState));
@@ -91,26 +91,26 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 
 	auto rootFrame = dynamic_cast<Frame^>(Window::Current->Content);
 
-	// Não repita a inicialização do aplicativo quando a Janela já tiver conteúdo,
-	// apenas verifique se a janela está ativa
+	// Do not repeat application initialization when the Window already contains content;
+	// just ensure that the window is active.
 	if (rootFrame == nullptr)
 	{
-		// Criar um Quadro para agir como o contexto de navegação e associá-lo a
-		// uma chave SuspensionManager
+		// Create a Frame to act as the navigation context and associate it with
+		// a SuspensionManager key.
         UwpDiagnostics::Record("root_frame_initializing");
 		rootFrame = ref new Frame();
 
 		rootFrame->NavigationFailed += ref new Windows::UI::Xaml::Navigation::NavigationFailedEventHandler(this, &App::OnNavigationFailed);
 
-		// Coloque o quadro na Janela atual
+		// Place the frame in the current Window.
 		Window::Current->Content = rootFrame;
 	}
 
 	if (rootFrame->Content == nullptr)
 	{
-		// Quando a pilha de navegação não for restaurada, navegar para a primeira página,
-		// configurando a nova página passando as informações necessárias como um parâmetro
-		// parâmetro
+		// When the navigation stack is not restored, navigate to the first page,
+		// configuring the new page by passing the required information as a navigation
+		// parameter.
         UwpDiagnostics::Record("main_page_navigating");
 		rootFrame->Navigate(TypeName(DirectXPage::typeid), e->Arguments);
         UwpDiagnostics::Record("main_page_navigated");
@@ -126,7 +126,7 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 		m_directXPage->LoadInternalState(ApplicationData::Current->LocalSettings->Values);
 	}
 	
-	// Verifique se a janela atual está ativa
+	// Ensure that the current window is active.
     UwpDiagnostics::Record("window_activating");
 	Window::Current->Activate();
     UwpDiagnostics::Record("window_activated");
@@ -148,16 +148,16 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 	}
 }
 /// <summary>
-/// Chamado quando a execução do aplicativo está sendo suspensa.  O estado do aplicativo é salvo
-/// sem saber se o aplicativo será encerrado ou retomado com o conteúdo
-/// da memória ainda intacto.
+/// Called when application execution is suspended. The application state is saved
+/// without knowing whether the application will be terminated or resumed with its
+/// memory contents still intact.
 /// </summary>
-/// <param name="sender">A fonte da solicitação de suspensão.</param>
-/// <param name="e">Detalhes sobre a solicitação de suspensão.</param>
+/// <param name="sender">The source of the suspension request.</param>
+/// <param name="e">Details about the suspension request.</param>
 void App::OnSuspending(Object^ sender, SuspendingEventArgs^ e)
 {
-	(void) sender;	// Parâmetro não usado
-	(void) e;	// Parâmetro não usado
+	(void) sender;	// Unused parameter.
+	(void) e;	// Unused parameter.
 
     UwpDiagnostics::Memory("app_suspending bytes/limit");
 	if (m_directXPage)
@@ -165,24 +165,24 @@ void App::OnSuspending(Object^ sender, SuspendingEventArgs^ e)
 }
 
 /// <summary>
-/// Invocado quando a execução do aplicativo é retomada.
+/// Invoked when application execution resumes.
 /// </summary>
-/// <param name="sender">A origem da solicitação de retomada.</param>
-/// <param name="args">Detalhes sobre a solicitação de retomada.</param>
+/// <param name="sender">The source of the resume request.</param>
+/// <param name="args">Details about the resume request.</param>
 void App::OnResuming(Object ^sender, Object ^args)
 {
-	(void) sender; // Parâmetro não usado
-	(void) args; // Parâmetro não usado
+	(void) sender; // Unused parameter.
+	(void) args; // Unused parameter.
 
 	if (m_directXPage)
         m_directXPage->LoadInternalState(ApplicationData::Current->LocalSettings->Values);
 }
 
 /// <summary>
-/// Chamado quando ocorre uma falha na Navegação para uma determinada página
+/// Called when navigation to a specific page fails.
 /// </summary>
-/// <param name="sender">O Quadro com navegação com falha</param>
-/// <param name="e">Detalhes sobre a falha na navegação</param>
+/// <param name="sender">The Frame whose navigation failed.</param>
+/// <param name="e">Details about the navigation failure.</param>
 void App::OnNavigationFailed(Platform::Object ^sender, Windows::UI::Xaml::Navigation::NavigationFailedEventArgs ^e)
 {
 	throw ref new FailureException("Failed to load Page " + e->SourcePageType.Name);

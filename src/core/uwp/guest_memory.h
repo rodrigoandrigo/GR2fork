@@ -11,6 +11,8 @@ void uwp_memory_set_log(void (*callback)(const char*));
 int uwp_memory_init(uint64_t physical_size, uint64_t direct_size, uintptr_t canonical,
                     const char* swap_path, int swap_enabled);
 void uwp_memory_shutdown(void);
+void uwp_memory_start(void);
+void uwp_memory_stop(void);
 int uwp_memory_map(uintptr_t address, uint64_t size, uint64_t physical, int protection,
                    int pageable);
 int uwp_memory_unmap(uintptr_t address, uint64_t size);
@@ -23,6 +25,8 @@ int uwp_memory_copy(void* destination, const void* source, uint64_t size);
 int uwp_memory_discard(uint64_t physical, uint64_t size);
 uint64_t uwp_memory_reclaim(uint64_t bytes, int urgent);
 void uwp_memory_report(void);
+void uwp_memory_diagnostics(void);
+void uwp_memory_log_diagnostic(const char* message);
 #ifdef __cplusplus
 }
 #endif

@@ -60,6 +60,14 @@ typedef struct ShadPS4Config {
     void* attach_context;
 } ShadPS4Config;
 
+typedef struct ShadPS4GuestMemoryRange {
+    uint64_t address;
+    uint64_t size;
+} ShadPS4GuestMemoryRange;
+
+SHADPS4_API int32_t __cdecl shadps4_adopt_guest_memory_reservations(
+    const ShadPS4GuestMemoryRange* ranges, uint32_t count);
+
 typedef struct ShadPS4TemporalJitterConfig {
     uint32_t size;
     uint32_t render_width, render_height, output_width, output_height, phases;

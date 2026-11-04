@@ -17,7 +17,7 @@ std::string Normalize(std::string_view path) {
         const auto part =
             path.substr(start, end == std::string_view::npos ? path.size() - start : end - start);
         if (part == ".." || part.find_first_of("\\:\0", 0, 3) != std::string_view::npos)
-            throw std::invalid_argument("Caminho PKG inválido.");
+            throw std::invalid_argument("Invalid PKG path.");
         if (!part.empty() && part != ".") {
             if (!result.empty())
                 result += '/';
@@ -219,7 +219,7 @@ FileStat PkgBackend::Stat(std::string_view relative) const {
     else if (const auto found = files.find(path); found != files.end())
         result.size = found->second;
     else
-        throw std::runtime_error("Arquivo não encontrado no PKG.");
+        throw std::runtime_error("File not found in PKG.");
     result.inode = GetGuestInode(FileIdentity{
         .kind = FileIdentity::Kind::VirtualFile,
         .host = {.device = source_inode},

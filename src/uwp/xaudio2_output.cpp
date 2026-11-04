@@ -1,4 +1,5 @@
 #include "uwp/xaudio2_output.h"
+#include "common/logging/log.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -88,7 +89,8 @@ void SuspendAudio(bool suspended) {
     audio_suspended = suspended;
 }
 
-XAudio2Output::XAudio2Output(uint32_t channels, uint32_t sample_rate, uint32_t frames) {
+XAudio2Output::XAudio2Output(uint32_t channels, uint32_t sample_rate, uint32_t frames)
+    : sample_rate{sample_rate}, buffer_frames{frames} {
     if ((channels != 1 && channels != 2 && channels != 8) || frames == 0 || frames > 65536 ||
         sample_rate < XAUDIO2_MIN_SAMPLE_RATE || sample_rate > XAUDIO2_MAX_SAMPLE_RATE) {
         throw std::invalid_argument("Invalid XAudio2 stream format");
@@ -127,6 +129,16 @@ XAudio2Output::~XAudio2Output() {
 }
 bool XAudio2Output::Submit(std::span<const float> samples) {
     std::scoped_lock lock{mutex};
+    const auto now = GetTickCount64();
+    const auto gap = previous_submit ? now - previous_submit : 0;
+    maximum_gap = std::max(maximum_gap, gap);
+    previous_submit = now;
+    XAUDIO2_VOICE_STATE state{};
+    voice->GetState(&state);
+    if (submitted && state.BuffersQueued == 0)
+        ++empty_observations;
+    if (error.load() != S_OK)
+        ReportQueue("voice_error", now);
     winrt::check_hresult(error.load());
     if (samples.size() != buffers.front().samples.size())
         throw std::invalid_argument("Invalid XAudio2 buffer size");
@@ -142,11 +154,41 @@ bool XAudio2Output::Submit(std::span<const float> samples) {
         const auto result = voice->SubmitSourceBuffer(&packet);
         if (FAILED(result)) {
             buffer.busy.store(false);
+            ++rejected;
+            ReportQueue("submit_failed", now, result);
             winrt::throw_hresult(result);
         }
+        ++submitted;
+        if (now - previous_report >= 5000 || (gap > 100 && now - previous_report >= 1000))
+            ReportQueue(gap > 100 ? "supply_gap" : "periodic", now);
         return true;
     }
+    ++rejected;
+    if (rejected == 1 || !previous_report || now - previous_report >= 1000)
+        ReportQueue("queue_full", now);
     return false;
+}
+
+void XAudio2Output::ReportQueue(const char* reason, uint64_t now, HRESULT result) noexcept {
+    XAUDIO2_VOICE_STATE state{};
+    voice->GetState(&state);
+    size_t busy{};
+    for (const auto& buffer : buffers)
+        busy += buffer.busy.load();
+    try {
+        LOG_WARNING(Lib_AudioOut,
+                "[AudioQueue] reason={} voice={} queued={} busy={} capacity={} submitted={} "
+                "completed={} rejected={} empty_observations={} samples_played={} "
+                "max_submit_gap_ms={} voice_error={:#x} submit_hresult={:#x} "
+                "frames={} sample_rate={} queued_ms={}",
+                reason, static_cast<void*>(voice), state.BuffersQueued, busy, buffers.size(),
+                submitted, completed.load(), rejected, empty_observations, state.SamplesPlayed,
+                maximum_gap, static_cast<uint32_t>(error.load()), static_cast<uint32_t>(result),
+                buffer_frames, sample_rate,
+                    uint64_t{1000} * state.BuffersQueued * buffer_frames / sample_rate);
+    } catch (...) {
+    }
+    previous_report = now;
 }
 void XAudio2Output::OnBufferEnd(void* context) noexcept {
     static_cast<Buffer*>(context)->busy.store(false);

@@ -2,6 +2,7 @@
 
 #include "ShadPS4Host.h"
 #include "UwpDiagnostics.h"
+#include "../src/core/uwp/guest_reservations.h"
 #include <cstring>
 
 #include <thread>
@@ -21,6 +22,24 @@ void UwpDiagnostics::Memory(const char* stage) noexcept {
 
 using namespace Microsoft::WRL;
 using namespace Windows::UI::Core;
+
+namespace {
+struct GuestMemoryBootstrap {
+    Core::Uwp::GuestReservations reservations;
+    DWORD error{};
+
+    GuestMemoryBootstrap() noexcept {
+        try {
+            if (!reservations.Reserve(0x400000, 0x10000000000ULL))
+                error = GetLastError();
+        } catch (...) {
+            error = ERROR_NOT_ENOUGH_MEMORY;
+        }
+    }
+};
+
+GuestMemoryBootstrap guest_memory_bootstrap;
+}
 
 ShadPS4Host::ShadPS4Host(Windows::UI::Xaml::Controls::SwapChainPanel ^ target) : panel{target} {}
 
@@ -67,7 +86,12 @@ void ShadPS4Host::SetLogConsumer(std::function<void(std::string)> consumer) {
 }
 
 void ShadPS4Host::Log(void* context, uint32_t level, const char* message) {
-    if (level >= 5 || std::strstr(message, "[UWP stage]") || std::strstr(message, "[MemDiag]"))
+    if (level >= 5 || std::strstr(message, "[UWP stage]") || std::strstr(message, "[MemDiag]") ||
+        std::strstr(message, "[KytyMemory]") || std::strstr(message, "[MemoryWatch]") ||
+        std::strstr(message, "[MutexDiag]") || std::strstr(message, "[MappingDiag]") ||
+        std::strstr(message, "[AudioQueue]") || std::strstr(message, "[AudioSupply]") ||
+        std::strstr(message, "[WaitTimer]") || std::strstr(message, "[SemaphoreDiag]") ||
+        std::strstr(message, "[SessionFailure]"))
         UwpDiagnostics::Record(message);
 
     if (context) {
@@ -96,6 +120,20 @@ void ShadPS4Host::Initialize(const std::wstring& user_directory, uint32_t width,
             (L"Could not load shadPS4.dll: " + std::to_wstring(GetLastError())).c_str()));
     }
     UwpDiagnostics::Record("core_loaded dll_base", reinterpret_cast<uintptr_t>(module));
+    UwpDiagnostics::Record("guest_address_pre_reserve error/ranges", guest_memory_bootstrap.error,
+                           guest_memory_bootstrap.reservations.Ranges().size());
+    if (!guest_memory_bootstrap.reservations.Ranges().empty()) {
+        const auto adopt = Resolve<decltype(&shadps4_adopt_guest_memory_reservations)>(
+            "shadps4_adopt_guest_memory_reservations");
+        std::vector<ShadPS4GuestMemoryRange> ranges;
+        for (const auto& range : guest_memory_bootstrap.reservations.Ranges())
+            ranges.push_back({range.first, range.second});
+        if (adopt(ranges.data(), static_cast<uint32_t>(ranges.size())) != 0)
+            throw ref new Platform::FailureException(
+                L"Could not adopt the guest address reservations.");
+        guest_memory_bootstrap.reservations.Take();
+        UwpDiagnostics::Record("guest_address_reservations_adopted", ranges.size());
+    }
     const auto version = Resolve<decltype(&shadps4_get_api_version)>("shadps4_get_api_version");
     if (version() != 1) {
         throw ref new Platform::FailureException(L"Unsupported shadPS4 DLL interface.");
@@ -208,13 +246,13 @@ void ShadPS4Host::Reload(const std::wstring &user_directory, uint32_t width,
     UwpDiagnostics::CoreStage("core_free_library_begin", this, reinterpret_cast<uintptr_t>(module));
     if (!FreeLibrary(module))
       throw ref new Platform::FailureException(
-          L"Não foi possível descarregar o núcleo.");
+          L"Could not unload the core.");
     module = nullptr;
     UwpDiagnostics::CoreStage("core_free_library_end", this);
     if (GetModuleHandleExW(0, L"shadPS4.dll", &module))
       throw ref new Platform::FailureException(
-          L"O núcleo ainda possui tarefas ativas; não é seguro iniciar outra "
-          L"sessão.");
+          L"The core still has active tasks; it is not safe to start another "
+          L"session.");
   }
   initialize = nullptr;
   state = nullptr;
@@ -275,8 +313,8 @@ std::wstring ShadPS4Host::MountFolder(Platform::Agile<Windows::Storage::StorageF
     if (result) {
         throw ref new Platform::FailureException(ref new Platform::String(message.c_str()));
     }
-    return L"Pasta vinculada por acesso brokered. eboot.bin: " + std::to_wstring(length) +
-           L" bytes. Pronto para iniciar o jogo.";
+    return L"Folder linked through brokered access. eboot.bin: " + std::to_wstring(length) +
+           L" bytes. Ready to start the game.";
 }
 
 void ShadPS4Host::Run(std::wstring executable,
@@ -290,9 +328,9 @@ void ShadPS4Host::Run(std::wstring executable,
     UwpDiagnostics::Record("game_run_return result", static_cast<uint32_t>(result));
     UwpDiagnostics::Memory("game_run_end bytes/limit");
     const auto message = FAILED(initialized)
-                             ? L"Não foi possível iniciar o worker MTA."
+                             ? L"Could not start the MTA worker."
                          : result ? Error()
-                                  : L"Sessão encerrada.";
+                                  : L"Session ended.";
     if (SUCCEEDED(initialized)) {
       RoUninitialize();
     }

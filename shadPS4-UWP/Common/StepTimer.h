@@ -4,7 +4,7 @@
 
 namespace DX
 {
-	// Classe do auxiliar para tempo de animação e de simulação.
+	// Helper class for animation and simulation timing.
 	class StepTimer
 	{
 	public:
@@ -29,40 +29,40 @@ namespace DX
 				throw ref new Platform::FailureException();
 			}
 
-			// Inicialize delta máxima para 1/10 de segundo.
+			// Initialize the maximum delta to one tenth of a second.
 			m_qpcMaxDelta = m_qpcFrequency.QuadPart / 10;
 		}
 
-		// Obtenha o tempo decorrido desde a chamada de Atualização anterior.
+		// Get the elapsed time since the previous Update call.
 		uint64 GetElapsedTicks() const						{ return m_elapsedTicks; }
 		double GetElapsedSeconds() const					{ return TicksToSeconds(m_elapsedTicks); }
 
-		// Obtenha o tempo total desde o início do programa.
+		// Get the total time since the program started.
 		uint64 GetTotalTicks() const						{ return m_totalTicks; }
 		double GetTotalSeconds() const						{ return TicksToSeconds(m_totalTicks); }
 
-		// Obtenha o número total de atualizações desde o início do programa.
+		// Get the total number of updates since the program started.
 		uint32 GetFrameCount() const						{ return m_frameCount; }
 
-		// Obtenha a taxa de quadros atual.
+		// Get the current frame rate.
 		uint32 GetFramesPerSecond() const					{ return m_framesPerSecond; }
 
-		// Defina se deseja usar o modo TimeStep fixo ou variável.
+		// Set whether to use a fixed or variable time step.
 		void SetFixedTimeStep(bool isFixedTimestep)			{ m_isFixedTimeStep = isFixedTimestep; }
 
-		// Defina a frequência para chamar a Atualização quando estiver no modo TimeStep fixo.
+		// Set the Update frequency when using a fixed time step.
 		void SetTargetElapsedTicks(uint64 targetElapsed)	{ m_targetElapsedTicks = targetElapsed; }
 		void SetTargetElapsedSeconds(double targetElapsed)	{ m_targetElapsedTicks = SecondsToTicks(targetElapsed); }
 
-		// O formato inteiro representa o tempo usando 10.000.000 tiques por segundo.
+		// The integer format represents time using 10,000,000 ticks per second.
 		static const uint64 TicksPerSecond = 10000000;
 
 		static double TicksToSeconds(uint64 ticks)			{ return static_cast<double>(ticks) / TicksPerSecond; }
 		static uint64 SecondsToTicks(double seconds)		{ return static_cast<uint64>(seconds * TicksPerSecond); }
 
-		// Depois de uma descontinuidade de tempo intencional (por exemplo, uma operação de bloqueio de E/S)
-		// chame isso para evitar que a lógica do TimeStep fixo tente realizar um conjunto de atualização 
-		// Chamadas de atualização.
+		// After an intentional timing discontinuity, such as a blocking I/O operation,
+		// call this to prevent fixed-time-step logic from attempting a batch of
+		// catch-up Update calls.
 
 		void ResetElapsedTime()
 		{
@@ -77,11 +77,11 @@ namespace DX
 			m_qpcSecondCounter = 0;
 		}
 
-		// Atualize o estado do temporizador, chamando a função Atualizar especificada o número determinado de vezes.
+		// Update the timer state, calling the specified Update function the required number of times.
 		template<typename TUpdate>
 		void Tick(const TUpdate& update)
 		{
-			// Consulte o tempo atual.
+			// Query the current time.
 			LARGE_INTEGER currentTime;
 
 			if (!QueryPerformanceCounter(&currentTime))
@@ -94,13 +94,13 @@ namespace DX
 			m_qpcLastTime = currentTime;
 			m_qpcSecondCounter += timeDelta;
 
-			// Fixe deltas de tempo excessivamente longos (por exemplo: após pausa no depurador).
+			// Clamp excessively long time deltas, such as after pausing in the debugger.
 			if (timeDelta > m_qpcMaxDelta)
 			{
 				timeDelta = m_qpcMaxDelta;
 			}
 
-			// Converta unidades QPC em um formato de tique canônico. Não será possível estourar devido à fixação anterior.
+			// Convert QPC units into a canonical tick format. The previous clamp prevents overflow.
 			timeDelta *= TicksPerSecond;
 			timeDelta /= m_qpcFrequency.QuadPart;
 
@@ -108,14 +108,14 @@ namespace DX
 
 			if (m_isFixedTimeStep)
 			{
-				// Lógica de atualização de TimeStep fixo
+				// Fixed-time-step update logic.
 
-				// Se o aplicativo estiver sendo executado muito próximo do tempo decorrido definido (dentro de 1/4 de milissegundo), basta restringir
-				// o relógio para corresponder exatamente ao valor de destino. Isso evita que erros pequenos e irrelevantes
-				// acumulem com o passar do tempo. Sem essa fixação, um jogo que solicitava 60 fps
-				// de atualização fixa, executando com vsync habilitado em uma tela NTSC de 59,94, acumularia
-				// com o tempo pequenos erros suficientes para remover um quadro. O melhor é apenas arredondar 
-				// pequenos desvios para zero para que tudo funcione perfeitamente.
+				// If the application is running very close to the target elapsed time, within a quarter millisecond,
+				// clamp the clock to match the target exactly. This prevents small, irrelevant errors
+				// from accumulating over time. Without this clamp, a game requesting a fixed 60 FPS
+				// update rate while running with VSync on a 59.94 Hz NTSC display would accumulate
+				// enough small errors over time to drop a frame. Rounding
+				// small deviations to zero keeps everything running smoothly.
 
 				if (abs(static_cast<int64>(timeDelta - m_targetElapsedTicks)) < TicksPerSecond / 4000)
 				{
@@ -136,7 +136,7 @@ namespace DX
 			}
 			else
 			{
-				// Lógica de atualização de TimeStep variável.
+				// Variable-time-step update logic.
 				m_elapsedTicks = timeDelta;
 				m_totalTicks += timeDelta;
 				m_leftOverTicks = 0;
@@ -145,7 +145,7 @@ namespace DX
 				update();
 			}
 
-			// Monitore a taxa de quadros atual.
+			// Track the current frame rate.
 			if (m_frameCount != lastFrameCount)
 			{
 				m_framesThisSecond++;
@@ -160,23 +160,23 @@ namespace DX
 		}
 
 	private:
-		// Os dados de tempo de origem usam unidades QPC.
+		// Source timing data uses QPC units.
 		LARGE_INTEGER m_qpcFrequency;
 		LARGE_INTEGER m_qpcLastTime;
 		uint64 m_qpcMaxDelta;
 
-		// Os dados de tempo derivados usam um formato de tique canônico.
+		// Derived timing data uses a canonical tick format.
 		uint64 m_elapsedTicks;
 		uint64 m_totalTicks;
 		uint64 m_leftOverTicks;
 
-		// Membros para acompanhar a taxa de quadros.
+		// Members for tracking the frame rate.
 		uint32 m_frameCount;
 		uint32 m_framesPerSecond;
 		uint32 m_framesThisSecond;
 		uint64 m_qpcSecondCounter;
 
-		// Membros para configurar o modo Timestep fixo.
+		// Members for configuring fixed-time-step mode.
 		bool m_isFixedTimeStep;
 		uint64 m_targetElapsedTicks;
 	};

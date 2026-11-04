@@ -25,6 +25,7 @@ struct AddressSpace::Impl {
             if (backing_base)
                 ReleaseReservation(reinterpret_cast<VAddr>(backing_base), BackingSize);
         });
+        reservations = Uwp::StagedGuestReservations().Take();
         SYSTEM_INFO sys_info{};
         GetSystemInfo(&sys_info);
         u64 alignment = sys_info.dwAllocationGranularity;
@@ -67,13 +68,18 @@ struct AddressSpace::Impl {
                                 MemoryRegion{addr, PAddr(-1), size, PAGE_NOACCESS, -1, false});
             }
         }
-        for (auto region : regions) {
+        for (const auto& [base, size] : reservations)
+            regions.emplace(base, MemoryRegion{base, PAddr(-1), size, PAGE_NOACCESS, -1, false});
+        for (const auto& [base, region] : regions) {
+            if (std::any_of(reservations.begin(), reservations.end(),
+                            [&](const auto& reserved) { return reserved.first == base; }))
+                continue;
             auto addr = static_cast<u8*>(VirtualAlloc2(
-                process, reinterpret_cast<PVOID>(region.second.base), region.second.size,
+                process, reinterpret_cast<PVOID>(region.base), region.size,
                 MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0));
             ASSERT_MSG(addr, "Unable to reserve virtual address space: {}",
                        Common::GetLastErrorMsg());
-            reservations.emplace_back(region.second.base, region.second.size);
+            reservations.emplace_back(region.base, region.size);
         }
         system_managed_base = reinterpret_cast<u8*>(regions.begin()->first);
         system_managed_size = SystemManagedSize - (regions.begin()->first - SYSTEM_MANAGED_MIN);
@@ -111,8 +117,8 @@ struct AddressSpace::Impl {
                               EmulatorSettings.IsMemorySwapEnabled()),
               "initialize guest memory");
         active_backing.store(this, std::memory_order_release);
-        LOG_INFO(Core, "UWP memory: reference private-first backing, 16 KiB demand pages, "
-                       "compressed swap, aliases promoted on demand");
+        LOG_INFO(Core, "UWP memory: Kyty demand paging, 64 KiB residency windows, "
+                       "temporary slot store, coherent physical aliases");
         StartPager();
         rollback.Cancel();
     }
@@ -423,69 +429,14 @@ struct AddressSpace::Impl {
 
     void StartPager() {
         std::scoped_lock lock{pager_mutex};
-        if (pager.joinable() || !EmulatorSettings.IsMemorySwapEnabled())
-            return;
-        pager = std::jthread([](std::stop_token stop) {
-            winrt::init_apartment(winrt::apartment_type::multi_threaded);
-            bool draining{};
-            u64 retry_at{};
-            u64 unreclaimed_usage{};
-            u64 retry_delay{40};
-            auto reported = GetTickCount64();
-            while (!stop.stop_requested()) {
-                u64 reclaimed{};
-                try {
-                    const auto limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
-                    const auto used = winrt::Windows::System::MemoryManager::AppMemoryUsage();
-                    if (limit > 1024_MB) {
-                        if (used > limit - 640_MB)
-                            draining = true;
-                        if (used <= limit - 768_MB)
-                            draining = false;
-                        if (!draining) {
-                            retry_at = 0;
-                            retry_delay = 40;
-                        } else if (GetTickCount64() >= retry_at ||
-                                   (used > unreclaimed_usage &&
-                                    used - unreclaimed_usage >= 32_MB)) {
-                            reclaimed = uwp_memory_reclaim(2_MB, false);
-                            if (reclaimed) {
-                                retry_at = 0;
-                                retry_delay = 40;
-                            } else {
-                                unreclaimed_usage = used;
-                                retry_at = GetTickCount64() + retry_delay;
-                                retry_delay = std::min<u64>(retry_delay * 2, 500);
-                            }
-                        }
-                    }
-                } catch (const winrt::hresult_error&) {
-                }
-                if (GetTickCount64() - reported >= 5000) {
-                    uwp_memory_report();
-                    if (auto driver = GetModuleHandleW(L"vulkan_dzn.dll")) {
-                        using ReportCompiles = void (*)();
-                        if (auto report = reinterpret_cast<ReportCompiles>(
-                                GetProcAddress(driver, "mesa_uwp_report_compiles")))
-                            report();
-                    }
-                    reported = GetTickCount64();
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(reclaimed ? 1 : 40));
-            }
-            winrt::uninit_apartment();
-        });
+        uwp_memory_start();
     }
 
     void StopPager() {
         std::scoped_lock lock{pager_mutex};
-        if (pager.joinable()) {
-            pager.request_stop();
-            pager.join();
-            uwp_memory_report();
-        }
+        uwp_memory_stop();
+        uwp_memory_report();
     }
-
     inline static std::atomic<Impl*> active_backing{};
     inline static std::atomic<u64> pressure_epoch{};
     std::shared_ptr<int> lifetime = std::make_shared<int>();
@@ -503,5 +454,4 @@ struct AddressSpace::Impl {
     std::map<VAddr, MemoryRegion> regions;
     std::vector<std::pair<VAddr, u64>> reservations;
     std::mutex pager_mutex;
-    std::jthread pager;
 };

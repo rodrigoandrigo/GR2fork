@@ -22,21 +22,21 @@ class PackageSource {
   public:
     explicit PackageSource(std::unique_ptr<IFile> value) : file(std::move(value)) {
         if (!file || !file->IsOpen())
-            throw std::runtime_error("Não foi possível abrir o PKG.");
+            throw std::runtime_error("Could not open the PKG.");
     }
     void Seek(u64 offset, Common::FS::SeekOrigin origin) {
         if (offset > static_cast<u64>(INT64_MAX) || !file->Seek(static_cast<s64>(offset), origin))
-            throw std::runtime_error("Offset PKG inválido.");
+            throw std::runtime_error("Invalid PKG offset.");
     }
     void Read(void* data, u64 length) {
         const auto position = file->Tell();
         if (position > file->Size() || length > file->Size() - position)
-            throw std::runtime_error("Leitura fora do PKG.");
+            throw std::runtime_error("Read outside PKG.");
         u64 done{};
         while (done < length) {
             const auto got = file->Read(static_cast<u8*>(data) + done, length - done);
             if (got <= 0)
-                throw std::runtime_error("Leitura incompleta do PKG.");
+                throw std::runtime_error("Incomplete PKG read.");
             done += static_cast<u64>(got);
         }
     }
@@ -153,7 +153,7 @@ class RawSource : public DataSource {
     void Read(u64 off, u64 len, u8* dst) override {
         std::memset(dst, 0, len);
         if (off > UINT64_MAX - base_)
-            throw std::runtime_error("Offset PKG inválido.");
+            throw std::runtime_error("Invalid PKG offset.");
         f_.Seek(base_ + off, Common::FS::SeekOrigin::SetOrigin);
         f_.Read(dst, len);
     }
@@ -168,7 +168,7 @@ class SubSource : public DataSource {
     SubSource(DataSource* inner, u64 off) : inner_(inner), off_(off) {}
     void Read(u64 off, u64 len, u8* dst) override {
         if (off > UINT64_MAX - off_)
-            throw std::runtime_error("Offset PFS inválido.");
+            throw std::runtime_error("Invalid PFS offset.");
         inner_->Read(off_ + off, len, dst);
     }
 
@@ -243,10 +243,10 @@ class PfscSource : public DataSource {
         u64 dl = Rd64(h + 0x28);
         if (std::memcmp(h, "PFSC", 4) || bs_ < 512 || bs_ > 16 * 1024 * 1024 || (bs_ & (bs_ - 1)) ||
             !dl || dl > UINT64_MAX - bs_)
-            throw std::runtime_error("Cabeçalho PFSC inválido.");
+            throw std::runtime_error("Invalid PFSC header.");
         n_ = (dl + bs_ - 1) / bs_;
         if (n_ > 8 * 1024 * 1024)
-            throw std::runtime_error("Tabela PFSC excede o limite.");
+            throw std::runtime_error("PFSC table exceeds the limit.");
         map_.resize(n_ + 1);
         std::vector<u8> raw((n_ + 1) * 8);
         inner_->Read(bo, raw.size(), raw.data());
@@ -261,11 +261,11 @@ class PfscSource : public DataSource {
         while (len > 0) {
             u64 bi = off / bs_, bo = off % bs_;
             if (bi >= n_)
-                throw std::runtime_error("Leitura fora do PFSC.");
+                throw std::runtime_error("Read outside PFSC.");
             if (cached_index_ != bi) {
                 u64 a = map_[bi], b = map_[bi + 1];
                 if (b <= a || b - a > bs_)
-                    throw std::runtime_error("Bloco PFSC inválido.");
+                    throw std::runtime_error("Invalid PFSC block.");
                 u64 clen = b - a;
                 comp.resize(clen);
                 inner_->Read(a, clen, comp.data());
@@ -276,7 +276,7 @@ class PfscSource : public DataSource {
                     if (uncompress(block.data(), &out, comp.data(), static_cast<uLong>(clen)) !=
                             Z_OK ||
                         out > bs_)
-                        throw std::runtime_error("Falha na descompressão PFSC.");
+                        throw std::runtime_error("PFSC decompression failed.");
                     std::fill(block.begin() + out, block.end(), 0);
                 }
                 cached_index_ = bi;
@@ -314,7 +314,7 @@ struct PkgImpl {
         u8 magic[4];
         pkg.Read(magic, sizeof(magic));
         if (Be32(magic) != 0x7f434e54)
-            throw std::runtime_error("Arquivo não é um PKG PS4 válido.");
+            throw std::runtime_error("File is not a valid PS4 PKG.");
         Build();
     }
 
@@ -392,7 +392,7 @@ struct PkgImpl {
         signed_flag = mode & 1;
         if (bs < 0x1000 || bs > 1024 * 1024 || (bs & (bs - 1)) || nd > 1024 * 1024 ||
             ndb > 1024 * 1024 || ndb > UINT64_MAX / bs)
-            throw std::runtime_error("Superbloco PFS inválido.");
+            throw std::runtime_error("Invalid PFS superblock.");
 
         DataSource* reader = raw;
         if (mode & 4) {
@@ -451,7 +451,7 @@ struct PkgImpl {
                 if (es == 0)
                     break;
                 if (es < 16 || es > bs - o || nl > es - 16)
-                    throw std::runtime_error("Entrada PFS inválida.");
+                    throw std::runtime_error("Invalid PFS entry.");
                 if (ty == 3 && nl > 0 && nl < 256 && o + 16 + nl <= bs) {
                     std::string nm(reinterpret_cast<const char*>(d.data() + o + 16), nl);
                     if (nm == name && ch < ino.size())
@@ -465,7 +465,7 @@ struct PkgImpl {
 
     void Walk(u32 i, const std::string& pre, DataSource* r, u32 bs) {
         if (pre.size() > 4096 || !visited.insert(i).second)
-            throw std::runtime_error("Diretório PFS cíclico ou profundo.");
+            throw std::runtime_error("Cyclic or excessively deep PFS directory.");
         if (i >= ino.size())
             return;
         u32 blocks = ino[i].blocks, st = ino[i].start;
@@ -481,11 +481,11 @@ struct PkgImpl {
                 if (es == 0)
                     break;
                 if (es < 16 || es > bs - o || nl > es - 16)
-                    throw std::runtime_error("Entrada PFS inválida.");
+                    throw std::runtime_error("Invalid PFS entry.");
                 if (nl > 0 && nl < 256 && o + 16 + nl <= bs) {
                     std::string nm(reinterpret_cast<const char*>(d.data() + o + 16), nl);
                     if (nm.find_first_of("/\\\0", 0, 3) != std::string::npos)
-                        throw std::runtime_error("Nome PFS inválido.");
+                        throw std::runtime_error("Invalid PFS name.");
                     if (ty == 2 && nm != "." && nm != ".." && ch < ino.size()) {
                         files[pre + "/" + nm] = {ino[ch].size, ino[ch].start};
                     } else if (ty == 3 && nm != "." && nm != "..") {
@@ -533,7 +533,7 @@ struct PkgImpl {
             }
         }
         if (!found)
-            throw std::runtime_error("Imagem PFSC não encontrada no PKG.");
+            throw std::runtime_error("PFSC image not found in PKG.");
         auto* sub = Make<SubSource>(outer, inner_blk * outer_bs);
         auto* pfsc = Make<PfscSource>(sub);
 

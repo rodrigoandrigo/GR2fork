@@ -10,6 +10,9 @@
 #include "common/rdtsc.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#ifdef SHADPS4_UWP
+#include "core/uwp/memory_diagnostics.h"
+#endif
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -192,16 +195,26 @@ u64 Scheduler::WaitTagged(u64 tick, WaitSite site) {
 }
 
 void Scheduler::Wait(u64 tick) {
+#ifdef SHADPS4_UWP
+    Core::Uwp::MemoryDiagnostics::Scope diagnostic{"gpu_wait", tick};
+    diagnostic.Stage("flush_if_needed");
+#endif
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
     if (threaded_recording) {
+#ifdef SHADPS4_UWP
+        diagnostic.Stage("wait_record_submit");
+#endif
         if (const u64 blocked = record_thread->WaitSubmitted(tick)) {
             RecordWait(WaitSite::RecordDrain, blocked);
         }
     }
+#ifdef SHADPS4_UWP
+    diagnostic.Stage("wait_gpu_semaphore");
+#endif
     work_semaphore.Wait(tick);
 }
 
@@ -320,6 +333,10 @@ void Scheduler::EndSession() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+#ifdef SHADPS4_UWP
+    Core::Uwp::MemoryDiagnostics::Scope diagnostic{"gpu_submit", work_semaphore.CurrentTick()};
+    diagnostic.Stage("wait_submit_mutex");
+#endif
     // The record thread takes submit_mutex for its queue submit; holding it here while a
     // Record() below waits on the full queue would deadlock.
     std::unique_lock lk{submit_mutex, std::defer_lock};
@@ -328,7 +345,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
     // Every stream-lane byte this command buffer reads must be in place
     // before the queue submit.
+#ifdef SHADPS4_UWP
+    diagnostic.Stage("drain_stream_copy");
+#endif
     VideoCore::StreamCopyLane::Instance().DrainProducer();
+#ifdef SHADPS4_UWP
+    diagnostic.Stage("submit_execution");
+#endif
     const u64 signal_value = work_semaphore.NextTick();
     // Cmdbuf rollover: mid-draw submits (stream wraparound flushes) must
     // synchronously invalidate all skip caches - a draw-entry token snapshot

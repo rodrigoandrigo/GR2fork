@@ -17,6 +17,7 @@
 #include "common/key_manager.h"
 #include "common/logging/log.h"
 #include "core/address_space.h"
+#include "core/uwp/guest_reservations.h"
 #include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
@@ -54,6 +55,7 @@ std::vector<std::stop_source> worker_stops;
 std::stop_source guest_stop_source;
 std::mutex api_mutex;
 std::string last_error;
+std::atomic<uint64_t> failure_sequence{};
 std::shared_ptr<Core::Uwp::DozenHost> presentation;
 std::shared_ptr<Core::Uwp::NativeHost> native_presentation;
 std::atomic<uint32_t> graphics_backend{SHADPS4_GRAPHICS_VULKAN_DOZEN};
@@ -71,7 +73,11 @@ int32_t Fail(std::string message) {
         callback = error_callback;
         context = error_context;
     }
-    LOG_ERROR(Core, "{}", message);
+    const auto sequence = failure_sequence.fetch_add(1) + 1;
+    LOG_ERROR(Core, "[SessionFailure] sequence={} stop_requested={} state={} memory_failure={} "
+                    "tid={} message={}",
+              sequence, stop_requested.load(), state.load(),
+              static_cast<uint32_t>(memory_failure_state.load()), GetCurrentThreadId(), message);
     if (callback) {
         try {
             callback(context, message.c_str());
@@ -303,6 +309,24 @@ int32_t shadps4_check_environment() {
     return 0;
 }
 
+int32_t shadps4_adopt_guest_memory_reservations(const ShadPS4GuestMemoryRange* ranges,
+                                                uint32_t count) {
+    if ((!ranges && count) || count > 65536)
+        return -1;
+    std::unique_lock session_lock{session_mutex};
+    if (state.load() != SHADPS4_UNINITIALIZED)
+        return -1;
+    try {
+        std::vector<Core::Uwp::GuestReservations::Range> incoming;
+        incoming.reserve(count);
+        for (uint32_t index = 0; index < count; ++index)
+            incoming.emplace_back(ranges[index].address, ranges[index].size);
+        return Core::Uwp::StagedGuestReservations().Adopt(incoming) ? 0 : -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
 int32_t shadps4_initialize(const ShadPS4Config* config) {
     if (!config || config->size != sizeof(ShadPS4Config) || config->version != 1 ||
         !config->user_directory || !*config->user_directory ||
@@ -334,6 +358,7 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
         Common::FS::InitializeUserPaths(config->user_directory);
         Common::Log::Setup("shadps4.log");
         stop_requested.store(false);
+        failure_sequence.store(0);
         VideoCore::CompletePresentationCapture();
         pause_requested.store(false);
         user_paused = false;

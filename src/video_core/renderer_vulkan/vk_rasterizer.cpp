@@ -13,6 +13,9 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#ifdef SHADPS4_UWP
+#include "core/uwp/memory_diagnostics.h"
+#endif
 #include "video_core/renderer_vulkan/vk_memory_recovery.h"
 #ifdef SHADPS4_UWP
 #include "video_core/renderer_vulkan/vk_resource_memory.h"
@@ -667,9 +670,13 @@ u64 Rasterizer::RecoverAllocationMemory(bool caches, bool aggressive) {
     u64 clean_buffers{};
     if (caches && Core::AddressSpace::MemoryHeadroom() < 640_MB &&
         now - memory_recovery_time >= 250) {
+        Core::Uwp::MemoryDiagnostics::Scope diagnostic{"allocation_recovery", scheduler.CurrentTick()};
+        diagnostic.Stage("release_clean_arenas");
         memory_recovery_time = now;
         clean_buffers = buffer_cache.ReleaseCleanArenas(64_MB);
+        diagnostic.Stage("release_clean_images");
         retired_images = texture_cache.ReleaseCleanImages(64_MB);
+        diagnostic.Stage("flush_and_drain");
         if (retired_images && Core::AddressSpace::MemoryHeadroom() < 256_MB)
             scheduler.Flush();
         scheduler.DrainPendingOperations();

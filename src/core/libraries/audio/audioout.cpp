@@ -13,6 +13,10 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#ifdef SHADPS4_UWP
+#include "core/uwp/guest_memory.h"
+#include "core/uwp/memory_diagnostics.h"
+#endif
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/audio/audioout_error.h"
@@ -170,9 +174,16 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
 
     Common::AccurateTimer timer(
         std::chrono::nanoseconds(1000000000ULL * port->buffer_frames / port->sample_rate));
+#ifdef SHADPS4_UWP
+    uint64_t previous_delivery{};
+    uint64_t previous_warning{};
+#endif
 
     while (true) {
         timer.Start();
+#ifdef SHADPS4_UWP
+        uint64_t late_gap{};
+#endif
 
         {
             std::unique_lock lock{port->mutex};
@@ -181,12 +192,29 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
             }
 
             if (port->output_ready) {
+#ifdef SHADPS4_UWP
+                const auto now = GetTickCount64();
+                const auto period = (uint64_t{1000} * port->buffer_frames + port->sample_rate - 1) /
+                                    port->sample_rate;
+                if (previous_delivery &&
+                    now - previous_delivery > std::max(uint64_t{100}, 4 * period) &&
+                    now - previous_warning >= 1000) {
+                    late_gap = now - previous_delivery;
+                    previous_warning = now;
+                }
+                previous_delivery = now;
+#endif
                 port->impl->Output(port->output_buffer);
                 port->output_ready = false;
                 port->last_output_time =
                     Kernel::sceKernelGetProcessTime(); // moved from sceAudioOutOutput TOOD recheck
             }
         }
+#ifdef SHADPS4_UWP
+        if (late_gap)
+            LOG_WARNING(Lib_AudioOut, "[AudioSupply] delivery_gap_ms={} frames={} sample_rate={}",
+                        late_gap, port->buffer_frames, port->sample_rate);
+#endif
 
         port->output_cv.notify_all();
 
@@ -614,6 +642,18 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
         return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
     }
 
+#ifdef SHADPS4_UWP
+    std::vector<u8> snapshot;
+    if (ptr) {
+        Core::Uwp::MemoryDiagnostics::Scope diagnostic{"audio_guest_copy",
+                                                      reinterpret_cast<uintptr_t>(ptr),
+                                                      port->BufferSize()};
+        snapshot.resize(port->BufferSize());
+        if (!uwp_memory_copy(snapshot.data(), ptr, snapshot.size()))
+            return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
+    }
+#endif
+
     s32 samples_sent = 0;
     {
         std::unique_lock lock{port->mutex};
@@ -632,7 +672,11 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
         }
 
         if (ptr != nullptr) {
+#ifdef SHADPS4_UWP
+            std::memcpy(port->output_buffer, snapshot.data(), snapshot.size());
+#else
             std::memcpy(port->output_buffer, ptr, port->BufferSize());
+#endif
             port->output_ready = true;
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
@@ -668,6 +712,15 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
         LOG_ERROR(Lib_AudioOut, "invalid pointer");
         return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
     }
+
+#ifdef SHADPS4_UWP
+    std::vector<OrbisAudioOutOutputParam> parameters(num);
+    if (!uwp_memory_copy(parameters.data(), param,
+                                        num * sizeof(OrbisAudioOutOutputParam)))
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
+    param = parameters.data();
+    std::vector<std::vector<u8>> snapshots(num);
+#endif
 
     std::vector<std::shared_ptr<PortOut>> ports;
     std::vector<std::unique_lock<std::mutex>> locks;
@@ -715,7 +768,9 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
             }
 
             ports.push_back(port);
+#ifndef SHADPS4_UWP
             locks.emplace_back(port->mutex);
+#endif
 
             // Check consistent buffer size
             if (i == 0) {
@@ -726,6 +781,22 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
             }
         }
     }
+
+#ifdef SHADPS4_UWP
+    for (u32 i = 0; i < num; ++i) {
+        if (param[i].ptr) {
+            Core::Uwp::MemoryDiagnostics::Scope diagnostic{
+                "audio_guest_copy", reinterpret_cast<uintptr_t>(param[i].ptr),
+                ports[i]->BufferSize()};
+            snapshots[i].resize(ports[i]->BufferSize());
+            if (!uwp_memory_copy(snapshots[i].data(), param[i].ptr,
+                                                snapshots[i].size()))
+                return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
+        }
+    }
+    for (const auto& port : ports)
+        locks.emplace_back(port->mutex);
+#endif
 
     // Wait for all ports to be ready
     for (u32 i = 0; i < num; i++) {
@@ -748,7 +819,11 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
     // Copy data to all ports
     for (u32 i = 0; i < num; i++) {
         if (param[i].ptr != nullptr) {
+#ifdef SHADPS4_UWP
+            std::memcpy(ports[i]->output_buffer, snapshots[i].data(), snapshots[i].size());
+#else
             std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
+#endif
             ports[i]->output_ready = true;
         }
     }

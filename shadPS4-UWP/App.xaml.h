@@ -1,6 +1,6 @@
 ﻿//
 // App.xaml.h
-// Declaração da classe App.
+// App class declaration.
 //
 
 #pragma once
@@ -11,7 +11,7 @@
 namespace shadPS4_UWP
 {
 		/// <summary>
-	/// Fornece o comportamento específico do aplicativo para complementar a classe Application padrão.
+	/// Provides application-specific behavior to supplement the default Application class.
 	/// </summary>
 	ref class App sealed
 	{

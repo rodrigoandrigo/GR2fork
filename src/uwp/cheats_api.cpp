@@ -30,7 +30,7 @@ std::map<std::string, bool> enabled_cheats;
 std::string Component(const std::string& name) {
     if (name.empty() || name.size() > 200 || name == "." || name == ".." ||
         name.find_first_of("/\\:") != std::string::npos)
-        throw std::runtime_error("Nome de arquivo inválido.");
+        throw std::runtime_error("Invalid filename.");
     return name;
 }
 std::string Version(std::string value) {
@@ -42,10 +42,10 @@ bool Compatible(std::string version, const std::string& game) {
 }
 std::string Read(const fs::path& path) {
     if (fs::file_size(path) > 4 * 1024 * 1024)
-        throw std::runtime_error("Arquivo de cheats/patches muito grande.");
+        throw std::runtime_error("Cheats/patches file is too large.");
     std::ifstream stream(path, std::ios::binary);
     if (!stream)
-        throw std::runtime_error("Não foi possível ler o arquivo.");
+        throw std::runtime_error("Could not read the file.");
     return {std::istreambuf_iterator<char>(stream), {}};
 }
 void Write(const fs::path& path, const std::string& text) {
@@ -61,19 +61,19 @@ void Write(const fs::path& path, const std::string& text) {
         stream.write(text.data(), text.size());
         stream.close();
         if (!stream)
-            throw std::runtime_error("Falha ao salvar cheats/patches.");
+            throw std::runtime_error("Failed to save cheats/patches.");
     }
     if (!(fs::exists(path)
               ? ReplaceFileFromAppW(path.c_str(), temporary.c_str(), nullptr, 0, nullptr, nullptr)
               : MoveFileFromAppW(temporary.c_str(), path.c_str())))
-        throw std::runtime_error("Falha ao substituir o arquivo de cheats/patches.");
+        throw std::runtime_error("Failed to replace the cheats/patches file.");
 }
 template <typename T>
 auto Wait(T operation) {
     if (operation.wait_for(std::chrono::seconds(30)) ==
         winrt::Windows::Foundation::AsyncStatus::Started) {
         operation.Cancel();
-        throw std::runtime_error("Tempo limite do download excedido.");
+        throw std::runtime_error("Download timed out.");
     }
     return operation.GetResults();
 }
@@ -86,7 +86,7 @@ std::string Download(const std::string& url, uint32_t limit = 4 * 1024 * 1024) {
     response.EnsureSuccessStatusCode();
     if (const auto length = response.Content().Headers().ContentLength();
         length && length.Value() > limit)
-        throw std::runtime_error("Download muito grande.");
+        throw std::runtime_error("Download is too large.");
     auto stream = Wait(response.Content().ReadAsInputStreamAsync());
     std::string result;
     for (;;) {
@@ -96,7 +96,7 @@ std::string Download(const std::string& url, uint32_t limit = 4 * 1024 * 1024) {
         if (!buffer.Length())
             break;
         if (buffer.Length() > limit - result.size())
-            throw std::runtime_error("Download muito grande.");
+            throw std::runtime_error("Download is too large.");
         result.append(reinterpret_cast<const char*>(buffer.data()), buffer.Length());
     }
     return result;
@@ -110,7 +110,7 @@ fs::path File(const json& request, bool patch) {
         return Root(false) / Component(request.at("file").get<std::string>());
     const auto repo = request.at("repository").get<std::string>();
     if (repo != "shadPS4" && repo != "GoldHEN")
-        throw std::runtime_error("Repositório desconhecido.");
+        throw std::runtime_error("Unknown repository.");
     return Root(true) / repo / Component(request.at("file").get<std::string>());
 }
 json Ids(pugi::xml_document& doc) {
@@ -212,7 +212,7 @@ void DownloadCheats(const std::string& repo, const std::string& serial) {
         const auto data = Download(base + (gold ? "json/" : "CHEATS/") + filename);
         const auto document = json::parse(data);
         if (!document.contains("mods") || !document["mods"].is_array())
-            throw std::runtime_error("Formato de cheats inválido.");
+            throw std::runtime_error("Invalid cheat format.");
         Write(Root(false) / filename, data);
     }
 }
@@ -224,7 +224,7 @@ void DownloadPatches(const std::string& repo, const std::string& serial) {
                  64 * 1024 * 1024);
     mz_zip_archive zip{};
     if (!mz_zip_reader_init_mem(&zip, archive.data(), archive.size(), 0))
-        throw std::runtime_error("Arquivo ZIP de patches inválido.");
+        throw std::runtime_error("Invalid patch ZIP archive.");
     SCOPE_EXIT {
         mz_zip_reader_end(&zip);
     };
@@ -233,7 +233,7 @@ void DownloadPatches(const std::string& repo, const std::string& serial) {
     for (mz_uint i = 0; i < mz_zip_reader_get_num_files(&zip); ++i) {
         mz_zip_archive_file_stat stat{};
         if (!mz_zip_reader_file_stat(&zip, i, &stat))
-            throw std::runtime_error("Falha ao ler catálogo de patches.");
+            throw std::runtime_error("Failed to read the patch catalog.");
         const std::string name = stat.m_filename;
         const auto slash = name.find('/');
         if (slash == std::string::npos)
@@ -244,13 +244,13 @@ void DownloadPatches(const std::string& repo, const std::string& serial) {
             continue;
         const auto filename = Component(relative.substr(prefix.size()));
         if (stat.m_uncomp_size > 4 * 1024 * 1024)
-            throw std::runtime_error("Patch muito grande.");
+            throw std::runtime_error("Patch is too large.");
         std::string data(stat.m_uncomp_size, '\0');
         if (!mz_zip_reader_extract_to_mem(&zip, i, data.data(), data.size(), 0))
-            throw std::runtime_error("Falha ao extrair patch.");
+            throw std::runtime_error("Failed to extract patch.");
         pugi::xml_document doc;
         if (!LoadXml(doc, data))
-            throw std::runtime_error("XML de patch inválido: " + filename);
+            throw std::runtime_error("Invalid patch XML: " + filename);
         const auto ids = Ids(doc);
         if (std::find(ids.begin(), ids.end(), serial) == ids.end())
             continue;
@@ -279,20 +279,20 @@ void DownloadPatches(const std::string& repo, const std::string& serial) {
 }
 void ApplyCheat(const json& request, const std::string& serial, const std::string& version) {
     if (shadps4_get_state() != SHADPS4_RUNNING)
-        throw std::runtime_error("Inicie este jogo antes de aplicar cheats.");
+        throw std::runtime_error("Start this game before applying cheats.");
     auto* memory_manager = Common::Singleton<Core::MemoryManager>::Instance();
     Core::MemoryManager::GuestCopyScope memory_scope(memory_manager);
     if (shadps4_get_state() != SHADPS4_RUNNING || MemoryPatcher::g_game_serial != serial ||
         !MemoryPatcher::g_eboot_address || !MemoryPatcher::g_eboot_image_size)
-        throw std::runtime_error("Inicie este jogo antes de aplicar cheats.");
+        throw std::runtime_error("Start this game before applying cheats.");
     const auto actual_version =
         Common::Singleton<PSF>::Instance()->GetString("APP_VER").value_or("");
     if (!Compatible(version, std::string(actual_version)))
-        throw std::runtime_error("Versão do jogo em execução diferente da selecionada.");
+        throw std::runtime_error("The running game version differs from the selected version.");
     const auto doc = json::parse(Read(File(request, false)));
     if (!Compatible(doc.value("version", ""), version) ||
         doc.value("process", "eboot.bin") != MemoryPatcher::g_eboot_name)
-        throw std::runtime_error("Cheat incompatível com a versão ou executável.");
+        throw std::runtime_error("Cheat is incompatible with this version or executable.");
     const auto& mod = doc.at("mods").at(request.at("index").get<size_t>());
     const bool enabled = request.at("enabled").get<bool>();
     std::vector<std::pair<uintptr_t, std::vector<uint8_t>>> writes;
@@ -301,23 +301,23 @@ void ApplyCheat(const json& request, const std::string& serial, const std::strin
         const auto offset = std::stoull(offset_text, nullptr, 16);
         const auto base = MemoryPatcher::g_eboot_address;
         if (offset > INT32_MAX || (mod.contains("hint") && offset < 0x400000))
-            throw std::runtime_error("Endereço de cheat inválido.");
+            throw std::runtime_error("Invalid cheat address.");
         const auto address = base + offset - (mod.contains("hint") ? 0x400000 : 0);
         const auto value = memory.at(enabled ? "on" : "off").get<std::string>();
         if (value.empty() || value.size() % 2 || value.size() > 65536 ||
             !std::ranges::all_of(value, [](unsigned char c) { return std::isxdigit(c); }))
-            throw std::runtime_error("Bytes de cheat inválidos.");
+            throw std::runtime_error("Invalid cheat bytes.");
         std::vector<uint8_t> bytes;
         for (size_t i = 0; i < value.size(); i += 2)
             bytes.push_back(static_cast<uint8_t>(std::stoul(value.substr(i, 2), nullptr, 16)));
         if (!memory_manager->IsValidMapping(address, bytes.size()))
-            throw std::runtime_error("Cheat aponta para memória guest não mapeada.");
+            throw std::runtime_error("Cheat points to unmapped guest memory.");
         writes.emplace_back(address, std::move(bytes));
     }
     for (const auto& [address, bytes] : writes) {
         if (!memory_manager->TryWriteBacking(reinterpret_cast<void*>(address), bytes.data(),
                                              bytes.size()))
-            throw std::runtime_error("Não foi possível escrever na memória guest.");
+            throw std::runtime_error("Could not write to guest memory.");
         FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), bytes.size());
     }
     const auto key = serial + "/" + request.at("file").get<std::string>() + "/" +
@@ -332,7 +332,7 @@ json Request(const json& request) {
     fs::create_directories(Root(true));
     const auto repo = request.value("repository", "shadPS4");
     if (repo != "shadPS4" && repo != "GoldHEN")
-        throw std::runtime_error("Repositório desconhecido.");
+        throw std::runtime_error("Unknown repository.");
     if (operation == "download_cheats")
         DownloadCheats(repo, serial);
     else if (operation == "download_patches")
@@ -343,10 +343,10 @@ json Request(const json& request) {
         const auto path = File(request, true);
         pugi::xml_document doc;
         if (!LoadXml(doc, Read(path)))
-            throw std::runtime_error("XML de patch inválido.");
+            throw std::runtime_error("Invalid patch XML.");
         const auto ids = Ids(doc);
         if (std::find(ids.begin(), ids.end(), serial) == ids.end())
-            throw std::runtime_error("Patch pertence a outro jogo.");
+            throw std::runtime_error("Patch belongs to another game.");
         size_t index{};
         bool found{};
         for (auto meta : doc.child("Patch").children("Metadata")) {
@@ -354,7 +354,7 @@ json Request(const json& request) {
                 continue;
             const bool enabled = request.at("enabled").get<bool>();
             if (enabled && !Compatible(meta.attribute("AppVer").as_string(), version))
-                throw std::runtime_error("Patch incompatível com a versão selecionada.");
+                throw std::runtime_error("Patch is incompatible with the selected version.");
             auto attr = meta.attribute("isEnabled");
             if (!attr)
                 attr = meta.append_attribute("isEnabled");
@@ -362,7 +362,7 @@ json Request(const json& request) {
             found = true;
         }
         if (!found)
-            throw std::runtime_error("Patch desconhecido.");
+            throw std::runtime_error("Unknown patch.");
         Write(path, Xml(doc));
         Reindex(path.parent_path());
     } else if (operation == "delete_cheats" || operation == "delete_patches") {
@@ -371,7 +371,7 @@ json Request(const json& request) {
         if (operation == "delete_patches")
             Reindex(path.parent_path());
     } else if (operation != "list")
-        throw std::runtime_error("Operação desconhecida.");
+        throw std::runtime_error("Unknown operation.");
     if (shadps4_get_state() != SHADPS4_RUNNING)
         enabled_cheats.clear();
     return Snapshot(serial, version);
@@ -386,7 +386,7 @@ int32_t shadps4_cheats_request(const char* request, char* response, uint32_t cap
     int32_t status{};
     try {
         if (shadps4_get_state() != SHADPS4_READY && shadps4_get_state() != SHADPS4_RUNNING)
-            throw std::runtime_error("Aguarde a inicialização do núcleo.");
+            throw std::runtime_error("Wait for core initialization.");
         result = Request(json::parse(request));
     } catch (const winrt::hresult_error& error) {
         result = {{"error", winrt::to_string(error.message())}};

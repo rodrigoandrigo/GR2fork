@@ -32,7 +32,7 @@ void AddressSpace::PinMappings(VAddr address, u64 size, bool protect) {
     const auto key = std::pair{address, size};
     if (protect) {
         impl->mapping_leases[key].push_back(
-            AcquireHostAccess(reinterpret_cast<void*>(address), size, false));
+            AcquireHostAccess(reinterpret_cast<void*>(address), size, true));
     } else if (auto it = impl->mapping_leases.find(key); it != impl->mapping_leases.end()) {
         it->second.pop_back();
         if (it->second.empty())
@@ -74,8 +74,6 @@ bool AddressSpace::CopyBacking(void* destination, const void* source, u64 size) 
     if (reinterpret_cast<uintptr_t>(source) - base >= BackingSize &&
         reinterpret_cast<uintptr_t>(destination) - base >= BackingSize)
         return false;
-    auto read = AcquireHostAccess(source, size, false);
-    auto write = AcquireHostAccess(destination, size, false);
     Impl::Check(uwp_memory_copy(destination, source, size), "copy physical backing");
     return true;
 }

@@ -1,6 +1,6 @@
 ﻿#pragma once
 
-#include <ppltasks.h>	// Para create_task
+#include <ppltasks.h>	// For create_task.
 
 namespace DX
 {
@@ -8,12 +8,12 @@ namespace DX
 	{
 		if (FAILED(hr))
 		{
-			// Defina um ponto de interrupção nesta linha para detectar erros da API do Win32.
+			// Set a breakpoint on this line to catch Win32 API errors.
 			throw Platform::Exception::CreateException(hr);
 		}
 	}
 
-	// Função que lê de um arquivo binário assincronamente.
+	// Reads a binary file asynchronously.
 	inline Concurrency::task<std::vector<byte>> ReadDataAsync(const std::wstring& filename)
 	{
 		using namespace Windows::Storage;
@@ -33,28 +33,28 @@ namespace DX
 		});
 	}
 
-	// Converte um tamanho em DPI (pixel independente de dispositivo) em um tamanho em pixels físicos.
+	// Convert a size in DIPs (device-independent pixels) to physical pixels.
 	inline float ConvertDipsToPixels(float dips, float dpi)
 	{
 		static const float dipsPerInch = 96.0f;
-		return floorf(dips * dpi / dipsPerInch + 0.5f); // Arredonde para o inteiro mais próximo.
+		return floorf(dips * dpi / dipsPerInch + 0.5f); // Round to the nearest integer.
 	}
 
 #if defined(_DEBUG)
-	// Verifique o suporte de Camadas SDK.
+	// Check SDK layer support.
 	inline bool SdkLayersAvailable()
 	{
 		HRESULT hr = D3D11CreateDevice(
 			nullptr,
-			D3D_DRIVER_TYPE_NULL,       // Não é necessário criar um dispositivo de hardware real.
+			D3D_DRIVER_TYPE_NULL,       // No actual hardware device is required.
 			0,
-			D3D11_CREATE_DEVICE_DEBUG,  // Verifique as camadas do SDK.
-			nullptr,                    // Qualquer nível de recurso servirá.
+			D3D11_CREATE_DEVICE_DEBUG,  // Check the SDK layers.
+			nullptr,                    // Any feature level is sufficient.
 			0,
-			D3D11_SDK_VERSION,          // Defina sempre como D3D11_SDK_VERSION para aplicativos da Microsoft Store.
-			nullptr,                    // Não é necessário manter a referência do dispositivo D3D.
-			nullptr,                    // Não é necessário saber o nível do recurso.
-			nullptr                     // Não é necessário manter a referência do contexto do dispositivo D3D.
+			D3D11_SDK_VERSION,          // Always set to D3D11_SDK_VERSION for Microsoft Store applications.
+			nullptr,                    // No need to retain the D3D device reference.
+			nullptr,                    // No need to retrieve the feature level.
+			nullptr                     // No need to retain the D3D device context reference.
 			);
 
 		return SUCCEEDED(hr);

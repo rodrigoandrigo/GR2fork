@@ -14,25 +14,25 @@ using namespace Platform;
 
 namespace DisplayMetrics
 {
-	// Monitores de alta resolução podem exigir muita energia da bateria e GPU para renderização.
-	// Telefones de alta resolução, por exemplo, talvez tenham problemas de vida útil curta da bateria se
-	// jogos tentam renderizar em 60 quadros por segundo com total fidelidade.
-	// A decisão de renderizar com fidelidade total em todas as plataformas e fatores forma
-	// deve ser proposital.
+	// High-resolution displays can require substantial battery and GPU power to render.
+	// High-resolution phones, for example, may suffer from short battery life if
+	// games try to render at 60 frames per second at full fidelity.
+	// The decision to render at full fidelity across all platforms and form factors
+	// should be deliberate.
 	static const bool SupportHighResolutions = false;
 
-	// Os limites padrão que definem uma exibição de "alta resolução". Se os limites
-	// forem excedidos e SupportHighResolutions for false, as dimensões serão escaladas
-	// em 50%.
-	static const float DpiThreshold = 192.0f;		// 200% da exibição padrão da área de trabalho.
-	static const float WidthThreshold = 1920.0f;	// Largura de 1080p.
-	static const float HeightThreshold = 1080.0f;	// Altura de 1080p.
+	// Default thresholds defining a high-resolution display. If these thresholds
+	// are exceeded and SupportHighResolutions is false, dimensions are scaled
+	// by 50%.
+	static const float DpiThreshold = 192.0f;		// 200% of the standard desktop display density.
+	static const float WidthThreshold = 1920.0f;	// 1080p width.
+	static const float HeightThreshold = 1080.0f;	// 1080p height.
 };
 
-// Constantes usadas para calcular as rotações de tela.
+// Constants used to calculate screen rotations.
 namespace ScreenRotation
 {
-	// Rotação Z de 0 grau
+	// Zero-degree Z rotation.
 	static const XMFLOAT4X4 Rotation0( 
 		1.0f, 0.0f, 0.0f, 0.0f,
 		0.0f, 1.0f, 0.0f, 0.0f,
@@ -40,7 +40,7 @@ namespace ScreenRotation
 		0.0f, 0.0f, 0.0f, 1.0f
 		);
 
-	// Rotação Z de 90 graus
+	// 90-degree Z rotation.
 	static const XMFLOAT4X4 Rotation90(
 		0.0f, 1.0f, 0.0f, 0.0f,
 		-1.0f, 0.0f, 0.0f, 0.0f,
@@ -48,7 +48,7 @@ namespace ScreenRotation
 		0.0f, 0.0f, 0.0f, 1.0f
 		);
 
-	// Rotação Z de 180 graus
+	// 180-degree Z rotation.
 	static const XMFLOAT4X4 Rotation180(
 		-1.0f, 0.0f, 0.0f, 0.0f,
 		0.0f, -1.0f, 0.0f, 0.0f,
@@ -56,7 +56,7 @@ namespace ScreenRotation
 		0.0f, 0.0f, 0.0f, 1.0f
 		);
 
-	// Rotação Z de 270 graus
+	// 270-degree Z rotation.
 	static const XMFLOAT4X4 Rotation270( 
 		0.0f, -1.0f, 0.0f, 0.0f,
 		1.0f, 0.0f, 0.0f, 0.0f,
@@ -65,7 +65,7 @@ namespace ScreenRotation
 		);
 };
 
-// Construtor para DeviceResources.
+// DeviceResources constructor.
 DX::DeviceResources::DeviceResources() : 
 	m_screenViewport(),
 	m_d3dFeatureLevel(D3D_FEATURE_LEVEL_9_1),
@@ -84,19 +84,19 @@ DX::DeviceResources::DeviceResources() :
 	CreateDeviceResources();
 }
 
-// Configura os recursos que não dependem do dispositivo Direct3D.
+// Configures resources that do not depend on the Direct3D device.
 void DX::DeviceResources::CreateDeviceIndependentResources()
 {
-	// Inicializa os recursos do Direct2D.
+	// Initializes Direct2D resources.
 	D2D1_FACTORY_OPTIONS options;
 	ZeroMemory(&options, sizeof(D2D1_FACTORY_OPTIONS));
 
 #if defined(_DEBUG)
-	// Se o projeto estiver em uma compilação de depuração, habilite a depuração do Direct2D via Camadas do SDK.
+	// In debug builds, enable Direct2D debugging through the SDK layers.
 	options.debugLevel = D2D1_DEBUG_LEVEL_INFORMATION;
 #endif
 
-	// Inicialize a Fábrica Direct2D.
+	// Initialize the Direct2D factory.
 	DX::ThrowIfFailed(
 		D2D1CreateFactory(
 			D2D1_FACTORY_TYPE_SINGLE_THREADED,
@@ -106,7 +106,7 @@ void DX::DeviceResources::CreateDeviceIndependentResources()
 			)
 		);
 
-	// Inicialize a Fábrica DirectWrite.
+	// Initialize the DirectWrite factory.
 	DX::ThrowIfFailed(
 		DWriteCreateFactory(
 			DWRITE_FACTORY_TYPE_SHARED,
@@ -115,7 +115,7 @@ void DX::DeviceResources::CreateDeviceIndependentResources()
 			)
 		);
 
-	// Inicialize a Fábrica do Windows Imaging Component (WIC).
+	// Initialize the Windows Imaging Component (WIC) factory.
 	DX::ThrowIfFailed(
 		CoCreateInstance(
 			CLSID_WICImagingFactory2,
@@ -126,25 +126,25 @@ void DX::DeviceResources::CreateDeviceIndependentResources()
 		);
 }
 
-// Configura o dispositivo Direct3D e armazena identificadores e o contexto de dispositivo nele.
+// Configures the Direct3D device and stores its handles and device context.
 void DX::DeviceResources::CreateDeviceResources() 
 {
-	// Este sinalizador adiciona suporte a superfícies com uma ordenação de canal de cor diferente
-	// do padrão da API. Isso é necessário para compatibilidade com o Direct2D.
+	// This flag adds support for surfaces with a color channel ordering different
+	// from the API default. This is required for Direct2D compatibility.
 	UINT creationFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
 #if defined(_DEBUG)
 	if (DX::SdkLayersAvailable())
 	{
-		// Se o projeto estiver em uma compilação de depuração, habilite a depuração via Camadas do SDK com este sinalizador.
+		// In debug builds, enable debugging through the SDK layers with this flag.
 		creationFlags |= D3D11_CREATE_DEVICE_DEBUG;
 	}
 #endif
 
-	// Esta matriz define o conjunto de níveis de recurso de hardware do DirectX ao qual este aplicativo dará suporte.
-	// Observe que a ordem deve ser preservada.
-	// Não se esqueça de declarar o nível mínimo de recurso necessário de seu aplicativo na
-	// descrição. Supõe-se que todos os aplicativos dão suporte a 9.1, salvo indicação em contrário.
+	// This array defines the supported DirectX hardware feature levels.
+	// Preserve the order of the entries.
+	// Remember to declare the minimum feature level required by the application in its
+	// description. Applications are assumed to support 9.1 unless stated otherwise.
 	D3D_FEATURE_LEVEL featureLevels[] = 
 	{
 		D3D_FEATURE_LEVEL_12_1,
@@ -158,32 +158,32 @@ void DX::DeviceResources::CreateDeviceResources()
 		D3D_FEATURE_LEVEL_9_1
 	};
 
-	// Crie o objeto do dispositivo de API do Direct3D 11 e um contexto correspondente.
+	// Create the Direct3D 11 device object and its corresponding context.
 	ComPtr<ID3D11Device> device;
 	ComPtr<ID3D11DeviceContext> context;
 
 	HRESULT hr = D3D11CreateDevice(
-		nullptr,					// Especifique nullptr para usar o adaptador padrão.
-		D3D_DRIVER_TYPE_HARDWARE,	// Crie um dispositivo usando um driver de gráficos de hardware.
-		0,							// Deve ser 0, a menos que o driver seja D3D_DRIVER_TYPE_SOFTWARE.
-		creationFlags,				// Defina sinalizadores de compatibilidade de depuração e do Direct2D.
-		featureLevels,				// Lista de níveis de recursos aos quais este aplicativo pode dar suporte.
-		ARRAYSIZE(featureLevels),	// O tamanho da lista acima.
-		D3D11_SDK_VERSION,			// Defina sempre como D3D11_SDK_VERSION para aplicativos da Microsoft Store.
-		&device,					// Retorna o dispositivo Direct3D criado.
-		&m_d3dFeatureLevel,			// Retorna o nível de recurso do dispositivo criado.
-		&context					// Retorna o contexto imediato do dispositivo.
+		nullptr,					// Specify nullptr to use the default adapter.
+		D3D_DRIVER_TYPE_HARDWARE,	// Create a device using a hardware graphics driver.
+		0,							// Must be zero unless the driver is D3D_DRIVER_TYPE_SOFTWARE.
+		creationFlags,				// Set debugging and Direct2D compatibility flags.
+		featureLevels,				// List of feature levels supported by this application.
+		ARRAYSIZE(featureLevels),	// Size of the list above.
+		D3D11_SDK_VERSION,			// Always set to D3D11_SDK_VERSION for Microsoft Store applications.
+		&device,					// Returns the Direct3D device created.
+		&m_d3dFeatureLevel,			// Returns the feature level of the device created.
+		&context					// Returns the immediate device context.
 		);
 
 	if (FAILED(hr))
 	{
-		// Se a inicialização falhar, retorne para o dispositivo WARP.
-		// Para obter mais informações sobre o WARP, consulte: 
+		// If initialization fails, fall back to a WARP device.
+		// For more information about WARP, see:
 		// https://go.microsoft.com/fwlink/?LinkId=286690
 		DX::ThrowIfFailed(
 			D3D11CreateDevice(
 				nullptr,
-				D3D_DRIVER_TYPE_WARP, // Crie um dispositivo WARP em vez de um dispositivo de hardware.
+				D3D_DRIVER_TYPE_WARP, // Create a WARP device instead of a hardware device.
 				0,
 				creationFlags,
 				featureLevels,
@@ -196,7 +196,7 @@ void DX::DeviceResources::CreateDeviceResources()
 			);
 	}
 
-	// Armazene ponteiros para o dispositivo da API do Direct3D 11.3 e o contexto imediato.
+	// Store pointers to the Direct3D 11.3 device and immediate context.
 	DX::ThrowIfFailed(
 		device.As(&m_d3dDevice)
 		);
@@ -205,7 +205,7 @@ void DX::DeviceResources::CreateDeviceResources()
 		context.As(&m_d3dContext)
 		);
 
-	// Crie o objeto do dispositivo Direct2D e um contexto correspondente.
+	// Create the Direct2D device object and corresponding context.
 	ComPtr<IDXGIDevice3> dxgiDevice;
 	DX::ThrowIfFailed(
 		m_d3dDevice.As(&dxgiDevice)
@@ -223,10 +223,10 @@ void DX::DeviceResources::CreateDeviceResources()
 		);
 }
 
-// Esses recursos devem ser recriados sempre que o tamanho da janela for alterado.
+// These resources must be recreated whenever the window size changes.
 void DX::DeviceResources::CreateWindowSizeDependentResources() 
 {
-	// Apague o contexto específico do tamanho da janela anterior.
+	// Clear the previous window-size-specific context.
 	ID3D11RenderTargetView* nullViews[] = {nullptr};
 	m_d3dContext->OMSetRenderTargets(ARRAYSIZE(nullViews), nullViews, nullptr);
 	m_d3dRenderTargetView = nullptr;
@@ -237,9 +237,9 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 
 	UpdateRenderTargetSize();
 
-	// A largura e a altura da cadeia de troca deve basear-se na
-	// largura e na altura da orientação nativa da janela. Se a janela não estiver na
-	// orientação nativa, as dimensões deverão ser invertidas.
+	// The swap chain width and height must be based on the
+	// width and height of the window's native orientation. If the window is not in its
+	// native orientation, the dimensions must be swapped.
 	DXGI_MODE_ROTATION displayRotation = ComputeDisplayRotation();
 
 	bool swapDimensions = displayRotation == DXGI_MODE_ROTATION_ROTATE90 || displayRotation == DXGI_MODE_ROTATION_ROTATE270;
@@ -248,9 +248,9 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 
 	if (m_swapChain != nullptr)
 	{
-		// Se a cadeia de troca já existir, redimensione-a.
+		// If the swap chain already exists, resize it.
 		HRESULT hr = m_swapChain->ResizeBuffers(
-			2, // Cadeia de troca com buffer duplo.
+			2, // Double-buffered swap chain.
 			lround(m_d3dRenderTargetSize.Width),
 			lround(m_d3dRenderTargetSize.Height),
 			DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -259,11 +259,11 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 
 		if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
 		{
-			// Se o dispositivo for removido por qualquer motivo, um novo dispositivo e cadeia de troca precisarão ser criados.
+			// If the device is removed for any reason, a new device and swap chain must be created.
 			HandleDeviceLost();
 
-			// Tudo está configurado agora. Não continue a execução deste método. HandleDeviceLost reinserirá este método 
-			// e configurará corretamente o novo dispositivo.
+			// Everything is set up now. Do not continue executing this method. HandleDeviceLost will reenter
+			// this method and configure the new device correctly.
 			return;
 		}
 		else
@@ -273,24 +273,24 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 	}
 	else
 	{
-		// Caso contrário, crie um novo usando o mesmo adaptador que o dispositivo Direct3D existente.
+		// Otherwise, create a new swap chain using the same adapter as the existing Direct3D device.
 		DXGI_SCALING scaling = DXGI_SCALING_STRETCH;
 		DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {0};
 
-		swapChainDesc.Width = lround(m_d3dRenderTargetSize.Width);		// Corresponda ao tamanho da janela.
+		swapChainDesc.Width = lround(m_d3dRenderTargetSize.Width);		// Match the window size.
 		swapChainDesc.Height = lround(m_d3dRenderTargetSize.Height);
-		swapChainDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;				// Este é o formato de cadeia de troca mais comum.
+		swapChainDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;				// This is the most common swap chain format.
 		swapChainDesc.Stereo = false;
-		swapChainDesc.SampleDesc.Count = 1;								// Não use diversas amostras.
+		swapChainDesc.SampleDesc.Count = 1;								// Do not use multisampling.
 		swapChainDesc.SampleDesc.Quality = 0;
 		swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-		swapChainDesc.BufferCount = 2;									// Use o buffer duplo para minimizar a latência.
-		swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;	// Todos os aplicativos da Microsoft Store devem usar SwapEffects _FLIP_.
+		swapChainDesc.BufferCount = 2;									// Use double buffering to minimize latency.
+		swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;	// All Microsoft Store applications must use _FLIP_ swap effects.
 		swapChainDesc.Flags = 0;
 		swapChainDesc.Scaling = scaling;
 		swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 
-		// Esta sequência obtém a fábrica DXGI usada para criar o dispositivo Direct3D acima.
+		// This sequence obtains the DXGI factory used to create the Direct3D device above.
 		ComPtr<IDXGIDevice3> dxgiDevice;
 		DX::ThrowIfFailed(
 			m_d3dDevice.As(&dxgiDevice)
@@ -306,7 +306,7 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 			dxgiAdapter->GetParent(IID_PPV_ARGS(&dxgiFactory))
 			);
 
-		// Ao usar a interoperabilidade XAML, a cadeia de troca deve ser criada para composição.
+		// When using XAML interop, the swap chain must be created for composition.
 		ComPtr<IDXGISwapChain1> swapChain;
 		DX::ThrowIfFailed(
 			dxgiFactory->CreateSwapChainForComposition(
@@ -321,11 +321,11 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 			swapChain.As(&m_swapChain)
 			);
 
-		// Associe a cadeia de troca ao SwapChainPanel
-		// Alterações na interface do usuário precisarão ser enviadas de volta ao thread da IU
+		// Associate the swap chain with the SwapChainPanel.
+		// User interface changes must be dispatched back to the UI thread.
 		m_swapChainPanel->Dispatcher->RunAsync(CoreDispatcherPriority::High, ref new DispatchedHandler([=]()
 		{
-			// Obtenha a interface nativa de suporte para o SwapChainPanel
+			// Obtain the native backing interface for the SwapChainPanel.
 			ComPtr<ISwapChainPanelNative> panelNative;
 			DX::ThrowIfFailed(
 				reinterpret_cast<IUnknown*>(m_swapChainPanel)->QueryInterface(IID_PPV_ARGS(&panelNative))
@@ -336,18 +336,18 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 				);
 		}, CallbackContext::Any));
 
-		// Assegure que o DXGI não coloque na fila mais de um quadro por vez. Isso reduz a latência e
-		// garante que o aplicativo renderizará somente após cada VSync, minimizando o consumo de energia.
+		// Ensure that DXGI does not queue more than one frame at a time. This reduces latency and
+		// ensures that the application renders only after each VSync, minimizing power consumption.
 		DX::ThrowIfFailed(
 			dxgiDevice->SetMaximumFrameLatency(1)
 			);
 	}
 
-	// Defina a orientação correta da cadeia de troca e gere as
-	// transformações de matrizes 2D e 3D para renderização da cadeia de troca girada.
-	// Observe que o ângulo de rotação das transformações 2D e 3D são diferentes.
-	// Isso ocorre devido à diferença nos espaços coordenados. Além disso,
-	// a matriz 3D é especificada explicitamente para evitar erros de arredondamento.
+	// Set the correct swap chain orientation and generate the
+	// 2D and 3D matrix transforms for rendering the rotated swap chain.
+	// The rotation angles of the 2D and 3D transforms differ
+	// because of their different coordinate spaces. In addition,
+	// the 3D matrix is specified explicitly to avoid rounding errors.
 
 	switch (displayRotation)
 	{
@@ -385,7 +385,7 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 		m_swapChain->SetRotation(displayRotation)
 		);
 
-	// Configure a escala inversa na cadeia de troca
+	// Configure inverse scaling on the swap chain.
 	DXGI_MATRIX_3X2_F inverseScale = { 0 };
 	inverseScale._11 = 1.0f / m_effectiveCompositionScaleX;
 	inverseScale._22 = 1.0f / m_effectiveCompositionScaleY;
@@ -398,7 +398,7 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 		spSwapChain2->SetMatrixTransform(&inverseScale)
 		);
 
-	// Crie uma exibição de destino de renderização do buffer de fundo da cadeia de troca.
+	// Create a render target view of the swap chain back buffer.
 	ComPtr<ID3D11Texture2D1> backBuffer;
 	DX::ThrowIfFailed(
 		m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer))
@@ -412,13 +412,13 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 			)
 		);
 
-	// Crie uma exibição do estêncil de profundidade para usar com a renderização 3D, se necessário.
+	// Create a depth-stencil view for 3D rendering, if needed.
 	CD3D11_TEXTURE2D_DESC1 depthStencilDesc(
 		DXGI_FORMAT_D24_UNORM_S8_UINT, 
 		lround(m_d3dRenderTargetSize.Width),
 		lround(m_d3dRenderTargetSize.Height),
-		1, // Esta exibição do estêncil de profundidade tem somente uma textura.
-		1, // Use um único nível de mipmap.
+		1, // This depth-stencil view has only one texture.
+		1, // Use a single mipmap level.
 		D3D11_BIND_DEPTH_STENCIL
 		);
 
@@ -440,7 +440,7 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 			)
 		);
 
-	// Defina o visor de renderização 3D como destino de toda a janela.
+	// Set the 3D rendering viewport to cover the entire window.
 	m_screenViewport = CD3D11_VIEWPORT(
 		0.0f,
 		0.0f,
@@ -450,8 +450,8 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 
 	m_d3dContext->RSSetViewports(1, &m_screenViewport);
 
-	// Crie um bitmap de destino do Direct2D associado ao
-	// buffer de fundo da cadeia de troca e defina-o como o destino atual.
+	// Create a Direct2D target bitmap associated with the
+	// swap chain back buffer and set it as the current target.
 	D2D1_BITMAP_PROPERTIES1 bitmapProperties = 
 		D2D1::BitmapProperties1(
 			D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
@@ -476,46 +476,46 @@ void DX::DeviceResources::CreateWindowSizeDependentResources()
 	m_d2dContext->SetTarget(m_d2dTargetBitmap.Get());
 	m_d2dContext->SetDpi(m_effectiveDpi, m_effectiveDpi);
 
-	// A suavização do texto em escala de cinza é recomendada para todos os aplicativos da Microsoft Store.
+	// Grayscale text antialiasing is recommended for all Microsoft Store applications.
 	m_d2dContext->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 }
 
-// Determine as dimensões do destino de renderização e se ele será reduzido verticalmente.
+// Determine the render target dimensions and whether it will be scaled down.
 void DX::DeviceResources::UpdateRenderTargetSize()
 {
 	m_effectiveDpi = m_dpi;
 	m_effectiveCompositionScaleX = m_compositionScaleX;
 	m_effectiveCompositionScaleY = m_compositionScaleY;
 
-	// Para aumentar a vida útil da bateria em dispositivos de alta resolução, renderize para um destino de renderização menor
-	// e permita à GPU escalar a saída quando ela é apresentada.
+	// To improve battery life on high-resolution devices, render to a smaller render target
+	// and let the GPU scale the output when it is presented.
 	if (!DisplayMetrics::SupportHighResolutions && m_dpi > DisplayMetrics::DpiThreshold)
 	{
 		float width = DX::ConvertDipsToPixels(m_logicalSize.Width, m_dpi);
 		float height = DX::ConvertDipsToPixels(m_logicalSize.Height, m_dpi);
 
-		// Quando o dispositivo estiver na orientação retrato, altura > largura. Compare a
-		// dimensão maior com o limite de largura e a dimensão menor
-		// com o limite de altura.
+		// When the device is in portrait orientation, height exceeds width. Compare the
+		// larger dimension with the width threshold and the smaller dimension
+		// with the height threshold.
 		if (max(width, height) > DisplayMetrics::WidthThreshold && min(width, height) > DisplayMetrics::HeightThreshold)
 		{
-			// Para escalar o aplicativo, alteramos o DPI efetivo. O tamanho lógico não é alterado.
+			// To scale the application, change the effective DPI. The logical size remains unchanged.
 			m_effectiveDpi /= 2.0f;
 			m_effectiveCompositionScaleX /= 2.0f;
 			m_effectiveCompositionScaleY /= 2.0f;
 		}
 	}
 
-	// Calcule o tamanho de destino de processamento necessário em pixels.
+	// Calculate the required render target size in pixels.
 	m_outputSize.Width = std::round(m_logicalSize.Width * m_effectiveCompositionScaleX);
 	m_outputSize.Height = std::round(m_logicalSize.Height * m_effectiveCompositionScaleY);
 
-	// Evite que conteúdo do DirectX com tamanho zero seja criado.
+	// Avoid creating zero-sized DirectX content.
 	m_outputSize.Width = max(m_outputSize.Width, 1);
 	m_outputSize.Height = max(m_outputSize.Height, 1);
 }
 
-// Este método é chamado quando o controle XAML é criado (ou recriado).
+// Called when the XAML control is created or recreated.
 void DX::DeviceResources::SetSwapChainPanel(SwapChainPanel^ panel)
 {
 	DisplayInformation^ currentDisplayInformation = DisplayInformation::GetForCurrentView();
@@ -532,7 +532,7 @@ void DX::DeviceResources::SetSwapChainPanel(SwapChainPanel^ panel)
 	CreateWindowSizeDependentResources();
 }
 
-// Este método é chamado no manipulador de eventos para o evento SizeChanged.
+// Called by the SizeChanged event handler.
 void DX::DeviceResources::SetLogicalSize(Windows::Foundation::Size logicalSize)
 {
 	if (m_logicalSize != logicalSize)
@@ -542,7 +542,7 @@ void DX::DeviceResources::SetLogicalSize(Windows::Foundation::Size logicalSize)
 	}
 }
 
-// Este método é chamado no manipulador de eventos para o evento DpiChanged.
+// Called by the DpiChanged event handler.
 void DX::DeviceResources::SetDpi(float dpi)
 {
 	if (dpi != m_dpi)
@@ -553,7 +553,7 @@ void DX::DeviceResources::SetDpi(float dpi)
 	}
 }
 
-// Este método é chamado no manipulador de eventos para o evento OrientationChanged.
+// Called by the OrientationChanged event handler.
 void DX::DeviceResources::SetCurrentOrientation(DisplayOrientations currentOrientation)
 {
 	if (m_currentOrientation != currentOrientation)
@@ -563,7 +563,7 @@ void DX::DeviceResources::SetCurrentOrientation(DisplayOrientations currentOrien
 	}
 }
 
-// Este método é chamado no manipulador de eventos para o evento CompositionScaleChanged.
+// Called by the CompositionScaleChanged event handler.
 void DX::DeviceResources::SetCompositionScale(float compositionScaleX, float compositionScaleY)
 {
 	if (m_compositionScaleX != compositionScaleX ||
@@ -575,13 +575,13 @@ void DX::DeviceResources::SetCompositionScale(float compositionScaleX, float com
 	}
 }
 
-// Este método é chamado no manipulador de eventos para o evento DisplayContentsInvalidated.
+// Called by the DisplayContentsInvalidated event handler.
 void DX::DeviceResources::ValidateDevice()
 {
-	// O Dispositivo D3D não será mais válido se o adaptador padrão for alterado após o dispositivo
-	// ser criado ou se o dispositivo foi removido.
+	// The D3D device becomes invalid if the default adapter changes after device
+	// creation or if the device is removed.
 
-	// Em primeiro lugar, obtenha as informações para o adaptador padrão a partir de quando o dispositivo foi criado.
+	// First, obtain the default adapter information from when the device was created.
 
 	ComPtr<IDXGIDevice3> dxgiDevice;
 	DX::ThrowIfFailed(m_d3dDevice.As(&dxgiDevice));
@@ -598,7 +598,7 @@ void DX::DeviceResources::ValidateDevice()
 	DXGI_ADAPTER_DESC1 previousDesc;
 	DX::ThrowIfFailed(previousDefaultAdapter->GetDesc1(&previousDesc));
 
-	// Em seguida, obtenha as informações para o adaptador padrão atual.
+	// Next, obtain the current default adapter information.
 
 	ComPtr<IDXGIFactory4> currentFactory;
 	DX::ThrowIfFailed(CreateDXGIFactory1(IID_PPV_ARGS(&currentFactory)));
@@ -609,25 +609,25 @@ void DX::DeviceResources::ValidateDevice()
 	DXGI_ADAPTER_DESC1 currentDesc;
 	DX::ThrowIfFailed(currentDefaultAdapter->GetDesc1(&currentDesc));
 
-	// Se os LUIDs do adaptador não corresponderem ou se os relatórios do dispositivo tiverem sido removidos,
-	// um novo dispositivo D3D deverá ser criado.
+	// If the adapter LUIDs differ or the device reports that it was removed,
+	// a new D3D device must be created.
 
 	if (previousDesc.AdapterLuid.LowPart != currentDesc.AdapterLuid.LowPart ||
 		previousDesc.AdapterLuid.HighPart != currentDesc.AdapterLuid.HighPart ||
 		FAILED(m_d3dDevice->GetDeviceRemovedReason()))
 	{
-		// Libere referências aos recursos relacionados ao dispositivo antigo.
+		// Release references to resources associated with the old device.
 		dxgiDevice = nullptr;
 		deviceAdapter = nullptr;
 		deviceFactory = nullptr;
 		previousDefaultAdapter = nullptr;
 
-		// Crie um novo dispositivo e cadeia de troca.
+		// Create a new device and swap chain.
 		HandleDeviceLost();
 	}
 }
 
-// Recrie todos os recursos de dispositivo e configure-os de volta ao estado atual.
+// Recreate all device resources and restore their current state.
 void DX::DeviceResources::HandleDeviceLost()
 {
 	m_swapChain = nullptr;
@@ -647,14 +647,14 @@ void DX::DeviceResources::HandleDeviceLost()
 	}
 }
 
-// Registre nossa DeviceNotify para ser informado da perda e da criação de dispositivos.
+// Register DeviceNotify to receive device loss and creation notifications.
 void DX::DeviceResources::RegisterDeviceNotify(DX::IDeviceNotify* deviceNotify)
 {
 	m_deviceNotify = deviceNotify;
 }
 
-// Chame este método quando o aplicativo for suspenso. Ele fornece uma dica para o driver de que o aplicativo 
-// está entrando em estado ocioso e os buffers temporários podem ser recuperados para uso por outros aplicativos.
+// Call this method when the application is suspended. It hints to the driver that the application
+// is becoming idle and temporary buffers may be reclaimed for other applications.
 void DX::DeviceResources::Trim()
 {
 	ComPtr<IDXGIDevice3> dxgiDevice;
@@ -663,25 +663,25 @@ void DX::DeviceResources::Trim()
 	dxgiDevice->Trim();
 }
 
-// Apresente o conteúdo da cadeia de troca na tela.
+// Present the swap chain contents on screen.
 void DX::DeviceResources::Present() 
 {
-	// O primeiro argumento instrui o DXGI para bloquear até o VSync, colocando o aplicativo
-	// em suspensão até o próximo VSync. Isso garante que não desperdiçaremos ciclos renderizando
-	// quadros que nunca serão exibidos na tela.
+	// The first argument tells DXGI to block until VSync, putting the application
+	// to sleep until the next VSync. This avoids wasting cycles rendering
+	// frames that will never appear on screen.
 	DXGI_PRESENT_PARAMETERS parameters = { 0 };
 	HRESULT hr = m_swapChain->Present1(1, 0, &parameters);
 
-	// Descarte o conteúdo do destino de renderização.
-	// Esta será uma operação válida somente quando o conteúdo existente for totalmente
-	// substituído. Se retângulos dirty ou scroll forem usados, você deverá modificar essa chamada.
+	// Discard the render target contents.
+	// This operation is valid only when the existing contents will be completely
+	// replaced. If dirty or scroll rectangles are used, this call must be modified.
 	m_d3dContext->DiscardView1(m_d3dRenderTargetView.Get(), nullptr, 0);
 
-	// Descarte o conteúdo do estêncil de profundidade.
+	// Discard the depth-stencil contents.
 	m_d3dContext->DiscardView1(m_d3dDepthStencilView.Get(), nullptr, 0);
 
-	// Se o dispositivo foi removido por uma desconexão ou uma atualização de driver, 
-	// será necessário recriar todos os recursos do dispositivo.
+	// If the device was removed due to disconnection or a driver update,
+	// all device resources must be recreated.
 	if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
 	{
 		HandleDeviceLost();
@@ -692,14 +692,14 @@ void DX::DeviceResources::Present()
 	}
 }
 
-// Este método determina a rotação entre a orientação nativa do dispositivo de vídeo e o
-// orientação de exibição atual.
+// Determine the rotation between the display device's native orientation and its
+// current display orientation.
 DXGI_MODE_ROTATION DX::DeviceResources::ComputeDisplayRotation()
 {
 	DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
 
-	// Observação: NativeOrientation somente poderá ser Paisagem ou Retrato, mesmo se
-	// a enumeração DisplayOrientations tiver outros valores.
+	// NativeOrientation can only be Landscape or Portrait, even though
+	// the DisplayOrientations enumeration has other values.
 	switch (m_nativeOrientation)
 	{
 	case DisplayOrientations::Landscape:
