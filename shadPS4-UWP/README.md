@@ -1,5 +1,23 @@
 # ShadPS4-UWP
 
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://www.youtube.com/watch?v=zbCdn8frSQ8">
+        <img src="https://img.youtube.com/vi/zbCdn8frSQ8/0.jpg" alt="Video Update 2" width="320" loading="lazy">
+      </a>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://www.youtube.com/watch?v=lJJZ_3zGVFc">
+        <img src="https://img.youtube.com/vi/lJJZ_3zGVFc/0.jpg" alt="Video Update 1" width="320" loading="lazy">
+      </a>
+    </td>
+  </tr>
+</table>
+
+
+
+
 ShadPS4-UWP adapts the shadPS4 PlayStation 4 emulator to the Universal Windows Platform (UWP), with an interface for Windows and Xbox in Developer Mode.
 
 The application combines a C++/XAML and ImGui frontend with the emulation core compiled as `shadPS4.dll`. The interface lets you manage your game library, import system modules, and control execution using a controller or keyboard. The project integrates the UWP lifecycle and window resizing with game execution.
