@@ -174,7 +174,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     if (guest_info._si_signo != 0) {
         if (g_curthread &&
             g_curthread->DispatchSignal(guest_info._si_signo, &guest_info, &guest_context)) {
-            guest_context.SyncHostFromGuest(pExp->ContextRecord);
+            guest_context.SyncHostFromGuest();
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -347,7 +347,6 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
             sigaddset(&guest_signal, SIGUSR1);
             pthread_sigmask(SIG_UNBLOCK, &guest_signal, nullptr);
             if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
-                context.SyncHostFromGuest(raw_context);
                 return;
             }
             UNREACHABLE_MSG("Unhandled access violation at code address {}: {} address {}",
@@ -368,7 +367,6 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     case SIGABRT:
     case SIGSYS: {
         if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
-            context.SyncHostFromGuest(raw_context);
             return;
         }
 
@@ -390,8 +388,8 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
         break;
     }
     case SIGUSR1:
-        if (thread && thread->DispatchPendingSignals(info_p, context_p)) {
-            context.SyncHostFromGuest(raw_context);
+        if (thread) {
+            thread->DispatchPendingSignals(info_p, context_p);
         }
         break;
     default:

@@ -264,7 +264,6 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
 
     const auto write_data = [this, image_addr, copy_size, download, discard_buffer_cache, is_sync] {
         download.Invalidate();
-        MarkAsGuestMemoryChanged(image_addr, download.mapped, copy_size);
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr), download.mapped,
                                                   copy_size);
         Skipcache::Framework::Instance().BumpMemGen();
@@ -342,7 +341,6 @@ bool TextureCache::DownloadImageMemoryAsync(ImageId image_id) {
                                       device_addr = image.info.guest_address,
                                       download_size]() mutable {
         staging->Invalidate(0, download_size);
-        MarkAsGuestMemoryChanged(device_addr, staging->mapped_data.data(), download_size);
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                   staging->mapped_data.data(), download_size);
         Skipcache::Framework::Instance().BumpMemGen();
@@ -442,55 +440,11 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 
 void TextureCache::MarkAsMaybeGpuDirty(VAddr addr, size_t size) {
     ForEachImageInRegion(addr, size, [&](ImageId image_id, Image& image) {
-        // The garbage collector relies on page protection to observe guest writes to the image.
-        if (image.HasGpuValidData()) {
-            TrackImage(image_id);
-        }
-        if (image.gpu_dirty_episode.load(std::memory_order_relaxed) == 0) {
-            image.gpu_dirty_episode.store(++gpu_dirty_episodes, std::memory_order_relaxed);
+        if (image.gpu_hash == 0) {
+            // Read backing pages directly, without faulting through the guest readback path.
+            image.gpu_hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
         }
     });
-}
-
-void TextureCache::MarkAsGuestMemoryChanged(VAddr addr, const void* data, u64 size) {
-    const auto compare = [&](ImageId, Image& image) {
-        // The stamp carries the episode it was compared in, so a stamp that lands after a touch
-        // ended the episode never matches the next one.
-        const u64 episode = image.gpu_dirty_episode.load(std::memory_order_relaxed);
-        if (episode == 0 ||
-            image.guest_changed_episode.load(std::memory_order_relaxed) == episode) {
-            return;
-        }
-        const VAddr begin = std::max(addr, image.info.guest_address);
-        const VAddr end =
-            std::min<VAddr>(addr + size, image.info.guest_address + image.info.guest_size);
-        if (BackingMemoryDiffers(begin, static_cast<const u8*>(data) + (begin - addr),
-                                 end - begin)) {
-            image.guest_changed_episode.store(episode, std::memory_order_relaxed);
-        }
-    };
-    ForEachImageInRegion(addr, size, compare);
-    // The garbage collector lists the images it compares before it unregisters them.
-    if (!gc_comparing.load(std::memory_order_acquire)) {
-        return;
-    }
-    const auto scan = [&] {
-        for (const ImageId image_id : gc_compare_images) {
-            Image& image = slot_images[image_id];
-            if (image.Overlaps(addr, size)) {
-                compare(image_id, image);
-            }
-        }
-    };
-    if (liverpool == nullptr || liverpool->OnGpuThread()) {
-        scan();
-        return;
-    }
-    // The GPU thread adds to and clears the list under the mutex.
-    std::scoped_lock lk{gc_compare_mutex};
-    if (gc_comparing.load(std::memory_order_relaxed)) {
-        scan();
-    }
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -515,7 +469,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     const bool bpp_match = requested_info.num_bits == cache_image.info.num_bits;
 
     // If an image in the cache has less slices we need to expand it
-    bool recreate = cache_image.info.resources < requested_info.resources;
+    bool recreate = !cache_image.info.resources.Contains(requested_info.resources);
 
     switch (binding) {
     case BindingType::Texture:
@@ -634,7 +588,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Size and resources are greater, expand the image.
         if (image_info.type == cache_image.info.type &&
-            image_info.resources > cache_image.info.resources) {
+            !cache_image.info.resources.Contains(image_info.resources)) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -1187,7 +1141,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             if (cands != 0) {
                 ++addr_filter_calls_;
                 addr_filter_cands_ += cands;
-                if (match && match_rec.resources >= info.resources) {
+                if (match && match_rec.resources.Contains(info.resources)) {
                     Image& image = slot_images[match];
                     DEBUG_ASSERT(image.info.guest_size == match_rec.guest_size &&
                                  image.info.pixel_format == match_rec.pixel_format &&
@@ -1239,7 +1193,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // evaluation on the slow route is safe. !image_id must stay the first
     // disjunct: the short circuit keeps a null id from indexing slot_images.
     if (!image_id || (exact_fmt && info.pixel_format != slot_images[image_id].info.pixel_format) ||
-        slot_images[image_id].info.resources < info.resources) [[unlikely]] {
+        !slot_images[image_id].info.resources.Contains(info.resources)) [[unlikely]] {
         image_id = FindImageSlow(desc, exact_fmt, image_id, image_ids, view_mip, view_slice);
     }
 
@@ -1286,7 +1240,7 @@ ImageId TextureCache::FindImageSlow(ImageDesc& desc, bool exact_fmt, ImageId ima
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources) {
+        } else if (!image_resolved.info.resources.Contains(info.resources)) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
@@ -1662,10 +1616,10 @@ void TextureCache::RefreshImage(Image& image) {
         image.cpu_hash = hash;
     }
 
+    image.gpu_hash = 0;
+
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
-    const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
-    const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     SmallVector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
@@ -2157,12 +2111,11 @@ void TextureCache::GarbageCollectImages() {
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
     boost::container::small_vector<ImageId, 8> download_queue;
-    gc_comparing.store(true, std::memory_order_release);
+    boost::container::small_vector<ImageId, 8> maybe_download;
 
     const auto configure = [&](bool allow_aggressive) {
-        pressured = total_used_memory >= pressure_gc_memory || process_headroom < 400_MB;
-        aggresive = allow_aggressive &&
-                    (total_used_memory >= critical_gc_memory || process_headroom < 250_MB);
+        pressured = total_used_memory >= pressure_gc_memory;
+        aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
@@ -2196,14 +2149,12 @@ void TextureCache::GarbageCollectImages() {
                 std::scoped_lock lk{image.mutex};
                 UntrackImage(image_id);
             }
-            if (image.gpu_dirty_episode.load(std::memory_order_relaxed) != 0) {
-                // Listed before the unregister, so a write-back meanwhile still finds the image.
-                std::scoped_lock lk{gc_compare_mutex};
-                gc_compare_images.push_back(image_id);
+            UnregisterImage(image_id);
+            if (image.gpu_hash != 0) {
+                maybe_download.push_back(image_id);
             } else {
                 download_queue.push_back(image_id);
             }
-            UnregisterImage(image_id);
         } else {
             FreeImage(image_id);
         }
@@ -2226,7 +2177,7 @@ void TextureCache::GarbageCollectImages() {
     configure(false);
     image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
-    if (total_used_memory >= critical_gc_memory || process_headroom < 250_MB) {
+    if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
@@ -2273,10 +2224,10 @@ void TextureCache::GarbageCollectImages() {
         }
     };
 
-    if (!gc_compare_images.empty()) {
-        const auto owned = page_ranges(gc_compare_images);
+    if (!maybe_download.empty()) {
+        const auto owned = page_ranges(maybe_download);
         own(owned);
-        for (const auto& image_id : gc_compare_images) {
+        for (const auto& image_id : maybe_download) {
             const auto& image = slot_images[image_id];
             buffer_cache.ReadMemory(image.info.guest_address, image.info.guest_size, false, true,
                                     true);
@@ -2286,20 +2237,15 @@ void TextureCache::GarbageCollectImages() {
         scheduler.DrainPendingOperations();
         release(owned);
 
-        for (const auto& image_id : gc_compare_images) {
+        for (const auto& image_id : maybe_download) {
             const auto& image = slot_images[image_id];
-            if (image.guest_changed_episode.load(std::memory_order_relaxed) ==
-                image.gpu_dirty_episode.load(std::memory_order_relaxed)) {
-                DeleteImage(image_id);
-            } else {
+            const u64 hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
+            if (image.gpu_hash == hash) {
                 download_queue.push_back(image_id);
+            } else {
+                DeleteImage(image_id);
             }
         }
-    }
-    {
-        std::scoped_lock lk{gc_compare_mutex};
-        gc_comparing.store(false, std::memory_order_relaxed);
-        gc_compare_images.clear();
     }
 
     const auto owned = page_ranges(download_queue);

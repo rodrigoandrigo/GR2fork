@@ -3038,11 +3038,9 @@ s32 PS4_SYSV_ABI LibraryOpenFontMemoryStub(void* library, u32 mode, const void* 
         std::vector<std::string> candidates;
         candidates.emplace_back(open_path);
 
-        const auto requested_path =
-            host_path_fs.empty() ? std::filesystem::path{open_path} : host_path_fs;
-        if (!requested_path.empty()) {
-            const auto sysfonts_dir = requested_path.parent_path();
-            const auto ps4_name = requested_path.filename().string();
+        if (!host_path_fs.empty()) {
+            const auto sysfonts_dir = host_path_fs.parent_path();
+            const auto ps4_name = host_path_fs.filename().string();
             const std::filesystem::path file_path{ps4_name};
             candidates.emplace_back((sysfonts_dir / "font" / file_path).string());
             candidates.emplace_back((sysfonts_dir / "font2" / file_path).string());

@@ -29,8 +29,6 @@ static vk::Format ConvertPixelFormat(const VideoOutFormat format) {
     // frame image view.
     case VideoOutFormat::A8R8G8B8Srgb:
         return vk::Format::eR8G8B8A8Srgb;
-    case VideoOutFormat::A16R16G16B16Float:
-        return vk::Format::eR16G16B16A16Sfloat;
     case VideoOutFormat::A2R10G10B10:
     case VideoOutFormat::A2R10G10B10Srgb:
     case VideoOutFormat::A2R10G10B10Bt2020Pq:
@@ -42,7 +40,8 @@ static vk::Format ConvertPixelFormat(const VideoOutFormat format) {
     return {};
 }
 
-ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group, VAddr cpu_address) {
+ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
+                     VAddr cpu_address) noexcept {
     const auto& attrib = group.attrib;
     props = ImageProperties{
         .is_tiled = attrib.tiling_mode == TilingMode::Tile,
@@ -58,12 +57,13 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group, VAd
     size.depth = 1;
     pitch = attrib.tiling_mode == TilingMode::Linear ? size.width : (size.width + 127) & (~127);
     num_bits = attrib.pixel_format != VideoOutFormat::A16R16G16B16Float ? 32 : 64;
+    ASSERT(num_bits == 32);
 
     guest_address = cpu_address;
     UpdateSize();
 }
 
-ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint) {
+ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint) noexcept {
     props = ImageProperties{
         .is_tiled = buffer.IsTiled(),
     };
@@ -92,15 +92,10 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
         mips_layout[0] = MipInfo(guest_size, pitch, size.height, 0);
     }
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && buffer.info.alt_tile_mode;
-    if (alt_tile && AmdGpu::IsMacroTiled(array_mode)) {
-        const auto macro = AmdGpu::CalculateMacrotileMode(tile_mode, num_bits, num_samples);
-        bank_swizzle = (guest_address >> 12) & (AmdGpu::GetAltNumBanks(macro) - 1);
-        guest_address &= ~(u64(bank_swizzle) << 12);
-    }
 }
 
 ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
-                     AmdGpu::CbDbExtent hint, bool write_buffer) {
+                     AmdGpu::CbDbExtent hint, bool write_buffer) noexcept {
     tile_mode = buffer.GetTileMode();
     array_mode = AmdGpu::GetArrayMode(tile_mode);
     pixel_format = LiverpoolToVK::DepthFormat(buffer.z_info.format, buffer.stencil_info.format);
@@ -186,13 +181,13 @@ ImageInfoMemo& GetImageInfoMemo() {
 
 } // Anonymous namespace
 
-ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc)
+ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept
     : ImageInfo{sharp, desc.is_depth} {}
 
 // The shader-resource ctor consumes only is_depth from the resource; this
 // form is what ImageDesc's deferred build uses, since the resource itself is
 // out of scope by the time a staged binding first needs the info.
-ImageInfo::ImageInfo(const AmdGpu::Image& sharp, bool is_depth) {
+ImageInfo::ImageInfo(const AmdGpu::Image& sharp, bool is_depth) noexcept {
     const auto raw = std::bit_cast<std::array<u64, 4>>(sharp);
     auto& entry = GetImageInfoMemo().entries[ImageInfoMemo::Index(raw)];
     if (entry.valid && entry.tsharp == raw && entry.is_depth == is_depth) {
@@ -226,10 +221,9 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, bool is_depth) {
     num_samples = image.NumSamples();
     num_bits = NumBitsPerBlock(data_fmt);
     guest_address = image.Address();
-    alt_tile = image.alt_tile_mode && Libraries::Kernel::sceKernelIsNeoMode();
-    if (alt_tile) {
+    if (image.alt_tile_mode) {
         bank_swizzle = sharp.GetBankSwizzle();
-        guest_address &= ~(u64(bank_swizzle) << 12);
+        alt_tile = Libraries::Kernel::sceKernelIsNeoMode();
     }
     UpdateSize();
 
@@ -245,7 +239,7 @@ bool ImageInfo::IsCompatible(const ImageInfo& info) const {
            num_samples == info.num_samples && num_bits == info.num_bits;
 }
 
-void ImageInfo::UpdateSize() {
+void ImageInfo::UpdateSize() noexcept {
     ASSERT_MSG(array_mode != AmdGpu::ArrayMode::ArrayLinearGeneral,
                "Unhandled array mode: ArrayLinearGeneral");
     if (std::has_single_bit(pitch) && std::bit_width(pitch) <= MAX_DIM_LOG2 &&

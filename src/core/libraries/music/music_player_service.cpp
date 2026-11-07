@@ -56,11 +56,7 @@ public:
         std::scoped_lock lock(m_mutex);
         m_tracks.clear();
         m_tracklists.clear();
-        m_usb_devices.clear();
-        m_in_transaction = false;
         m_tracklist_version++;
-        std::scoped_lock event_lock{m_event_mutex};
-        m_event_queue = {};
     }
 
     s32 SetUsbStorageDeviceInfo(const OrbisMusicPlayerUsbDeviceInfo* devices, u32 count) {

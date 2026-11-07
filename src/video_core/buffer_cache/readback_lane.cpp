@@ -67,7 +67,6 @@ ReadbackLanes::~ReadbackLanes() {
         std::scoped_lock lk{mutex};
         stopping = true;
     }
-    job_cv.notify_all();
     lanes.clear();
 }
 
@@ -89,42 +88,19 @@ void ReadbackLanes::Run(Lane& lane, std::stop_token stop) {
         Job* job{};
         {
             std::unique_lock lk{mutex};
-            Common::CondvarWait(job_cv, lk, stop,
-                                [this] { return stopping || !pending.empty(); });
+            Common::CondvarWait(job_cv, lk, stop, [this] { return !pending.empty(); });
             if (pending.empty()) {
                 return;
             }
             job = pending.front();
             pending.erase(pending.begin());
         }
-        bool failed = false;
-        try {
-            Process(lane, *job);
-        } catch (const std::exception& error) {
-            LOG_ERROR(Render_Vulkan, "Readback copy failed: {}", error.what());
-            failed = true;
-        } catch (...) {
-            LOG_ERROR(Render_Vulkan, "Readback copy failed");
-            failed = true;
-        }
+        Process(lane, *job);
         {
             std::scoped_lock lk{mutex};
-            if (failed) {
-                stopping = true;
-                job->copied.reset();
-                for (auto* pending_job : pending) {
-                    pending_job->copied.reset();
-                    pending_job->done = true;
-                }
-                pending.clear();
-            }
             job->done = true;
         }
         done_cv.notify_all();
-        if (failed) {
-            job_cv.notify_all();
-            return;
-        }
     }
 }
 

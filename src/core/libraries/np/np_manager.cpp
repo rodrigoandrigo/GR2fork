@@ -27,11 +27,6 @@ static bool g_shadnet_enabled = false;
 static s32 g_firmware_version = -1;
 static s32 g_active_requests = 0;
 static std::mutex g_request_mutex;
-static s8 g_default_age_restriction{};
-static std::vector<OrbisNpAgeRestriction> g_age_restrictions;
-static OrbisNpTitleId g_title_id{};
-static OrbisNpTitleSecret g_title_secret{};
-static bool g_title_id_set{};
 
 static std::map<std::string, std::function<void()>> g_np_callbacks;
 static std::mutex g_np_callbacks_mutex;
@@ -83,22 +78,6 @@ static s8 GetAgeFromProfile(Libraries::UserService::OrbisUserServiceUserId user_
         return 13;
     }
     return static_cast<s8>(v);
-}
-
-static bool MeetsContentRestriction(s32 user_id) {
-    OrbisNpCountryCode country{};
-    FillCountryCodeFromProfile(user_id, &country);
-    s8 required_age = g_default_age_restriction;
-    for (const auto& restriction : g_age_restrictions) {
-        if (std::tolower(static_cast<unsigned char>(restriction.country_code.country_code[0])) ==
-                std::tolower(static_cast<unsigned char>(country.country_code[0])) &&
-            std::tolower(static_cast<unsigned char>(restriction.country_code.country_code[1])) ==
-                std::tolower(static_cast<unsigned char>(country.country_code[1]))) {
-            required_age = restriction.age;
-            break;
-        }
-    }
-    return GetAgeFromProfile(user_id) >= required_age;
 }
 
 static void FillDateOfBirthFromProfile(Libraries::UserService::OrbisUserServiceUserId user_id,
@@ -242,9 +221,6 @@ s32 PS4_SYSV_ABI sceNpCheckNpAvailabilityA(s32 req_id,
         return err;
     if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
-    }
-    if (!MeetsContentRestriction(user_id)) {
-        return CompleteRequest(*req, ORBIS_NP_ERROR_AGE_RESTRICTION);
     }
     LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, user_id = {}", req_id, user_id);
     return CompleteRequest(*req, ORBIS_OK);
@@ -770,36 +746,19 @@ s32 PS4_SYSV_ABI sceNpHasSignedUp(Libraries::UserService::OrbisUserServiceUserId
 }
 
 s32 PS4_SYSV_ABI sceNpSetContentRestriction(const OrbisNpContentRestriction* restriction) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     if (restriction == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
     if (restriction->size != sizeof(OrbisNpContentRestriction)) {
         return ORBIS_NP_ERROR_INVALID_SIZE;
     }
-    if (restriction->default_age_restriction < 0 || restriction->age_restriction_count < 0 ||
-        restriction->age_restriction_count > 0x100) {
+    if (restriction->default_age_restriction < 0 || restriction->age_restriction_count > 0x100) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
     if (restriction->age_restriction_count > 0 && restriction->age_restriction == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    std::vector<OrbisNpAgeRestriction> restrictions;
-    try {
-        for (s32 i = 0; i < restriction->age_restriction_count; ++i) {
-            const auto& entry = restriction->age_restriction[i];
-            const auto& code = entry.country_code.country_code;
-            if (entry.age < 0 || !std::isalpha(static_cast<unsigned char>(code[0])) ||
-                !std::isalpha(static_cast<unsigned char>(code[1]))) {
-                return ORBIS_NP_ERROR_INVALID_ARGUMENT;
-            }
-            restrictions.push_back(entry);
-        }
-    } catch (const std::bad_alloc&) {
-        return ORBIS_NP_ERROR_OUT_OF_MEMORY;
-    }
-    std::scoped_lock lock{g_request_mutex};
-    g_default_age_restriction = restriction->default_age_restriction;
-    g_age_restrictions = std::move(restrictions);
     return ORBIS_OK;
 }
 
@@ -809,20 +768,7 @@ s32 PS4_SYSV_ABI sceNpSetNpTitleId(const OrbisNpTitleId* title_id,
         LOG_ERROR(Lib_NpManager, "called with invalid arguments");
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (title_id->id[12] != '\0' ||
-        !std::all_of(std::begin(title_id->id), std::begin(title_id->id) + 12, [](char c) {
-            return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-        })) {
-        return ORBIS_NP_ERROR_INVALID_NP_TITLE_ID;
-    }
-    std::scoped_lock lock{g_request_mutex};
-    if (g_title_id_set && std::memcmp(g_title_id.id, title_id->id, sizeof(g_title_id.id)) != 0) {
-        return ORBIS_NP_ERROR_INCONSISTENT_NP_TITLE_ID;
-    }
-    g_title_id = *title_id;
-    g_title_secret = *title_secret;
-    g_title_id_set = true;
-    LOG_INFO(Lib_NpManager, "Registered NP title {}", title_id->id);
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called, title_id = {}", title_id->id);
     return ORBIS_OK;
 }
 
@@ -1263,14 +1209,6 @@ void DeregisterNpCallback(std::string key) {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    {
-        std::scoped_lock lock{g_request_mutex};
-        g_default_age_restriction = 0;
-        g_age_restrictions.clear();
-        g_title_id = {};
-        g_title_secret = {};
-        g_title_id_set = false;
-    }
     ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&g_firmware_version) == ORBIS_OK,
                "Failed to get compiled SDK version.");
     g_shadnet_enabled = EmulatorSettings.IsShadNetEnabled();

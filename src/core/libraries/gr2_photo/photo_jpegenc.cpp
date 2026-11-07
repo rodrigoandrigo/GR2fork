@@ -189,7 +189,7 @@ static int PackImage(const OrbisJpegEncEncodeParam* param, std::vector<u8>& pack
 }
 
 // The game draws the photo between creating the encoder and encoding the photo. A draw skipped
-// for a pipeline still compiling would leave the photo black, so those compiles are waited for.
+// for a shader or pipeline still compiling would leave the photo black, so those are waited for.
 s32 PS4_SYSV_ABI sceJpegEncCreate(const OrbisJpegEncCreateParam* param, void* memory,
                                   u32 memory_size, OrbisJpegEncHandle* handle) {
     const s32 result = Libraries::JpegEnc::sceJpegEncCreate(param, memory, memory_size, handle);

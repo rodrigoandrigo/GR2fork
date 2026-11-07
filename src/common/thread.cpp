@@ -124,59 +124,62 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
     SetThreadPriority(handle, windows_priority);
 }
 
-bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
-                   const bool interruptible) {
-    const auto begin_sleep = std::chrono::high_resolution_clock::now();
+namespace {
+/// One waitable timer per thread, created on first use, closed on exit
+/// Uses High-Res Timer so sleeps aren't rounded up
+struct ThreadTimer {
+    HANDLE handle{};
 
-    LARGE_INTEGER interval{
-        .QuadPart = -1 * (duration.count() / 100u),
-    };
-    struct TimerCache {
-        HANDLE idle{};
-        u64 created{};
-        u64 reused{};
-        u64 failures{};
-        ~TimerCache() {
-            if (idle)
-                CloseHandle(idle);
-        }
-    };
-    thread_local TimerCache cache;
-    HANDLE timer = cache.idle;
-    cache.idle = nullptr;
-    if (!timer) {
-        timer = CreateWaitableTimer(nullptr, TRUE, nullptr);
-        if (timer)
-            ++cache.created;
-    } else {
-        ++cache.reused;
-    }
-    DWORD ret{};
-    if (timer && SetWaitableTimer(timer, &interval, 0, nullptr, nullptr, false)) {
-        ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-        CancelWaitableTimer(timer);
-    } else {
-        const auto error = GetLastError();
-        if (timer) {
-            CloseHandle(timer);
-            timer = nullptr;
-        }
-        if (++cache.failures == 1) {
-            try {
-                LOG_WARNING(Common, "[WaitTimer] fallback tid={} win32={} created={} reused={}",
-                            GetCurrentThreadId(), error, cache.created, cache.reused);
-            } catch (...) {
+    HANDLE Get() {
+        if (!handle) {
+            handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+            if (!handle) {
+                handle = CreateWaitableTimerW(nullptr, FALSE, nullptr);
             }
         }
-        const auto milliseconds = std::chrono::ceil<std::chrono::milliseconds>(duration).count();
-        ret = SleepEx(static_cast<DWORD>(std::clamp<int64_t>(milliseconds, 0, INFINITE - 1)),
-                      interruptible);
+        return handle;
     }
-    if (timer) {
-        if (!cache.idle)
-            cache.idle = timer;
-        else
-            CloseHandle(timer);
+
+    void Reset() {
+        if (handle) {
+            CloseHandle(handle);
+            handle = nullptr;
+        }
+    }
+
+    ~ThreadTimer() {
+        Reset();
+    }
+};
+thread_local ThreadTimer thread_timer;
+} // namespace
+
+bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
+                   const bool interruptible) {
+    // Zero or negative sleeps is a yield, no timer.
+    if (duration.count() <= 0) {
+        const auto ret = SleepEx(0, interruptible);
+        if (remaining) {
+            *remaining = std::chrono::nanoseconds(0);
+        }
+        return ret != WAIT_IO_COMPLETION;
+    }
+
+    const auto begin_sleep = std::chrono::high_resolution_clock::now();
+
+    // Timer interval is in 100 ns units, sleep shorter than that becomes one unit instead of 0
+    LARGE_INTEGER interval{
+        .QuadPart = -1 * std::max<s64>(duration.count() / 100, 1),
+    };
+    HANDLE timer = thread_timer.Get();
+    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
+    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
+
+    // After interrupted wait, timer is still armed, if fired later ends next sleep early.
+    // Ends timer early so it can be recreated safely.
+    if (ret != WAIT_OBJECT_0) {
+        thread_timer.Reset();
     }
 
     if (remaining) {

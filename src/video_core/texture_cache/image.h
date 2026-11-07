@@ -283,13 +283,9 @@ public:
     u32 backing_num_samples{};
     u64* memory_usage_counter{};
     u64 cpu_hash{};
+    u64 gpu_hash{};
     u64 head_hash{};
     u64 tail_hash{};
-    // Non-zero while buffer cache writes may have changed the image memory. A backing write that
-    // differs stamps the episode into guest_changed_episode; a stamp from an ended episode never
-    // matches the next one.
-    std::atomic<u64> gpu_dirty_episode{};
-    std::atomic<u64> guest_changed_episode{};
 
     struct {
         u32 texture : 1;

@@ -12,7 +12,6 @@
 
 #ifdef _WIN64
 #include <windows.h>
-#include "semaphore_diagnostics.h"
 #elif defined(__APPLE__)
 #include <dispatch/dispatch.h>
 #else
@@ -31,8 +30,6 @@ public:
     {
 #ifdef _WIN64
         sem = CreateSemaphore(nullptr, initialCount, max, nullptr);
-        initial_count = initialCount;
-        SemaphoreDiagnostics::Created(this, sem, max, initialCount);
         ASSERT_MSG(sem != nullptr, "Failed to create Win32 semaphore");
 #elif defined(__APPLE__)
         sem = dispatch_semaphore_create(initialCount);
@@ -42,16 +39,7 @@ public:
 
     ~Semaphore() {
 #ifdef _WIN64
-        const auto previous = GetLastError();
-        if (CloseHandle(sem)) {
-            ++SemaphoreDiagnostics::counters.closed;
-            --SemaphoreDiagnostics::counters.live;
-        } else {
-            const auto error = GetLastError();
-            ++SemaphoreDiagnostics::counters.close_failures;
-            SemaphoreDiagnostics::Report("CloseHandle.failed", this, sem, max, initial_count, error);
-        }
-        SetLastError(previous);
+        CloseHandle(sem);
 #elif defined(__APPLE__)
         dispatch_release(sem);
 #endif
@@ -59,14 +47,8 @@ public:
 
     void release() {
 #ifdef _WIN64
-        const bool released = ReleaseSemaphore(sem, 1, nullptr);
-        const auto error = GetLastError();
-        if (!released) {
-            ++SemaphoreDiagnostics::counters.release_failures;
-            SemaphoreDiagnostics::Report("ReleaseSemaphore.failed", this, sem, max, initial_count, error);
-        }
-        SetLastError(error);
-        ASSERT_MSG(released, "Failed to release Win32 semaphore: {}", error);
+        ASSERT_MSG(ReleaseSemaphore(sem, 1, nullptr) != 0, "Failed to release Win32 semaphore: {}",
+                   GetLastError());
 #elif defined(__APPLE__)
         dispatch_semaphore_signal(sem);
 #else
@@ -76,21 +58,13 @@ public:
 
     void acquire() {
 #ifdef _WIN64
-        SemaphoreDiagnostics::Waiting waiting;
         for (;;) {
             u64 res = WaitForSingleObjectEx(sem, INFINITE, true);
-            const auto error = GetLastError();
             if (res == WAIT_OBJECT_0) {
                 return;
             }
-            if (res != WAIT_IO_COMPLETION) {
-                ++SemaphoreDiagnostics::counters.wait_failures;
-                SemaphoreDiagnostics::Report("wait.failed", this, sem, max, initial_count, error,
-                                               static_cast<DWORD>(res));
-            }
-            SetLastError(error);
             ASSERT_MSG(res == WAIT_IO_COMPLETION,
-                       "Unexpected Win32 semaphore wait result {:#x}: {}", res, error);
+                       "Unexpected Win32 semaphore wait result {:#x}: {}", res, GetLastError());
         }
 #elif defined(__APPLE__)
         for (;;) {
@@ -106,9 +80,7 @@ public:
 
     bool try_acquire() {
 #ifdef _WIN64
-        const auto result = WaitForSingleObjectEx(sem, 0, true);
-        RecordWaitResult(result, GetLastError());
-        return result == WAIT_OBJECT_0;
+        return WaitForSingleObjectEx(sem, 0, true) == WAIT_OBJECT_0;
 #elif defined(__APPLE__)
         return dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW) == 0;
 #else
@@ -120,9 +92,7 @@ public:
     // non-alertable call; the native Darwin and standard C++ semaphore calls already behave so.
     bool try_acquire_pending() {
 #ifdef _WIN64
-        const auto result = WaitForSingleObjectEx(sem, 0, false);
-        RecordWaitResult(result, GetLastError());
-        return result == WAIT_OBJECT_0;
+        return WaitForSingleObjectEx(sem, 0, false) == WAIT_OBJECT_0;
 #elif defined(__APPLE__)
         return dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW) == 0;
 #else
@@ -133,7 +103,6 @@ public:
     template <class Rep, class Period>
     bool try_acquire_for(const std::chrono::duration<Rep, Period>& rel_time) {
 #ifdef _WIN64
-        SemaphoreDiagnostics::Waiting waiting;
         using Clock = std::chrono::steady_clock;
         if (rel_time <= std::chrono::duration<Rep, Period>::zero()) {
             return try_acquire_pending();
@@ -156,7 +125,6 @@ public:
             const DWORD timeout_ms =
                 static_cast<DWORD>(std::min<s64>(remaining_ms.count(), MaxFiniteWait));
             const DWORD res = WaitForSingleObjectEx(sem, timeout_ms, true);
-            RecordWaitResult(res, GetLastError());
             if (res == WAIT_OBJECT_0) {
                 return true;
             }
@@ -184,17 +152,7 @@ public:
 
 private:
 #ifdef _WIN64
-    void RecordWaitResult(DWORD result, DWORD error) {
-        if (result == WAIT_TIMEOUT) {
-            ++SemaphoreDiagnostics::counters.timeouts;
-        } else if (result != WAIT_OBJECT_0 && result != WAIT_IO_COMPLETION) {
-            ++SemaphoreDiagnostics::counters.wait_failures;
-            SemaphoreDiagnostics::Report("wait.failed", this, sem, max, initial_count, error, result);
-        }
-        SetLastError(error);
-    }
     HANDLE sem;
-    s32 initial_count{};
 #elif defined(__APPLE__)
     dispatch_semaphore_t sem;
 #else

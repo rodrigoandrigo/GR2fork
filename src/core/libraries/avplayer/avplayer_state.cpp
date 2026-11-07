@@ -176,8 +176,7 @@ bool AvPlayerState::GetStreamInfo(u32 stream_index, AvPlayerStreamInfo& info) {
 // Called inside GAME thread
 bool AvPlayerState::Start() {
     std::unique_lock lock(m_source_mutex);
-    if (m_up_source &&
-        (m_current_state == AvState::Ready || m_current_state == AvState::Stop || StopSource())) {
+    if (m_current_state == AvState::Ready || m_current_state == AvState::Stop || Stop()) {
         m_eof_stop_event_sent = false;
         SetState(AvState::Starting);
         if (!m_up_source->Start()) {
@@ -280,11 +279,7 @@ bool AvPlayerState::EnableStream(u32 stream_index) {
 
 // Called inside GAME thread
 bool AvPlayerState::Stop() {
-    std::unique_lock lock(m_source_mutex);
-    return StopSource();
-}
-
-bool AvPlayerState::StopSource() {
+    std::shared_lock lock(m_source_mutex);
     if (m_up_source == nullptr || m_current_state == AvState::Stop) {
         return false;
     }
@@ -317,14 +312,10 @@ bool AvPlayerState::GetVideoData(AvPlayerFrameInfoEx& video_info) {
 
 bool AvPlayerState::GetAudioData(AvPlayerFrameInfo& audio_info) {
     std::shared_lock lock(m_source_mutex);
-    const bool result = m_up_source != nullptr && m_up_source->GetAudioData(audio_info);
-    static const bool trace_av = getenv("GAME_AUDIO_TRACE") != nullptr;
-    if (trace_av) {
-        LOG_INFO(Lib_AvPlayer, "GetAudioData -> {} rate={} channels={} size={} ts={}", result,
-                 audio_info.details.audio.sample_rate, audio_info.details.audio.channel_count,
-                 audio_info.details.audio.size, audio_info.timestamp);
+    if (m_up_source == nullptr) {
+        return false;
     }
-    return result;
+    return m_up_source->GetAudioData(audio_info);
 }
 
 bool AvPlayerState::IsActive() {

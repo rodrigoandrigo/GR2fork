@@ -51,7 +51,7 @@ public:
 private:
     struct Job {
         Request request;
-        std::optional<u64> copied;
+        u64 copied;
         bool done;
     };
     struct Lane;

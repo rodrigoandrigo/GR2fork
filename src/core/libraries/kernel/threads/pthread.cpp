@@ -1099,9 +1099,7 @@ static void ExceptionHandler(void*, void*, void*, PCONTEXT ctx) {
         ._si_code = POSIX_SI_LWP,
         ._si_addr = (void*)u.uc_mcontext.mc_rip,
     };
-    if (g_curthread->DispatchPendingSignals(&i, &u)) {
-        u.SyncHostFromGuest(ctx);
-    }
+    g_curthread->DispatchPendingSignals(&i, &u);
 }
 #endif
 
@@ -1200,12 +1198,15 @@ bool Pthread::DispatchSignal(s32 sig, Siginfo* info, Ucontext* context) {
 
         auto* stack = reinterpret_cast<void*>(
             (reinterpret_cast<uintptr_t>(sigaltstack.ss_sp) + sigaltstack.ss_size) & (~15ull));
-        _runOnAnotherStack(&arg, reinterpret_cast<void*>(CallbackWrapper), stack,
-                           sigaltstack.ss_sp);
+        _runOnAnotherStack(&arg, reinterpret_cast<void*>(CallbackWrapper), stack);
 
         sigaltstack.ss_flags &= ~POSIX_SS_ONSTACK;
     } else {
         CallbackWrapper(&arg);
+    }
+
+    if (context) {
+        context->SyncHostFromGuest();
     }
 
     SetGuestSigmask(old_mask);

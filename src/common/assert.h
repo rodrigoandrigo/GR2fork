@@ -12,8 +12,6 @@
 // everywhere. So let's just move the handling of the failed assert to a single cpp file.
 
 void assert_fail_impl();
-void assert_fail_msg(const char* file, int line, const char* func, fmt::string_view format,
-                     fmt::format_args args);
 [[noreturn]] void unreachable_impl();
 
 #ifdef _MSC_VER
@@ -33,7 +31,7 @@ SHAD_COLD_NO_INLINE void AssertFail(const char* file, int line, const char* func
                                     fmt::format_string<Args...> format, Args... args) {
     Common::Log::VLog(Common::Log::Class::Debug, Common::Log::Level::Critical, file, line, func,
                       format, fmt::make_format_args(args...));
-    assert_fail_msg(file, line, func, format, fmt::make_format_args(args...));
+    assert_fail_impl();
 }
 
 template <typename... Args>
@@ -42,7 +40,6 @@ template <typename... Args>
                                                       Args... args) {
     Common::Log::VLog(Common::Log::Class::Debug, Common::Log::Level::Critical, file, line, func,
                       format, fmt::make_format_args(args...));
-    assert_fail_msg(file, line, func, format, fmt::make_format_args(args...));
     unreachable_impl();
 }
 

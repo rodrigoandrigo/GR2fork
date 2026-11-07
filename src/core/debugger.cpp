@@ -1,7 +1,6 @@
 //  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "common/logging/log.h"
 #include "debugger.h"
 
 #include <iostream>
@@ -63,7 +62,7 @@ void Core::Debugger::WaitForDebuggerAttach() {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         if (--count <= 0) {
             count = 10;
-            LOG_INFO(Core, "Waiting for debugger to attach...");
+            std::cerr << "Waiting for debugger to attach..." << std::endl;
         }
     }
 }

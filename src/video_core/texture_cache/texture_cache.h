@@ -205,9 +205,6 @@ public:
     /// Marks all images as maybe GPU dirty within the provided range.
     void MarkAsMaybeGpuDirty(VAddr addr, size_t size);
 
-    /// Marks maybe GPU dirty images in the range whose memory differs from the data to be written.
-    void MarkAsGuestMemoryChanged(VAddr addr, const void* data, u64 size);
-
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
@@ -534,10 +531,6 @@ private:
     /// With texture_lru_lazy_touch only the gc tick is stamped; the garbage collector
     /// walk relinks the entry when it meets it.
     void TouchImage(Image& image) {
-        // Image is still valid
-        if (image.gpu_dirty_episode.load(std::memory_order_relaxed) != 0) {
-            image.gpu_dirty_episode.store(0, std::memory_order_relaxed);
-        }
         if (lru_lazy_touch) {
             image.gc_tick_accessed_last = gc_tick;
             return;
@@ -814,10 +807,6 @@ private:
     TileManager tile_manager;
     absl::flat_hash_map<u64, SamplerId> samplers;
     absl::flat_hash_set<ImageId> download_images;
-    boost::container::small_vector<ImageId, 8> gc_compare_images;
-    std::atomic<bool> gc_comparing{};
-    std::mutex gc_compare_mutex;
-    u64 gpu_dirty_episodes{};
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;

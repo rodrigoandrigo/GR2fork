@@ -4,7 +4,6 @@
 #pragma once
 
 #include <chrono>
-#include <atomic>
 
 #include "common/types.h"
 
@@ -60,7 +59,6 @@ public:
             const auto rel_ms = std::chrono::ceil<std::chrono::milliseconds>(abs_time - now);
             u64 res = WaitForSingleObjectEx(mtx, static_cast<u64>(rel_ms.count()), true);
             if (res == WAIT_OBJECT_0) {
-                ++held;
                 return true;
             } else if (res == WAIT_TIMEOUT) {
                 return false;
@@ -74,7 +72,6 @@ public:
 private:
 #ifdef _WIN64
     HANDLE mtx;
-    std::atomic<u32> held{};
 #else
     std::timed_mutex mtx;
 #endif

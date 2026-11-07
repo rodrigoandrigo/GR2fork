@@ -26,10 +26,17 @@
 namespace Libraries::Kernel {
 
 #ifndef _WIN32
-Ucontext::Ucontext(siginfo_t const* inf, ucontext_t* raw_context) : Ucontext{} {
+static thread_local ucontext_t* s_current_host_context = nullptr;
+#else
+static thread_local PCONTEXT s_current_host_context = nullptr;
+#endif
+
+#ifndef _WIN32
+Ucontext::Ucontext(siginfo_t const* inf, ucontext_t* raw_context) {
     if (!inf || !raw_context) {
         return;
     }
+    s_current_host_context = raw_context;
 #ifdef ARCH_X86_64
 #ifdef __APPLE__
     const auto& regs = raw_context->uc_mcontext->__ss;
@@ -103,10 +110,11 @@ Ucontext::Ucontext(siginfo_t const* inf, ucontext_t* raw_context) : Ucontext{} {
 #endif
 }
 #else
-Ucontext::Ucontext(PCONTEXT context) : Ucontext{} {
+Ucontext::Ucontext(PCONTEXT context) {
     if (!context) {
         return;
     }
+    s_current_host_context = context;
     uc_mcontext.mc_r8 = context->R8;
     uc_mcontext.mc_r9 = context->R9;
     uc_mcontext.mc_r10 = context->R10;
@@ -129,39 +137,34 @@ Ucontext::Ucontext(PCONTEXT context) : Ucontext{} {
 }
 #endif
 
-void Ucontext::SyncHostFromGuest(void* host_context) const {
-#ifdef _WIN32
-    auto* native_context = static_cast<CONTEXT*>(host_context);
-#else
-    auto* native_context = static_cast<ucontext_t*>(host_context);
-#endif
-    if (!native_context) {
+void Ucontext::SyncHostFromGuest() {
+    if (!s_current_host_context) {
         return;
     }
 
 #ifdef ARCH_X86_64
 #ifdef _WIN32
-    native_context->R8 = uc_mcontext.mc_r8;
-    native_context->R9 = uc_mcontext.mc_r9;
-    native_context->R10 = uc_mcontext.mc_r10;
-    native_context->R11 = uc_mcontext.mc_r11;
-    native_context->R12 = uc_mcontext.mc_r12;
-    native_context->R13 = uc_mcontext.mc_r13;
-    native_context->R14 = uc_mcontext.mc_r14;
-    native_context->R15 = uc_mcontext.mc_r15;
-    native_context->Rdi = uc_mcontext.mc_rdi;
-    native_context->Rsi = uc_mcontext.mc_rsi;
-    native_context->Rbp = uc_mcontext.mc_rbp;
-    native_context->Rbx = uc_mcontext.mc_rbx;
-    native_context->Rdx = uc_mcontext.mc_rdx;
-    native_context->Rax = uc_mcontext.mc_rax;
-    native_context->Rcx = uc_mcontext.mc_rcx;
-    native_context->Rsp = uc_mcontext.mc_rsp;
-    native_context->Rip = uc_mcontext.mc_rip;
-    // native_context->SegFs = static_cast<DWORD>(uc_mcontext.mc_fs);
-    // native_context->SegGs = static_cast<DWORD>(uc_mcontext.mc_gs);
+    s_current_host_context->R8 = uc_mcontext.mc_r8;
+    s_current_host_context->R9 = uc_mcontext.mc_r9;
+    s_current_host_context->R10 = uc_mcontext.mc_r10;
+    s_current_host_context->R11 = uc_mcontext.mc_r11;
+    s_current_host_context->R12 = uc_mcontext.mc_r12;
+    s_current_host_context->R13 = uc_mcontext.mc_r13;
+    s_current_host_context->R14 = uc_mcontext.mc_r14;
+    s_current_host_context->R15 = uc_mcontext.mc_r15;
+    s_current_host_context->Rdi = uc_mcontext.mc_rdi;
+    s_current_host_context->Rsi = uc_mcontext.mc_rsi;
+    s_current_host_context->Rbp = uc_mcontext.mc_rbp;
+    s_current_host_context->Rbx = uc_mcontext.mc_rbx;
+    s_current_host_context->Rdx = uc_mcontext.mc_rdx;
+    s_current_host_context->Rax = uc_mcontext.mc_rax;
+    s_current_host_context->Rcx = uc_mcontext.mc_rcx;
+    s_current_host_context->Rsp = uc_mcontext.mc_rsp;
+    s_current_host_context->Rip = uc_mcontext.mc_rip;
+    // s_current_host_context->SegFs = static_cast<DWORD>(uc_mcontext.mc_fs);
+    // s_current_host_context->SegGs = static_cast<DWORD>(uc_mcontext.mc_gs);
 #elif __APPLE__
-    auto& regs = native_context->uc_mcontext->__ss;
+    auto& regs = s_current_host_context->uc_mcontext->__ss;
     regs.__r8 = uc_mcontext.mc_r8;
     regs.__r9 = uc_mcontext.mc_r9;
     regs.__r10 = uc_mcontext.mc_r10;
@@ -182,7 +185,7 @@ void Ucontext::SyncHostFromGuest(void* host_context) const {
     regs.__gs = uc_mcontext.mc_gs;
     regs.__rip = uc_mcontext.mc_rip;
 #elif defined(__FreeBSD__)
-    auto& regs = native_context->uc_mcontext;
+    auto& regs = s_current_host_context->uc_mcontext;
     regs.mc_r8 = uc_mcontext.mc_r8;
     regs.mc_r9 = uc_mcontext.mc_r9;
     regs.mc_r10 = uc_mcontext.mc_r10;
@@ -203,7 +206,7 @@ void Ucontext::SyncHostFromGuest(void* host_context) const {
     regs.mc_gs = uc_mcontext.mc_gs;
     regs.mc_rip = uc_mcontext.mc_rip;
 #else
-    auto& regs = native_context->uc_mcontext.gregs;
+    auto& regs = s_current_host_context->uc_mcontext.gregs;
     regs[REG_R8] = uc_mcontext.mc_r8;
     regs[REG_R9] = uc_mcontext.mc_r9;
     regs[REG_R10] = uc_mcontext.mc_r10;

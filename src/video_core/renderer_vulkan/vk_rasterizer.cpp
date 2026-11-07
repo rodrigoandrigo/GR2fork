@@ -847,9 +847,7 @@ void Rasterizer::RequestFlush(u64 tick) {
     FlushRequested();
 }
 
-void Rasterizer::MarkAsGuestMemoryChanged(VAddr address, const void* data, u64 size) {
-    texture_cache.MarkAsGuestMemoryChanged(address, data, size);
-}
+
 
 void Rasterizer::FlushRequested(bool force) {
     // No request pending, or a flush since the request submitted the batch the waiter needs.

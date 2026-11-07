@@ -590,11 +590,6 @@ s32 PS4_SYSV_ABI sceVoiceWriteToIPort(u32 port_id, const void* data, u32* size, 
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    {
-        std::scoped_lock lock{g_state.mutex};
-        g_state.initialized = false;
-        g_state.ports = {};
-    }
     LIB_FUNCTION("oV9GAdJ23Gw", "libSceVoice", 1, "libSceVoice", sceVoiceConnectIPortToOPort);
     LIB_FUNCTION("nXpje5yNpaE", "libSceVoice", 1, "libSceVoice", sceVoiceCreatePort);
     LIB_FUNCTION("b7kJI+nx2hg", "libSceVoice", 1, "libSceVoice", sceVoiceDeletePort);

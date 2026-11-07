@@ -1476,8 +1476,6 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             return dcb;
         case PM4ItOpcode::AcquireMem: {
             VideoCore::StreamCopyLane::Instance().DrainProducer();
-            if (rasterizer)
-                rasterizer->CpSync();
             break;
         }
         case PM4ItOpcode::IncrementDeCounter: {
@@ -1486,8 +1484,6 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
         }
         case PM4ItOpcode::PfpSyncMe: {
             VideoCore::StreamCopyLane::Instance().DrainProducer();
-            if (rasterizer)
-                rasterizer->CpSync();
             break;
         }
         case PM4ItOpcode::StrmoutBufferUpdate: {

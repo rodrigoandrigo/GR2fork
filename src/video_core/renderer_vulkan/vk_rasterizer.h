@@ -104,7 +104,6 @@ public:
     void Finish() override;
     void RequestFlush(u64 tick) override;
     void FlushRequested(bool force = false) override;
-    void MarkAsGuestMemoryChanged(VAddr address, const void* data, u64 size) override;
     void OnSubmit() override;
     void OnFence() override;
 

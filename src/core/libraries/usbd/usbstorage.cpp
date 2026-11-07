@@ -383,11 +383,6 @@ static s32 PS4_SYSV_ABI sceUsbStorageGetdentsClose(s32 fd) {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    {
-        std::scoped_lock lock{g_usb_getdents_mutex};
-        g_usb_getdents_table.clear();
-        g_usb_next_fd = 1;
-    }
     LIB_FUNCTION("BDDZwF5kuTc", "libSceUsbStorage", 1, "libSceUsbStorage", sceUsbStorageInit);
     LIB_FUNCTION("Wp8zHTocS5E", "libSceUsbStorage", 1, "libSceUsbStorage", sceUsbStorageTerm);
     LIB_FUNCTION("vFkdkzJgSpw", "libSceUsbStorage", 1, "libSceUsbStorage",

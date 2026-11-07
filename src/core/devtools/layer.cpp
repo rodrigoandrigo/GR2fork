@@ -299,7 +299,7 @@ static void LoadSettings(const char* line) {
         return;
     }
     if (sscanf(line, "show_advanced_debug=%d", &i) == 1) {
-        DebugState.IsShowingDebugMenuBar() = i != 0;
+        // The debug menu bar starts hidden at every boot.
         return;
     }
     if (sscanf(line, "show_frame_graph=%d", &i) == 1) {

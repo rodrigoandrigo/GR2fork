@@ -1,41 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <limits>
-#include <memory>
-#include <mutex>
-#include <unordered_map>
-#include <vector>
-#include <httplib.h>
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
-#include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/ssl2.h"
 #include "core/libraries/network/ssl2_error.h"
 
 namespace Libraries::Ssl2 {
-
-namespace {
-struct CertificateBlock {
-    std::vector<std::vector<u8>> bytes;
-    std::vector<OrbisSslData> entries;
-    u64 size{};
-};
-
-struct SslContext {
-    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> tls{nullptr, SSL_CTX_free};
-    std::unordered_map<void*, std::unique_ptr<CertificateBlock>> certificates;
-    u64 pool_size{};
-    u64 in_use{};
-    u64 peak_in_use{};
-};
-
-std::mutex context_mutex;
-std::unordered_map<s32, SslContext> contexts;
-s32 next_context_id{};
-} // namespace
 
 int PS4_SYSV_ABI CA_MGMT_extractKeyBlobEx() {
     LOG_ERROR(Lib_Ssl2, "(STUBBED) called");
@@ -137,23 +109,19 @@ int PS4_SYSV_ABI sceSslEnableVerifyOption() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceSslFreeCaCerts(s32 context_id, OrbisSslCaCerts* certs) {
-    if (!certs) {
+int PS4_SYSV_ABI sceSslFreeCaCerts(s32 ssl_ctx_id, OrbisSslCaCerts* certs) {
+    LOG_ERROR(Lib_Ssl2, "(DUMMY) called");
+    if (certs == nullptr) {
         return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
     }
-    std::scoped_lock lock{context_mutex};
-    const auto context = contexts.find(context_id);
-    if (context == contexts.end()) {
-        return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
+    if (certs->certs != nullptr) {
+        for (s32 data = 0; data < certs->num; data++) {
+            free(certs->certs[data].ptr);
+        }
+        delete (certs->certs);
     }
-    const auto allocation = context->second.certificates.find(certs->pool);
-    if (allocation == context->second.certificates.end() ||
-        allocation->second->entries.data() != certs->certs) {
-        return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
-    }
-    context->second.in_use -= allocation->second->size;
-    context->second.certificates.erase(allocation);
-    *certs = {};
+
+    // delete (certs->pool);
     return ORBIS_OK;
 }
 
@@ -172,55 +140,20 @@ int PS4_SYSV_ABI sceSslGetAlpnSelected() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceSslGetCaCerts(s32 context_id, OrbisSslCaCerts* certs) {
-    if (!certs) {
+int PS4_SYSV_ABI sceSslGetCaCerts(s32 ssl_ctx_id, OrbisSslCaCerts* certs) {
+    LOG_ERROR(Lib_Ssl2, "(DUMMY) called");
+    if (certs == nullptr) {
         return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
     }
-    std::scoped_lock lock{context_mutex};
-    const auto entry = contexts.find(context_id);
-    if (entry == contexts.end()) {
-        return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
-    }
-    auto& context = entry->second;
-    try {
-        auto block = std::make_unique<CertificateBlock>();
-        const auto* certificates =
-            X509_STORE_get0_objects(SSL_CTX_get_cert_store(context.tls.get()));
-        const u64 available = context.pool_size - context.in_use;
-        for (int i = 0; i < sk_X509_OBJECT_num(certificates); ++i) {
-            const auto* object = sk_X509_OBJECT_value(certificates, i);
-            if (X509_OBJECT_get_type(object) != X509_LU_X509) {
-                continue;
-            }
-            auto* certificate = X509_OBJECT_get0_X509(object);
-            const int size = i2d_X509(certificate, nullptr);
-            if (size <= 0) {
-                continue;
-            }
-            const u64 allocation = sizeof(OrbisSslData) + static_cast<u64>(size);
-            if (allocation > available - block->size) {
-                return ORBIS_KERNEL_ERROR_ENOMEM;
-            }
-            auto& bytes = block->bytes.emplace_back(size);
-            auto* destination = bytes.data();
-            if (i2d_X509(certificate, &destination) != size) {
-                return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
-            }
-            block->size += allocation;
-        }
-        for (auto& bytes : block->bytes) {
-            block->entries.push_back({reinterpret_cast<char*>(bytes.data()), bytes.size()});
-        }
-        OrbisSslCaCerts result{block->entries.data(), block->entries.size(), block.get()};
-        const auto bytes = block->size;
-        context.certificates.emplace(block.get(), std::move(block));
-        context.in_use += bytes;
-        context.peak_in_use = std::max(context.peak_in_use, context.in_use);
-        *certs = result;
-        return ORBIS_OK;
-    } catch (const std::bad_alloc&) {
-        return ORBIS_KERNEL_ERROR_ENOMEM;
-    }
+    // Allocate a buffer to store dummy data in.
+    const char* dummy_data = "dummy";
+    u64 dummy_length = strlen(dummy_data) + 1;
+    char* data = static_cast<char*>(malloc(dummy_length));
+    strncpy(data, dummy_data, dummy_length);
+    certs->certs = new OrbisSslData{data, dummy_length};
+    certs->num = 1;
+    certs->pool = nullptr;
+    return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSslGetCaList() {
@@ -238,17 +171,8 @@ int PS4_SYSV_ABI sceSslGetIssuerName() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceSslGetMemoryPoolStats(s32 context_id, OrbisSslMemoryPoolStats* stats) {
-    if (!stats) {
-        return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
-    }
-    std::scoped_lock lock{context_mutex};
-    const auto entry = contexts.find(context_id);
-    if (entry == contexts.end()) {
-        return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
-    }
-    const auto& context = entry->second;
-    *stats = {context.pool_size, context.peak_in_use, context.in_use, 0};
+int PS4_SYSV_ABI sceSslGetMemoryPoolStats() {
+    LOG_ERROR(Lib_Ssl2, "(STUBBED) called");
     return ORBIS_OK;
 }
 
@@ -302,33 +226,11 @@ int PS4_SYSV_ABI sceSslGetSubjectName() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceSslInit(std::size_t pool_size) {
-    if (!pool_size) {
-        return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
-    }
-    try {
-        SslContext context;
-        context.tls.reset(SSL_CTX_new(TLS_client_method()));
-        if (!context.tls) {
-            return ORBIS_KERNEL_ERROR_ENOMEM;
-        }
-        SSL_CTX_set_verify(context.tls.get(), SSL_VERIFY_PEER, nullptr);
-        if (!httplib::tls::load_system_certs(context.tls.get())) {
-            LOG_WARNING(Lib_Ssl2, "No host trust certificates available for SSL context");
-        }
-        context.pool_size = pool_size;
-        std::scoped_lock lock{context_mutex};
-        if (next_context_id == std::numeric_limits<s32>::max()) {
-            return ORBIS_KERNEL_ERROR_ENOMEM;
-        }
-        const s32 id = next_context_id + 1;
-        contexts.emplace(id, std::move(context));
-        next_context_id = id;
-        LOG_INFO(Lib_Ssl2, "Initialized SSL context {}, pool size {}", id, pool_size);
-        return id;
-    } catch (const std::bad_alloc&) {
-        return ORBIS_KERNEL_ERROR_ENOMEM;
-    }
+int PS4_SYSV_ABI sceSslInit(std::size_t poolSize) {
+    LOG_ERROR(Lib_Ssl2, "(DUMMY) called poolSize = {}", poolSize);
+    // return a value >1
+    static int id = 0;
+    return ++id;
 }
 
 int PS4_SYSV_ABI sceSslLoadCert() {
@@ -381,9 +283,9 @@ int PS4_SYSV_ABI sceSslSetVerifyCallback() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceSslTerm(s32 context_id) {
-    std::scoped_lock lock{context_mutex};
-    return contexts.erase(context_id) ? ORBIS_OK : ORBIS_SSL_ERROR_INVALID_ARGUMENT;
+int PS4_SYSV_ABI sceSslTerm() {
+    LOG_ERROR(Lib_Ssl2, "(STUBBED) called");
+    return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSslUnloadCert() {
@@ -412,11 +314,6 @@ int PS4_SYSV_ABI Func_28F8791A771D39C7() {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    {
-        std::scoped_lock lock{context_mutex};
-        contexts.clear();
-        next_context_id = 0;
-    }
     LIB_FUNCTION("Md+HYkCBZB4", "libSceSsl", 1, "libSceSsl", CA_MGMT_extractKeyBlobEx);
     LIB_FUNCTION("9bKYzKP6kYU", "libSceSsl", 1, "libSceSsl", CA_MGMT_extractPublicKeyInfo);
     LIB_FUNCTION("ipLIammTj2Q", "libSceSsl", 1, "libSceSsl", CA_MGMT_freeKeyBlob);

@@ -4,7 +4,6 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <mutex>
 #include <optional>
 #include <utility>

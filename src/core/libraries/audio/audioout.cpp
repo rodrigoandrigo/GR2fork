@@ -520,10 +520,6 @@ s32 PS4_SYSV_ABI sceAudioOutGetLastOutputTime(s32 handle, u64* output_time) {
     std::unique_lock lock{port->mutex};
     *output_time = port->last_output_time;
 
-    static const auto trace_time = getenv("GAME_AUDIO_TRACE") != nullptr;
-    if (trace_time) {
-        LOG_INFO(Lib_AudioOut, "GetLastOutputTime handle={:#x} -> {}", handle, *output_time);
-    }
     return ORBIS_OK;
 }
 
@@ -590,11 +586,6 @@ s32 PS4_SYSV_ABI sceAudioOutGetPortState(s32 handle, OrbisAudioOutPortState* sta
 
     state->rerouteCounter = 0;
     state->flag = 0;
-    static const auto trace_state = getenv("GAME_AUDIO_TRACE") != nullptr;
-    if (trace_state) {
-        LOG_INFO(Lib_AudioOut, "GetPortState handle={:#x} output={} channel={} volume={}",
-                 handle, state->output, state->channel, state->volume);
-    }
     LOG_DEBUG(Lib_AudioOut,
               "called, handle={:#x}, state={}, output={}, channel={}, volume={}, "
               "rerouteCounter={}, flag={}",
@@ -604,7 +595,6 @@ s32 PS4_SYSV_ABI sceAudioOutGetPortState(s32 handle, OrbisAudioOutPortState* sta
 }
 
 s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
-    static const auto trace_out = getenv("GAME_AUDIO_TRACE") != nullptr;
     LOG_TRACE(Lib_AudioOut, "(STUBBED) called, handle={:#x}, ptr={}", handle, fmt::ptr(ptr));
 
     if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
@@ -680,10 +670,6 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
             port->output_ready = true;
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
-    }
-    if (trace_out) {
-        LOG_INFO(Lib_AudioOut, "Output handle={:#x} ptr={} -> {}", handle, fmt::ptr(ptr),
-                 samples_sent);
     }
     return samples_sent;
 }

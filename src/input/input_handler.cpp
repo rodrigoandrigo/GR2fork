@@ -122,8 +122,8 @@ axis_right_x = axis_right_x
 axis_right_y = axis_right_y
 
 # Range of deadzones: 1 (almost none) to 127 (max)
-analog_deadzone = leftjoystick, 5, 127
-analog_deadzone = rightjoystick, 5, 127
+analog_deadzone = leftjoystick, 20, 127
+analog_deadzone = rightjoystick, 15, 127
 
 override_controller_color = false, 0, 0, 255
 
@@ -700,7 +700,7 @@ void ParseInputConfig(const std::string game_id = "") {
                     {"rightjoystick", rightjoystick_deadzone},
                     {"l2", lefttrigger_deadzone},
                     {"r2", righttrigger_deadzone},
-                };
+            };
             output_gamepad_id = output_gamepad_id == -1 ? 1 : output_gamepad_id;
 
             if (auto it = deadzone_map.find(device); it != deadzone_map.end()) {

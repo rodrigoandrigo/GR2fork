@@ -86,7 +86,7 @@ public:
     static bool Download(Frame& frame);
 
     /// The guest draws a photo between creating the JPEG encoder and encoding the photo. While
-    /// set, a new graphics pipeline is waited for as long as one that draws into the photo.
+    /// set, draws wait for the shaders and pipelines they need instead of being skipped.
     static void SetCapturing(bool value) noexcept {
         capturing.store(value, std::memory_order_relaxed);
     }
